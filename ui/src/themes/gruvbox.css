@@ -1,0 +1,93 @@
+/* Gruvbox for Gall: dark (hard) in dark mode, light (soft) in light mode.
+   Palette: https://github.com/ellisonleao/gruvbox.nvim/blob/main/lua/gruvbox.lua (MIT).
+   Built into Gall: pick "Gruvbox" in Settings › Appearance › Custom theme. A file
+   <settings>/themes/gruvbox.css takes its place. See docs/themes/README.md. */
+
+/* 1. Main colours */
+:root:root[data-theme="light"] {
+  --accent: #af3a03 !important; /* faded_orange; !important beats the accent picked in Settings */
+  --brand-b: #b57614;           /* faded_yellow: second colour of the header and disk-bar gradient */
+  --accent-2: #427b58;          /* faded_aqua: second colour of the focused-pane border */
+
+  --bg: #f2e5bc;        /* light0_soft: canvas behind the panes */
+  --bg-2: #fbf1c7;      /* light0: panes, sidebar */
+  --bg-3: #ebdbb2;      /* light1: buttons, inputs */
+  --bg-hover: #d5c4a1;  /* light2 */
+  --fg: #3c3836;        /* dark1: foreground */
+  --fg-dim: #665c54;    /* dark3 */
+  --fg-faint: #7c6f64;  /* dark4 */
+  --border: #d5c4a1;    /* light2 */
+  --border-soft: rgba(60, 56, 54, 0.08);
+  --glass: rgba(251, 241, 199, 0.88);
+  --hover: rgba(60, 56, 54, 0.05);
+
+  --mark: #fabd2f;      /* bright_yellow */
+  --mark-fg: #282828;   /* dark0 */
+  --folder: #79740e;    /* faded_green, as Gruvbox colours directories */
+  --danger: #9d0006;    /* faded_red */
+  --ok: #79740e;        /* faded_green */
+  --warn: #b57614;      /* faded_yellow */
+
+  --sm-cpu: #af3a03;    /* system monitor rings */
+  --sm-gpu: #076678;
+  --sm-mem: #79740e;
+
+  /* 2. Syntax colours (compare view and source previews) */
+  --sx-comment: #928374;
+  --sx-string: #79740e;
+  --sx-number: #8f3f71;
+  --sx-keyword: #9d0006;
+  --sx-operator: #af3a03;
+  --sx-function: #79740e;
+  --sx-type: #b57614;
+  --sx-variable: #076678;
+  --sx-attr: #af3a03;
+}
+
+:root:root[data-theme="dark"] {
+  --accent: #fe8019 !important; /* bright_orange; !important beats the accent picked in Settings */
+  --brand-b: #fabd2f;           /* bright_yellow: second colour of the header and disk-bar gradient */
+  --accent-2: #8ec07c;          /* bright_aqua: second colour of the focused-pane border */
+
+  --bg: #1d2021;        /* dark0_hard: canvas behind the panes */
+  --bg-2: #282828;      /* dark0: panes, sidebar */
+  --bg-3: #3c3836;      /* dark1: buttons, inputs */
+  --bg-hover: #504945;  /* dark2 */
+  --fg: #ebdbb2;        /* light1: foreground */
+  --fg-dim: #bdae93;    /* light3 */
+  --fg-faint: #928374;  /* gray: comment */
+  --border: #3c3836;    /* dark1 */
+  --border-soft: rgba(235, 219, 178, 0.06);
+  --glass: rgba(40, 40, 40, 0.88);
+  --hover: rgba(235, 219, 178, 0.05);
+
+  --mark: #fabd2f;      /* bright_yellow */
+  --mark-fg: #1d2021;   /* dark0_hard */
+  --folder: #b8bb26;    /* bright_green, as Gruvbox colours directories */
+  --danger: #fb4934;    /* bright_red */
+  --ok: #b8bb26;        /* bright_green */
+  --warn: #fabd2f;      /* bright_yellow */
+
+  --sm-cpu: #fe8019;    /* system monitor rings */
+  --sm-gpu: #83a598;
+  --sm-mem: #b8bb26;
+
+  /* 2. Syntax colours (compare view and source previews) */
+  --sx-comment: #928374;
+  --sx-string: #b8bb26;
+  --sx-number: #d3869b;
+  --sx-keyword: #fb4934;
+  --sx-operator: #fe8019;
+  --sx-function: #b8bb26;
+  --sx-type: #fabd2f;
+  --sx-variable: #83a598;
+  --sx-attr: #fe8019;
+}
+
+/* 3. The GALL wordmark in the title bar */
+:root:root[data-theme="light"] .wordmark {
+  background-image: linear-gradient(100deg, #af3a03 0%, #3c3836 45%, #b57614 100%);
+}
+:root:root[data-theme="dark"] .wordmark {
+  background-image: linear-gradient(100deg, #fe8019 0%, #ebdbb2 45%, #fabd2f 100%);
+}

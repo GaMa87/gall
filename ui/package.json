@@ -1,0 +1,46 @@
+{
+  "name": "gall-ui",
+  "private": true,
+  "version": "0.1.2",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "test": "vitest run",
+    "typecheck": "tsc -b --noEmit"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.12.4",
+    "@tauri-apps/plugin-dialog": "^2.8.4",
+    "@tauri-apps/plugin-opener": "^2.7.2",
+    "dompurify": "^3.4.17",
+    "markdown-it": "^15.0.3",
+    "pdfjs-dist": "^6.4.299",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@types/markdown-it": "^14.2.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.5",
+    "vitest": "^5.0.5"
+  },
+  "description": "UI of Gall, an open-source Miller-column dual-pane file manager",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/GaMa87/gall.git",
+    "directory": "ui"
+  },
+  "keywords": [
+    "file-manager",
+    "miller-columns",
+    "dual-pane",
+    "tauri",
+    "react",
+    "linux"
+  ]
+}

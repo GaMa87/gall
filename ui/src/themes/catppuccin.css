@@ -1,0 +1,76 @@
+/* Catppuccin for Gall: Mocha in dark mode, Latte in light mode.
+   Palette: https://catppuccin.com/palette (MIT).
+   Built into Gall: pick "Catppuccin" in Settings › Appearance › Custom theme. A file
+   <settings>/themes/catppuccin.css takes its place. See docs/themes/README.md. */
+
+/* ── Mocha (dark) ─────────────────────────────────────────── */
+:root:root[data-theme="dark"] {
+  --accent: #89b4fa !important; /* blue; !important beats the accent picked in Settings */
+  --brand-b: #cba6f7;           /* mauve: second colour of the header and disk-bar gradient */
+  --accent-2: #94e2d5;          /* teal: second colour of the focused-pane border */
+
+  --bg: #11111b;        /* crust: canvas behind the panes */
+  --bg-2: #1e1e2e;      /* base: panes, sidebar */
+  --bg-3: #313244;      /* surface0: buttons, inputs */
+  --bg-hover: #45475a;  /* surface1 */
+  --fg: #cdd6f4;        /* text */
+  --fg-dim: #a6adc8;    /* subtext0 */
+  --fg-faint: #6c7086;  /* overlay0 */
+  --border: #313244;
+  --border-soft: rgba(205, 214, 244, 0.06);
+  --glass: rgba(30, 30, 46, 0.86);
+  --hover: rgba(205, 214, 244, 0.05);
+
+  --mark: #f9e2af;      /* search highlight: yellow */
+  --mark-fg: #11111b;
+  --folder: #f9e2af;
+  --danger: #f38ba8;
+  --ok: #a6e3a1;
+  --warn: #fab387;
+
+  --sm-cpu: #89b4fa;    /* system monitor rings */
+  --sm-gpu: #fab387;
+  --sm-mem: #a6e3a1;
+}
+:root:root[data-theme="dark"] {
+  --sx-comment: #7f849c; --sx-string: #a6e3a1; --sx-number: #fab387; --sx-keyword: #cba6f7;
+  --sx-operator: #89dceb; --sx-function: #89b4fa; --sx-type: #f9e2af; --sx-variable: #f38ba8;
+  --sx-attr: #f9e2af;
+}
+:root:root[data-theme="dark"] .wordmark { background-image: linear-gradient(100deg, #89b4fa 0%, #cdd6f4 45%, #f5c2e7 100%); }
+
+/* ── Latte (light) ────────────────────────────────────────── */
+:root:root[data-theme="light"] {
+  --accent: #1e66f5 !important;
+  --brand-b: #8839ef;
+  --accent-2: #179299;
+
+  --bg: #dce0e8;        /* crust */
+  --bg-2: #eff1f5;      /* base */
+  --bg-3: #e6e9ef;      /* mantle */
+  --bg-hover: #ccd0da;  /* surface0 */
+  --fg: #4c4f69;
+  --fg-dim: #6c6f85;
+  --fg-faint: #9ca0b0;
+  --border: #ccd0da;
+  --border-soft: rgba(76, 79, 105, 0.08);
+  --glass: rgba(239, 241, 245, 0.88);
+  --hover: rgba(76, 79, 105, 0.05);
+
+  --mark: rgba(223, 142, 29, 0.35);
+  --mark-fg: inherit;
+  --folder: #df8e1d;
+  --danger: #d20f39;
+  --ok: #40a02b;
+  --warn: #fe640b;
+
+  --sm-cpu: #1e66f5;
+  --sm-gpu: #fe640b;
+  --sm-mem: #40a02b;
+}
+:root:root[data-theme="light"] {
+  --sx-comment: #8c8fa1; --sx-string: #40a02b; --sx-number: #fe640b; --sx-keyword: #8839ef;
+  --sx-operator: #04a5e5; --sx-function: #1e66f5; --sx-type: #df8e1d; --sx-variable: #d20f39;
+  --sx-attr: #df8e1d;
+}
+:root:root[data-theme="light"] .wordmark { background-image: linear-gradient(100deg, #1e66f5 0%, #4c4f69 50%, #ea76cb 100%); }

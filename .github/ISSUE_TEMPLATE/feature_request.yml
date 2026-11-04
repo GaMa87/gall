@@ -1,0 +1,18 @@
+name: Feature request
+description: Suggest an idea or improvement
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes: { label: What problem would this solve? }
+    validations: { required: true }
+  - type: textarea
+    id: proposal
+    attributes: { label: Proposed behaviour, description: Keyboard shortcuts, mouse interactions, settings… }
+  - type: checkboxes
+    id: cleanroom
+    attributes:
+      label: Clean-room
+      options:
+        - label: My description is based on my own observation or public documentation, not on decompiled or copied code from other products.
+          required: true
