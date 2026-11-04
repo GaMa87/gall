@@ -1,0 +1,35 @@
+{
+    "version": "0.1.2",
+    "description": "Keyboard-first file manager: Miller columns, dual pane, instant search, compare tool and Vim keys",
+    "homepage": "https://github.com/GaMa87/gall",
+    "license": "MIT",
+    "notes": "Settings and data are kept in $persist_dir\\UserData and survive updates.",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/GaMa87/gall/releases/download/v0.1.2/Gall-0.1.2-windows-x64-portable.zip",
+            "hash": "TODO: sha256 from SHA256SUMS of the release",
+            "extract_dir": "Gall-0.1.2-windows-x64-portable"
+        }
+    },
+    "bin": "gall.exe",
+    "shortcuts": [
+        [
+            "gall.exe",
+            "Gall"
+        ]
+    ],
+    "persist": "UserData",
+    "checkver": "github",
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/GaMa87/gall/releases/download/v$version/Gall-$version-windows-x64-portable.zip",
+                "extract_dir": "Gall-$version-windows-x64-portable",
+                "hash": {
+                    "url": "https://github.com/GaMa87/gall/releases/download/v$version/SHA256SUMS",
+                    "regex": "$sha256\\s+\\*?$basename"
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,26 @@
+# Maintainer: Matej Gajšek <37571659+GaMa87@users.noreply.github.com>
+# Draft for the AUR package "gall-bin": repackages the official .deb from GitHub Releases.
+# Update: bump pkgver, then `updpkgsums && makepkg --printsrcinfo > .SRCINFO`.
+pkgname=gall-bin
+pkgver=0.1.2
+pkgrel=1
+pkgdesc="Keyboard-first file manager: Miller columns, dual pane, instant search, compare tool and Vim keys"
+arch=('x86_64')
+url="https://github.com/GaMa87/gall"
+license=('MIT')
+depends=('webkit2gtk-4.1' 'gtk3' 'hicolor-icon-theme')
+optdepends=('gst-plugins-good: video and audio preview'
+            'gst-libav: more video formats in the preview'
+            'git: Git status in the file list'
+            'ttf-nerd-fonts-symbols: Nerd Font file icons')
+provides=('gall')
+conflicts=('gall')
+source=("$url/releases/download/v$pkgver/Gall_${pkgver}_amd64.deb"
+        "LICENSE-$pkgver::https://raw.githubusercontent.com/GaMa87/gall/v$pkgver/LICENSE")
+sha256sums=('SKIP'
+            'SKIP')
+
+package() {
+  bsdtar -xf data.tar.gz -C "$pkgdir"
+  install -Dm644 "LICENSE-$pkgver" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

@@ -1,0 +1,26 @@
+name: Bug report
+description: Something does not work as expected
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes: { label: What happened?, description: Include what you expected instead. }
+    validations: { required: true }
+  - type: textarea
+    id: steps
+    attributes: { label: Steps to reproduce, placeholder: "1. Open …\n2. Drag …\n3. …" }
+    validations: { required: true }
+  - type: input
+    id: version
+    attributes: { label: Gall version, placeholder: "0.1.0 (About dialog)" }
+    validations: { required: true }
+  - type: input
+    id: platform
+    attributes: { label: OS / desktop, placeholder: "Fedora 44, KDE Plasma 6 (Wayland)" }
+    validations: { required: true }
+  - type: textarea
+    id: log
+    attributes:
+      label: Log excerpt
+      description: "Linux: ~/.local/share/org.gall.app/logs/ (or run `find ~/.local/share -name '*.log' -path '*gall*'`)"
+      render: text

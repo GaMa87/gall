@@ -1,0 +1,96 @@
+%YAML 1.2
+---
+# A compact PowerShell grammar for the preview and compare colours. bat's full grammar
+# needs Oniguruma and is left out of the pure-Rust (fancy-regex) syntax set we use.
+name: PowerShell
+file_extensions: [ps1, psm1, psd1, ps1xml, pssc, psrc]
+first_line_match: '^#!.*\bpwsh\b'
+scope: source.powershell
+
+contexts:
+  main:
+    - match: '<#'
+      scope: punctuation.definition.comment.powershell
+      push: block_comment
+    - match: '#.*$'
+      scope: comment.line.powershell
+    - match: '@"\s*$'
+      scope: punctuation.definition.string.begin.powershell
+      push: here_double
+    - match: "@'\\s*$"
+      scope: punctuation.definition.string.begin.powershell
+      push: here_single
+    - match: '"'
+      scope: punctuation.definition.string.begin.powershell
+      push: double
+    - match: "'"
+      scope: punctuation.definition.string.begin.powershell
+      push: single
+    - include: variables
+    - match: '(?i)\b(if|elseif|else|switch|foreach|for|while|do|until|function|filter|workflow|configuration|param|begin|process|end|clean|dynamicparam|return|break|continue|try|catch|finally|throw|trap|exit|in|class|enum|using|namespace|module|data|hidden|static)\b'
+      scope: keyword.control.powershell
+    - match: '(?i)-(eq|ne|gt|ge|lt|le|like|notlike|match|notmatch|contains|notcontains|in|notin|replace|creplace|ireplace|split|join|is|isnot|as|and|or|xor|not|band|bor|bxor|bnot|shl|shr|f|ceq|cne|clike|cmatch|ieq|ine)\b'
+      scope: keyword.operator.powershell
+    - match: '\[[A-Za-z_][\w.`]*(\[\])?\]'
+      scope: support.type.powershell
+    - match: '\b[A-Za-z]+-[A-Za-z][\w]*\b'
+      scope: support.function.powershell
+    - match: '(?<=\s)-[A-Za-z][\w]*'
+      scope: variable.parameter.powershell
+    - match: '\b(0x[0-9a-fA-F]+|\d+(\.\d+)?([eE][+-]?\d+)?)([kKmMgGtTpP][bB])?\b'
+      scope: constant.numeric.powershell
+    - match: '[=!<>+\-*/%|&]+'
+      scope: keyword.operator.powershell
+
+  variables:
+    - match: '(?i)\$(true|false|null)\b'
+      scope: constant.language.powershell
+    - match: '\$\{[^}]*\}'
+      scope: variable.other.powershell
+    - match: '\$(\w+:)?[\w?^$]+'
+      scope: variable.other.powershell
+
+  block_comment:
+    - meta_scope: comment.block.powershell
+    - match: '#>'
+      pop: true
+
+  double:
+    - meta_scope: string.quoted.double.powershell
+    - match: '`.'
+      scope: constant.character.escape.powershell
+    - match: '""'
+    - match: '\$\('
+      push: subexpr
+    - include: variables
+    - match: '"'
+      scope: punctuation.definition.string.end.powershell
+      pop: true
+
+  single:
+    - meta_scope: string.quoted.single.powershell
+    - match: "''"
+    - match: "'"
+      scope: punctuation.definition.string.end.powershell
+      pop: true
+
+  here_double:
+    - meta_scope: string.quoted.double.heredoc.powershell
+    - match: '^"@'
+      scope: punctuation.definition.string.end.powershell
+      pop: true
+    - match: '\$\('
+      push: subexpr
+    - include: variables
+
+  here_single:
+    - meta_scope: string.quoted.single.heredoc.powershell
+    - match: "^'@"
+      scope: punctuation.definition.string.end.powershell
+      pop: true
+
+  subexpr:
+    - clear_scopes: 1
+    - match: '\)'
+      pop: true
+    - include: main

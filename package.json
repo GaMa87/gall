@@ -1,0 +1,21 @@
+{
+  "name": "gall",
+  "private": true,
+  "version": "0.1.2",
+  "description": "Open-source Miller-column, dual-pane file manager for Linux (Tauri + Rust + React)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/GaMa87/gall.git"
+  },
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "test": "cargo test --workspace && npm --prefix ui test",
+    "lint": "cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && npm --prefix ui run typecheck"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.12.4"
+  }
+}

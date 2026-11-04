@@ -1,0 +1,48 @@
+[package]
+name = "gall"
+description = "Fast Miller-column, dual-pane file manager (Tauri + Rust + React)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "gall_app"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+gall-core = { path = "../crates/gall-core" }
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-opener = "2"
+tauri-plugin-log = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-dialog = "2"
+arboard = { version = "3.7.0", features = ["wayland-data-control", "image-data"] }
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+dirs = "7.0.0"
+crossbeam-channel = "0.5.17"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gdk = "0.18"
+
+[target.'cfg(windows)'.dependencies]
+# Paths of files dropped from other apps (WebView2 hands them to the host); the versions
+# Tauri's wry uses, so the types are the same.
+webview2-com = "0.39.1"
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Com"] }
+
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+# Dragging files out to other apps as real files (Explorer / Finder, mail): a web page's
+# drag carries only text. Linux's GTK drag already offers them as file URIs.
+drag = "2.1.1"

@@ -1,0 +1,26 @@
+# cargo-deny policy: only permissive / weak-copyleft licences compatible with
+# distributing Gall under MIT. Run locally: `cargo deny check`.
+[graph]
+all-features = false
+
+[licenses]
+confidence-threshold = 0.9
+allow = [
+  "MIT", "MIT-0", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause",
+  "ISC", "Zlib", "Unicode-3.0", "Unicode-DFS-2016", "CC0-1.0", "Unlicense", "BSL-1.0",
+  "MPL-2.0", "CDLA-Permissive-2.0", "0BSD", "OFL-1.1",
+]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+
+[advisories]
+# Transitive GTK3 bindings used by Tauri on Linux are flagged "unmaintained";
+# they are outside our control until Tauri moves to GTK4.
+unmaintained = "workspace"

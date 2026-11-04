@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metadata (software centres, Flathub). Validate: appstreamcli validate -->
+<component type="desktop-application">
+  <id>org.gall.app</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Gall</name>
+  <summary>Keyboard-first file manager with instant search and compare</summary>
+  <description>
+    <p>Gall is a fast file manager for people who live on the keyboard. It pairs Miller columns with two side-by-side browsers and tabs, and adds instant search over the whole computer, a built-in compare tool and Vim keys.</p>
+    <ul>
+      <li>Find any file on the computer as you type (fuzzy, fzf-style syntax) and search text inside files with the ripgrep engine</li>
+      <li>Compare text and code, Excel, ODS and CSV files cell by cell, images (swipe, onion skin, pixel difference) and whole folders</li>
+      <li>Undo copy, move, rename, batch rename and delete with Ctrl+Z; a background task queue shows progress and time left</li>
+      <li>Vim keys, a which-key command menu on Space and rebindable shortcuts</li>
+      <li>Previews for images, PDF, video, audio, text, code and archives</li>
+      <li>Git status, folder sizes, colour tags, notes and file templates</li>
+      <li>Dark and light themes, Nerd Font icons and custom CSS themes (Catppuccin and Gruvbox included)</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">Gall.desktop</launchable>
+  <url type="homepage">https://github.com/GaMa87/gall</url>
+  <url type="bugtracker">https://github.com/GaMa87/gall/issues</url>
+  <url type="vcs-browser">https://github.com/GaMa87/gall</url>
+  <developer id="io.github.gama87"><name>Gall contributors</name></developer>
+  <categories><category>System</category><category>FileManager</category><category>Utility</category></categories>
+  <keywords><keyword>file manager</keyword><keyword>miller columns</keyword><keyword>dual pane</keyword><keyword>explorer</keyword><keyword>finder</keyword><keyword>commander</keyword><keyword>search</keyword><keyword>diff</keyword><keyword>compare</keyword><keyword>vim</keyword></keywords>
+  <provides><mediatype>inode/directory</mediatype></provides>
+  <content_rating type="oars-1.1" />
+  <screenshots>
+    <screenshot type="default"><caption>Two browsers with Miller columns</caption><image>https://raw.githubusercontent.com/GaMa87/gall/main/docs/screenshots/main.png</image></screenshot>
+    <screenshot><caption>Comparing two versions of a file, with word-level changes</caption><image>https://raw.githubusercontent.com/GaMa87/gall/main/docs/screenshots/compare-text.png</image></screenshot>
+    <screenshot><caption>Comparing two spreadsheets cell by cell</caption><image>https://raw.githubusercontent.com/GaMa87/gall/main/docs/screenshots/compare-excel.png</image></screenshot>
+    <screenshot><caption>Every shortcut in one searchable sheet</caption><image>https://raw.githubusercontent.com/GaMa87/gall/main/docs/screenshots/key-sheet.png</image></screenshot>
+    <screenshot><caption>Light theme with a thumbnail grid</caption><image>https://raw.githubusercontent.com/GaMa87/gall/main/docs/screenshots/light-grid.png</image></screenshot>
+  </screenshots>
+  <releases><release version="0.1.2" date="2026-11-04"/><release version="0.1.1" date="2026-11-03"/><release version="0.1.0" date="2026-10-31"/></releases>
+</component>
