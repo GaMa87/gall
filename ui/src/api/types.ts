@@ -166,7 +166,7 @@ export interface CloudFolder {
 export type SortKey = "name" | "ext" | "modified" | "created" | "size";
 export type Layout = "standard" | "columns" | "classic";
 export type ThemeMode = "system" | "dark" | "light";
-export type PathFormat = "native" | "nativeQuoted" | "escaped" | "forward" | "forwardQuoted" | "uri";
+export type PathFormat = "native" | "nativeQuoted" | "escaped" | "forward" | "forwardQuoted" | "uri" | "linux";
 
 export interface Tab {
   id: number;
@@ -301,6 +301,8 @@ export interface IndexResult {
   total: number;
   searched: number;
   elapsedMs: number;
+  /** The folder is not in the system index (WSL, a network share) and is being scanned. */
+  scanning: boolean;
 }
 
 export interface IndexStatus {
@@ -319,8 +321,30 @@ export interface GrepOptions {
   exclude: string[];
   includeHidden: boolean;
   respectGitignore: boolean;
+  /** Search everything: no excluded folders, .gitignore, .gallignore or cache folders. */
+  everything: boolean;
   maxMatches: number;
 }
+
+/** The .gallignore line that hides an item from search. */
+export interface HiddenBy {
+  file: string;
+  line: string;
+}
+
+/** Which items of a folder a .gallignore hides from search. */
+export interface HiddenState {
+  /** The folder itself or one above it is hidden: everything in it is. */
+  folder: string | null;
+  folderRule: HiddenBy | null;
+  entries: Record<string, HiddenBy>;
+}
+
+export type ShowOutcome =
+  | { kind: "removed"; file: string }
+  | { kind: "excepted"; file: string }
+  | { kind: "insideHidden"; folder: string }
+  | { kind: "notHidden" };
 
 export interface LineMatch {
   line: number;

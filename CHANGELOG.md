@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+## 0.1.3 — 2026-11-05
+- Usage: [search scope and exclusions](README.md#new-in-013-search-scope-and-exclusions) and [WSL browsing](README.md#windows-browse-wsl-distributions).
+- Added (Windows): browse installed WSL distributions from Drives, start stopped distributions, open a terminal there and copy Linux-format paths. File operations use the Linux trash where available; Stop terminates the distribution after confirmation.
+- Added: a support card in About and Settings, with featured tips shown first.
+- Fixed: batch rename no longer overwrites a file whose name collides with a temporary staging path; a failed undo stays below operations completed while it was running.
+- Fixed: a cross-drive move that cannot finish removing its source preserves the destination copy in the undo journal and attempts to restore partially removed source entries.
+- Fixed: a failed note save keeps the draft open for retry instead of discarding it.
+- Fixed: extracting archive entries no longer aliases names that need filesystem sanitization, races with another extraction, or overwrites members named `.used` with cache bookkeeping.
+- Fixed: find-in-files include patterns no longer bring back files hidden by `.gallignore`; hiding an item during an on-demand folder scan no longer lets that scan restore the hidden result.
+- Fixed: Quick Open no longer offers Alt+I inside archives, lets a delayed coverage check override the chosen scope, or applies stale search results and errors after changing the query or closing the window.
+- Fixed: Quick Open respects input-method composition and AltGr input, and no longer adds opened folders to the recent-file list.
+- Fixed: Quick Open no longer offers the unusable "this folder" scope inside archives.
+- Changed: Quick Open starts in the open folder and below; Tab searches everywhere (it was the other way round). With no match in the folder it says so and points to Tab.
+- Fixed: a WSL folder listed in Settings › Search › Indexed folders was still read again by Quick Open instead of using the index.
+- Fixed (WSL): copying, duplicating or moving a folder inside WSL was refused when a file somewhere inside it had a name ending with a dot or space, although Linux does that copy; the whole folder was also read beforehand. Only a permanent delete, a copy or move to Windows and archives still check every name.
+- Fixed (WSL): undo of several trashed items stopped at the first whose place was taken again; the others now come back too.
+- Fixed (WSL): undo restores the newest copy when the same path was trashed more than once within a second.
+- Fixed: Alt+I in Quick Open passed Quick Open's syntax (`ext:pdf`, `'exact`, several words) to the name search, which then found nothing.
+- Changed: Hide from search no longer re-indexes the whole computer for each item; the cache-folder check costs one attribute query per folder.
+- Fixed: Quick Open found nothing in a WSL distribution, on a network share or in a folder outside the indexed ones. It now opens scoped to such a folder and starts reading it as soon as it opens (reused for two minutes), so results are there by the time you type. Find in files › Home inside WSL searches the Linux home instead of the Windows one.
+- Added: per-project search exclusions. A `.gallignore` file (gitignore syntax, also outside git) hides files and folders from Quick Open, find in files and the name search (F3) in its folder and below, also when a search starts in a subfolder. Right-click › Hide from search adds the selected items to it (with Undo); Quick Open drops them at once.
+- Added: items hidden from search are dimmed in italics; right-click › Show in search again takes the line out, or adds a `!` exception when a pattern hides the item. A hidden folder says "hidden from search" in its header (click to show it again). Hand edits to a `.gallignore` reach Quick Open without a manual re-index.
+- Added: Alt+I searches ignored files too: a toggle in find in files and the name search (F3), and in Quick Open it searches the current folder by name including what the index leaves out.
+- Added: folders tagged as caches (`CACHEDIR.TAG`, e.g. Cargo's `target`) are skipped by every search. New installs also skip `coverage`, `.next`, `.nuxt`, `.svelte-kit`, `.turbo`, `.parcel-cache`, `.gradle`, `.tox`, `.mypy_cache` and `.pytest_cache`.
+- Changed: the name search (F3) skips the folders in Settings › Search › Never index or search (node_modules, target, dist, …) and, with *Skip files ignored by .gitignore*, what `.gitignore` leaves out, like Quick Open and find in files.
+
 ## 0.1.2 — 2026-11-04
 - Changed: the compare view shows the folders of both files as ~/… inside the home folder (it showed the full path).
 - Added: the .deb and .rpm install the AppStream metadata, so KDE Discover and GNOME Software show Gall's description and screenshots. Releases include a SHA256SUMS file.

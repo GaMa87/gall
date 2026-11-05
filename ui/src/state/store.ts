@@ -32,7 +32,7 @@ export interface MenuItem {
 
 export type Overlay =
   | { type: "pathEdit"; b: number }
-  | { type: "search"; root: string }
+  | { type: "search"; root: string; pattern?: string; everything?: boolean }
   | { type: "trash" }
   | { type: "quickOpen"; initial?: string }
   | { type: "grep"; root: string; scope: "folder" | "home" | "root" }
@@ -50,7 +50,8 @@ export type Overlay =
   | { type: "dircmp"; left: string; right: string }
   | { type: "matrix"; paths: string[] }
   | { type: "openWith"; paths: string[]; mode: "file" | "terminal" | "editor" }
-  | { type: "dialog"; dialog: DialogSpec };
+  /** `under`: the window the dialog was asked from; it stays open beneath and comes back. */
+  | { type: "dialog"; dialog: DialogSpec; under?: Overlay | null };
 
 export interface FolderSize extends DirSize {
   done: boolean;

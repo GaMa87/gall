@@ -11,6 +11,7 @@ import * as A from "../state/actions";
 import { controller } from "../state/controllers";
 import { useStore } from "../state/store";
 import { FileIcon, Icon } from "./Icon";
+import { primaryMod } from "../core/keymap";
 
 const TOKENS: { token: string; label: string; title: string }[] = [
   { token: "{name}", label: "Name", title: "The current name without the extension" },
@@ -97,7 +98,7 @@ export function BatchRename({ b, entries }: { b: number; entries: FileEntry[] })
     e.stopPropagation();
     if (e.key === "Escape") { e.preventDefault(); return close(); }
     const inText = (e.target as HTMLElement).tagName === "TEXTAREA";
-    if (e.key === "Enter" && (e.ctrlKey || !inText)) { e.preventDefault(); apply(); }
+    if (e.key === "Enter" && (primaryMod(e) || !inText)) { e.preventDefault(); apply(); }
   };
 
   return (

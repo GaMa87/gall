@@ -12,6 +12,7 @@ pub mod fuzzy;
 pub mod gitstatus;
 pub mod grep;
 pub mod hexdiff;
+pub mod ignorefile;
 pub mod index;
 pub mod listing;
 pub mod ops;
@@ -21,6 +22,7 @@ pub mod table;
 pub mod trashbin;
 pub mod volumes;
 pub mod watcher;
+pub mod wsl;
 
 pub use entry::{EntryKind, FileEntry};
 

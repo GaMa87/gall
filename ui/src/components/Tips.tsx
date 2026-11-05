@@ -18,7 +18,10 @@ interface Tip {
 const TIP_GROUPS: { title: string; icon: string; tips: Tip[] }[] = [
   {
     title: "Getting around", icon: "forward", tips: [
-      { title: "Go to any file", body: (k) => <>{k("quickOpen")} opens Quick Open over an index of your folders. End the query with <code>/</code> to list only folders; <code>ext:md</code>, <code>^start</code>, <code>end$</code>, <code>'exact</code> and <code>!skip</code> narrow it down.</> },
+      { title: "Go to any file", body: (k) => <>{k("quickOpen")} searches the open folder and below; <kbd>Tab</kbd> switches to everywhere in the index. Unindexed folders are read on demand. Inside archives, only index search is available. End the query with <code>/</code> to list only folders; <code>ext:md</code>, <code>^start</code>, <code>end$</code>, <code>'exact</code> and <code>!skip</code> narrow it down.</> },
+      { title: "Hide search noise", body: () => <>Right-click › Hide from search adds an item to <code>.gallignore</code>; Show in search again brings it back. Rules also apply to subfolders, find in files and F3, without changing Git's rules.</> },
+      { title: "Find ignored files", body: () => <><kbd>Alt+I</kbd> includes ignored files in find in files and the name search. In Quick Open it opens the name search in the current folder, including ignored files (not available inside archives).</> },
+      { title: "Browse WSL on Windows", body: (k) => <>Open a distribution from Drives › Not mounted to start it. {k("terminal")} opens its Linux shell here. Delete uses its Linux trash where available; Gall's Trash window only shows the Windows Recycle Bin. Stop terminates every program in the distribution.</> },
       { title: "Type to filter", body: () => <>Start typing in a folder to filter it (with vim keys on, press <kbd>/</kbd> first). <kbd>Esc</kbd> clears the filter.</> },
       { title: "Every action by name", body: (k) => <>{k("commandPalette")} opens the command palette: search any action and see its keys.</> },
       { title: "A menu instead of shortcuts", body: (_k, leader) => leader ? <>Press <kbd>{leader}</kbd> (the leader key) for a menu of grouped actions; each letter leads one level deeper.</> : <>Set a leader key in Settings › Vim keys for a menu of grouped actions instead of shortcuts.</> },
@@ -67,6 +70,7 @@ const TIP_GROUPS: { title: string; icon: string; tips: Tip[] }[] = [
 ];
 
 const ALL_TIPS = TIP_GROUPS.flatMap((g) => g.tips);
+const FEATURED_TIP_TITLES = new Set(["Go to any file", "Work across both", "Peek inside"]);
 
 function useTipKeys(): { k: K; leader: string } {
   const keys = useKeyLabels();
@@ -79,24 +83,43 @@ function useTipKeys(): { k: K; leader: string } {
   return { k, leader: leaderSetting };
 }
 
-/** Every tip, grouped. */
+/** A few standout tips shown before the support card in Settings › About. */
+export function FeaturedTips() {
+  const { k, leader } = useTipKeys();
+  const tips = ALL_TIPS.filter((tip) => FEATURED_TIP_TITLES.has(tip.title));
+  return (
+    <div className="tip-grid">
+      {tips.map((tip) => (
+        <div key={tip.title} className="tip">
+          <b>{tip.title}</b>
+          <p>{tip.body(k, leader)}</p>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** Remaining tips, grouped. */
 export function TipsList() {
   const { k, leader } = useTipKeys();
   return (
     <div className="tips">
-      {TIP_GROUPS.map((g) => (
+      {TIP_GROUPS.map((g) => {
+        const tips = g.tips.filter((tip) => !FEATURED_TIP_TITLES.has(tip.title));
+        return tips.length > 0 && (
         <section key={g.title} className="tip-group">
           <h5><Icon name={g.icon} size={14} />{g.title}</h5>
           <div className="tip-grid">
-            {g.tips.map((t) => (
-              <div key={t.title} className="tip">
-                <b>{t.title}</b>
-                <p>{t.body(k, leader)}</p>
+            {tips.map((tip) => (
+              <div key={tip.title} className="tip">
+                <b>{tip.title}</b>
+                <p>{tip.body(k, leader)}</p>
               </div>
             ))}
           </div>
         </section>
-      ))}
+        );
+      })}
     </div>
   );
 }

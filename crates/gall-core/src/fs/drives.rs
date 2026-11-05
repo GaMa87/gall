@@ -4,7 +4,7 @@ use serde::Serialize;
 use std::path::Path;
 use sysinfo::Disks;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Drive {
     /// Short label shown in the drives column (e.g. `C:` or `/`, `data`).
@@ -74,6 +74,7 @@ fn is_user_visible(mount: &str, fs: &str) -> bool {
         if HIDDEN_PREFIX
             .iter()
             .any(|p| mount == *p || mount.starts_with(&format!("{p}/")))
+            || super::wsl::hidden_mount(mount)
         {
             return false;
         }
@@ -118,8 +119,13 @@ pub fn list_drives() -> Vec<Drive> {
         } else {
             device.clone()
         };
+        // Gall inside WSL: /mnt/c is drive C: of Windows.
+        let (short, label) = match super::wsl::drvfs_letter(&mount, &fs) {
+            Some(letter) => (letter, "Windows".to_string()),
+            None => (short_name(&mount, &label), label),
+        };
         out.push(Drive {
-            short: short_name(&mount, &label),
+            short,
             label,
             mount,
             fs,
@@ -148,6 +154,8 @@ pub fn list_drives() -> Vec<Drive> {
     }
     #[cfg(unix)]
     share_space(&mut out);
+    // WSL distributions (Windows; detected in the background, never waited for).
+    out.extend(super::wsl::drives());
     out
 }
 
@@ -291,6 +299,12 @@ fn statvfs(path: &str) -> Option<(u64, u64)> {
 /// Unmounts / ejects a removable drive using the platform tool. When that fails, the
 /// message names the programs that still have files open on the drive ([`holders`]).
 pub fn eject(mount: &str) -> crate::Result<()> {
+    // A WSL distribution: "Eject" stops it.
+    if cfg!(windows) {
+        if let Some(w) = super::wsl::parse_unc(mount) {
+            return super::wsl::terminate(&w.distro);
+        }
+    }
     eject_inner(mount).map_err(|e| {
         let who = holders(mount);
         if who.is_empty() {
@@ -1208,6 +1222,10 @@ fn fstab_mounts() -> Vec<std::path::PathBuf> {
 /// letter, a folder under /run/media/<user>, /media, /mnt or /Volumes, an fstab mount
 /// point): those folders come back with the drive. History drops the gone ones.
 pub fn folder_gone(path: &Path) -> bool {
+    // Looking into a stopped WSL distribution would start it.
+    if !super::wsl::may_touch(path) {
+        return false;
+    }
     // Only a clear "not found": no permission or a network error is not "deleted".
     if !matches!(path.try_exists(), Ok(false)) {
         return false;

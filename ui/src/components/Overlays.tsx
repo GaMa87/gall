@@ -8,6 +8,7 @@ import { api } from "../api/ipc";
 import type { FileEntry, Template } from "../api/types";
 import { formatEta } from "../core/eta";
 import { formatDateTime, formatSize } from "../core/format";
+import { primaryMod } from "../core/keymap";
 import { basename, parent, sepOf } from "../core/path";
 import * as A from "../state/actions";
 import { controller } from "../state/controllers";
@@ -212,6 +213,11 @@ function Dialog({ d }: { d: DialogSpec }) {
   const [value, setValue] = useState(d.input?.value ?? "");
   const inputRef = useRef<HTMLInputElement>(null);
   const toggle = useRef(0);
+  // The window the dialog was asked from (it stays open beneath) gets the keyboard back.
+  useEffect(() => {
+    const prev = document.activeElement as HTMLElement | null;
+    return () => { if (prev && prev !== document.body && prev.isConnected) prev.focus(); };
+  }, []);
   useEffect(() => {
     const el = inputRef.current;
     if (!el) return;
@@ -229,6 +235,9 @@ function Dialog({ d }: { d: DialogSpec }) {
       <div className="modal" onMouseDown={(e) => e.stopPropagation()}
         onKeyDown={(e) => {
           e.stopPropagation();
+          // Enter / Esc that end an input method's composition (Japanese, Chinese…) belong
+          // to it: they submitted or cancelled the dialog with the half-typed name.
+          if (e.nativeEvent.isComposing) return;
           const plain = !e.ctrlKey && !e.altKey && !e.metaKey;
           // Vim keys (no text field to type into): h/l move between buttons, q cancels.
           const vimKey = vim && plain && !d.input ? e.key : "";
@@ -250,7 +259,7 @@ function Dialog({ d }: { d: DialogSpec }) {
             e.preventDefault();
             const fb = focusedButton();
             if (fb && plain) finish(fb.dataset.id!);
-            else if (e.ctrlKey && d.buttons.some((b) => b.id === "open")) finish("open");
+            else if (primaryMod(e) && d.buttons.some((b) => b.id === "open")) finish("open");
             else if (e.shiftKey && d.buttons.some((b) => b.id === "moveIn")) finish("moveIn");
             else finish(primary.id);
           } else if (e.key === "F2" && d.input?.toggleSelections?.length && inputRef.current) {
@@ -298,8 +307,10 @@ function PathEdit({ b }: { b: number }) {
   }, []);
   useEffect(() => {
     if (!value || value === current) return setCompletions([]);
-    const t = setTimeout(() => api.pathComplete(value).then(setCompletions).catch(() => {}), 80);
-    return () => clearTimeout(t);
+    // A reply for what was typed before is dropped (it would list the wrong folder).
+    let alive = true;
+    const t = setTimeout(() => api.pathComplete(value).then((c) => alive && setCompletions(c)).catch(() => {}), 80);
+    return () => { alive = false; clearTimeout(t); };
   }, [value, current]);
 
   const suggestions = useMemo(() => {
@@ -344,18 +355,21 @@ function PathEdit({ b }: { b: number }) {
             onContextMenu={(e) => {
               e.preventDefault();
               A.showMenu(e.clientX, e.clientY, (
-                [["native", "Copy path"], ["nativeQuoted", "Copy path in quotes"], ["escaped", "Copy with escaped backslashes"], ["forward", "Copy with forward slashes"], ["forwardQuoted", "Copy with forward slashes, quoted"], ["uri", "Copy as file:// URI"]] as const
-              ).map(([f, l]) => ({ label: l, run: () => api.pathFormat(current, f).then((t) => api.clipSetText(t)).then(() => A.notify("Path copied")).catch(A.fail) })));
+                [["native", "Copy path"], ["nativeQuoted", "Copy path in quotes"], ["escaped", "Copy with escaped backslashes"], ["forward", "Copy with forward slashes"], ["forwardQuoted", "Copy with forward slashes, quoted"], ["uri", "Copy as file:// URI"], ["linux", "Copy as Linux path (WSL)"]] as const
+              ).filter(([f]) => f !== "linux" || getState().info?.platform === "windows").map(([f, l]) => ({ label: l, run: () => api.pathFormat(current, f).then((t) => api.clipSetText(t)).then(() => A.notify("Path copied")).catch(A.fail) })));
             }}
             onKeyDown={(e) => {
               e.stopPropagation();
+              if (e.nativeEvent.isComposing) return; // the input method's Enter / Esc
               if (e.key === "Escape") A.openOverlay(null);
               else if (e.key === "ArrowDown") { e.preventDefault(); setSel((s) => Math.min(suggestions.length - 1, s + 1)); }
               else if (e.key === "ArrowUp") { e.preventDefault(); setSel((s) => Math.max(-1, s - 1)); }
-              else if (e.key === "Tab" && suggestions[0]) { e.preventDefault(); { const p = suggestions[Math.max(0, sel)].path; setValue(p.endsWith(sepOf(p)) ? p : p + sepOf(p)); } }
-              else if (e.key === "Enter") go(sel >= 0 ? suggestions[sel].path : value);
-              else if (e.key === "c" && e.ctrlKey && inputRef.current?.selectionStart === inputRef.current?.selectionEnd) {
-                api.clipSetText(value).then(() => A.notify("Path copied"));
+              // The list can shrink under the highlight (completions and the clipboard arrive
+              // later): an index past its end means none.
+              else if (e.key === "Tab" && suggestions[0]) { e.preventDefault(); { const p = (suggestions[sel] ?? suggestions[0]).path; setValue(p.endsWith(sepOf(p)) ? p : p + sepOf(p)); } }
+              else if (e.key === "Enter") go(suggestions[sel]?.path ?? value);
+              else if (e.key === "c" && primaryMod(e) && inputRef.current?.selectionStart === inputRef.current?.selectionEnd) {
+                api.clipSetText(value).then(() => A.notify("Path copied")).catch(A.fail);
               }
             }}
           />
@@ -384,10 +398,12 @@ function Templates({ dir, b }: { dir: string; b: number }) {
   const nameRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    api.templatesList().then((l) => {
-      const all: Template[] = [{ name: "Empty file", path: "", suggested: "New file.txt" }, ...l];
-      setList(all);
-      setName(all[0].suggested);
+    // Without the templates (folder unreadable) an empty file can still be made: the list
+    // stayed empty and the name blank, so the window could not create anything.
+    const empty: Template = { name: "Empty file", path: "", suggested: "New file.txt" };
+    api.templatesList().catch((e) => (A.fail(e), [] as Template[])).then((l) => {
+      setList([empty, ...l]);
+      setName(empty.suggested);
     });
     listRef.current?.focus();
   }, []);
@@ -405,8 +421,9 @@ function Templates({ dir, b }: { dir: string; b: number }) {
       <div className="modal" style={{ width: 460 }} onMouseDown={(e) => e.stopPropagation()} tabIndex={-1}
         onKeyDown={(e) => {
           e.stopPropagation();
+          if (e.nativeEvent.isComposing) return; // the input method's Enter / Esc
           if (e.key === "Escape") A.openOverlay(null);
-          if (e.key === "Enter") { e.preventDefault(); create(e.ctrlKey); }
+          if (e.key === "Enter") { e.preventDefault(); create(primaryMod(e)); }
         }}>
         <h3>New file</h3>
         <div className="body">
@@ -439,33 +456,65 @@ function Templates({ dir, b }: { dir: string; b: number }) {
 
 // ───────── note editor (O-09) ─────────
 
-function NoteEditor({ dir, path, text }: { dir: string; path?: string; text?: string }) {
+function NoteEditor({ dir, path, text, overlay }: {
+  dir: string;
+  path?: string;
+  text?: string;
+  overlay: Extract<Overlay, { type: "note" }>;
+}) {
   const [value, setValue] = useState(text ?? "");
+  const [notePath, setNotePath] = useState(path);
+  const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
+  const notePathRef = useRef(path);
+  const valueRef = useRef(value);
+  valueRef.current = value;
   const save = async () => {
+    // A slow write must not start a second create/update, but edits made while it is
+    // pending remain in the editor and can be saved again after this request completes.
+    if (savingRef.current) return;
+    savingRef.current = true;
+    setSaving(true);
+    const submitted = valueRef.current;
+    let succeeded = false;
     try {
-      if (path) await api.updateNote(path, value);
-      else if (value.trim()) await api.createNote(dir, value);
-      A.refreshUndo();
+      if (notePathRef.current) await api.updateNote(notePathRef.current, submitted);
+      else if (submitted.trim()) {
+        const createdPath = await api.createNote(dir, submitted);
+        notePathRef.current = createdPath;
+        setNotePath(createdPath);
+      }
+      succeeded = true;
     } catch (e) {
       A.fail(e);
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
     }
-    A.openOverlay(null);
+    if (!succeeded) return;
+    void A.refreshUndo();
+    // Do not discard edits typed during the write, or close an overlay opened since.
+    if (getState().overlay === overlay && valueRef.current === submitted) A.openOverlay(null);
   };
   return (
     <div className="backdrop" onMouseDown={() => A.openOverlay(null)}>
       <div className="modal" style={{ width: 520 }} onMouseDown={(e) => e.stopPropagation()} tabIndex={-1}
         onKeyDown={(e) => {
           e.stopPropagation();
+          if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
           if (e.key === "Escape") A.openOverlay(null);
-          if (e.key === "Enter" && e.ctrlKey) save();
+          if (e.key === "Enter" && primaryMod(e)) { e.preventDefault(); void save(); }
         }}>
-        <h3>{path ? `Edit note — ${basename(path)}` : "New note"}</h3>
+        <h3>{notePath ? `Edit note — ${basename(notePath)}` : "New note"}</h3>
         <div className="body">
-          <textarea autoFocus rows={8} value={value} onChange={(e) => setValue(e.target.value)} placeholder="First line becomes the file name…" />
+          <textarea autoFocus rows={8} value={value} onChange={(e) => {
+            valueRef.current = e.target.value;
+            setValue(e.target.value);
+          }} placeholder="First line becomes the file name…" />
         </div>
         <div className="buttons">
           <button className="btn" onClick={() => A.openOverlay(null)}>Cancel</button>
-          <button className="btn primary" onClick={save}>Save<small>Ctrl+Enter</small></button>
+          <button className="btn primary" disabled={saving} onClick={() => void save()}>{saving ? "Saving…" : "Save"}<small>Ctrl+Enter</small></button>
         </div>
       </div>
     </div>
@@ -554,6 +603,7 @@ function PreviewWindow({ b }: { b: number }) {
   const vim = useStore((s) => s.settings?.vimKeys ?? false);
   useEffect(() => {
     const key = (e: KeyboardEvent) => {
+      if (dialogOnTop()) return;
       if (e.key === "Escape" || e.key === " ") {
         if ((e.target as HTMLElement).tagName === "VIDEO" && e.key === " ") return;
         e.preventDefault();
@@ -704,17 +754,32 @@ export function Overlays() {
     return () => window.removeEventListener("keydown", onKey, true);
   }, [o]);
   if (!o) return null;
+  // A dialog asked from a window is drawn over it: the window keeps its place in the tree
+  // (and so its state, e.g. unsaved merges in the compare view) while the dialog is open.
+  const base = o.type === "dialog" ? o.under : o;
+  return (
+    <>
+      {base && <OverlayWindow o={base} />}
+      {/* A fresh dialog for each question: the focus starts on it, not on a button of the last one. */}
+      {o.type === "dialog" && <Dialog key={dialogKey(o.dialog)} d={o.dialog} />}
+    </>
+  );
+}
+
+/** A dialog is open over the window that asked it (its window-wide keys must wait). */
+const dialogOnTop = () => getState().overlay?.type === "dialog";
+
+function OverlayWindow({ o }: { o: Overlay }) {
   switch (o.type) {
-    // A fresh dialog for each question: the focus starts on it, not on a button of the last one.
-    case "dialog": return <Dialog key={dialogKey(o.dialog)} d={o.dialog} />;
+    case "dialog": return null;
     case "pathEdit": return <PathEdit b={o.b} />;
     case "templates": return <Templates dir={o.dir} b={o.b} />;
-    case "note": return <NoteEditor dir={o.dir} path={o.path} text={o.text} />;
+    case "note": return <NoteEditor dir={o.dir} path={o.path} text={o.text} overlay={o} />;
     case "tag": return <TagPopup paths={o.paths} />;
     case "properties": return <Properties entry={o.entry} />;
     case "batchRename": return <BatchRename b={o.b} entries={o.entries} />;
     case "previewWindow": return <PreviewWindow b={o.b} />;
-    case "search": return <SearchWindow root={o.root} />;
+    case "search": return <SearchWindow root={o.root} initialPattern={o.pattern} initialEverything={o.everything} />;
     case "trash": return <TrashWindow />;
     case "quickOpen": return <QuickOpen initial={o.initial} />;
     case "grep": return <FindInFiles root={o.root} scope={o.scope} />;

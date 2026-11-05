@@ -1,0 +1,40 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.10.0.schema.json
+
+# Two installers from the same release:
+#   - NSIS setup.exe: per-user (Tauri's default installMode "currentUser"),
+#     installs to %LOCALAPPDATA%\Gall, uninstall key HKCU\...\Uninstall\Gall.
+#   - WiX MSI: per-machine (ALLUSERS=1), installs to %ProgramFiles%\Gall.
+# winget picks the user installer by default and the MSI for `--scope machine`.
+# The ProductCode/UpgradeCode below are read from the MSI (msiinfo/msidump).
+# The Tauri app identifier (org.gall.app -> io.github.GaMa87.Gall) is not used
+# here; PackageIdentifier GaMa87.Gall is winget's own ID and stays the same.
+
+PackageIdentifier: GaMa87.Gall
+PackageVersion: 0.1.2
+MinimumOSVersion: 10.0.17763.0
+UpgradeBehavior: install
+ReleaseDate: 2026-11-04
+Installers:
+- Architecture: x64
+  InstallerType: nullsoft
+  Scope: user
+  InstallerUrl: https://github.com/GaMa87/gall/releases/download/v0.1.2/Gall_0.1.2_x64-setup.exe
+  InstallerSha256: B1BA61B08A2C0F28349DE76272577B72D3D519F11C1C63C88163F5E9F08B284C
+  ProductCode: Gall
+  AppsAndFeaturesEntries:
+  - DisplayName: Gall
+    Publisher: Matej Gajšek
+    ProductCode: Gall
+- Architecture: x64
+  InstallerType: wix
+  Scope: machine
+  InstallerUrl: https://github.com/GaMa87/gall/releases/download/v0.1.2/Gall_0.1.2_x64_en-US.msi
+  InstallerSha256: 7E6DC9F7EED63CD9488360487A4E74E19F8B4FED61A9871E12C4DF750C6CFA34
+  ProductCode: '{F550EEEB-2219-4C9F-8AF1-9DE363579A62}'
+  AppsAndFeaturesEntries:
+  - DisplayName: Gall
+    Publisher: Matej Gajšek
+    ProductCode: '{F550EEEB-2219-4C9F-8AF1-9DE363579A62}'
+    UpgradeCode: '{3270BE9A-59D6-59C7-93A4-C7DFCA07EFB3}'
+ManifestType: installer
+ManifestVersion: 1.10.0

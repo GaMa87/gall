@@ -33,6 +33,9 @@ pub struct AppState {
     pub search_cancel: Mutex<Option<Arc<AtomicBool>>>,
     pub grep_cancel: Mutex<Option<Arc<AtomicBool>>>,
     pub index: Arc<FileIndex>,
+    /// Quick Open in a folder the system index does not hold (WSL, a network share):
+    /// a separate index of just that folder, scanned on demand.
+    pub folder_scan: Mutex<Option<FolderScan>>,
     pub clipboard: Mutex<FileClipboard>,
     /// Message shown once at startup (e.g. settings restored from backup).
     pub startup_notice: Mutex<Option<String>>,
@@ -42,6 +45,14 @@ pub struct AppState {
     pub monitor: Arc<Mutex<Option<gall_core::sysmon::Monitor>>>,
     /// Cancels the running folder comparison or sync.
     pub dircmp_cancel: Mutex<Option<Arc<AtomicBool>>>,
+}
+
+pub struct FolderScan {
+    pub root: std::path::PathBuf,
+    pub index: Arc<FileIndex>,
+    pub cancel: Arc<AtomicBool>,
+    /// The settings it was built with (see `commands::scan_key`).
+    pub key: String,
 }
 
 pub fn home() -> String {
@@ -133,6 +144,7 @@ impl AppState {
             search_cancel: Mutex::new(None),
             grep_cancel: Mutex::new(None),
             index: Arc::new(FileIndex::new()),
+            folder_scan: Mutex::new(None),
             clipboard: Mutex::new(FileClipboard::default()),
             startup_notice: Mutex::new(notice),
             first_run,

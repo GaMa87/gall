@@ -74,6 +74,7 @@ const P: Record<string, string> = {
   alert: "M12 4l9 16H3z M12 10v4.5 M12 17.5v.01",
   cloud: "M7 18a4.5 4.5 0 0 1-.6-8.96A6 6 0 0 1 17.8 8.5 4.75 4.75 0 0 1 17.25 18z",
   bell: "M6 16V11a6 6 0 0 1 12 0v5l2 2H4z M10 20a2 2 0 0 0 4 0",
+  eye: "M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z M12 9a3 3 0 1 0 0 6a3 3 0 1 0 0-6z",
 };
 
 export function Icon({ name, size = 16, color, style, title }: { name: string; size?: number; color?: string; style?: CSSProperties; title?: string }) {

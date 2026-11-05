@@ -386,6 +386,9 @@ function PdfPreview({ path }: { path: string }) {
         const data = await fetch(fileSrc(path)).then((r) => r.arrayBuffer());
         loaded = await pdfjs.getDocument({ data }).promise;
         if (alive) setDoc(loaded);
+        // Another file was chosen while this one loaded: the cleanup ran before there was
+        // a document to destroy, so it is destroyed here (else its worker memory stays).
+        else loaded.destroy?.();
       } catch (e) {
         if (alive) setErr(String(e));
       }
@@ -400,8 +403,12 @@ function PdfPreview({ path }: { path: string }) {
     if (!doc || !canvas.current || !box.current) return;
     let task: any = null;
     let text: any = null;
+    // A newer page / zoom started meanwhile: stop, so two renders never share the canvas
+    // (pdf.js refuses that, and the older page could end up drawn over the newer one).
+    let stale = false;
     (async () => {
       const p = await doc.getPage(page);
+      if (stale || !canvas.current || !box.current) return;
       const base = p.getViewport({ scale: 1 });
       const bw = box.current!.clientWidth - 16;
       const bh = box.current!.clientHeight - 16;
@@ -419,12 +426,13 @@ function PdfPreview({ path }: { path: string }) {
         tb.replaceChildren();
         tb.style.setProperty("--total-scale-factor", String(scale));
         const { TextLayer } = await import("pdfjs-dist");
+        if (stale) return;
         text = new TextLayer({ textContentSource: p.streamTextContent(), container: tb, viewport: p.getViewport({ scale }) });
         text.render().catch(() => {});
       }
       await task.promise.catch(() => {});
     })();
-    return () => { task?.cancel?.(); text?.cancel?.(); };
+    return () => { stale = true; task?.cancel?.(); text?.cancel?.(); };
   }, [doc, page, fitWidth, zoom]);
 
   if (err) return <div className="pv-icon"><Icon name="pdf" size={56} /><span>PDF preview failed</span></div>;

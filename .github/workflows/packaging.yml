@@ -1,0 +1,220 @@
+name: Packaging
+
+# Checks the package manifests in packaging/ against the published release:
+# AUR gall-bin (Arch container), Scoop (portable zip) and winget (setup.exe + MSI).
+# Nothing is submitted anywhere; the maintainer submits by hand (see packaging/README.md).
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "packaging/**"
+      - ".github/workflows/packaging.yml"
+
+concurrency:
+  group: packaging-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  aur:
+    # Only on the public repo: the private development repo runs no CI/CD.
+    if: github.repository == 'GaMa87/gall'
+    name: AUR gall-bin (makepkg, namcap, install, run)
+    runs-on: ubuntu-24.04
+    container: archlinux:latest
+    steps:
+      - name: Install build tools
+        run: pacman -Syu --noconfirm --needed base-devel namcap git sudo xorg-server-xvfb
+
+      - uses: actions/checkout@v7
+
+      - name: Prepare non-root build user
+        run: |
+          useradd -m builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+          cp -r packaging/aur/gall-bin /home/builder/gall-bin
+          chown -R builder: /home/builder/gall-bin
+
+      - name: .SRCINFO matches PKGBUILD
+        working-directory: /home/builder/gall-bin
+        run: sudo -u builder makepkg --printsrcinfo | diff -u .SRCINFO -
+
+      - name: namcap PKGBUILD
+        working-directory: /home/builder/gall-bin
+        run: |
+          namcap PKGBUILD | tee namcap-pkgbuild.txt
+          ! grep -E '^PKGBUILD \([^)]*\) E:' namcap-pkgbuild.txt
+
+      - name: makepkg (as non-root, checks sha256sums)
+        working-directory: /home/builder/gall-bin
+        run: sudo -u builder makepkg --syncdeps --noconfirm --cleanbuild
+
+      - name: namcap package
+        working-directory: /home/builder/gall-bin
+        run: |
+          pkg=$(ls gall-bin-*.pkg.tar.zst)
+          namcap -i "$pkg" | tee namcap-pkg.txt
+          ! grep -E '^gall-bin E:' namcap-pkg.txt
+
+      - name: Install package
+        working-directory: /home/builder/gall-bin
+        run: |
+          pacman -U --noconfirm gall-bin-*.pkg.tar.zst
+          pacman -Qi gall-bin
+          pacman -Ql gall-bin
+
+      - name: No missing shared libraries
+        run: |
+          ldd /usr/bin/gall | tee ldd.txt
+          ! grep -q 'not found' ldd.txt
+
+      - name: Binary starts (no --version/--help; stays up 15 s under Xvfb)
+        run: |
+          # gall has no --version/--help: unknown flags are logged and the window opens.
+          set +e
+          sudo -u builder env WEBKIT_DISABLE_COMPOSITING_MODE=1 \
+            xvfb-run -a timeout 15 gall --version > run.log 2>&1
+          rc=$?
+          set -e
+          cat run.log
+          if [ "$rc" -ne 124 ]; then echo "gall exited early with code $rc"; exit 1; fi
+          if grep -q 'panicked' run.log; then echo "gall panicked"; exit 1; fi
+          echo "gall was still running after 15 s"
+
+  scoop:
+    # Only on the public repo: the private development repo runs no CI/CD.
+    if: github.repository == 'GaMa87/gall'
+    name: Scoop (install from local manifest, checkver, autoupdate)
+    runs-on: windows-latest
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Release info
+        shell: pwsh
+        run: gh api repos/GaMa87/gall/releases --jq '.[] | "\(.tag_name) prerelease=\(.prerelease) draft=\(.draft)"'
+
+      - name: Install Scoop
+        shell: pwsh
+        run: |
+          iex "& {$(irm get.scoop.sh)} -RunAsAdmin"
+          "$env:USERPROFILE\scoop\shims" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Install Gall from packaging/scoop/gall.json
+        shell: pwsh
+        run: |
+          scoop install .\packaging\scoop\gall.json
+          $app = "$env:USERPROFILE\scoop\apps\gall\current"
+          if (-not (Test-Path "$app\gall.exe")) { throw "gall.exe not installed" }
+          if (-not (Test-Path "$app\portable")) { throw "portable marker missing" }
+          $lnk = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Scoop Apps\Gall.lnk"
+          if (-not (Test-Path $lnk)) { throw "Start menu shortcut missing" }
+          if (-not (Test-Path "$env:USERPROFILE\scoop\shims\gall.exe")) { throw "shim missing" }
+          scoop info gall
+
+      - name: gall runs (via shim) and writes UserData into persist
+        shell: pwsh
+        run: |
+          Start-Process -FilePath "$env:USERPROFILE\scoop\shims\gall.exe"
+          Start-Sleep -Seconds 20
+          $p = Get-Process -Name gall -ErrorAction SilentlyContinue | Where-Object { $_.Path -notlike '*\shims\*' }
+          if (-not $p) { throw "gall.exe is not running after 20 s" }
+          $p | Format-Table Id, Path
+          $p | Stop-Process -Force
+          Get-Process -Name gall -ErrorAction SilentlyContinue | Stop-Process -Force
+          Get-ChildItem "$env:USERPROFILE\scoop\persist\gall\UserData" | Format-Table Name
+          if (-not (Get-ChildItem "$env:USERPROFILE\scoop\persist\gall\UserData")) { throw "UserData in persist is empty" }
+
+      - name: checkver and autoupdate
+        shell: pwsh
+        run: |
+          $bin = "$env:USERPROFILE\scoop\apps\scoop\current\bin"
+          & "$bin\checkver.ps1" -App gall -Dir "$PWD\packaging\scoop"
+          # Re-create the manifest from "autoupdate" and compare the hash with the committed one.
+          $tmp = New-Item -ItemType Directory -Path "$env:RUNNER_TEMP\scoop-au"
+          Copy-Item packaging\scoop\gall.json $tmp
+          & "$bin\checkver.ps1" -App gall -Dir $tmp -Version 0.1.2 -Update -ForceUpdate
+          $want = (Get-Content packaging\scoop\gall.json | ConvertFrom-Json).architecture.'64bit'
+          $got = (Get-Content "$tmp\gall.json" | ConvertFrom-Json).architecture.'64bit'
+          "committed: $($want.hash)"; "autoupdate: $($got.hash)"
+          if ($want.hash -ne $got.hash -or $want.url -ne $got.url -or $want.extract_dir -ne $got.extract_dir) {
+            throw "autoupdate does not reproduce the committed manifest"
+          }
+
+  winget:
+    # Only on the public repo: the private development repo runs no CI/CD.
+    if: github.repository == 'GaMa87/gall'
+    name: winget (validate, install user + machine)
+    runs-on: windows-latest
+    env:
+      MANIFEST: packaging\winget\manifests\g\GaMa87\Gall\0.1.2
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Ensure winget
+        shell: pwsh
+        run: |
+          if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+            Install-PackageProvider -Name NuGet -Force | Out-Null
+            Install-Module -Name Microsoft.WinGet.Client -Force -Repository PSGallery
+            Repair-WinGetPackageManager -AllUsers -Latest -Force
+          }
+          winget --version
+          winget settings --enable LocalManifestFiles
+
+      - name: winget validate
+        shell: pwsh
+        run: |
+          winget validate --manifest $env:MANIFEST --disable-interactivity
+          if ($LASTEXITCODE -ne 0) { throw "winget validate failed ($LASTEXITCODE)" }
+
+      - name: Install, run and uninstall both installers
+        shell: pwsh
+        run: |
+          function Get-Arp {
+            $keys = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                    'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                    'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+            Get-ItemProperty $keys -ErrorAction SilentlyContinue | Where-Object DisplayName -like 'Gall*'
+          }
+          function Test-Run($exe) {
+            if (-not (Test-Path $exe)) { throw "$exe not found" }
+            $p = Start-Process -FilePath $exe -PassThru
+            Start-Sleep -Seconds 20
+            if ($p.HasExited) { throw "$exe exited early with code $($p.ExitCode)" }
+            "$exe is running (pid $($p.Id))"
+            Get-Process -Name gall -ErrorAction SilentlyContinue | Stop-Process -Force
+            Start-Sleep -Seconds 2
+          }
+          $common = '--manifest', $env:MANIFEST, '--silent', '--accept-package-agreements',
+                    '--accept-source-agreements', '--disable-interactivity'
+
+          "=== user scope (NSIS) ==="
+          winget install @common --scope user
+          if ($LASTEXITCODE -ne 0) { throw "winget install --scope user failed ($LASTEXITCODE)" }
+          $arp = Get-Arp
+          $arp | Format-List PSChildName, PSPath, DisplayName, DisplayVersion, Publisher, InstallLocation, UninstallString, QuietUninstallString
+          $nsis = $arp | Where-Object PSPath -like '*HKEY_CURRENT_USER*'
+          if (-not $nsis) { throw "no per-user ARP entry" }
+          if ($nsis.PSChildName -ne 'Gall') { throw "NSIS ProductCode is '$($nsis.PSChildName)', manifest says 'Gall'" }
+          $loc = "$($nsis.InstallLocation)".Trim('"')
+          if (-not $loc) { $loc = "$env:LOCALAPPDATA\Gall" }
+          Test-Run (Join-Path $loc 'gall.exe')
+          winget uninstall --product-code Gall --silent --disable-interactivity --accept-source-agreements
+          if (Get-Arp | Where-Object PSPath -like '*HKEY_CURRENT_USER*') { throw "per-user uninstall left an ARP entry" }
+
+          "=== machine scope (MSI) ==="
+          winget install @common --scope machine
+          if ($LASTEXITCODE -ne 0) { throw "winget install --scope machine failed ($LASTEXITCODE)" }
+          $arp = Get-Arp
+          $arp | Format-List PSChildName, PSPath, DisplayName, DisplayVersion, Publisher, InstallLocation
+          $msi = $arp | Where-Object PSChildName -eq '{F550EEEB-2219-4C9F-8AF1-9DE363579A62}'
+          if (-not $msi) { throw "MSI ProductCode not found in ARP" }
+          Test-Run "$env:ProgramFiles\Gall\gall.exe"
+          winget uninstall --product-code '{F550EEEB-2219-4C9F-8AF1-9DE363579A62}' --silent --disable-interactivity --accept-source-agreements
+          if ($LASTEXITCODE -ne 0) { throw "winget uninstall (MSI) failed ($LASTEXITCODE)" }

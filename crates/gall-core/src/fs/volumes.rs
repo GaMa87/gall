@@ -162,7 +162,10 @@ pub fn other_volumes() -> Vec<Volume> {
     }
     #[cfg(windows)]
     {
-        win::locked_drives()
+        let mut v = win::locked_drives();
+        // WSL distributions that are not running yet.
+        v.extend(super::wsl::volumes());
+        v
     }
     #[cfg(not(any(target_os = "linux", windows)))]
     {
@@ -216,6 +219,13 @@ fn udisksctl(args: &[&str], stdin: Option<&str>) -> std::result::Result<String, 
 
 /// Mounts a device and returns where. Already mounted counts as success.
 pub fn mount_volume(id: &str) -> Result<String> {
+    // A WSL distribution ("\\wsl.localhost\Ubuntu\"): starting it mounts it.
+    if cfg!(windows) {
+        if let Some(w) = super::wsl::parse_unc(id) {
+            super::wsl::start(&w.distro)?;
+            return Ok(id.to_string());
+        }
+    }
     #[cfg(target_os = "linux")]
     {
         match udisksctl(&["mount", "-b", id], None) {

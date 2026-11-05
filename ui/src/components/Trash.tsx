@@ -10,6 +10,7 @@ import * as A from "../state/actions";
 import { controller } from "../state/controllers";
 import { getState, useStore } from "../state/store";
 import { FileIcon, Icon } from "./Icon";
+import { primaryMod } from "../core/keymap";
 
 type SortKey = "name" | "originalParent" | "deleted" | "size";
 
@@ -148,7 +149,7 @@ export function TrashWindow() {
         return goTo(Math.max(0, Math.min(rows.length - 1, (anchor ?? -1) + (k === "j" ? 1 : -1))));
       }
     }
-    if (e.key === "a" && e.ctrlKey && !typing) {
+    if (e.key === "a" && primaryMod(e) && !typing) {
       e.preventDefault();
       setSel(new Set(rows.map((r) => r.id)));
     } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {

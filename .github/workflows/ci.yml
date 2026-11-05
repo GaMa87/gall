@@ -15,6 +15,8 @@ env:
 
 jobs:
   ui:
+    # Only on the public repo: the private development repo runs no CI/CD.
+    if: github.repository == 'GaMa87/gall'
     name: UI (typecheck, tests, build)
     runs-on: ubuntu-24.04
     steps:
@@ -30,6 +32,8 @@ jobs:
       - run: npm --prefix ui run build
 
   rust:
+    # Only on the public repo: the private development repo runs no CI/CD.
+    if: github.repository == 'GaMa87/gall'
     name: Rust (fmt, clippy, tests) – Linux
     runs-on: ubuntu-24.04
     steps:
@@ -55,11 +59,13 @@ jobs:
       - run: cargo test --workspace
 
   core:
+    # Only on the public repo: the private development repo runs no CI/CD.
+    if: github.repository == 'GaMa87/gall'
     name: Core tests – ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest]
+        os: [windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -67,7 +73,43 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p gall-core
 
+  macos:
+    # Only on the public repo: the private development repo runs no CI/CD.
+    if: github.repository == 'GaMa87/gall'
+    name: macOS (UI build, clippy, tests, app bundle)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            ui/package-lock.json
+      # tauri::generate_context! needs the built frontend.
+      - run: npm ci --prefix ui && npm --prefix ui run build
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      # Builds the real .app (debug, unsigned) so Info.plist, icons and bundle settings
+      # are checked too.
+      - run: npm ci
+      - run: npx tauri build --debug --bundles app --no-sign
+      - name: Check the bundle
+        run: |
+          app="target/debug/bundle/macos/Gall.app"
+          ls -la "$app/Contents/MacOS"
+          test -n "$(ls "$app/Contents/MacOS")"
+          plutil -lint "$app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$app/Contents/Info.plist"
+
   licenses:
+    # Only on the public repo: the private development repo runs no CI/CD.
+    if: github.repository == 'GaMa87/gall'
     name: Licenses & advisories (cargo-deny)
     runs-on: ubuntu-24.04
     steps:

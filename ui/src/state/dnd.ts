@@ -14,7 +14,7 @@
 //   ("ask" — show a menu — is available as a default action only)
 import type React from "react";
 import { getState } from "./store";
-import { named, notify, showMenu, transfer } from "./actions";
+import { fail, named, notify, refreshUndo, showMenu, transfer } from "./actions";
 import { listen } from "@tauri-apps/api/event";
 import { api } from "../api/ipc";
 import { isInside } from "../core/path";
@@ -194,6 +194,10 @@ if (typeof window !== "undefined") {
   window.addEventListener("drop", () => setTimeout(endDrag, 0), true);
   window.addEventListener("dragleave", (e) => {
     if (e.clientX <= 0 || e.clientY <= 0 || e.clientX >= window.innerWidth || e.clientY >= window.innerHeight) {
+      // A drag from another app gets no dragend here, and no drop once it left: end it now,
+      // or the modifier keys would be polled every 60 ms until the next drag. (It starts
+      // again with the next dragover if the pointer comes back.)
+      if (!current && externalDrag) return endDrag();
       target = null;
       setHint(null);
     }
@@ -235,7 +239,13 @@ export function startDrag(e: React.DragEvent, paths: string[]) {
       });
     return;
   }
-  begin(e, { kind: "files", paths }, paths.join("\n"), paths.map((p) => "file://" + encodeURI(p)).join("\r\n"));
+  begin(e, { kind: "files", paths }, paths.join("\n"), paths.map(fileUri).join("\r\n"));
+}
+
+/** `file://` URI of an absolute (Unix) path. Each name is encoded whole: `encodeURI` keeps
+ *  "#" and "?", so a receiving app read "Track #1.mp3" as "Track " plus a fragment. */
+export function fileUri(path: string): string {
+  return "file://" + path.split("/").map(encodeURIComponent).join("/");
 }
 
 export function startTabDrag(e: React.DragEvent, b: number, idx: number, label: string) {
@@ -378,17 +388,24 @@ function performDrop(paths: string[], dest: string, ev: EvMods, at: { x: number;
       mods = m;
       const kind = currentAction(paths, dest, ev);
       if (kind === "link") {
-        Promise.all(paths.map((p) => api.symlink(p, dest)))
-          .then(() => notify(`Created ${paths.length === 1 ? "a link to" : "links to"} ${named(paths)} in ${baseName(dest)}`, "success"))
-          .catch((err) => notify(String(err), "error"));
+        linkInto(paths, dest);
       } else if (kind === "menu") {
         showMenu(at.x, at.y, [
           { label: `Move ${named(paths)} here`, run: () => transfer("move", paths, dest) },
           { label: `Copy ${named(paths)} here`, run: () => transfer("copy", paths, dest) },
-          { label: paths.length === 1 ? "Create symbolic link here" : "Create symbolic links here", run: () => paths.forEach((p) => api.symlink(p, dest).catch(() => {})) },
+          { label: paths.length === 1 ? "Create symbolic link here" : "Create symbolic links here", run: () => linkInto(paths, dest) },
         ]);
       } else transfer(kind === "copy" ? "copy" : "move", paths, dest);
     });
+}
+
+/** Symbolic links to `paths` in `dest` (Alt-drop or the drop menu). A failure is said in
+ *  words; the menu item used to drop it silently. */
+function linkInto(paths: string[], dest: string) {
+  Promise.all(paths.map((p) => api.symlink(p, dest)))
+    .then(() => notify(`Created ${paths.length === 1 ? "a link to" : "links to"} ${named(paths)} in ${baseName(dest)}`, "success"))
+    .catch(fail)
+    .finally(refreshUndo);
 }
 
 /** Kept for callers that only need copy/move (e.g. tests). */

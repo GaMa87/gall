@@ -13,6 +13,7 @@ import * as A from "../state/actions";
 import { useStore } from "../state/store";
 import { Icon } from "./Icon";
 import { Highlight } from "./QuickOpen";
+import { primaryMod } from "../core/keymap";
 
 type Row =
   | { kind: "app"; app: AppChoice; tag: string; star?: boolean; positions: number[] }
@@ -132,7 +133,7 @@ export function OpenWith({ paths, mode }: { paths: string[]; mode: "file" | "ter
       if (!e.ctrlKey && (e.key === "j" || e.key === "k")) return move(e.key === "j" ? 1 : -1);
       if (/^[1-9]$/.test(e.key) && Number(e.key) <= n) {
         e.preventDefault();
-        accept(rows[Number(e.key) - 1], e.ctrlKey);
+        accept(rows[Number(e.key) - 1], primaryMod(e));
         return;
       }
     }
@@ -145,7 +146,7 @@ export function OpenWith({ paths, mode }: { paths: string[]; mode: "file" | "ter
     if (e.key === "ArrowUp" || (e.ctrlKey && (e.key === "k" || e.key === "p"))) return move(-1);
     if (e.key === "Enter") {
       e.preventDefault();
-      accept(cur, e.ctrlKey);
+      accept(cur, primaryMod(e));
     }
   };
 
@@ -162,7 +163,7 @@ export function OpenWith({ paths, mode }: { paths: string[]; mode: "file" | "ter
         <div className="qo-list">
           {apps === null && <div className="qo-empty">Looking for applications…</div>}
           {rows.map((r, i) => (
-            <div key={i} className={`qo-row cmd ${i === idx ? "on" : ""}`} onMouseMove={() => i !== idx && setIdx(i)} onClick={(e) => accept(r, e.ctrlKey)}>
+            <div key={i} className={`qo-row cmd ${i === idx ? "on" : ""}`} onMouseMove={() => i !== idx && setIdx(i)} onClick={(e) => accept(r, primaryMod(e))}>
               <span className="ow-star">{r.kind === "app" && r.star ? "★" : ""}</span>
               {!q && i < 9 && <kbd className="ow-num">{i + 1}</kbd>}
               <span className="qo-name">

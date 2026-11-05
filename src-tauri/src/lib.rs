@@ -186,6 +186,12 @@ pub fn run() {
             let watcher = FolderWatcher::new(
                 debounce,
                 Arc::new(move |p, storm| {
+                    // A .gallignore created, edited or deleted here: Quick Open follows it.
+                    if gall_core::fs::ignorefile::gallignore_changed_in(p) {
+                        if let Some(st) = h3.try_state::<state::AppState>() {
+                            commands::index_rebuild_bg(&h3, &st, 0);
+                        }
+                    }
                     let _ = h3.emit(
                         "fs-changed",
                         FsChanged {
@@ -335,7 +341,11 @@ pub fn run() {
             commands::search_cancel,
             commands::index_status,
             commands::index_refresh,
+            commands::hide_from_search,
+            commands::show_in_search,
+            commands::search_hidden,
             commands::index_query,
+            commands::index_covers,
             commands::grep_start,
             commands::grep_cancel,
             commands::grep_context,

@@ -34,6 +34,9 @@ pub struct GrepOptions {
     pub exclude: Vec<String>,
     pub include_hidden: bool,
     pub respect_gitignore: bool,
+    /// Search everything: no `.gallignore`, no cache folders skipped (the caller
+    /// also leaves out the excluded-folders setting and `.gitignore`).
+    pub everything: bool,
     pub max_matches: usize,
     /// Files larger than this (bytes) are skipped.
     pub max_filesize: u64,
@@ -49,6 +52,7 @@ impl Default for GrepOptions {
             exclude: vec![],
             include_hidden: false,
             respect_gitignore: true,
+            everything: false,
             max_matches: 20_000,
             max_filesize: 16 * 1024 * 1024,
         }
@@ -97,7 +101,10 @@ pub fn build_matcher(pattern: &str, opts: &GrepOptions) -> Result<RegexMatcher, 
     };
     b.word(opts.whole_word)
         .fixed_strings(!opts.regex)
-        .line_terminator(Some(b'\n'));
+        .line_terminator(Some(b'\n'))
+        // `$` also matches before the `\r` of Windows (CRLF) line endings.
+        .crlf(true)
+        .multi_line(true);
     b.build(pattern).map_err(|e| e.to_string())
 }
 
@@ -127,9 +134,11 @@ pub fn grep(
         .filter_entry({
             // Network shares inside the folder are not searched (see `remote_mounts`).
             let remote = super::index::remote_mounts();
+            let everything = opts.everything;
             move |e| {
                 !super::index::is_system_skip(e.path())
                     && (e.depth() == 0 || !remote.contains(e.path()))
+                    && (everything || !super::ignorefile::skip_cache(e))
             }
         })
         .max_filesize(Some(opts.max_filesize))
@@ -139,6 +148,7 @@ pub fn grep(
                 .unwrap_or(4)
                 .min(12),
         );
+    super::ignorefile::configure(&mut wb, !opts.everything);
     let globs = |list: &[String]| -> Vec<String> {
         list.iter()
             .flat_map(|g| g.split(','))
@@ -147,11 +157,17 @@ pub fn grep(
             .collect()
     };
     let (inc, exc) = (globs(&opts.include), globs(&opts.exclude));
-    if !inc.is_empty() || !exc.is_empty() {
+    let include = if inc.is_empty() {
+        None
+    } else {
         let mut ob = ignore::overrides::OverrideBuilder::new(root);
         for g in &inc {
             ob.add(g).map_err(|e| format!("include '{g}': {e}"))?;
         }
+        Some(ob.build().map_err(|e| e.to_string())?)
+    };
+    if !exc.is_empty() {
+        let mut ob = ignore::overrides::OverrideBuilder::new(root);
         for g in &exc {
             ob.add(&format!("!{g}"))
                 .map_err(|e| format!("exclude '{g}': {e}"))?;
@@ -169,10 +185,13 @@ pub fn grep(
         let matcher = matcher.clone();
         let mut searcher = SearcherBuilder::new()
             .binary_detection(BinaryDetection::quit(b'\x00'))
+            // Must agree with the matcher's CRLF mode, or every search fails.
+            .line_terminator(grep_matcher::LineTerminator::crlf())
             .line_number(true)
             .build();
         let (files, matches, searched, truncated) = (&files, &matches, &searched, &truncated);
         let cloud_only = &cloud_only;
+        let include = &include;
         Box::new(move |res| {
             use ignore::WalkState;
             if cancel.load(Ordering::Relaxed) || truncated.load(Ordering::Relaxed) {
@@ -182,6 +201,14 @@ pub fn grep(
                 return WalkState::Continue;
             };
             if !entry.file_type().is_some_and(|t| t.is_file()) {
+                return WalkState::Continue;
+            }
+            // Apply includes to files only, rather than letting an override
+            // whitelist them during traversal and bypass .gallignore.
+            if include
+                .as_ref()
+                .is_some_and(|patterns| !patterns.matched(entry.path(), false).is_whitelist())
+            {
                 return WalkState::Continue;
             }
             if cfg!(any(windows, target_os = "macos"))
@@ -260,13 +287,22 @@ fn shorten(line: &str, lnum: u64, ranges: &[(usize, usize)]) -> LineMatch {
     let ranges = ranges
         .iter()
         .filter(|(s, e)| *e > from && *s < to)
-        .map(|&(s, e)| (u16_at(s), u16_at(e)))
+        // A regex match can start or end inside a letter (`x*` matches empty between the
+        // bytes of `č`); widen it to whole letters.
+        .map(|&(s, e)| (u16_at(floor_char(line, s)), u16_at(ceil_char(line, e))))
         .collect();
     LineMatch {
         line: lnum,
         text,
         ranges,
     }
+}
+
+fn ceil_char(s: &str, mut i: usize) -> usize {
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
 }
 
 fn floor_char(s: &str, mut i: usize) -> usize {
@@ -409,6 +445,66 @@ mod tests {
             &|_| {}
         )
         .is_err());
+    }
+
+    #[test]
+    fn include_globs_do_not_resurface_gallignored_files() {
+        let d = tree();
+        let secret = d.path().join("src/secret.rs");
+        std::fs::write(&secret, "foo\n").unwrap();
+        std::fs::write(d.path().join("src/visible.rs"), "foo\n").unwrap();
+        super::super::ignorefile::hide_from_search(&secret).unwrap();
+
+        let opts = GrepOptions {
+            include: vec!["*.rs".into()],
+            ..Default::default()
+        };
+        let (files, _) = run(d.path(), "foo", opts.clone());
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().all(|f| !f.path.ends_with("secret.rs")));
+        assert!(files.iter().all(|f| f.path.ends_with(".rs")));
+
+        let opts = GrepOptions {
+            everything: true,
+            ..opts
+        };
+        let (files, _) = run(d.path(), "foo", opts);
+        assert!(files.iter().any(|f| f.path.ends_with("secret.rs")));
+        assert!(files.iter().all(|f| f.path.ends_with(".rs")));
+    }
+
+    /// Files saved on Windows end their lines with CRLF; `$` still matches at the end.
+    #[test]
+    fn regex_end_anchor_matches_crlf_lines() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("win.txt"), "food\r\nbar\r\n").unwrap();
+        let o = GrepOptions {
+            regex: true,
+            ..Default::default()
+        };
+        let (files, _) = run(d.path(), r"fo+d$", o.clone());
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].matches[0].text, "food");
+        assert_eq!(files[0].matches[0].ranges, vec![(0, 4)]);
+        let (files, _) = run(d.path(), r"^bar$", o);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].matches[0].line, 2);
+    }
+
+    /// Regex matches may start or end inside a multi-byte letter (empty matches of `x*`,
+    /// byte classes); the search still finishes and highlights whole letters.
+    #[test]
+    fn matches_inside_a_letter_do_not_crash() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("u.txt"), "čšž abc\n").unwrap();
+        let o = GrepOptions {
+            regex: true,
+            ..Default::default()
+        };
+        let (files, _) = run(d.path(), "x*", o.clone());
+        assert_eq!(files.len(), 1);
+        let (files, _) = run(d.path(), r"(?-u:\xC4)", o);
+        assert_eq!(files[0].matches[0].ranges, vec![(0, 1)], "č highlighted");
     }
 
     #[test]

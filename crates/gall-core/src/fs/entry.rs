@@ -70,15 +70,16 @@ pub fn extension_of(name: &str) -> String {
     }
 }
 
+/// Windows: the item has the hidden attribute (`AppData`, `desktop.ini`).
 #[cfg(windows)]
-fn hidden_attr(meta: &Metadata) -> bool {
+pub(crate) fn hidden_attr(meta: &Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
     const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
     meta.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0
 }
 
 #[cfg(not(windows))]
-fn hidden_attr(_meta: &Metadata) -> bool {
+pub(crate) fn hidden_attr(_meta: &Metadata) -> bool {
     false
 }
 

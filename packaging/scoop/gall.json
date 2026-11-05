@@ -3,11 +3,14 @@
     "description": "Keyboard-first file manager: Miller columns, dual pane, instant search, compare tool and Vim keys",
     "homepage": "https://github.com/GaMa87/gall",
     "license": "MIT",
-    "notes": "Settings and data are kept in $persist_dir\\UserData and survive updates.",
+    "notes": [
+        "Settings and data are kept in $persist_dir\\UserData and survive updates.",
+        "Gall needs the Microsoft Edge WebView2 Runtime (included in Windows 10 and 11)."
+    ],
     "architecture": {
         "64bit": {
             "url": "https://github.com/GaMa87/gall/releases/download/v0.1.2/Gall-0.1.2-windows-x64-portable.zip",
-            "hash": "TODO: sha256 from SHA256SUMS of the release",
+            "hash": "aede2926beadfeb74de9edca0120cc4adeef52696531a70d9911c3e5699489e3",
             "extract_dir": "Gall-0.1.2-windows-x64-portable"
         }
     },
@@ -19,15 +22,18 @@
         ]
     ],
     "persist": "UserData",
-    "checkver": "github",
+    "checkver": {
+        "url": "https://api.github.com/repos/GaMa87/gall/releases",
+        "jsonpath": "$[0].tag_name",
+        "regex": "v([\\w.-]+)"
+    },
     "autoupdate": {
         "architecture": {
             "64bit": {
                 "url": "https://github.com/GaMa87/gall/releases/download/v$version/Gall-$version-windows-x64-portable.zip",
                 "extract_dir": "Gall-$version-windows-x64-portable",
                 "hash": {
-                    "url": "https://github.com/GaMa87/gall/releases/download/v$version/SHA256SUMS",
-                    "regex": "$sha256\\s+\\*?$basename"
+                    "url": "$baseurl/SHA256SUMS"
                 }
             }
         }

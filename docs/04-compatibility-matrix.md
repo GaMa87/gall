@@ -85,7 +85,7 @@ the original is still against the manual only (`M:`), not against live observati
 | O-20 | Symlink | O | ✅ | unit | Hard links ❌ |
 | O-21 | Context menus | E | ✅ | manual | Own menu; desktop service menus ❌ |
 | S-01…S-04 | Sidebar | E | ✅ | build | Map network drive ➖ (use system mounts) |
-| Q-01 | Search | I | ✅ | unit | |
+| Q-01 | Search | I | ✅ | unit | Skips the excluded folders, `.gitignore` (setting) and `.gallignore` like Quick Open and find in files |
 | Q-02 | Tag search | O | ✅ | unit | |
 | Q-03 | Indexed instant search | A | ❌ | | |
 | A-01 | Themes | I | 🟡 | build | Dark/light/system + CSS themes. Named theme pack ❌ |

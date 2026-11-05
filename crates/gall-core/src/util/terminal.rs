@@ -136,6 +136,11 @@ pub fn open_terminal_with(dir: &Path, template: &str) -> Result<()> {
 /// Opens a terminal in `dir`: `configured` (a template, may use `{dir}`) if set,
 /// else the first installed terminal.
 pub fn open_terminal(dir: &Path, configured: &str) -> Result<()> {
+    // A folder inside WSL: a shell of that distribution, in the Linux folder.
+    #[cfg(windows)]
+    if let Some(argv) = crate::fs::wsl::terminal_argv(&dir.to_string_lossy(), which("wt")) {
+        return spawn(&argv, None);
+    }
     if !configured.trim().is_empty() {
         return open_terminal_with(dir, configured);
     }

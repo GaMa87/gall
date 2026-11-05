@@ -36,6 +36,23 @@ pub fn validate_name(name: &str) -> Result<()> {
     }
 }
 
+fn files_equal(a: &Path, b: &Path) -> Result<bool> {
+    let mut a_file = fs::File::open(a).ctx("read", a)?;
+    let mut b_file = fs::File::open(b).ctx("read", b)?;
+    let mut left = [0; 64 * 1024];
+    let mut right = [0; 64 * 1024];
+    loop {
+        let a_len = a_file.read(&mut left).ctx("read", a)?;
+        let b_len = b_file.read(&mut right).ctx("read", b)?;
+        if a_len != b_len || left[..a_len] != right[..b_len] {
+            return Ok(false);
+        }
+        if a_len == 0 {
+            return Ok(true);
+        }
+    }
+}
+
 /// Device names Windows reserves in every folder, also with an extension (`NUL.txt`).
 fn windows_reserved(name: &str) -> bool {
     let stem = name
@@ -92,8 +109,18 @@ fn unique_path_avoiding(
         },
         _ => (stem, 2),
     };
+    // Names are at most 255 bytes (UTF-8 on Linux and macOS, fewer UTF-16 units on
+    // Windows): a long name is shortened to make room for the counter.
+    let name_n = |n: u32| {
+        let tail = format!(" ({n}){ext}");
+        let mut end = 255usize.saturating_sub(tail.len()).min(base.len());
+        while !base.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}{tail}", &base[..end])
+    };
     (start..)
-        .map(|n| dir.join(format!("{base} ({n}){ext}")))
+        .map(|n| dir.join(name_n(n)))
         .find(free)
         .expect("unbounded range")
 }
@@ -335,6 +362,88 @@ pub struct UndoJournal {
 
 const UNDO_LIMIT: usize = 100;
 
+#[allow(clippy::result_large_err)] // rare path; the record is handed back by value
+fn revert_moved(
+    pairs: Vec<(PathBuf, PathBuf)>,
+    rename_op: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+    remove_source: &dyn Fn(&Path) -> Result<()>,
+) -> std::result::Result<(), (CoreError, Option<UndoRecord>)> {
+    if pairs.iter().all(|(from, to)| from.parent() == to.parent()) {
+        for (from, to) in &pairs {
+            let freed = pairs.iter().any(|(_, target)| target == from) || same_entry(from, to);
+            if exists_no_follow(from) && !freed {
+                return Err((
+                    CoreError::AlreadyExists(from.clone()),
+                    Some(UndoRecord::Moved { pairs }),
+                ));
+            }
+        }
+        let back: Vec<_> = pairs
+            .iter()
+            .map(|(from, to)| (to.clone(), from.clone()))
+            .collect();
+        return rename_many(&back).map_err(|error| {
+            (
+                error,
+                Some(UndoRecord::Moved {
+                    pairs: pairs.clone(),
+                }),
+            )
+        });
+    }
+
+    if let Some((from, _)) = pairs.iter().find(|(from, _)| exists_no_follow(from)) {
+        return Err((
+            CoreError::AlreadyExists(from.clone()),
+            Some(UndoRecord::Moved { pairs }),
+        ));
+    }
+    for k in (0..pairs.len()).rev() {
+        let (from, to) = &pairs[k];
+        if let Some(parent) = from.parent() {
+            if let Err(error) = fs::create_dir_all(parent).ctx("create folder", parent) {
+                return Err((
+                    error,
+                    Some(UndoRecord::Moved {
+                        pairs: pairs[..=k].to_vec(),
+                    }),
+                ));
+            }
+        }
+        if let Err(failure) = move_one_with_ops(
+            to,
+            from,
+            &AtomicBool::new(false),
+            &mut |_| {},
+            rename_op,
+            remove_source,
+        ) {
+            let left = match failure.recovered_source {
+                Some(true) => {
+                    let mut records = vec![UndoRecord::Created {
+                        paths: vec![to.clone()],
+                    }];
+                    if k > 0 {
+                        records.push(UndoRecord::Moved {
+                            pairs: pairs[..k].to_vec(),
+                        });
+                    }
+                    UndoRecord::Batch {
+                        label: "recovered move copy".into(),
+                        records,
+                        dirs: Vec::new(),
+                    }
+                }
+                Some(false) | None => UndoRecord::Moved {
+                    pairs: pairs[..=k].to_vec(),
+                },
+            };
+            return Err((failure.error, Some(left)));
+        }
+    }
+    Ok(())
+}
+
 impl UndoJournal {
     pub fn push(&self, r: UndoRecord) {
         let mut s = self.stack.lock().unwrap();
@@ -379,15 +488,30 @@ impl UndoJournal {
     /// instead of trashed. Offered after the trash refused them (a network drive) with an
     /// error starting `no-trash:`, which would otherwise block Ctrl+Z for good.
     pub fn undo_with(&self, permanent: bool) -> Result<String> {
-        let rec = self
-            .stack
-            .lock()
-            .unwrap()
-            .pop()
-            .ok_or(CoreError::NothingToUndo)?;
-        Self::revert(rec, permanent).map_err(|(e, left)| {
+        self.undo_with_reverter(permanent, Self::revert)
+    }
+
+    fn undo_with_reverter(
+        &self,
+        permanent: bool,
+        revert: impl FnOnce(
+            UndoRecord,
+            bool,
+        ) -> std::result::Result<String, (CoreError, Option<UndoRecord>)>,
+    ) -> Result<String> {
+        let (at, rec) = {
+            let mut s = self.stack.lock().unwrap();
+            let at = s.len().checked_sub(1).ok_or(CoreError::NothingToUndo)?;
+            (at, s.pop().expect("stack length checked"))
+        };
+        revert(rec, permanent).map_err(|(e, left)| {
             if let Some(r) = left {
-                self.stack.lock().unwrap().push(r);
+                let mut s = self.stack.lock().unwrap();
+                let at = at.min(s.len());
+                s.insert(at, r);
+                if s.len() > UNDO_LIMIT {
+                    s.remove(0);
+                }
             }
             e
         })
@@ -456,38 +580,9 @@ impl UndoJournal {
                     }
                 }
             }
-            UndoRecord::Moved { pairs } if pairs.iter().all(|(f, t)| f.parent() == t.parent()) => {
-                // Renames (also a batch that swapped names): all back in one go.
-                for (from, to) in &pairs {
-                    let freed = pairs.iter().any(|(_, t)| t == from) || same_entry(from, to);
-                    if exists_no_follow(from) && !freed {
-                        let e = CoreError::AlreadyExists(from.clone());
-                        return Err((e, Some(UndoRecord::Moved { pairs })));
-                    }
-                }
-                let back: Vec<_> = pairs.iter().map(|(f, t)| (t.clone(), f.clone())).collect();
-                if let Err(e) = rename_many(&back) {
-                    return Err((e, Some(UndoRecord::Moved { pairs })));
-                }
-            }
             UndoRecord::Moved { pairs } => {
-                // Check every name first: a taken one stops the undo before anything moves.
-                if let Some((from, _)) = pairs.iter().find(|(f, _)| exists_no_follow(f)) {
-                    let e = CoreError::AlreadyExists(from.clone());
-                    return Err((e, Some(UndoRecord::Moved { pairs })));
-                }
-                for k in (0..pairs.len()).rev() {
-                    let (from, to) = &pairs[k];
-                    // A merge removes the source folders it emptied: bring them back.
-                    let res = from
-                        .parent()
-                        .map_or(Ok(()), |p| fs::create_dir_all(p).ctx("create folder", p))
-                        .and_then(|()| move_one(to, from, &AtomicBool::new(false), &mut |_| {}));
-                    if let Err(e) = res {
-                        let left = pairs[..=k].to_vec();
-                        return Err((e, Some(UndoRecord::Moved { pairs: left })));
-                    }
-                }
+                let rename_op = |a: &Path, b: &Path| fs::rename(a, b);
+                revert_moved(pairs, &rename_op, &remove_any)?;
             }
             UndoRecord::RemovedDirs { dirs } => {
                 for (k, d) in dirs.iter().enumerate() {
@@ -580,6 +675,26 @@ impl UndoJournal {
     }
 }
 
+/// Restores trashed items: those inside WSL from their distribution's trash, the others
+/// from the system trash.
+fn restore_from_trash(paths: &[PathBuf], at: i64, until: i64) -> Result<()> {
+    let (wsl, rest): (Vec<PathBuf>, Vec<PathBuf>) = paths
+        .iter()
+        .cloned()
+        .partition(|p| super::wsl::is_wsl_path(p));
+    let from_wsl = if wsl.is_empty() {
+        Ok(())
+    } else {
+        super::wsl::restore(&wsl, at, until)
+    };
+    let from_system = if rest.is_empty() {
+        Ok(())
+    } else {
+        restore_from_system_trash(&rest, at, until)
+    };
+    from_wsl.and(from_system)
+}
+
 #[cfg(any(
     target_os = "windows",
     all(
@@ -589,7 +704,7 @@ impl UndoJournal {
         not(target_os = "android")
     )
 ))]
-fn restore_from_trash(paths: &[PathBuf], at: i64, until: i64) -> Result<()> {
+fn restore_from_system_trash(paths: &[PathBuf], at: i64, until: i64) -> Result<()> {
     let items = list_trash()?;
     let wanted = pick_trashed(items, paths, at, until, |i| {
         (i.original_path(), i.time_deleted, trash_fine_time(&i.id))
@@ -598,7 +713,7 @@ fn restore_from_trash(paths: &[PathBuf], at: i64, until: i64) -> Result<()> {
         return Err(CoreError::Trash("items are no longer in the trash".into()));
     }
     let missing = paths.len() - wanted.len();
-    with_trash(move || trash::os_limited::restore_all(wanted))?;
+    with_trash(move || restore_trash_items(wanted))?;
     if missing > 0 {
         return Err(CoreError::Trash(format!(
             "{} no longer in the trash",
@@ -610,6 +725,61 @@ fn restore_from_trash(paths: &[PathBuf], at: i64, until: i64) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Puts trash items back where they were deleted from (`trash::os_limited::restore_all`).
+/// On freedesktop systems the crate follows a trashed symlink: one to a folder became an
+/// empty folder at its original place and the restore failed. Symlinks are moved back
+/// here instead.
+#[cfg(any(
+    target_os = "windows",
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+))]
+pub(crate) fn restore_trash_items(
+    items: Vec<trash::TrashItem>,
+) -> std::result::Result<(), trash::Error> {
+    #[cfg(not(windows))]
+    let items = {
+        let fs_err = |path: &Path, source| trash::Error::FileSystem {
+            path: path.to_path_buf(),
+            source,
+        };
+        let mut rest = Vec::new();
+        let mut iter = items.into_iter();
+        while let Some(item) = iter.next() {
+            // The id is `<trash>/info/<x>.trashinfo`, the item is `<trash>/files/<x>`.
+            let info = PathBuf::from(&item.id);
+            let stored = match (info.parent().and_then(Path::parent), info.file_stem()) {
+                (Some(trash_dir), Some(stem)) => trash_dir.join("files").join(stem),
+                _ => PathBuf::new(),
+            };
+            if !fs::symlink_metadata(&stored).is_ok_and(|m| m.file_type().is_symlink()) {
+                rest.push(item);
+                continue;
+            }
+            let original = item.original_path();
+            if exists_no_follow(&original) {
+                return Err(trash::Error::RestoreCollision {
+                    path: original,
+                    remaining_items: std::iter::once(item).chain(rest).chain(iter).collect(),
+                });
+            }
+            fs::create_dir_all(&item.original_parent)
+                .map_err(|e| fs_err(&item.original_parent, e))?;
+            fs::rename(&stored, &original).map_err(|e| fs_err(&stored, e))?;
+            fs::remove_file(&info).map_err(|e| fs_err(&info, e))?;
+        }
+        rest
+    };
+    if items.is_empty() {
+        return Ok(());
+    }
+    trash::os_limited::restore_all(items)
 }
 
 /// The trash items that undo restores: deleted from one of `paths` between `at` and
@@ -829,6 +999,20 @@ static TRASHED: AtomicU64 = AtomicU64::new(0);
 fn trash_paths(paths: &[PathBuf]) -> Result<()> {
     #[cfg(test)]
     TRASHED.fetch_add(1, Ordering::Relaxed);
+    // Inside WSL: the distribution's own trash (Windows has no Recycle Bin there and
+    // would delete for good when asked to recycle).
+    let (wsl, rest): (Vec<PathBuf>, Vec<PathBuf>) = paths
+        .iter()
+        .cloned()
+        .partition(|p| super::wsl::is_wsl_path(p));
+    if !wsl.is_empty() {
+        let _released = release(wsl.iter().map(PathBuf::as_path));
+        super::wsl::trash(&wsl)?;
+    }
+    if rest.is_empty() {
+        return Ok(());
+    }
+    let paths = rest.as_slice();
     // Windows deletes items on network drives for good when asked to recycle them.
     #[cfg(windows)]
     if let Some(p) = paths.iter().find(|p| on_network_drive(p)) {
@@ -851,7 +1035,7 @@ fn trash_paths(paths: &[PathBuf]) -> Result<()> {
         not(target_os = "android")
     )
 )))]
-fn restore_from_trash(_paths: &[PathBuf], _at: i64, _until: i64) -> Result<()> {
+fn restore_from_system_trash(_paths: &[PathBuf], _at: i64, _until: i64) -> Result<()> {
     Err(CoreError::Trash(
         "restoring from trash is not supported on this platform".into(),
     ))
@@ -861,6 +1045,7 @@ fn restore_from_trash(_paths: &[PathBuf], _at: i64, _until: i64) -> Result<()> {
 
 pub fn rename(path: &Path, new_name: &str, journal: &UndoJournal) -> Result<PathBuf> {
     validate_name(new_name)?;
+    super::wsl::check_path(path)?;
     let parent = path
         .parent()
         .ok_or_else(|| CoreError::InvalidName(new_name.into()))?;
@@ -896,12 +1081,21 @@ fn same_entry(a: &Path, b: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        x.dev() == y.dev() && x.ino() == y.ino() && a.parent() == b.parent()
+        // Two hard links of one file are two entries: the same file under one name only
+        // when it has no other link, or the names differ only in case.
+        let one_name = x.is_dir()
+            || x.nlink() == 1
+            || (cfg!(target_os = "macos")
+                && a.file_name().map(|n| n.to_string_lossy().to_lowercase())
+                    == b.file_name().map(|n| n.to_string_lossy().to_lowercase()));
+        x.dev() == y.dev() && x.ino() == y.ino() && a.parent() == b.parent() && one_name
     }
     #[cfg(not(unix))]
     {
         let _ = (x, y);
-        a.parent() == b.parent()
+        // Folders inside WSL tell case apart: "README" and "Readme" are two files there.
+        !super::wsl::is_wsl_path(a)
+            && a.parent() == b.parent()
             && a.file_name().map(|n| n.to_string_lossy().to_lowercase())
                 == b.file_name().map(|n| n.to_string_lossy().to_lowercase())
     }
@@ -911,6 +1105,15 @@ fn same_entry(a: &Path, b: &Path) -> bool {
 /// the set (swaps, a → b → c) or only its case changes, everything goes through a
 /// temporary name first. A failure reverts the renames already done.
 fn rename_many(pairs: &[(PathBuf, PathBuf)]) -> Result<()> {
+    rename_many_with_ids(pairs, &mut || {
+        RENAME_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+    })
+}
+
+fn rename_many_with_ids(
+    pairs: &[(PathBuf, PathBuf)],
+    next_id: &mut dyn FnMut() -> u64,
+) -> Result<()> {
     let _released = release(pairs.iter().map(|(f, _)| f.as_path()));
     let froms: std::collections::HashSet<&PathBuf> = pairs.iter().map(|(f, _)| f).collect();
     let overlap = pairs
@@ -918,7 +1121,7 @@ fn rename_many(pairs: &[(PathBuf, PathBuf)]) -> Result<()> {
         .any(|(f, t)| froms.contains(t) || (exists_no_follow(t) && same_entry(f, t)));
     // Every rename that happens is reported (tags follow, also through temporary names).
     let mv = |a: &Path, b: &Path| -> Result<()> {
-        fs::rename(a, b).ctx("rename", a)?;
+        rename_noreplace(a, b).ctx("rename", a)?;
         moved(a, b);
         Ok(())
     };
@@ -933,17 +1136,30 @@ fn rename_many(pairs: &[(PathBuf, PathBuf)]) -> Result<()> {
         }
         return Ok(());
     }
-    let tmp: Vec<PathBuf> = pairs
-        .iter()
-        .enumerate()
-        .map(|(i, (f, _))| f.with_file_name(format!(".gall-rename-{}-{i}", std::process::id())))
-        .collect();
+    let mut tmp = Vec::with_capacity(pairs.len());
     for (i, (from, _)) in pairs.iter().enumerate() {
-        if let Err(e) = mv(from, &tmp[i]) {
-            for j in (0..i).rev() {
-                let _ = mv(&tmp[j], &pairs[j].0);
+        let staged = loop {
+            let id = next_id();
+            let candidate =
+                from.with_file_name(format!(".gall-rename-{}-{id}", std::process::id()));
+            match mv(from, &candidate) {
+                Ok(()) => break Ok(candidate),
+                Err(CoreError::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::AlreadyExists =>
+                {
+                    continue
+                }
+                Err(e) => break Err(e),
             }
-            return Err(e);
+        };
+        match staged {
+            Ok(path) => tmp.push(path),
+            Err(e) => {
+                for j in (0..i).rev() {
+                    let _ = mv(&tmp[j], &pairs[j].0);
+                }
+                return Err(e);
+            }
         }
     }
     for (i, (_, to)) in pairs.iter().enumerate() {
@@ -960,6 +1176,74 @@ fn rename_many(pairs: &[(PathBuf, PathBuf)]) -> Result<()> {
     Ok(())
 }
 
+static RENAME_TEMP_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Atomically renames without replacing an entry created concurrently at `to`.
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let from = std::ffi::CString::new(from.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        let to = std::ffi::CString::new(to.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        // SAFETY: both paths are NUL-terminated and the syscall does not retain them.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                from.as_ptr(),
+                libc::AT_FDCWD,
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let from = std::ffi::CString::new(from.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        let to = std::ffi::CString::new(to.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        // SAFETY: both paths are NUL-terminated and the call does not retain them.
+        if unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        #[link(name = "Kernel32")]
+        unsafe extern "system" {
+            fn MoveFileW(existing: *const u16, new: *const u16) -> i32;
+        }
+        let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+        let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+        // MoveFileW fails rather than replacing an existing destination.
+        if unsafe { MoveFileW(from.as_ptr(), to.as_ptr()) } != 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios", windows)))]
+    {
+        let _ = (from, to);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "atomic no-replace rename is unsupported on this platform",
+        ))
+    }
+}
+
 /// Renames several items at once (batch rename) as one undo step; returns the new paths
 /// in the order given. Items may swap names or change only the case of a letter. When
 /// one rename fails, the others are reverted.
@@ -968,6 +1252,7 @@ pub fn batch_rename(items: &[(PathBuf, String)], journal: &UndoJournal) -> Resul
     let mut pairs = Vec::new();
     for (path, name) in items {
         validate_name(name)?;
+        super::wsl::check_path(path)?;
         let parent = path
             .parent()
             .ok_or_else(|| CoreError::InvalidName(name.clone()))?;
@@ -1044,11 +1329,20 @@ pub fn create_file(
                 CoreError::io("create file", &p, e)
             }
         })?;
-    if let Some(t) = template {
-        let mut src = fs::File::open(t).ctx("open template", t)?;
-        std::io::copy(&mut src, &mut f).ctx("write", &p)?;
-    } else if let Some(c) = contents {
-        f.write_all(c).ctx("write", &p)?;
+    let written = (|| -> Result<()> {
+        if let Some(t) = template {
+            let mut src = fs::File::open(t).ctx("open template", t)?;
+            std::io::copy(&mut src, &mut f).ctx("write", &p)?;
+        } else if let Some(c) = contents {
+            f.write_all(c).ctx("write", &p)?;
+        }
+        Ok(())
+    })();
+    drop(f);
+    // Closed by now: removed again when the template cannot be read or the write fails.
+    if let Err(e) = written {
+        let _ = fs::remove_file(&p);
+        return Err(e);
     }
     journal.push(UndoRecord::Created {
         paths: vec![p.clone()],
@@ -1124,7 +1418,8 @@ pub fn apply_sync(
                         rep.replaced += 1;
                     }
                     let mut bytes = 0u64;
-                    copy_tree(src, dest, cancel, &mut |b| bytes += b)?;
+                    // A failed or cancelled copy is removed again (see `copy_fresh`).
+                    copy_fresh(src, dest, cancel, &mut |b| bytes += b, false)?;
                     rep.bytes += bytes;
                     rep.copied += 1;
                     if !created.iter().any(|c| dest.starts_with(c)) {
@@ -1820,6 +2115,10 @@ fn copy_fresh(
     if exists_no_follow(dst) {
         return Err(CoreError::AlreadyExists(dst.to_path_buf()));
     }
+    // Both inside WSL: Linux copies (faster; permissions, owners and links stay).
+    if let Some(done) = super::wsl::copy_inside_linux(src, dst, cancel, tick, durable) {
+        return done;
+    }
     copy_tree_with(src, dst, cancel, tick, durable).inspect_err(|err| {
         let foreign = matches!(err, CoreError::Io { path, source, .. }
             if path == dst && source.kind() == std::io::ErrorKind::AlreadyExists);
@@ -1829,9 +2128,23 @@ fn copy_fresh(
     })
 }
 
-fn move_one(src: &Path, dst: &Path, cancel: &AtomicBool, tick: &mut Tick) -> Result<()> {
+struct MoveFailure {
+    error: CoreError,
+    /// `Some(true)` means the full source is intact alongside the copy; `Some(false)`
+    /// means recovery could not prove that, so undo must keep both paths protected.
+    recovered_source: Option<bool>,
+}
+
+fn move_one_with_ops(
+    src: &Path,
+    dst: &Path,
+    cancel: &AtomicBool,
+    tick: &mut Tick,
+    rename_op: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+    remove_source: &dyn Fn(&Path) -> Result<()>,
+) -> std::result::Result<(), MoveFailure> {
     let _released = release([src]);
-    match fs::rename(src, dst) {
+    match rename_op(src, dst) {
         Ok(()) => {
             moved(src, dst);
             tick(0);
@@ -1840,16 +2153,100 @@ fn move_one(src: &Path, dst: &Path, cancel: &AtomicBool, tick: &mut Tick) -> Res
         Err(e) if is_cross_device(&e) => {
             // Another drive: copy, make sure the copy is on the disk, only then delete the
             // source. A failed or cancelled copy is removed; the source stays untouched.
-            copy_fresh(src, dst, cancel, tick, true)?;
+            copy_fresh(src, dst, cancel, tick, true).map_err(|error| MoveFailure {
+                error,
+                recovered_source: None,
+            })?;
             if let Some(parent) = dst.parent() {
-                sync_dir(parent)?;
+                if let Err(error) = sync_dir(parent) {
+                    return Err(MoveFailure {
+                        error,
+                        recovered_source: Some(true),
+                    });
+                }
             }
-            remove_any(src)?;
+            if let Err(error) = remove_source(src) {
+                if !exists_no_follow(src) {
+                    moved(src, dst);
+                    return Ok(());
+                }
+                let recovered_source = restore_missing_from_copy(dst, src).is_ok();
+                return Err(MoveFailure {
+                    error,
+                    recovered_source: Some(recovered_source),
+                });
+            }
             moved(src, dst);
             Ok(())
         }
-        Err(e) => Err(CoreError::io("move", src, e)),
+        Err(e) => Err(MoveFailure {
+            error: CoreError::io("move", src, e),
+            recovered_source: None,
+        }),
     }
+}
+
+/// Fills only missing entries of a partially removed source from its completed copy.
+/// Existing source entries are never overwritten.
+fn restore_missing_from_copy(copy: &Path, source: &Path) -> Result<()> {
+    if !exists_no_follow(source) {
+        copy_fresh(copy, source, &AtomicBool::new(false), &mut |_| {}, true)?;
+        return Ok(());
+    }
+    let copy_meta = fs::symlink_metadata(copy).ctx("stat", copy)?;
+    let source_meta = fs::symlink_metadata(source).ctx("stat", source)?;
+    if copy_meta.file_type().is_symlink() || source_meta.file_type().is_symlink() {
+        if copy_meta.file_type().is_symlink()
+            && source_meta.file_type().is_symlink()
+            && fs::read_link(copy).ctx("read link", copy)?
+                == fs::read_link(source).ctx("read link", source)?
+        {
+            return Ok(());
+        }
+        return Err(CoreError::Other(format!(
+            "cannot safely restore conflicting entry {}",
+            quoted(source)
+        )));
+    }
+    if copy_meta.is_file() || source_meta.is_file() {
+        if copy_meta.is_file() && source_meta.is_file() && files_equal(copy, source)? {
+            return Ok(());
+        }
+        return Err(CoreError::Other(format!(
+            "cannot safely restore conflicting entry {}",
+            quoted(source)
+        )));
+    }
+    if !copy_meta.is_dir() || !source_meta.is_dir() {
+        return Err(CoreError::Other(format!(
+            "cannot safely restore conflicting entry {}",
+            quoted(source)
+        )));
+    }
+    let mut failure = None;
+    for entry in fs::read_dir(copy).ctx("list", copy)? {
+        let entry = entry.ctx("list", copy)?;
+        let from = entry.path();
+        let to = source.join(entry.file_name());
+        let result = if !exists_no_follow(&to) {
+            copy_fresh(&from, &to, &AtomicBool::new(false), &mut |_| {}, true)
+        } else {
+            restore_missing_from_copy(&from, &to)
+        };
+        if let Err(error) = result {
+            failure.get_or_insert(error);
+        }
+    }
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    let metadata = fs::metadata(copy).ctx("stat", copy)?;
+    fs::set_permissions(source, metadata.permissions()).ctx("permissions", source)?;
+    if let Ok(modified) = metadata.modified() {
+        set_dir_modified(source, modified);
+    }
+    sync_dir(source)?;
+    Ok(())
 }
 
 /// True when `inner` is `outer` or lies inside it (also through symlinks).
@@ -1908,13 +2305,30 @@ impl Transfer<'_> {
         out: &mut Placed,
         tick: &mut Tick,
     ) -> Result<bool> {
+        let rename_op = |from: &Path, to: &Path| fs::rename(from, to);
+        self.place_with_ops(src, dest_dir, out, tick, &rename_op, &remove_any)
+    }
+
+    fn place_with_ops(
+        &self,
+        src: &Path,
+        dest_dir: &Path,
+        out: &mut Placed,
+        tick: &mut Tick,
+        rename_op: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+        remove_source: &dyn Fn(&Path) -> Result<()>,
+    ) -> Result<bool> {
         if self.cancel.load(Ordering::Relaxed) {
             return Err(CoreError::Cancelled);
         }
-        let name = file_name(src)?;
+        // Any name, also one that is not valid UTF-8 (found inside merged folders).
+        let name = src
+            .file_name()
+            .ok_or_else(|| CoreError::InvalidName(src.to_string_lossy().into_owned()))?;
         let mut target = dest_dir.join(name);
         // Also through a symlink: `target` is then the source itself.
         let same_place = in_dir(src, dest_dir);
+        let mut replaced_here = false;
         if exists_no_follow(&target) {
             if self.kind == TaskKind::Move && same_place {
                 out.skipped += 1; // moving onto itself is a no-op
@@ -1927,6 +2341,15 @@ impl Transfer<'_> {
             let policy = match self.conflict {
                 ConflictPolicy::OverwriteOlder if newer(src, &target) => ConflictPolicy::Overwrite,
                 ConflictPolicy::OverwriteOlder => ConflictPolicy::Skip,
+                p => p,
+            };
+            // What this operation put there itself (two sources with one name, from search
+            // results) is never replaced: the first item would go to the trash.
+            let ours = out.created.contains(&target) || out.moved.iter().any(|(_, t)| *t == target);
+            let policy = match policy {
+                ConflictPolicy::Overwrite | ConflictPolicy::OverwritePermanently if ours => {
+                    ConflictPolicy::KeepBoth
+                }
                 p => p,
             };
             // Replacing a folder that holds the source would remove the source with it
@@ -1943,7 +2366,10 @@ impl Transfer<'_> {
                 )));
             }
             match (policy, same_place) {
-                (_, true) | (ConflictPolicy::KeepBoth, _) => target = unique_path(dest_dir, name),
+                (_, true) | (ConflictPolicy::KeepBoth, _) => {
+                    // A name that is not UTF-8 keeps both under a readable name.
+                    target = unique_path(dest_dir, &name.to_string_lossy())
+                }
                 (ConflictPolicy::Skip | ConflictPolicy::OverwriteOlder, _) => {
                     out.skipped += 1;
                     return Ok(false);
@@ -1953,16 +2379,43 @@ impl Transfer<'_> {
                     let when = trash_timed(std::slice::from_ref(&target))
                         .map_err(|e| no_trash_to_replace(&target, e))?;
                     out.replaced.push((target.clone(), when));
+                    replaced_here = true;
                 }
                 // Chosen after the trash failed (see `no_trash_to_replace`).
                 (ConflictPolicy::OverwritePermanently, _) => remove_any(&target)?,
             }
         }
+        let res = if self.kind == TaskKind::Copy {
+            copy_fresh(src, &target, self.cancel, tick, false)
+        } else {
+            move_one_with_ops(src, &target, self.cancel, tick, rename_op, remove_source).map_err(
+                |failure| {
+                    if let Some(source_recovered) = failure.recovered_source {
+                        if source_recovered {
+                            out.created.push(target.clone());
+                        } else {
+                            out.moved.push((src.to_path_buf(), target.clone()));
+                        }
+                    }
+                    failure.error
+                },
+            )
+        };
+        if let Err(e) = res {
+            // Cancelled or failed after the old item went to the trash: put it back, so
+            // the destination is not left with neither version. Where that fails, undo
+            // can still restore it.
+            if replaced_here {
+                let (p, (at, until)) = out.replaced.pop().expect("checked");
+                if restore_from_trash(std::slice::from_ref(&p), at, until).is_err() {
+                    out.replaced.push((p, (at, until)));
+                }
+            }
+            return Err(e);
+        }
         if self.kind == TaskKind::Copy {
-            copy_fresh(src, &target, self.cancel, tick, false)?;
             out.created.push(target);
         } else {
-            move_one(src, &target, self.cancel, tick)?;
             out.moved.push((src.to_path_buf(), target));
         }
         Ok(true)
@@ -2227,6 +2680,8 @@ impl TaskManager {
         handle: &TaskHandle,
         req: TaskRequest,
     ) -> Result<(u64, u64, Option<String>)> {
+        // Names inside WSL that Windows cannot hold or address: refused before anything.
+        super::wsl::check_task(req.kind, &req.sources, req.dest.as_deref(), &handle.cancel)?;
         let totals = match req.kind {
             TaskKind::Compress => Totals {
                 bytes: super::archive::source_bytes(&req.sources),
@@ -2519,6 +2974,27 @@ mod tests {
         assert_eq!(msg, "Deleted “made” for good");
         assert!(!dir.exists());
         assert!(j.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)] // matches the reverter's by-value failure record
+    fn failed_undo_stays_before_operations_added_during_revert() {
+        let j = UndoJournal::default();
+        let older = UndoRecord::RemovedDirs {
+            dirs: vec![PathBuf::from("older")],
+        };
+        let newer = UndoRecord::RemovedDirs {
+            dirs: vec![PathBuf::from("newer")],
+        };
+        j.push(older.clone());
+        let result = j.undo_with_reverter(false, |record, _| {
+            j.push(newer.clone());
+            Err((CoreError::Cancelled, Some(record)))
+        });
+        assert!(matches!(result, Err(CoreError::Cancelled)));
+        assert_eq!(j.peek_description(), Some(newer.describe()));
+        j.undo().unwrap();
+        assert_eq!(j.peek_description(), Some(older.describe()));
     }
 
     /// A case-only rename with non-ASCII letters (Slovenian, German, …) works where the
@@ -3360,6 +3836,8 @@ mod tests {
     fn batch_rename_with_swaps_and_case_changes_and_one_undo() {
         let d = test_dir();
         let p = |n: &str| d.path().join(n);
+        let collision = p(&format!(".gall-rename-{}-0", std::process::id()));
+        fs::write(&collision, "unrelated").unwrap();
         for (n, c) in [
             ("a.txt", "A"),
             ("b.txt", "B"),
@@ -3383,13 +3861,410 @@ mod tests {
         assert_eq!(out, vec![p("b.txt"), p("a.txt"), p("C.TXT"), p("x.txt")]);
         assert_eq!(
             names(d.path()),
-            ["C.TXT=C", "a.txt=B", "b.txt=A", "x.txt=X"]
+            [
+                ".gall-rename-".to_string() + &std::process::id().to_string() + "-0=unrelated",
+                "C.TXT=C".into(),
+                "a.txt=B".into(),
+                "b.txt=A".into(),
+                "x.txt=X".into()
+            ]
         );
+        assert_eq!(fs::read_to_string(collision).unwrap(), "unrelated");
         assert_eq!(j.peek_description().as_deref(), Some("rename 3 items"));
         j.undo().unwrap();
         assert_eq!(
             names(d.path()),
-            ["a.txt=A", "b.txt=B", "c.txt=C", "x.txt=X"]
+            [
+                ".gall-rename-".to_string() + &std::process::id().to_string() + "-0=unrelated",
+                "a.txt=A".into(),
+                "b.txt=B".into(),
+                "c.txt=C".into(),
+                "x.txt=X".into()
+            ]
+        );
+    }
+
+    #[test]
+    fn no_replace_rename_preserves_existing_destination() {
+        let d = test_dir();
+        let source = d.path().join("source");
+        let destination = d.path().join("destination");
+        fs::write(&source, "source data").unwrap();
+        fs::write(&destination, "unrelated data").unwrap();
+        let error = rename_noreplace(&source, &destination).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(source).unwrap(), "source data");
+        assert_eq!(fs::read_to_string(destination).unwrap(), "unrelated data");
+    }
+
+    #[test]
+    fn batch_rename_retries_a_colliding_staging_name() {
+        let d = test_dir();
+        let source = d.path().join("a");
+        let destination = d.path().join("b");
+        let colliding_temp = d
+            .path()
+            .join(format!(".gall-rename-{}-41", std::process::id()));
+        fs::write(&source, "source").unwrap();
+        fs::write(&destination, "destination").unwrap();
+        fs::write(&colliding_temp, "unrelated").unwrap();
+        let ids = [41, 42, 43];
+        let mut next = ids.into_iter();
+        rename_many_with_ids(
+            &[
+                (source.clone(), destination.clone()),
+                (destination.clone(), source.clone()),
+            ],
+            &mut || next.next().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(&source).unwrap(), "destination");
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "source");
+        assert_eq!(fs::read_to_string(colliding_temp).unwrap(), "unrelated");
+    }
+
+    #[test]
+    fn cross_device_move_cleanup_failure_restores_source_and_journals_copy() {
+        let d = test_dir();
+        let src = d.path().join("src");
+        let dest = d.path().join("dest");
+        fs::create_dir_all(src.join("nested")).unwrap();
+        fs::create_dir(&dest).unwrap();
+        fs::write(src.join("first.txt"), "first").unwrap();
+        fs::write(src.join("nested/second.txt"), "second").unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let transfer = Transfer {
+            kind: TaskKind::Move,
+            conflict: ConflictPolicy::KeepBoth,
+            merge: false,
+            cancel: &cancel,
+        };
+        let mut placed = Placed::default();
+        let mut tick = |_| {};
+        let cross_device =
+            |_: &Path, _: &Path| Err(std::io::Error::from(std::io::ErrorKind::CrossesDevices));
+        let partial_remove = |path: &Path| {
+            fs::remove_file(path.join("first.txt")).unwrap();
+            Err(CoreError::io(
+                "delete",
+                path,
+                std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            ))
+        };
+        let result = transfer.place_with_ops(
+            &src,
+            &dest,
+            &mut placed,
+            &mut tick,
+            &cross_device,
+            &partial_remove,
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            tree(d.path()),
+            [
+                "dest",
+                "dest/src",
+                "dest/src/first.txt=first",
+                "dest/src/nested",
+                "dest/src/nested/second.txt=second",
+                "src",
+                "src/first.txt=first",
+                "src/nested",
+                "src/nested/second.txt=second"
+            ]
+        );
+        assert_eq!(placed.created, [dest.join("src")]);
+
+        let journal = UndoJournal::default();
+        journal.push(UndoRecord::Created {
+            paths: placed.created,
+        });
+        journal.undo_with(true).unwrap();
+        assert!(!dest.join("src").exists());
+        assert_eq!(
+            tree(&src),
+            ["first.txt=first", "nested", "nested/second.txt=second"]
+        );
+    }
+
+    #[test]
+    fn failed_move_recovery_does_not_accept_changed_source_file() {
+        let d = test_dir();
+        let src = d.path().join("src");
+        let dest = d.path().join("dest");
+        fs::create_dir(&src).unwrap();
+        fs::create_dir(&dest).unwrap();
+        let source = src.join("item.txt");
+        fs::write(&source, "original").unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let transfer = Transfer {
+            kind: TaskKind::Move,
+            conflict: ConflictPolicy::KeepBoth,
+            merge: false,
+            cancel: &cancel,
+        };
+        let mut placed = Placed::default();
+        let mut tick = |_| {};
+        let cross_device =
+            |_: &Path, _: &Path| Err(std::io::Error::from(std::io::ErrorKind::CrossesDevices));
+        let replace_during_remove = |path: &Path| {
+            fs::remove_file(path).unwrap();
+            fs::write(path, "concurrent replacement").unwrap();
+            Err(CoreError::io(
+                "delete",
+                path,
+                std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            ))
+        };
+        assert!(transfer
+            .place_with_ops(
+                &source,
+                &dest,
+                &mut placed,
+                &mut tick,
+                &cross_device,
+                &replace_during_remove,
+            )
+            .is_err());
+        assert!(placed.created.is_empty());
+        assert_eq!(placed.moved, [(source.clone(), dest.join("item.txt"))]);
+        assert_eq!(
+            fs::read_to_string(&source).unwrap(),
+            "concurrent replacement"
+        );
+        assert_eq!(
+            fs::read_to_string(dest.join("item.txt")).unwrap(),
+            "original"
+        );
+    }
+
+    #[test]
+    fn move_recovery_restores_missing_files_after_a_conflict() {
+        let d = test_dir();
+        let copy = d.path().join("copy");
+        let source = d.path().join("source");
+        fs::create_dir(&copy).unwrap();
+        fs::create_dir(&source).unwrap();
+        for name in ["first.txt", "second.txt"] {
+            fs::write(copy.join(name), "original").unwrap();
+        }
+        let names: Vec<_> = fs::read_dir(&copy)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        let changed = source.join(&names[0]);
+        let missing = source.join(&names[1]);
+        fs::write(&changed, "modified").unwrap();
+
+        assert!(restore_missing_from_copy(&copy, &source).is_err());
+        assert_eq!(fs::read_to_string(changed).unwrap(), "modified");
+        assert_eq!(fs::read_to_string(missing).unwrap(), "original");
+        for name in &names {
+            assert_eq!(fs::read_to_string(copy.join(name)).unwrap(), "original");
+        }
+    }
+
+    #[test]
+    fn failed_move_recovery_detects_changed_nested_file_and_keeps_protective_undo() {
+        let d = test_dir();
+        let src = d.path().join("src");
+        let dest = d.path().join("dest");
+        fs::create_dir_all(src.join("nested")).unwrap();
+        fs::create_dir(&dest).unwrap();
+        fs::write(src.join("nested/a-restored.txt"), "restore me").unwrap();
+        fs::write(src.join("nested/b-changed.txt"), "original").unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let transfer = Transfer {
+            kind: TaskKind::Move,
+            conflict: ConflictPolicy::KeepBoth,
+            merge: false,
+            cancel: &cancel,
+        };
+        let mut placed = Placed::default();
+        let mut tick = |_| {};
+        let cross_device =
+            |_: &Path, _: &Path| Err(std::io::Error::from(std::io::ErrorKind::CrossesDevices));
+        let partially_remove_and_modify = |path: &Path| {
+            fs::remove_file(path.join("nested/a-restored.txt")).unwrap();
+            fs::write(path.join("nested/b-changed.txt"), "modified").unwrap();
+            Err(CoreError::io(
+                "delete",
+                path,
+                std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            ))
+        };
+        let target = dest.join("src");
+        assert!(transfer
+            .place_with_ops(
+                &src,
+                &dest,
+                &mut placed,
+                &mut tick,
+                &cross_device,
+                &partially_remove_and_modify,
+            )
+            .is_err());
+        assert!(placed.created.is_empty());
+        assert_eq!(placed.moved, [(src.clone(), target.clone())]);
+        assert_eq!(
+            fs::read_to_string(src.join("nested/a-restored.txt")).unwrap(),
+            "restore me",
+            "missing data was safely recovered"
+        );
+        assert_eq!(
+            fs::read_to_string(src.join("nested/b-changed.txt")).unwrap(),
+            "modified"
+        );
+        assert_eq!(
+            fs::read_to_string(target.join("nested/b-changed.txt")).unwrap(),
+            "original",
+            "the completed copy remains intact"
+        );
+
+        let journal = UndoJournal::default();
+        journal.push(UndoRecord::Moved {
+            pairs: placed.moved,
+        });
+        assert!(matches!(journal.undo(), Err(CoreError::AlreadyExists(_))));
+        assert_eq!(journal.len(), 1, "the protective undo record remains");
+        assert_eq!(
+            fs::read_to_string(src.join("nested/b-changed.txt")).unwrap(),
+            "modified"
+        );
+        assert_eq!(
+            fs::read_to_string(target.join("nested/b-changed.txt")).unwrap(),
+            "original"
+        );
+    }
+
+    #[test]
+    fn failed_cross_device_undo_journals_duplicate_for_safe_cleanup() {
+        let d = test_dir();
+        let original = d.path().join("original");
+        let moved_to = d.path().join("destination/item");
+        fs::create_dir_all(moved_to.parent().unwrap()).unwrap();
+        fs::write(&moved_to, "same data").unwrap();
+        let cross_device =
+            |_: &Path, _: &Path| Err(std::io::Error::from(std::io::ErrorKind::CrossesDevices));
+        let fail_remove = |path: &Path| {
+            Err(CoreError::io(
+                "delete",
+                path,
+                std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            ))
+        };
+        let (error, left) = revert_moved(
+            vec![(original.clone(), moved_to.clone())],
+            &cross_device,
+            &fail_remove,
+        )
+        .unwrap_err();
+        assert!(matches!(error, CoreError::Io { .. }));
+        let Some(UndoRecord::Batch { records, .. }) = left else {
+            panic!("the duplicate must remain undoable");
+        };
+        assert!(matches!(
+            records.as_slice(),
+            [UndoRecord::Created { paths }] if paths == std::slice::from_ref(&moved_to)
+        ));
+        assert_eq!(fs::read_to_string(&original).unwrap(), "same data");
+        assert_eq!(fs::read_to_string(&moved_to).unwrap(), "same data");
+
+        let journal = UndoJournal::default();
+        journal.push(UndoRecord::Batch {
+            label: "recovered move copy".into(),
+            records,
+            dirs: Vec::new(),
+        });
+        journal.undo_with(true).unwrap();
+        assert!(!moved_to.exists());
+        assert_eq!(fs::read_to_string(original).unwrap(), "same data");
+    }
+
+    #[test]
+    fn failed_replacement_keeps_copy_and_trash_in_undo_order() {
+        if cfg!(target_os = "macos") {
+            return; // restoring from the trash is not supported there
+        }
+        let d = test_dir();
+        let src_dir = d.path().join("src");
+        let dest = d.path().join("dest");
+        fs::create_dir(&src_dir).unwrap();
+        fs::create_dir(&dest).unwrap();
+        let source = src_dir.join("item.txt");
+        let target = dest.join("item.txt");
+        fs::write(&source, "new copy").unwrap();
+        fs::write(&target, "old destination").unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let transfer = Transfer {
+            kind: TaskKind::Move,
+            conflict: ConflictPolicy::Overwrite,
+            merge: false,
+            cancel: &cancel,
+        };
+        let mut placed = Placed::default();
+        let mut tick = |_| {};
+        let cross_device =
+            |_: &Path, _: &Path| Err(std::io::Error::from(std::io::ErrorKind::CrossesDevices));
+        let replace_during_remove = |path: &Path| {
+            fs::remove_file(path).unwrap();
+            fs::write(path, "concurrent source replacement").unwrap();
+            Err(CoreError::io(
+                "delete",
+                path,
+                std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            ))
+        };
+        assert!(transfer
+            .place_with_ops(
+                &source,
+                &dest,
+                &mut placed,
+                &mut tick,
+                &cross_device,
+                &replace_during_remove,
+            )
+            .is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new copy");
+        assert_eq!(
+            fs::read_to_string(&source).unwrap(),
+            "concurrent source replacement"
+        );
+
+        let record = transfer_batch(
+            TaskKind::Move,
+            std::slice::from_ref(&source),
+            placed.created,
+            placed.moved,
+            placed.replaced,
+            placed.merged,
+            placed.emptied,
+        );
+        let UndoRecord::Batch { records, .. } = &record else {
+            panic!("replacement recovery must preserve its undo batch");
+        };
+        assert!(matches!(
+            records.as_slice(),
+            [UndoRecord::Trashed { .. }, UndoRecord::Moved { .. }]
+        ));
+        let journal = UndoJournal::default();
+        journal.push(record);
+        assert!(matches!(journal.undo(), Err(CoreError::AlreadyExists(_))));
+        let stack = journal.stack.lock().unwrap();
+        assert!(matches!(
+            stack.last(),
+            Some(UndoRecord::Batch { records, .. })
+                if matches!(records.as_slice(), [UndoRecord::Trashed { .. }, UndoRecord::Moved { .. }])
+        ));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new copy");
+        assert_eq!(
+            fs::read_to_string(&source).unwrap(),
+            "concurrent source replacement"
         );
     }
 
@@ -3809,5 +4684,252 @@ mod tests {
         fs::write(&a, "x").unwrap();
         let j = UndoJournal::default();
         assert_eq!(duplicate(&a, &j).unwrap(), d.path().join("doc (2).md"));
+    }
+
+    /// A "Replace" that is cancelled (or fails) after the old item went to the trash
+    /// puts the old item back: the destination is never left with neither version.
+    #[test]
+    fn cancelled_replace_keeps_the_old_item() {
+        if cfg!(target_os = "macos") {
+            return; // restoring from the trash is not supported there
+        }
+        let d = test_dir();
+        let src = d.path().join("src");
+        let dst = d.path().join("dst");
+        fs::create_dir_all(src.join("folder")).unwrap();
+        fs::create_dir_all(dst.join("folder")).unwrap();
+        fs::write(src.join("folder/new.txt"), "new").unwrap();
+        fs::write(dst.join("folder/old.txt"), "old").unwrap();
+        let handle = Arc::new(TaskHandle {
+            id: 1,
+            cancel: AtomicBool::new(false),
+        });
+        let h = handle.clone();
+        // Cancel as soon as the copy reports progress (after the old folder was trashed).
+        let m = TaskManager::new(
+            Arc::new(UndoJournal::default()),
+            Arc::new(move |e| {
+                if matches!(e, TaskEvent::Progress(_)) {
+                    h.cancel.store(true, Ordering::Relaxed);
+                }
+            }),
+        );
+        let r = m.run(
+            &handle,
+            task(
+                TaskKind::Copy,
+                &src.join("folder"),
+                &dst,
+                ConflictPolicy::Overwrite,
+            ),
+        );
+        assert!(matches!(r, Err(CoreError::Cancelled)), "{r:?}");
+        assert_eq!(names(&dst.join("folder")), ["old.txt=old"]);
+        assert!(m.journal().is_empty(), "nothing left to undo");
+    }
+
+    /// A sync copy that fails part-way leaves no partial copy behind: undo then brings
+    /// back what the copy replaced, and a new item is not left half-copied.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn failed_sync_copy_leaves_no_partial_copy() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root reads unreadable files
+        }
+        let d = test_dir();
+        let src = d.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("1-ok.txt"), "new").unwrap();
+        let locked = src.join("2-locked.txt");
+        fs::write(&locked, "secret").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let replaced = d.path().join("replaced");
+        fs::create_dir(&replaced).unwrap();
+        fs::write(replaced.join("old.txt"), "old").unwrap();
+        let fresh = d.path().join("fresh");
+        let j = UndoJournal::default();
+        let cancel = AtomicBool::new(false);
+        let r1 = apply_sync(
+            &[SyncOp::Copy {
+                src: src.clone(),
+                dest: fresh.clone(),
+            }],
+            &j,
+            &cancel,
+        );
+        let r2 = apply_sync(
+            &[SyncOp::Copy {
+                src: src.clone(),
+                dest: replaced.clone(),
+            }],
+            &j,
+            &cancel,
+        );
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(r1.is_err() && r2.is_err());
+        assert!(!fresh.exists(), "no partial copy left");
+        assert!(!replaced.exists(), "no partial copy left");
+        j.undo().unwrap();
+        assert_eq!(names(&replaced), ["old.txt=old"]);
+    }
+
+    /// Duplicating (or "keep both") a file whose name is close to the 255-byte limit
+    /// shortens the name to fit the " (2)" instead of failing.
+    #[test]
+    fn unique_name_of_a_very_long_name_fits() {
+        let d = test_dir();
+        // 255 bytes, also with multi-byte letters (an "č" must not be cut in half).
+        for name in [
+            format!("{}.txt", "a".repeat(251)),
+            format!("{}.txt", "č".repeat(125) + "a"),
+        ] {
+            let f = d.path().join(&name);
+            // Some file systems count letters differently (decomposed "č" on HFS+).
+            if fs::write(&f, "x").is_err() {
+                continue;
+            }
+            let m = mgr();
+            let mut req = task(TaskKind::Duplicate, &f, d.path(), ConflictPolicy::KeepBoth);
+            req.dest = None;
+            assert_eq!(run(&m, req).unwrap(), (1, 0));
+            let copy = duplicate_targets(std::slice::from_ref(&f));
+            let made: Vec<String> = fs::read_dir(d.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|n| *n != name && n.ends_with(" (2).txt"))
+                .collect();
+            assert_eq!(made.len(), 1, "{made:?}");
+            assert!(made[0].len() <= 255);
+            // The next copy continues the counter.
+            assert!(copy[0].to_string_lossy().ends_with(" (3).txt"), "{copy:?}");
+            fs::remove_file(d.path().join(&made[0])).unwrap();
+            fs::remove_file(&f).unwrap();
+        }
+    }
+
+    /// Merging folders that hold a file whose name is not valid UTF-8 (from an old
+    /// archive or another system) does not stop half-way: the file is copied or moved too.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn merge_handles_names_that_are_not_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+        let odd = std::ffi::OsStr::from_bytes(b"caf\xe9.txt");
+        for kind in [TaskKind::Copy, TaskKind::Move] {
+            let d = test_dir();
+            let (src, dst) = (d.path().join("src/a"), d.path().join("dst/a"));
+            fs::create_dir_all(&src).unwrap();
+            fs::create_dir_all(&dst).unwrap();
+            fs::write(src.join(odd), "odd").unwrap();
+            fs::write(src.join("z.txt"), "z").unwrap();
+            fs::write(dst.join(odd), "old").unwrap();
+            let m = mgr();
+            let r = run(
+                &m,
+                merge_task(kind, &src, &d.path().join("dst"), ConflictPolicy::KeepBoth),
+            );
+            assert_eq!(r.unwrap(), (1, 0), "{kind:?}");
+            assert_eq!(fs::read(dst.join(odd)).unwrap(), b"old");
+            assert_eq!(fs::read(dst.join("z.txt")).unwrap(), b"z");
+            assert_eq!(
+                fs::read_dir(&dst).unwrap().count(),
+                3,
+                "{kind:?}: kept both"
+            );
+        }
+    }
+
+    /// A new file from a template that cannot be read (deleted meanwhile, a folder)
+    /// fails without leaving an empty file behind.
+    #[test]
+    fn create_file_from_a_missing_template_leaves_nothing() {
+        let d = test_dir();
+        let j = UndoJournal::default();
+        for template in [d.path().join("gone.docx"), d.path().to_path_buf()] {
+            let r = create_file(d.path(), "new.docx", Some(&template), None, &j);
+            assert!(r.is_err(), "{template:?}");
+            assert!(!d.path().join("new.docx").exists(), "{template:?}");
+        }
+        assert!(j.is_empty());
+    }
+
+    /// Undoing the delete of a symlink to a folder brings the symlink back. (The trash
+    /// crate followed the link, made an empty folder in its place and failed.)
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn undo_delete_of_a_symlink_to_a_folder() {
+        let d = test_dir();
+        let target = d.path().join("Projects");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("a.txt"), "a").unwrap();
+        let link = d.path().join("projects-link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let j = UndoJournal::default();
+        trash_items(std::slice::from_ref(&link), &j).unwrap();
+        assert!(fs::symlink_metadata(&link).is_err());
+        j.undo().unwrap();
+        let m = fs::symlink_metadata(&link).unwrap();
+        assert!(m.file_type().is_symlink(), "a symlink again, not a folder");
+        assert_eq!(fs::read_link(&link).unwrap(), target);
+        assert_eq!(names(&target), ["a.txt=a"]);
+    }
+
+    /// Renaming to the name of a hard link of the same file is refused like any taken
+    /// name: it is another entry, not the same one with other letter case (rename did
+    /// nothing and a batch rename left a hidden temporary file).
+    #[cfg(unix)]
+    #[test]
+    fn rename_onto_a_hard_link_is_refused() {
+        let d = test_dir();
+        let (a, b) = (d.path().join("a.txt"), d.path().join("b.txt"));
+        fs::write(&a, "x").unwrap();
+        fs::hard_link(&a, &b).unwrap();
+        let j = UndoJournal::default();
+        assert!(matches!(
+            rename(&a, "b.txt", &j),
+            Err(CoreError::AlreadyExists(_))
+        ));
+        assert!(matches!(
+            batch_rename(&[(a.clone(), "b.txt".into())], &j),
+            Err(CoreError::AlreadyExists(_))
+        ));
+        assert_eq!(names(d.path()), ["a.txt=x", "b.txt=x"]);
+        // Where case matters (Linux), "A.txt" is another name too.
+        if !cfg!(target_os = "macos") {
+            fs::hard_link(&a, d.path().join("A.txt")).unwrap();
+            assert!(matches!(
+                rename(&a, "A.txt", &j),
+                Err(CoreError::AlreadyExists(_))
+            ));
+        }
+        assert!(j.is_empty());
+    }
+
+    /// Two sources with one name (from search results) moved or copied with "Replace":
+    /// the second does not replace what the same operation just put there (the first
+    /// item went to the trash and undo failed), it keeps both.
+    #[test]
+    fn replace_never_replaces_an_item_of_the_same_operation() {
+        if cfg!(target_os = "macos") {
+            return; // restoring from the trash is not supported there
+        }
+        for kind in [TaskKind::Copy, TaskKind::Move] {
+            let d = test_dir();
+            let p = |s: &str| d.path().join(s);
+            for dir in ["x", "y", "dest"] {
+                fs::create_dir(p(dir)).unwrap();
+            }
+            fs::write(p("x/f.txt"), "x").unwrap();
+            fs::write(p("y/f.txt"), "y").unwrap();
+            fs::write(p("dest/f.txt"), "old").unwrap();
+            let before = tree(d.path());
+            let m = mgr();
+            let mut req = task(kind, &p("x/f.txt"), &p("dest"), ConflictPolicy::Overwrite);
+            req.sources.push(p("y/f.txt"));
+            assert_eq!(run(&m, req).unwrap(), (2, 0), "{kind:?}");
+            assert_eq!(names(&p("dest")), ["f (2).txt=y", "f.txt=x"], "{kind:?}");
+            m.journal().undo().unwrap();
+            assert_eq!(tree(d.path()), before, "{kind:?}");
+        }
     }
 }

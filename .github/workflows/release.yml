@@ -12,6 +12,8 @@ permissions:
 
 jobs:
   build:
+    # Only on the public repo: the private development repo runs no CI/CD.
+    if: github.repository == 'GaMa87/gall'
     strategy:
       fail-fast: false
       matrix:

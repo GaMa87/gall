@@ -31,7 +31,7 @@ pub struct TrashEntry {
 ))]
 mod imp {
     use super::*;
-    use crate::fs::ops::{list_trash, with_trash};
+    use crate::fs::ops::{list_trash, restore_trash_items, with_trash};
     use std::path::{Path, PathBuf};
     use trash::os_limited;
 
@@ -46,6 +46,25 @@ mod imp {
             (Some(trash_dir), Some(stem)) => trash_dir.join("files").join(stem),
             _ => id,
         }
+    }
+
+    /// The item's id for the UI, one per item: its path in the trash, or, on Unix when
+    /// that is not valid UTF-8, `bytes:` and the path's bytes in hex (a lossy string
+    /// would give two such items the same id). Trash paths are absolute, so the prefix
+    /// never clashes with a real path.
+    fn item_id(item: &trash::TrashItem) -> String {
+        #[cfg(unix)]
+        if item.id.to_str().is_none() {
+            use std::os::unix::ffi::OsStrExt;
+            let hex: String = item
+                .id
+                .as_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            return format!("bytes:{hex}");
+        }
+        item.id.to_string_lossy().into_owned()
     }
 
     fn entry(item: &trash::TrashItem) -> TrashEntry {
@@ -65,7 +84,7 @@ mod imp {
             meta.map(|m| m.len()).unwrap_or(0)
         };
         TrashEntry {
-            id: item.id.to_string_lossy().into_owned(),
+            id: item_id(item),
             name: item.name.to_string_lossy().into_owned(),
             original_parent: item.original_parent.to_string_lossy().into_owned(),
             deleted: item.time_deleted,
@@ -86,7 +105,7 @@ mod imp {
         let items = list_trash()?;
         let picked: Vec<_> = items
             .into_iter()
-            .filter(|i| ids.iter().any(|id| *id == i.id.to_string_lossy()))
+            .filter(|i| ids.contains(&item_id(i)))
             .collect();
         if picked.is_empty() && !ids.is_empty() {
             return Err(CoreError::Trash(
@@ -101,7 +120,7 @@ mod imp {
         // Say which item could not go back, not the crate's debug text.
         let r = std::thread::Builder::new()
             .name("trash".into())
-            .spawn(move || os_limited::restore_all(items))
+            .spawn(move || restore_trash_items(items))
             .map_err(|e| CoreError::Trash(e.to_string()))?
             .join()
             .map_err(|_| CoreError::Trash("restoring failed".into()))?;
@@ -210,5 +229,41 @@ mod tests {
         let e = find().expect("in the trash again");
         super::purge(&[e.id]).unwrap();
         assert!(find().is_none(), "deleted for good");
+    }
+
+    /// Two trashed items whose names are not valid UTF-8 (old archives, other systems)
+    /// had the same id ("�.txt"): deleting one for good deleted both.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn items_with_non_utf8_names_are_told_apart() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join(std::ffi::OsStr::from_bytes(b"\xff.txt"));
+        let b = dir.path().join(std::ffi::OsStr::from_bytes(b"\xfe.txt"));
+        std::fs::write(&a, "a").unwrap();
+        std::fs::write(&b, "b").unwrap();
+        if trash::delete_all([&a, &b]).is_err() {
+            return; // no trash here
+        }
+        let parent = dir.path().to_string_lossy().into_owned();
+        let mine = || -> Vec<_> {
+            super::list()
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.original_parent == parent)
+                .collect()
+        };
+        let items = mine();
+        assert_eq!(items.len(), 2);
+        let purged = super::purge(std::slice::from_ref(&items[0].id));
+        let left = mine();
+        // Clean up whatever is left of this test in the trash.
+        let ids: Vec<_> = left.iter().map(|e| e.id.clone()).collect();
+        if !ids.is_empty() {
+            let _ = super::purge(&ids);
+        }
+        purged.unwrap();
+        assert_eq!(left.len(), 1, "only the chosen item is deleted for good");
+        assert_ne!(left[0].id, items[0].id);
     }
 }

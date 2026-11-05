@@ -6,6 +6,7 @@ import { api } from "../api/ipc";
 import type { DiffOptions, DiffResult, DiffSource, SyntaxHighlight } from "../api/types";
 import { applyBlock, buildSplit, buildUnified, joinLines, moveTarget, offsets, rowAt, segments, wrappedLines, type Cell, type Spans, type SplitRow, type SyntaxRuns, type UnifiedRow } from "../core/diffRows";
 import { refreshAll } from "../state/controllers";
+import { primaryMod } from "../core/keymap";
 import { formatSize } from "../core/format";
 import { basename, join, parent, tildify } from "../core/path";
 import * as A from "../state/actions";
@@ -88,21 +89,26 @@ export function DiffView({ a: a0, b: b0, back }: { a: DiffSource; b: DiffSource;
     return e ? { kind: "text", label: srcName(src[i]), text: joinLines(e, meta.current[i].crlf, meta.current[i].finalNewline) } : src[i];
   }, [edits, src]);
 
+  // Only the latest comparison's reply counts: options toggled quickly (w, i, e…) or merges
+  // in a row start several, and an older reply arriving last showed the wrong diff.
+  const runSeq = useRef(0);
   const run = useCallback(() => {
     setLoading(true);
     setErr(null);
     const keep = keepView.current;
     keepView.current = false;
+    const my = ++runSeq.current;
     api.diffCompare(eff(0), eff(1), opts)
       .then((r) => {
+        if (my !== runSeq.current) return;
         // Remember each file's line endings while it is unedited, to save it the same way.
         if (!edits[0]) meta.current[0] = { crlf: r.left.crlf, finalNewline: r.left.finalNewline };
         if (!edits[1]) meta.current[1] = { crlf: r.right.crlf, finalNewline: r.right.finalNewline };
         setRes(r);
         if (!keep) { setCur(-1); setExpanded(new Set()); }
       })
-      .catch((e) => setErr(String(e)))
-      .finally(() => setLoading(false));
+      .catch((e) => { if (my === runSeq.current) setErr(String(e)); })
+      .finally(() => { if (my === runSeq.current) setLoading(false); });
   }, [eff, edits, opts]);
   useEffect(run, [run]);
   useEffect(() => { localStorage.setItem(OPTS_KEY, JSON.stringify(opts)); }, [opts]);
@@ -177,7 +183,9 @@ export function DiffView({ a: a0, b: b0, back }: { a: DiffSource; b: DiffSource;
 
   // ── merge ──
   const applyBlock_ = (dir: "toRight" | "toLeft", k = cur) => {
-    if (!tx) return;
+    // While the last merge is being compared again, `tx` still holds the lines from before
+    // it: a block applied now would be cut from those and silently undo that merge.
+    if (!tx || loading) return;
     const target = dir === "toRight" ? 1 : 0;
     if (!editable(target)) return A.notify(`The ${target ? "right" : "left"} side is read-only (${src[target].kind === "gitHead" ? "Git HEAD" : "clipboard"})`, "warn");
     const op = tx.ops.filter((o) => o.tag !== "equal")[k < 0 ? 0 : k];
@@ -244,8 +252,11 @@ export function DiffView({ a: a0, b: b0, back }: { a: DiffSource; b: DiffSource;
     const el = bodyRef.current;
     const k = e.key;
     const by = (n: number) => { if (el) el.scrollTop += n; };
-    if (e.ctrlKey && k === "s") saveEdits();
-    else if (e.ctrlKey && k === "z") undoEdit();
+    if (primaryMod(e) && k === "s") saveEdits();
+    else if (primaryMod(e) && k === "z") undoEdit();
+    // Other Cmd chords are the system's (Cmd+Q, Cmd+C…): not the letter commands below
+    // (Cmd+S swapped the sides, Cmd+Q closed the view instead of quitting).
+    else if (e.metaKey) return;
     else if (e.altKey && k === "ArrowRight") applyBlock_("toRight");
     else if (e.altKey && k === "ArrowLeft") applyBlock_("toLeft");
     else if (k === "Escape" || k === "q") close();

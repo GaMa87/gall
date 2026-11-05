@@ -130,7 +130,8 @@ function MillerColumn({ b, dir, onPath, width, isCurrent, onHover }: ColProps) {
       onMouseLeave={() => onHover?.(false)}
       tabIndex={-1}
       onKeyDown={(e) => {
-        if (e.key.length === 1 && /[\p{L}\p{N}.]/u.test(e.key) && !e.ctrlKey && !e.altKey) {
+        // Not with Cmd (macOS): Cmd+T, Cmd+W… are shortcuts, not letters for the filter.
+        if (e.key.length === 1 && /[\p{L}\p{N}.]/u.test(e.key) && !e.ctrlKey && !e.altKey && !e.metaKey) {
           setFilter((f) => f + e.key);
           e.stopPropagation();
         } else if (e.key === "Escape" && filter) {

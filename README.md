@@ -52,10 +52,18 @@ product and is not affiliated with it (see [clean-room policy](docs/00-clean-roo
 
 ### ⚡ Find any file on your computer as you type
 
-`Ctrl+P` (or `Space Space`) searches every file name on the machine. Gall builds the index
+`Ctrl+P` (or `Space Space`) searches file names in the open folder and below; `Tab` widens it to
+every file name on the machine. Gall builds the index
 in the background with a parallel walk, so a query over a few hundred thousand paths returns
 in tens of milliseconds. Matching is fuzzy and uses fzf-style syntax (`ext:jpg`, `'exact`, `!not`),
 and the selected file shows a live preview. Type `>` to switch to the command palette.
+
+Build output stays out of the results: `node_modules`, `target`, `dist`, `build`, folders tagged as
+caches (`CACHEDIR.TAG`) and everything `.gitignore` leaves out are skipped. For anything else in a
+project, right-click it and choose **Hide from search**, or list it in a `.gallignore` file (gitignore
+syntax) in the project folder. A `.gallignore` works without git too, Quick Open, find in files and
+`F3` all honour it, and hidden items are dimmed in the file list. When you do need the build output,
+`Alt+I` searches ignored files too.
 
 <p align="center"><img src="docs/screenshots/quick-open.gif" alt="Quick Open finds a photo among 360,000 indexed paths in 33 ms" width="860"></p>
 
@@ -216,6 +224,75 @@ Some shortcuts: `Ctrl+P` find a file · `Ctrl+F` / `Ctrl+Shift+F` find text · `
 `?` all shortcuts · `F2` rename · `Alt+C`/`Alt+M` copy/move to the other pane · `Ctrl+Shift+N` new folder ·
 `F3` search · `F10` terminal here · `Alt+P` preview pane · `Alt+S` sidebar · `Ctrl+H` hidden files ·
 `Ctrl+,` settings. All are listed and editable in *Settings › Shortcuts*.
+
+### New in 0.1.3: search scope and exclusions
+
+Open a folder and press `Ctrl+P`: Quick Open now searches **that folder and its subfolders**
+first. Press `Tab` to switch to **everywhere**, and again to return. In WSL, on a network
+share or outside the indexed folders, Gall reads the open folder on demand; you can type
+while it says "Reading…". "Everywhere" searches the system index, not every unindexed
+share or WSL distribution. Configure permanent roots in *Settings › Search › Indexed folders*.
+Inside an archive, Quick Open searches the system index; folder scope and `Alt+I` are unavailable.
+
+To keep generated or noisy items out of results, right-click them and choose **Hide from search**.
+This writes a `.gallignore` next to the items; it does not delete them or change `.gitignore`.
+They remain visible in the file list, dimmed and italic. Right-click **Show in search again**
+to remove the rule or add an exception; a hidden folder's header also lets you show it again.
+Hide from search offers Undo.
+
+You can edit `.gallignore` yourself. For example, put this in your project folder:
+
+```gitignore
+# Skip generated output and logs
+/generated/
+*.log
+# Keep this log searchable
+!important.log
+```
+
+Rules use gitignore syntax and apply to that folder and everything below it, even outside
+a Git repository and when a search starts in a subfolder. Quick Open, find in files and
+the name search (`F3`) all respect them. Edits are picked up without manually rebuilding
+the index. Global exclusions live in *Settings › Search › Never index or search*;
+folders with a valid `CACHEDIR.TAG` are skipped too.
+
+**Need an ignored item just this time?** In find in files or `F3`, `Alt+I` toggles inclusion
+of ignored files, including `.gallignore`, `.gitignore`, excluded folders and caches.
+In Quick Open, `Alt+I` instead opens the name search in the current folder with ignored
+files included; it does not add them to the index. That search uses plain names and
+wildcards (`*`, `?`), rather than Quick Open's fuzzy syntax. `Ctrl+H` only changes the
+file list's hidden-file visibility; it does not remove search exclusions.
+
+### Windows: browse WSL distributions
+
+Installed WSL distributions appear in the sidebar's **Drives** group. Expand **Not mounted**
+and click a stopped distribution to start and open it; running ones appear among the drives.
+You can also type `\\wsl.localhost\Ubuntu\home\yourname` in the path bar (replace the names
+with your own); Gall also supports `\\wsl$\Ubuntu\…` on older Windows installations.
+Typing `/etc` opens it in the current WSL distribution, or the default one when outside WSL.
+Docker Desktop's internal distributions are intentionally hidden; this is not Docker container browsing.
+
+Browse, preview, rename, copy and move as usual, including between Windows and WSL or between
+distributions. **Terminal here** (`F10`) opens a shell in that distribution's current folder.
+In find in files, **Home** refers to the Linux home when opened from WSL. Use
+**Copy path › Linux path (WSL)** for `/home/…` or `/mnt/c/…`; the default format is configurable
+in Settings.
+
+Delete inside WSL normally uses the distribution's Linux trash; `Ctrl+Z` restores the items.
+Gall's Trash window shows only the Windows Recycle Bin, so use undo or a Linux file manager
+for WSL trash. If trash is unavailable, Gall asks before deleting permanently; that cannot
+be undone. Copying names Windows cannot store into Windows is refused with an explanation.
+For an individual name ending in a dot or space, rename it in a WSL terminal first;
+copying a normally named folder within WSL can preserve such names inside it.
+
+The eject button **Stop … (WSL)** terminates the whole distribution, not just Gall's view.
+Save work in its other programs before confirming. If external changes do not appear,
+press `F5` to refresh.
+
+More details and a manual verification checklist: [WSL support](docs/wsl-manual-test.md).
+The [0.1.3 changelog](CHANGELOG.md#013--2026-11-05) lists the accompanying fixes.
+
+### Settings, data and themes
 
 Settings are in `~/.config/gall/` and data in `~/.local/share/gall/`. A file named
 `portable` next to the executable switches storage to `./UserData` (settings, data, logs and the

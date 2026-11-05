@@ -194,6 +194,16 @@ pub fn default_excludes() -> Vec<String> {
         ".venv",
         "dist",
         "build",
+        "coverage",
+        ".next",
+        ".nuxt",
+        ".svelte-kit",
+        ".turbo",
+        ".parcel-cache",
+        ".gradle",
+        ".tox",
+        ".mypy_cache",
+        ".pytest_cache",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -254,6 +264,9 @@ pub struct IndexResult {
     pub total: usize,
     pub searched: usize,
     pub elapsed_ms: u64,
+    /// The folder is not in the system index and is being scanned for this query
+    /// (a WSL distribution, a network share, a folder outside the indexed ones).
+    pub scanning: bool,
 }
 
 pub struct FileIndex {
@@ -362,6 +375,45 @@ impl FileIndex {
         true
     }
 
+    /// Drops `path` and everything below it from the current snapshot at once, so
+    /// Quick Open stops showing what was just hidden from search before the next
+    /// rebuild finishes. Returns how many entries were dropped.
+    pub fn forget_under(&self, path: &Path) -> usize {
+        let p = path.to_string_lossy();
+        let p = p.trim_end_matches(['/', '\\']);
+        if p.is_empty() {
+            return 0;
+        }
+        let under = |s: &str| {
+            s.strip_prefix(p)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(['/', '\\']))
+        };
+        let mut w = self.snap.write().unwrap();
+        let old = w.clone();
+        let removed = old.entries.iter().filter(|e| under(old.path(e))).count();
+        if removed == 0 {
+            return 0;
+        }
+        let mut snap = Snapshot {
+            arena: String::with_capacity(old.arena.len()),
+            entries: Vec::with_capacity(old.entries.len() - removed),
+            roots: old.roots.clone(),
+            built_at: old.built_at,
+            build_ms: old.build_ms,
+        };
+        for e in &old.entries {
+            let s = old.path(e);
+            if under(s) {
+                continue;
+            }
+            let start = snap.arena.len() as u32;
+            snap.arena.push_str(s);
+            snap.entries.push(Entry { start, ..*e });
+        }
+        *w = Arc::new(snap);
+        removed
+    }
+
     /// Current roots, plus `extra` if it is not already covered.
     pub fn roots_with(&self, extra: &Path) -> Vec<PathBuf> {
         let mut r = self.snap.read().unwrap().roots.clone();
@@ -389,6 +441,7 @@ impl FileIndex {
                 total: 0,
                 searched: snap.entries.len(),
                 elapsed_ms: 0,
+                scanning: false,
             };
         }
 
@@ -473,8 +526,24 @@ impl FileIndex {
             total,
             searched: snap.entries.len(),
             elapsed_ms: t0.elapsed().as_millis() as u64,
+            scanning: false,
         }
     }
+}
+
+/// Whether the system index (built from `roots`) holds what is in `path`. Not for a
+/// folder outside every root (a WSL distribution `\\wsl.localhost\…` on Windows, whose
+/// default roots are the drives; a folder outside custom indexed folders) or on a
+/// network mount below a root, which the index never walks into: Quick Open scans those
+/// itself. A WSL folder listed as an indexed folder is covered like any other root.
+pub fn index_covers(roots: &[PathBuf], path: &Path) -> bool {
+    let remote = remote_mounts();
+    roots.iter().any(|r| {
+        path.starts_with(r)
+            && !remote
+                .iter()
+                .any(|m| m != r && m.starts_with(r) && path.starts_with(m))
+    })
 }
 
 /// Max-heap ordering is inverted so the heap root is the *worst* kept hit.
@@ -557,7 +626,9 @@ fn build(roots: &[PathBuf], opts: &IndexOptions, cancel: &AtomicBool) -> Snapsho
             .require_git(true)
             .follow_links(false)
             .filter_entry(move |e| {
-                !is_system_skip(e.path()) && (e.depth() == 0 || !remote.contains(e.path()))
+                !is_system_skip(e.path())
+                    && (e.depth() == 0 || !remote.contains(e.path()))
+                    && !super::ignorefile::skip_cache(e)
             })
             .threads(
                 std::thread::available_parallelism()
@@ -565,6 +636,7 @@ fn build(roots: &[PathBuf], opts: &IndexOptions, cancel: &AtomicBool) -> Snapsho
                     .unwrap_or(4)
                     .min(8),
             );
+        super::ignorefile::configure(&mut wb, true);
         if !opts.exclude.is_empty() {
             let mut ob = ignore::overrides::OverrideBuilder::new(root);
             for g in &opts.exclude {
@@ -742,6 +814,57 @@ mod tests {
         );
         assert!(r.hits.iter().any(|h| h.name == "src"));
         assert_eq!(idx.query("fpane/", None, 10).total, 0);
+    }
+
+    #[test]
+    fn hidden_items_leave_at_once_and_stay_out() {
+        let d = tree();
+        let p = d.path();
+        std::fs::create_dir_all(p.join("target/debug")).unwrap();
+        std::fs::write(
+            p.join("target/CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55",
+        )
+        .unwrap();
+        std::fs::write(p.join("target/debug/app.rs"), "").unwrap();
+        let opts = IndexOptions {
+            exclude: vec![],
+            ..Default::default()
+        };
+        let idx = FileIndex::new();
+        let cancel = AtomicBool::new(false);
+        idx.rebuild(&[p.to_path_buf()], &opts, &cancel);
+        let rs = |idx: &FileIndex| idx.query("ext:rs", None, 50).total;
+        // Cargo's target is a tagged cache: skipped even without an exclude for it.
+        assert_eq!(rs(&idx), 2);
+
+        // ui and everything below it, not "ui2" or "src".
+        std::fs::create_dir(p.join("ui2")).unwrap();
+        idx.rebuild(&[p.to_path_buf()], &opts, &cancel);
+        let before = idx.status().entries;
+        assert_eq!(idx.forget_under(&p.join("ui")), 4);
+        assert_eq!(idx.status().entries, before - 4);
+        assert_eq!(idx.query("FolderPane", None, 10).total, 0);
+        assert_eq!(idx.query("ui2", None, 10).total, 1);
+        assert_eq!(idx.forget_under(&p.join("ui")), 0);
+
+        // After a .gallignore entry, a rebuild keeps it out.
+        crate::fs::ignorefile::hide_from_search(&p.join("src")).unwrap();
+        idx.rebuild(&[p.to_path_buf()], &opts, &cancel);
+        assert_eq!(rs(&idx), 0);
+        assert!(idx.query("App.tsx", None, 10).total > 0);
+    }
+
+    #[test]
+    fn covers_only_folders_inside_the_roots() {
+        let d = tree();
+        let p = d.path();
+        let roots = [p.join("src")];
+        assert!(index_covers(&roots, &p.join("src")));
+        assert!(index_covers(&roots, &p.join("src/fs")));
+        assert!(!index_covers(&roots, &p.join("ui")));
+        assert!(!index_covers(&roots, p));
+        assert!(!index_covers(&[], p));
     }
 
     #[test]

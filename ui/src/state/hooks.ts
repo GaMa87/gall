@@ -2,7 +2,7 @@
 // backend watcher, and per-folder preferences.
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { api } from "../api/ipc";
-import type { FileEntry, GitStatus, ResolvedPrefs, Settings } from "../api/types";
+import type { FileEntry, GitStatus, HiddenState, ResolvedPrefs, Settings } from "../api/types";
 import { archiveOf } from "../core/archive";
 import { onFolderChanged } from "./controllers";
 import { useStore } from "./store";
@@ -195,5 +195,40 @@ export function useGitStatus(path: string, enabled: boolean): GitStatus | null {
       window.removeEventListener("focus", soon);
     };
   }, [path, enabled]);
+  return st && st.path === path ? st.st : null;
+}
+
+// ── items a .gallignore hides from search (dimmed in the list) ──
+
+const hiddenSubs = new Set<() => void>();
+/** Reloads every folder's hidden-from-search state (after Hide / Show in search). */
+export function bumpSearchHidden() {
+  hiddenSubs.forEach((f) => f());
+}
+
+export function useSearchHidden(path: string): HiddenState | null {
+  const [st, setSt] = useState<{ path: string; st: HiddenState | null } | null>(null);
+  useEffect(() => {
+    if (!path || archiveOf(path)) {
+      setSt(null);
+      return;
+    }
+    let alive = true;
+    let timer = 0;
+    const load = () =>
+      api.searchHidden(path)
+        .then((s) => alive && setSt({ path, st: s }))
+        .catch(() => alive && setSt({ path, st: null }));
+    const soon = () => { clearTimeout(timer); timer = window.setTimeout(load, 300); };
+    load();
+    const off = onFolderChanged(path, soon);
+    hiddenSubs.add(load);
+    return () => {
+      alive = false;
+      clearTimeout(timer);
+      off();
+      hiddenSubs.delete(load);
+    };
+  }, [path]);
   return st && st.path === path ? st.st : null;
 }

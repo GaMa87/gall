@@ -1,26 +1,51 @@
 # Maintainer: Matej Gajšek <37571659+GaMa87@users.noreply.github.com>
-# Draft for the AUR package "gall-bin": repackages the official .deb from GitHub Releases.
-# Update: bump pkgver, then `updpkgsums && makepkg --printsrcinfo > .SRCINFO`.
+#
+# AUR package "gall-bin": repackages the official .deb from GitHub Releases.
+# Bump: set pkgver (pkgrel=1), run `updpkgsums && makepkg --printsrcinfo > .SRCINFO`.
+#
+# App ID / file names that come from the .deb (change when the app ID changes;
+# nothing in this PKGBUILD depends on them, they are listed so namcap output makes sense):
+#   /usr/share/applications/Gall.desktop
+#   /usr/share/metainfo/org.gall.app.metainfo.xml
+#   /usr/share/icons/hicolor/*/apps/gall.png
 pkgname=gall-bin
+_pkgname=gall
 pkgver=0.1.2
 pkgrel=1
 pkgdesc="Keyboard-first file manager: Miller columns, dual pane, instant search, compare tool and Vim keys"
 arch=('x86_64')
 url="https://github.com/GaMa87/gall"
 license=('MIT')
-depends=('webkit2gtk-4.1' 'gtk3' 'hicolor-icon-theme')
+# From the ELF NEEDED entries of /usr/bin/gall (readelf -d):
+#   libwebkit2gtk-4.1, libjavascriptcoregtk-4.1 -> webkit2gtk-4.1
+#   libgtk-3, libgdk-3 -> gtk3; libgdk_pixbuf-2.0 -> gdk-pixbuf2; libcairo -> cairo
+#   libglib/gobject/gio-2.0 -> glib2; libsoup-3.0 -> libsoup3; libdbus-1 -> dbus
+#   libgcc_s -> gcc-libs; libc/libm/ld-linux -> glibc
+depends=('cairo'
+         'dbus'
+         'gcc-libs'
+         'gdk-pixbuf2'
+         'glib2'
+         'glibc'
+         'gtk3'
+         'hicolor-icon-theme'
+         'libsoup3'
+         'webkit2gtk-4.1')
 optdepends=('gst-plugins-good: video and audio preview'
             'gst-libav: more video formats in the preview'
             'git: Git status in the file list'
             'ttf-nerd-fonts-symbols: Nerd Font file icons')
-provides=('gall')
-conflicts=('gall')
+provides=("$_pkgname")
+conflicts=("$_pkgname")
+options=('!strip' '!debug')
 source=("$url/releases/download/v$pkgver/Gall_${pkgver}_amd64.deb"
         "LICENSE-$pkgver::https://raw.githubusercontent.com/GaMa87/gall/v$pkgver/LICENSE")
-sha256sums=('SKIP'
-            'SKIP')
+sha256sums=('28f67f9730eaa9be02a29bce169ef456acbd2a33fcb3e6960debebe4f0b41e7c'
+            '565441b185f6bf183284cc87c34d43e2084b04d2c94275536b60d2e93eca3ba3')
 
 package() {
-  bsdtar -xf data.tar.gz -C "$pkgdir"
+  # makepkg unpacks the .deb (ar) into control.tar.gz and data.tar.gz.
+  bsdtar -xf data.tar.gz -C "$pkgdir" --no-same-owner
+  chmod 755 "$pkgdir/usr/bin/$_pkgname"
   install -Dm644 "LICENSE-$pkgver" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

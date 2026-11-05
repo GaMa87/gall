@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { api, fileSrc } from "../api/ipc";
 import type { ImageDiff } from "../api/types";
+import { getState } from "../state/store";
 
 export const IMAGE_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp", "avif", "svg", "ico"]);
 const PIXEL_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp"]);
@@ -34,6 +35,7 @@ export function ImageCompare({ left, right }: { left: string; right: string }) {
   // Keys 1–4 switch modes; [ and ] move the divider / opacity.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if (getState().overlay?.type === "dialog") return; // a dialog over the compare view has the keys
       const i = ["1", "2", "3", "4"].indexOf(e.key);
       if (i >= 0) setMode(MODES[i][0]);
       else if (e.key === "[" || e.key === "]") {

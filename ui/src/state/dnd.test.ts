@@ -36,3 +36,15 @@ describe("drop action: held keys override the default only while held", () => {
     expect(currentAction(["/a/x"], "/b", keys(false, false, true))).toBe("link");
   });
 });
+
+describe("file:// URIs given to other apps when dragging out", () => {
+  it("encode # and ? (a fragment / query would cut the name short)", async () => {
+    const { fileUri } = await import("./dnd");
+    expect(fileUri("/home/u/Track #1?.mp3")).toBe("file:///home/u/Track%20%231%3F.mp3");
+  });
+  it("round-trip through draggedPaths' decoding", async () => {
+    const { fileUri } = await import("./dnd");
+    for (const p of ["/a/50% off.txt", "/a/x#y/z?.md", "/a/č ž/ü&b;c.txt"])
+      expect(decodeURIComponent(fileUri(p).slice(7))).toBe(p);
+  });
+});

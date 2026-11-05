@@ -8,14 +8,17 @@ import { ancestors, basename, parent } from "../core/path";
 import * as A from "../state/actions";
 import { controller } from "../state/controllers";
 import { FileIcon, Icon, TAG_COLORS } from "./Icon";
+import { primaryMod } from "../core/keymap";
 
 let searchSeq = 1;
 
-export function SearchWindow({ root }: { root: string }) {
+export function SearchWindow({ root, initialPattern, initialEverything }: { root: string; initialPattern?: string; initialEverything?: boolean }) {
   const [tab, setTab] = useState<"files" | "tags">("files");
-  const [pattern, setPattern] = useState("");
+  const [pattern, setPattern] = useState(initialPattern ?? "");
   const [scope, setScope] = useState(root);
-  const [hidden, setHidden] = useState(false);
+  const [hidden, setHidden] = useState(!!initialEverything);
+  // Also what Settings › Search excludes, .gitignore, .gallignore and cache folders.
+  const [everything, setEverything] = useState(!!initialEverything);
   const [results, setResults] = useState<FileEntry[]>([]);
   const [running, setRunning] = useState(false);
   const [done, setDone] = useState<string>("");
@@ -52,8 +55,15 @@ export function SearchWindow({ root }: { root: string }) {
     setSel(new Set());
     setRunning(true);
     setDone("");
-    api.searchStart(id.current, scope, pattern, hidden).catch(A.fail);
+    api.searchStart(id.current, scope, pattern, hidden, everything).catch(A.fail);
   };
+  // Opened from Quick Open with a query: search right away.
+  const autoStarted = useRef(false);
+  useEffect(() => {
+    if (autoStarted.current || !initialPattern?.trim()) return;
+    autoStarted.current = true;
+    start();
+  });
 
   const locate = (p: string) => {
     const b = A.activeBrowser();
@@ -71,7 +81,11 @@ export function SearchWindow({ root }: { root: string }) {
   return (
     <div className="backdrop" onMouseDown={() => A.openOverlay(null)}>
       <div className="modal search-win" onMouseDown={(e) => e.stopPropagation()} tabIndex={-1}
-        onKeyDown={(e) => { e.stopPropagation(); if (e.key === "Escape") A.openOverlay(null); }}>
+        onKeyDown={(e) => {
+          e.stopPropagation();
+          if (e.key === "Escape") A.openOverlay(null);
+          if (e.altKey && e.key.toLowerCase() === "i") { e.preventDefault(); setEverything((v) => !v); }
+        }}>
         <div className="shead">
           <button className={`btn ${tab === "files" ? "primary" : ""}`} onClick={() => setTab("files")}>Files</button>
           <button className={`btn ${tab === "tags" ? "primary" : ""}`} onClick={() => setTab("tags")}>Tags</button>
@@ -79,12 +93,13 @@ export function SearchWindow({ root }: { root: string }) {
             <>
               <input ref={inputRef} type="text" placeholder="Name or wildcard: *.pdf, report?.txt" value={pattern}
                 onChange={(e) => setPattern(e.target.value)}
-                onKeyDown={(e) => { if (e.key === "Enter") { if (results.length && !running && e.ctrlKey) openSelected(); else start(); } }} />
+                onKeyDown={(e) => { if (e.key === "Enter") { if (results.length && !running && primaryMod(e)) openSelected(); else start(); } }} />
               <select value={scope} onChange={(e) => setScope(e.target.value)} title="Search in">
                 <option value={root}>This folder: {basename(root)}</option>
                 {top !== root && <option value={top}>Whole drive: {top}</option>}
               </select>
               <label style={{ display: "flex", gap: 4, alignItems: "center" }}><input type="checkbox" checked={hidden} onChange={(e) => setHidden(e.target.checked)} /> hidden</label>
+              <label style={{ display: "flex", gap: 4, alignItems: "center" }} title="Also search what is normally skipped: Settings › Search › Never index or search, .gitignore, .gallignore and cache folders (Alt+I)"><input type="checkbox" checked={everything} onChange={(e) => setEverything(e.target.checked)} /> ignored</label>
               {running ? <button className="btn" onClick={() => api.searchCancel()}>Stop</button> : <button className="btn primary" onClick={start}>Search</button>}
             </>
           ) : (
@@ -100,7 +115,7 @@ export function SearchWindow({ root }: { root: string }) {
           {tab === "files"
             ? results.map((r, i) => (
                 <div key={r.path} className={`r ${sel.has(i) ? "on" : ""}`}
-                  onClick={(e) => setSel((s) => { const n = new Set(e.ctrlKey ? s : []); n.has(i) && e.ctrlKey ? n.delete(i) : n.add(i); return n; })}
+                  onClick={(e) => setSel((s) => { const n = new Set(primaryMod(e) ? s : []); n.has(i) && primaryMod(e) ? n.delete(i) : n.add(i); return n; })}
                   onDoubleClick={() => A.openEntries(A.activeBrowser(), [r])}>
                   <button className="icon-btn" title="Locate in browser" onClick={(e) => { e.stopPropagation(); locate(r.path); }}><Icon name="locate" size={14} /></button>
                   <FileIcon entry={r} />
@@ -120,7 +135,7 @@ export function SearchWindow({ root }: { root: string }) {
               ))}
         </div>
         <div className="foot">
-          <span>{tab === "files" ? (running ? `Searching… ${results.length}` : done || "Wildcards: * any text, ? one character. Plain text matches anywhere in the name.") : `${tagged.length} tagged item${tagged.length === 1 ? "" : "s"}`}</span>
+          <span>{tab === "files" ? (running ? `Searching… ${results.length}` : done || "Wildcards: * any text, ? one character. Plain text matches anywhere in the name. Skips node_modules, .gitignore and .gallignore; Alt+I searches them too.") : `${tagged.length} tagged item${tagged.length === 1 ? "" : "s"}`}</span>
           {tab === "files" && results.length > 0 && <span>Enter: search again · Ctrl+Enter / double-click: open · ⌖ locate</span>}
         </div>
       </div>

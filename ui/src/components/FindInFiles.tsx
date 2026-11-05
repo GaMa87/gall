@@ -4,11 +4,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api, events } from "../api/ipc";
 import type { FileMatches, GrepOptions, GrepStats } from "../api/types";
-import { ancestors, basename, parent, tildify } from "../core/path";
+import { ancestors, basename, linuxHome, parent, tildify } from "../core/path";
 import * as A from "../state/actions";
 import { controller } from "../state/controllers";
 import { pushRecent, useStore } from "../state/store";
 import { FileIcon, Icon } from "./Icon";
+import { primaryMod } from "../core/keymap";
 
 type Scope = "folder" | "home" | "root";
 const ROW_H = 24;
@@ -43,7 +44,7 @@ export function FindInFiles({ root, scope: initialScope }: { root: string; scope
   const info = useStore((s) => s.info)!;
   const [pattern, setPattern] = useState("");
   const [scope, setScope] = useState<Scope>(initialScope);
-  const [opts, setOpts] = useState({ caseSensitive: false, wholeWord: false, regex: false });
+  const [opts, setOpts] = useState({ caseSensitive: false, wholeWord: false, regex: false, everything: false });
   const [include, setInclude] = useState("");
   const [exclude, setExclude] = useState("");
   const [showFilters, setShowFilters] = useState(false);
@@ -62,7 +63,7 @@ export function FindInFiles({ root, scope: initialScope }: { root: string; scope
 
   const roots: Record<Scope, string> = {
     folder: root,
-    home: info.home,
+    home: linuxHome(root) ?? info.home,
     root: ancestors(root)[0] ?? "/",
   };
   const searchRoot = roots[scope];
@@ -114,7 +115,8 @@ export function FindInFiles({ root, scope: initialScope }: { root: string; scope
         regex: opts.regex,
         include: split(include),
         exclude: split(exclude),
-        respectGitignore: true,
+        respectGitignore: !opts.everything,
+        everything: opts.everything,
         maxMatches: 20000,
       };
       api.grepStart(id.current, searchRoot, pattern, o).catch(A.fail);
@@ -190,10 +192,11 @@ export function FindInFiles({ root, scope: initialScope }: { root: string; scope
     if (k === "ArrowDown" || (k === "F4" && !e.shiftKey) || (e.ctrlKey && (k === "j" || k === "n"))) { e.preventDefault(); step(1); return; }
     if (k === "ArrowUp" || (k === "F4" && e.shiftKey) || (e.ctrlKey && (k === "k" || k === "p"))) { e.preventDefault(); step(-1); return; }
     if (k === "Enter" && (e.target as HTMLElement).tagName === "INPUT" && (e.target as HTMLElement).dataset.role !== "query") return;
-    if (k === "Enter") { e.preventDefault(); open(e.ctrlKey ? "reveal" : e.shiftKey ? "other" : "open"); return; }
+    if (k === "Enter") { e.preventDefault(); open(primaryMod(e) ? "reveal" : e.shiftKey ? "other" : "open"); return; }
     if (e.altKey && k.toLowerCase() === "c") { e.preventDefault(); setOpts((o) => ({ ...o, caseSensitive: !o.caseSensitive })); }
     if (e.altKey && k.toLowerCase() === "w") { e.preventDefault(); setOpts((o) => ({ ...o, wholeWord: !o.wholeWord })); }
     if (e.altKey && k.toLowerCase() === "r") { e.preventDefault(); setOpts((o) => ({ ...o, regex: !o.regex })); }
+    if (e.altKey && k.toLowerCase() === "i") { e.preventDefault(); setOpts((o) => ({ ...o, everything: !o.everything })); }
   };
 
   const first = Math.max(0, Math.floor(scrollTop / ROW_H) - 10);
@@ -212,6 +215,7 @@ export function FindInFiles({ root, scope: initialScope }: { root: string; scope
             <button className={`tgl ${opts.caseSensitive ? "on" : ""}`} title="Match case (Alt+C)" onClick={() => setOpts((o) => ({ ...o, caseSensitive: !o.caseSensitive }))}>Aa</button>
             <button className={`tgl ${opts.wholeWord ? "on" : ""}`} title="Whole word (Alt+W)" onClick={() => setOpts((o) => ({ ...o, wholeWord: !o.wholeWord }))}><u>ab</u></button>
             <button className={`tgl ${opts.regex ? "on" : ""}`} title="Regular expression (Alt+R)" onClick={() => setOpts((o) => ({ ...o, regex: !o.regex }))}>.*</button>
+            <button className={`tgl ${opts.everything ? "on" : ""}`} title="Also search ignored files: node_modules and the other excluded folders, .gitignore, .gallignore, cache folders (Alt+I)" onClick={() => setOpts((o) => ({ ...o, everything: !o.everything }))}><Icon name="eye" size={15} /></button>
             <button className={`tgl ${showFilters || include || exclude ? "on" : ""}`} title="Include / exclude files" onClick={() => setShowFilters((v) => !v)}><Icon name="more" size={15} /></button>
           </div>
           <div className="seg" role="tablist">
@@ -265,7 +269,7 @@ export function FindInFiles({ root, scope: initialScope }: { root: string; scope
                   : !pattern ? <>
                       <Icon name="search" size={34} />
                       <div>Search the contents of every text file in <b>{tilde(searchRoot)}</b></div>
-                      <small>Respects .gitignore · skips binary files · <kbd>Alt+C</kbd> case <kbd>Alt+W</kbd> word <kbd>Alt+R</kbd> regex</small>
+                      <small>{opts.everything ? "Searching ignored files too" : "Respects .gitignore and .gallignore"} · skips binary files · <kbd>Alt+C</kbd> case <kbd>Alt+W</kbd> word <kbd>Alt+R</kbd> regex <kbd>Alt+I</kbd> ignored files</small>
                     </>
                   : running ? "Searching…" : "No results"}
               </div>

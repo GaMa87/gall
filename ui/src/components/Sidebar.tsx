@@ -63,7 +63,7 @@ function DrivesGroup({ current }: { current: string }) {
                 the size lines up whether or not a drive can be ejected. */}
             <span className="drive-actions">
               {d.lockable ? <button className="icon-btn" title="Unmount and lock" onClick={(e) => { e.stopPropagation(); A.lockDrive(d); }}><Icon name="lock" size={14} /></button> : null}
-              {d.removable ? <button className="icon-btn" title={`Eject ${d.label || d.short}`} onClick={(e) => { e.stopPropagation(); A.ejectDrive(d); }}><Icon name="eject" size={14} /></button> : null}
+              {d.removable ? <button className="icon-btn" title={d.fs === "wsl" ? `Stop ${d.short} (WSL)` : `Eject ${d.label || d.short}`} onClick={(e) => { e.stopPropagation(); A.ejectDrive(d); }}><Icon name="eject" size={14} /></button> : null}
             </span>
             {space && <div className="bar"><div className={used > 0.92 ? "full" : ""} style={{ width: `${used * 100}%` }} /></div>}
           </div>
@@ -102,7 +102,7 @@ function NotMounted() {
           onClick={() => mount(v.id)}>
           <Icon name={v.locked ? "lock" : "drive"} size={16} />
           <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{v.label}</span>
-          <span className="meta">{busy === v.id ? (v.locked ? "unlocking…" : "mounting…") : v.size ? formatSize(v.size) : v.fs}</span>
+          <span className="meta">{busy === v.id ? (v.locked ? "unlocking…" : v.fs === "wsl" ? "starting…" : "mounting…") : v.size ? formatSize(v.size) : v.fs}</span>
         </div>
       ))}
     </>

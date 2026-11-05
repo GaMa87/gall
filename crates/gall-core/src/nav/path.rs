@@ -60,6 +60,9 @@ pub enum PathFormat {
     ForwardQuoted,
     /// `file://` URI (useful on Linux desktops).
     Uri,
+    /// The path as Linux sees it under WSL: `\\wsl.localhost\Ubuntu\home\u` → `/home/u`,
+    /// `C:\Users\me` → `/mnt/c/Users/me`. Other paths stay as they are.
+    Linux,
 }
 
 pub fn format_path(path: &str, fmt: PathFormat) -> String {
@@ -69,6 +72,9 @@ pub fn format_path(path: &str, fmt: PathFormat) -> String {
         PathFormat::Escaped => path.replace('\\', "\\\\"),
         PathFormat::Forward => path.replace('\\', "/"),
         PathFormat::ForwardQuoted => format!("\"{}\"", path.replace('\\', "/")),
+        PathFormat::Linux => {
+            crate::fs::wsl::linux_path_for(path).unwrap_or_else(|| path.to_string())
+        }
         PathFormat::Uri => {
             let fwd = path.replace('\\', "/");
             let encoded: String = fwd
@@ -181,12 +187,16 @@ pub fn complete(typed: &str, limit: usize) -> Vec<String> {
     };
     let mut v: Vec<String> = rd
         .flatten()
-        .filter(|e| e.path().is_dir())
         .filter(|e| {
             let n = e.file_name().to_string_lossy().to_lowercase();
             n.starts_with(&frag) && (!n.starts_with('.') || frag.starts_with('.'))
         })
-        .take(limit * 4)
+        // All matches, then the first by name: the folder's own order is arbitrary. The
+        // entry's type needs no extra stat, except for symlinks (followed to folders).
+        .filter(|e| match e.file_type() {
+            Ok(t) if !t.is_symlink() => t.is_dir(),
+            _ => e.path().is_dir(),
+        })
         .map(|e| e.path().to_string_lossy().into_owned())
         .collect();
     v.sort_by_key(|s| s.to_lowercase());
@@ -273,5 +283,25 @@ mod tests {
         let r = complete(&typed, 10);
         assert_eq!(r.len(), 2);
         assert!(r[0].ends_with("Windows") && r[1].ends_with("work"));
+    }
+
+    /// In a big folder the suggestions are the first matches by name, not whichever
+    /// ones the folder happens to list first.
+    #[test]
+    fn completion_in_a_big_folder_offers_the_first_names() {
+        let d = tempfile::tempdir().unwrap();
+        for i in 0..300 {
+            std::fs::create_dir(d.path().join(format!("w{i:03}"))).unwrap();
+        }
+        let r = complete(&format!("{}/w", d.path().display()), 5);
+        let names: Vec<_> = r.iter().map(|p| display_name(Path::new(p))).collect();
+        assert_eq!(names, ["w000", "w001", "w002", "w003", "w004"]);
+        // A symlink to a folder is still offered.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(d.path().join("w100"), d.path().join("a-link")).unwrap();
+            let r = complete(&format!("{}/a", d.path().display()), 5);
+            assert_eq!(r.len(), 1);
+        }
     }
 }

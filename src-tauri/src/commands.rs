@@ -3,6 +3,7 @@
 //! promises in the UI and become notifications.
 
 use crate::state::{AppState, FileClipboard};
+use gall_core::fs::index::FileIndex;
 use gall_core::fs::ops::{self, ConflictPolicy, TaskKind, TaskRequest};
 use gall_core::fs::{archive_view, drives, grep, listing, search, FileEntry, ListOptions};
 use gall_core::nav::path::{self as npath, PathFormat};
@@ -100,6 +101,8 @@ pub fn set_settings(state: State<'_, AppState>, settings: Settings) -> R<()> {
 #[tauri::command]
 pub async fn list_dir(path: String, opts: ListOptions) -> R<Vec<FileEntry>> {
     tauri::async_runtime::spawn_blocking(move || {
+        // A stopped WSL distribution is started first, with a timeout and a clear message.
+        gall_core::fs::wsl::prepare(Path::new(&path)).map_err(e)?;
         listing::list_dir(Path::new(&path), opts).map_err(e)
     })
     .await
@@ -1255,6 +1258,19 @@ pub async fn path_resolve(input: String, base: Option<String>) -> ResolvedPath {
 fn resolve_path(input: String, base: Option<String>) -> ResolvedPath {
     // file:// URIs decoded (%20) and native (C:\ on Windows).
     let expanded = file_uri_path(&npath::expand(&input));
+    // Windows: a Linux path (/home/u) is that folder in the open (or default) WSL distribution.
+    let expanded = if cfg!(windows) {
+        use gall_core::fs::wsl;
+        let default = wsl::default_distro();
+        wsl::resolve_typed(
+            &expanded,
+            base.as_deref(),
+            default.as_ref().map(|(d, h)| (d.as_str(), *h)),
+        )
+        .unwrap_or(expanded)
+    } else {
+        expanded
+    };
     let mut p = PathBuf::from(&expanded);
     if p.is_relative() {
         if let Some(b) = base {
@@ -1300,7 +1316,9 @@ pub fn search_start(
     root: String,
     pattern: String,
     include_hidden: bool,
+    everything: Option<bool>,
 ) {
+    let everything = everything.unwrap_or(false);
     let cancel = Arc::new(AtomicBool::new(false));
     if let Some(prev) = state.search_cancel.lock().unwrap().replace(cancel.clone()) {
         prev.store(true, Ordering::Relaxed);
@@ -1308,9 +1326,20 @@ pub fn search_start(
     std::thread::spawn(move || {
         let mut batch = Vec::new();
         let mut last = std::time::Instant::now();
-        let opts = search::SearchOptions {
-            include_hidden,
-            ..Default::default()
+        let opts = {
+            let st = app.state::<AppState>();
+            let s = st.settings.read().unwrap();
+            search::SearchOptions {
+                include_hidden,
+                respect_gitignore: !everything && s.search_respect_gitignore,
+                exclude: if everything {
+                    vec![]
+                } else {
+                    s.index_exclude.clone()
+                },
+                everything,
+                ..Default::default()
+            }
         };
         let hits = search::search(Path::new(&root), &pattern, opts, &cancel, |entry| {
             batch.push(entry);
@@ -1347,6 +1376,83 @@ pub fn search_cancel(state: State<'_, AppState>) {
 }
 
 // ───────────────────────── quick open index / find in files ─────────────────────────
+
+/// Adds `path` to the `.gallignore` next to it, so Quick Open, find in files and the
+/// name search skip it. Returns the `.gallignore` path, or None when it was already
+/// listed there. Quick Open drops it at once, and every later rebuild reads the
+/// `.gallignore`, so no rebuild is forced (a whole-system walk per hidden item); an
+/// already-running scan is cancelled if it may still publish the newly hidden item.
+#[tauri::command]
+pub async fn hide_from_search(app: AppHandle, path: String) -> R<Option<String>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let p = Path::new(&path);
+        let (file, added) = gall_core::fs::ignorefile::hide_from_search(p).map_err(e)?;
+        let st = app.state::<AppState>();
+        st.index.forget_under(p);
+        let mut folder_scan = st.folder_scan.lock().unwrap();
+        if let Some(f) = folder_scan.as_ref() {
+            let active = f.index.is_building() || f.index.age().is_none();
+            if active {
+                f.cancel.store(true, Ordering::Relaxed);
+            }
+            f.index.forget_under(p);
+            if active {
+                folder_scan.take();
+            }
+        }
+        drop(folder_scan);
+        if st.index.is_building() {
+            index_rebuild_bg(&app, &st, 0);
+        }
+        Ok(added.then(|| file.to_string_lossy().into_owned()))
+    })
+    .await
+    .map_err(e)?
+}
+
+/// Undoes "Hide from search", or makes an exception for an item a pattern hides.
+#[tauri::command]
+pub async fn show_in_search(
+    app: AppHandle,
+    path: String,
+) -> R<gall_core::fs::ignorefile::ShowOutcome> {
+    use gall_core::fs::ignorefile::ShowOutcome;
+    tauri::async_runtime::spawn_blocking(move || {
+        let out = gall_core::fs::ignorefile::show_in_search(Path::new(&path)).map_err(e)?;
+        if matches!(
+            out,
+            ShowOutcome::Removed { .. } | ShowOutcome::Excepted { .. }
+        ) {
+            let st = app.state::<AppState>();
+            // The folder scan is read again on its next use, with the item.
+            if let Some(f) = st.folder_scan.lock().unwrap().take() {
+                f.cancel.store(true, Ordering::Relaxed);
+            }
+            index_rebuild_bg(&app, &st, 0);
+        }
+        Ok(out)
+    })
+    .await
+    .map_err(e)?
+}
+
+/// Which items of `dir` a `.gallignore` hides from search (dimmed in the list).
+#[tauri::command]
+pub async fn search_hidden(
+    app: AppHandle,
+    dir: String,
+) -> R<gall_core::fs::ignorefile::HiddenState> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = gall_core::fs::ignorefile::hidden_state(Path::new(&dir));
+        // Noticed a hand edit to a .gallignore here or above: Quick Open follows it.
+        if gall_core::fs::ignorefile::take_changed() {
+            index_rebuild_bg(&app, &app.state::<AppState>(), 0);
+        }
+        st
+    })
+    .await
+    .map_err(e)
+}
 
 fn index_options(s: &Settings) -> (Vec<PathBuf>, gall_core::fs::index::IndexOptions) {
     use gall_core::fs::index::{system_roots, IndexOptions};
@@ -1421,16 +1527,113 @@ pub fn index_refresh(app: AppHandle, state: State<'_, AppState>, force: bool) ->
     index_rebuild_bg(&app, &state, if force { 0 } else { 60 })
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScopeInfo {
+    /// The system index holds the folder.
+    covered: bool,
+    /// Not covered: Quick Open's own scan of it is still running.
+    scanning: bool,
+    /// Not covered: items found by that scan.
+    entries: usize,
+}
+
+/// Whether the system index holds `path`. When it does not (WSL, a network share),
+/// the folder scan starts right away, so results are ready by the time one types.
+#[tauri::command]
+pub fn index_covers(app: AppHandle, state: State<'_, AppState>, path: String) -> ScopeInfo {
+    let roots = index_options(&state.settings.read().unwrap()).0;
+    let p = Path::new(&path);
+    if gall_core::fs::index::index_covers(&roots, p) {
+        return ScopeInfo {
+            covered: true,
+            scanning: false,
+            entries: 0,
+        };
+    }
+    let fi = folder_scan(&app, &state, p);
+    ScopeInfo {
+        covered: false,
+        scanning: fi.is_building() || fi.age().is_none(),
+        entries: fi.status().entries,
+    }
+}
+
+/// Seconds a folder scan is reused before Quick Open scans the folder again.
+const FOLDER_SCAN_FRESH_S: u64 = 120;
+
+/// What a folder scan depends on besides the folder: scanned again when it changes.
+fn scan_key(o: &gall_core::fs::index::IndexOptions) -> String {
+    format!(
+        "{}|{}|{}",
+        o.include_hidden,
+        o.respect_gitignore,
+        o.exclude.join("\n")
+    )
+}
+
+/// The index of a folder the system index does not hold (see [`index_covers`]):
+/// reused while fresh and built with the current settings, else scanned again in the
+/// background (`index-updated` when done).
+fn folder_scan(app: &AppHandle, state: &AppState, root: &Path) -> Arc<FileIndex> {
+    let opts = index_options(&state.settings.read().unwrap()).1;
+    let key = scan_key(&opts);
+    let mut g = state.folder_scan.lock().unwrap();
+    if let Some(f) = g.as_ref() {
+        let stale = f
+            .index
+            .age()
+            .is_some_and(|a| a.as_secs() >= FOLDER_SCAN_FRESH_S);
+        if root.starts_with(&f.root) && !stale && f.key == key && !f.cancel.load(Ordering::Relaxed)
+        {
+            return f.index.clone();
+        }
+        f.cancel.store(true, Ordering::Relaxed);
+    }
+    let index = Arc::new(FileIndex::new());
+    let cancel = Arc::new(AtomicBool::new(false));
+    *g = Some(crate::state::FolderScan {
+        root: root.to_path_buf(),
+        index: index.clone(),
+        cancel: cancel.clone(),
+        key,
+    });
+    let (app, idx, root) = (app.clone(), index.clone(), root.to_path_buf());
+    let _ = std::thread::Builder::new()
+        .name("folder-scan".into())
+        .spawn(move || {
+            // A stopped WSL distribution is started first, as when opening it.
+            if gall_core::fs::wsl::prepare(&root).is_err() {
+                return;
+            }
+            idx.rebuild(std::slice::from_ref(&root), &opts, &cancel);
+            if !cancel.load(Ordering::Relaxed) {
+                let st = app.state::<AppState>();
+                let _ = app.emit("index-updated", st.index.status());
+            }
+        });
+    index
+}
+
 #[tauri::command]
 pub async fn index_query(
+    app: AppHandle,
     state: State<'_, AppState>,
     query: String,
     scope: Option<String>,
     limit: usize,
 ) -> R<gall_core::fs::index::IndexResult> {
-    let idx = state.index.clone();
+    let scope = scope.map(PathBuf::from);
+    let roots = index_options(&state.settings.read().unwrap()).0;
+    let live = scope
+        .as_deref()
+        .filter(|s| !query.trim().is_empty() && !gall_core::fs::index::index_covers(&roots, s))
+        .map(|s| folder_scan(&app, &state, s));
+    let idx = live.clone().unwrap_or_else(|| state.index.clone());
     tauri::async_runtime::spawn_blocking(move || {
-        idx.query(&query, scope.as_deref().map(Path::new), limit.clamp(1, 500))
+        let mut r = idx.query(&query, scope.as_deref(), limit.clamp(1, 500));
+        r.scanning = live.is_some() && (idx.is_building() || idx.age().is_none());
+        r
     })
     .await
     .map_err(e)
@@ -1467,8 +1670,12 @@ pub fn grep_start(
     }
     {
         let s = state.settings.read().unwrap();
-        opts.exclude.extend(s.index_exclude.iter().cloned());
-        opts.respect_gitignore = opts.respect_gitignore && s.search_respect_gitignore;
+        if opts.everything {
+            opts.respect_gitignore = false;
+        } else {
+            opts.exclude.extend(s.index_exclude.iter().cloned());
+            opts.respect_gitignore = opts.respect_gitignore && s.search_respect_gitignore;
+        }
     }
     std::thread::spawn(move || {
         // Workers push into a channel; this thread batches emits (~10/s).

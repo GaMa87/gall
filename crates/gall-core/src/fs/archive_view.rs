@@ -8,12 +8,12 @@ use super::archive::{detect, local_name, safe_relative, ArchiveFormat};
 use super::entry::{extension_of, is_hidden_name, EntryKind, FileEntry};
 use crate::error::{CoreError, IoContext, Result};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf, MAIN_SEPARATOR};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, SystemTime};
 
 /// One item of an archive (folders implied by file paths included).
@@ -397,13 +397,81 @@ pub fn folder_totals(archive: &Path, inner: &str) -> Result<(usize, u64)> {
 
 // ───────────────────────────── extraction ─────────────────────────────
 
-/// Where an archive's extracted entries are kept: `<cache>/gall/archives/<id>/` (see `cache_base`), one id
-/// per archive version, so a changed archive never serves stale files.
+/// One cache root per archive version (see `cache_base`). Members live under
+/// `entries/`, separate from the root's bookkeeping and staging files.
 fn cache_root(archive: &Path) -> Result<PathBuf> {
     let st = stamp(archive)?;
     let mut h = DefaultHasher::new();
-    (archive, st.0, st.1).hash(&mut h);
+    ("member-cache-v2", archive, st.0, st.1).hash(&mut h);
     Ok(cache_base().join(format!("{:016x}", h.finish())))
+}
+
+fn extraction_lock(root: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+    let mut locks = LOCKS.get_or_init(Default::default).lock().unwrap();
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(root).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(root.to_path_buf(), Arc::downgrade(&lock));
+    lock
+}
+
+/// Assign sibling names together, reserving every preferred name before adding
+/// suffixes. Parents use the same mapping whether extracted alone or recursively.
+fn member_paths(items: &[Item]) -> HashMap<String, PathBuf> {
+    let mut children: BTreeMap<&str, Vec<(&Item, String)>> = BTreeMap::new();
+    for item in items {
+        let name = item.name.rsplit('/').next().unwrap();
+        let local = local_name(PathBuf::from(name))
+            .to_string_lossy()
+            .into_owned();
+        children
+            .entry(parent_of(&item.name))
+            .or_default()
+            .push((item, local));
+    }
+    let mut paths: HashMap<String, PathBuf> = HashMap::new();
+    for (parent, mut siblings) in children {
+        // Prefer unchanged names, so sanitizing `a:b` never renames a real `a_b`.
+        siblings.sort_by_key(|(item, local)| {
+            (item.name.rsplit('/').next().unwrap() != local, &item.name)
+        });
+        let mut reserved: HashSet<String> = siblings
+            .iter()
+            .map(|(_, local)| local.to_uppercase())
+            .collect();
+        let mut used = HashSet::new();
+        for (item, mut local) in siblings {
+            if !used.insert(local.to_uppercase()) {
+                let path = Path::new(&local);
+                let stem = path.file_stem().unwrap().to_string_lossy();
+                let ext = path
+                    .extension()
+                    .map(|ext| format!(".{}", ext.to_string_lossy()))
+                    .unwrap_or_default();
+                let mut suffix = 1;
+                loop {
+                    let candidate = format!("{stem}~{suffix}{ext}");
+                    let key = candidate.to_uppercase();
+                    if reserved.insert(key.clone()) {
+                        used.insert(key);
+                        local = candidate;
+                        break;
+                    }
+                    suffix += 1;
+                }
+            }
+            let path = if parent.is_empty() {
+                PathBuf::from(local)
+            } else {
+                paths[parent].join(local)
+            };
+            paths.insert(item.name.clone(), path);
+        }
+    }
+    paths
 }
 
 /// Windows: the per-user temp folder. Elsewhere `/tmp` is shared by all users (another
@@ -426,8 +494,8 @@ fn prune_once() {
         };
         let day = Duration::from_secs(24 * 3600);
         for e in rd.flatten() {
-            let old = e
-                .metadata()
+            let old = fs::metadata(e.path().join(".used"))
+                .or_else(|_| e.metadata())
                 .and_then(|m| m.modified())
                 .ok()
                 .and_then(|t| t.elapsed().ok())
@@ -457,14 +525,17 @@ pub fn materialize(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     }
     for (archive, wanted) in by_archive {
         let root = cache_root(&archive)?;
+        let lock = extraction_lock(&root);
+        let _guard = lock.lock().unwrap();
         let items = index(&archive)?;
+        let members = member_paths(&items);
         let mut need: Vec<String> = Vec::new();
         for (i, inner) in &wanted {
             let it = items
                 .iter()
                 .find(|it| &it.name == inner)
                 .ok_or_else(|| CoreError::NotFound(PathBuf::from(virtual_path(&archive, inner))))?;
-            let target = root.join(local_name(PathBuf::from(inner)));
+            let target = root.join("entries").join(&members[inner]);
             // A folder is re-extracted each time (cheap to check, hard to know if complete);
             // a file is reused when it is already there with the right size.
             let ready = !it.is_dir
@@ -476,14 +547,14 @@ pub fn materialize(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
         }
         if !need.is_empty() {
             fs::create_dir_all(&root).ctx("create", &root)?;
-            extract_entries(&archive, &root, &need)?;
+            extract_entries(&archive, &root, &need, &members)?;
         }
         let _ = filetime_touch(&root);
     }
     Ok(out)
 }
 
-/// Marks a cache folder as used (pruning goes by its modification time).
+/// Marks a cache folder as used, outside the extracted members' namespace.
 fn filetime_touch(dir: &Path) -> io::Result<()> {
     let f = dir.join(".used");
     fs::write(f, b"")
@@ -501,29 +572,29 @@ fn wanted_by(name: &str, wanted: &[String]) -> bool {
 
 /// Extracts the wanted entries (and folders' contents) of `archive` under `root`,
 /// each file written to a temporary name first so readers never see half a file.
-fn extract_entries(archive: &Path, root: &Path, wanted: &[String]) -> Result<()> {
+fn extract_entries(
+    archive: &Path,
+    root: &Path,
+    wanted: &[String],
+    members: &HashMap<String, PathBuf>,
+) -> Result<()> {
     let (format, _) = detect(archive).ok_or_else(|| not_archive(archive))?;
     let file = fs::File::open(archive).ctx("open", archive)?;
     let err = |what: &str, e: &dyn std::fmt::Display| CoreError::Other(format!("{what}: {e}"));
     let write = |name: &str, is_dir: bool, data: &mut dyn Read| -> Result<()> {
-        let out = root.join(local_name(PathBuf::from(name)));
+        let out = root.join("entries").join(&members[name]);
         if is_dir {
             return fs::create_dir_all(&out).ctx("create", &out);
         }
         if let Some(p) = out.parent() {
             fs::create_dir_all(p).ctx("create", p)?;
         }
-        let tmp = out.with_file_name(format!(
-            ".{}.gall-part",
-            out.file_name()
-                .map(|n| n.to_string_lossy())
-                .unwrap_or_default()
-        ));
+        // Writes are serialized per root; no archive member can alias this file.
+        let tmp = root.join(".gall-part");
         {
             let mut w = fs::File::create(&tmp).ctx("create", &tmp)?;
             io::copy(data, &mut w).ctx("write", &tmp)?;
         }
-        let _ = fs::remove_file(&out);
         fs::rename(&tmp, &out).ctx("move", &out)
     };
     match format {
@@ -601,6 +672,19 @@ fn extract_entries(archive: &Path, root: &Path, wanted: &[String]) -> Result<()>
 mod tests {
     use super::*;
     use std::io::Write;
+
+    fn zip_with_entries(dir: &Path, entries: &[(&str, &[u8])]) -> PathBuf {
+        let path = dir.join("members.zip");
+        let mut writer = zip::ZipWriter::new(fs::File::create(&path).unwrap());
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, data) in entries {
+            writer.start_file(*name, options).unwrap();
+            writer.write_all(data).unwrap();
+        }
+        writer.finish().unwrap();
+        path
+    }
 
     fn sample_zip(dir: &Path) -> PathBuf {
         let p = dir.join("photos.zip");
@@ -681,7 +765,131 @@ mod tests {
         // Second time: served from the cache.
         let again = materialize(&[ar.join("readme.txt")]).unwrap();
         assert_eq!(again[0], got[0]);
-        let _ = fs::remove_dir_all(got[0].parent().unwrap());
+        let _ = fs::remove_dir_all(cache_root(&ar).unwrap());
+    }
+
+    #[test]
+    fn materializes_colliding_names_without_aliasing_files_or_folders() {
+        let t = tempfile::tempdir().unwrap();
+        let names = [
+            "contents/report:old.txt",
+            "contents/report_old.txt",
+            "contents/report_old~1.txt",
+            "contents/folder:old/item.txt",
+            "contents/folder_old/item.txt",
+            "contents/folder_old~1/item.txt",
+            "contents/Case.txt",
+            "contents/case.txt",
+            "contents/case~1.txt",
+            "contents/aux.txt",
+            "contents/_aux.txt",
+            "contents/ends.",
+            "contents/ends",
+            "contents/ends ",
+            "contents/...",
+            "contents/_",
+            "contents/Σ.txt",
+            "contents/ς.txt",
+            "contents/σ.txt",
+        ];
+        let contents: Vec<_> = (0..names.len()).map(|i| format!("{i:04}")).collect();
+        let entries: Vec<_> = names
+            .iter()
+            .zip(&contents)
+            .map(|(name, data)| (*name, data.as_bytes()))
+            .collect();
+        // zip's enclosed_name rejects some Windows-invalid names before indexing;
+        // tar keeps them, so it exercises the cache's sanitization itself.
+        let ar = t.path().join("members.tar");
+        let mut writer = tar::Builder::new(fs::File::create(&ar).unwrap());
+        for (name, data) in &entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            writer.append_data(&mut header, name, *data).unwrap();
+        }
+        writer.finish().unwrap();
+        drop(writer);
+        let mut cached = Vec::new();
+        // Separate calls exercise readiness checks for equal-size colliding entries.
+        for (name, data) in &entries {
+            let got = materialize(&[ar.join(name)]).unwrap().remove(0);
+            assert_eq!(fs::read(&got).unwrap(), *data, "{name}");
+            cached.push(got);
+        }
+        assert_eq!(cached.iter().collect::<HashSet<_>>().len(), entries.len());
+        let folder = materialize(&[ar.join("contents")]).unwrap().remove(0);
+        for ((name, data), path) in entries.iter().zip(&cached) {
+            assert!(path.starts_with(&folder), "{name}");
+            assert_eq!(fs::read(path).unwrap(), *data, "{name}");
+            assert_eq!(
+                materialize(&[ar.join(name)]).unwrap()[0],
+                *path,
+                "folder and individual extraction must share the mapping"
+            );
+        }
+        let safe = &cached[1];
+        assert_eq!(safe.file_name().unwrap(), "report_old.txt");
+        assert_eq!(
+            cached[4].parent().unwrap().file_name().unwrap(),
+            "folder_old"
+        );
+        fs::remove_dir_all(cache_root(&ar).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn cache_bookkeeping_and_staging_do_not_overwrite_members() {
+        let t = tempfile::tempdir().unwrap();
+        let entries: &[(&str, &[u8])] = &[
+            (".used", b"archive bookkeeping name"),
+            (".gall-part", b"archive staging name"),
+            (".file.txt.gall-part", b"old staging name"),
+            ("file.txt", b"file data"),
+            ("entries/.used", b"nested bookkeeping name"),
+        ];
+        let ar = zip_with_entries(t.path(), entries);
+        for _ in 0..2 {
+            for (name, data) in entries {
+                let got = materialize(&[ar.join(name)]).unwrap();
+                assert_eq!(fs::read(&got[0]).unwrap(), *data, "{name}");
+            }
+        }
+        fs::remove_dir_all(cache_root(&ar).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn concurrent_materializations_share_a_complete_cache() {
+        let t = tempfile::tempdir().unwrap();
+        let data = vec![b'x'; 2 * 1024 * 1024];
+        let ar = zip_with_entries(t.path(), &[("folder/file.txt", &data)]);
+        let barrier = std::sync::Barrier::new(8);
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        // Folder requests force extraction even after the first success.
+                        for _ in 0..3 {
+                            let paths =
+                                materialize(&[ar.join("folder"), ar.join("folder/file.txt")])?;
+                            assert_eq!(paths[0].join("file.txt"), paths[1]);
+                            assert_eq!(fs::read(&paths[1]).unwrap(), data);
+                        }
+                        Ok::<_, CoreError>(())
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        for result in results {
+            result.unwrap();
+        }
+        let path = materialize(&[ar.join("folder/file.txt")]).unwrap();
+        assert_eq!(fs::read(&path[0]).unwrap(), data);
+        fs::remove_dir_all(cache_root(&ar).unwrap()).unwrap();
     }
 
     #[test]

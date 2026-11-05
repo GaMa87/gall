@@ -1,0 +1,30 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.10.0.schema.json
+
+PackageIdentifier: GaMa87.Gall
+PackageVersion: 0.1.2
+PackageLocale: en-US
+Publisher: Matej Gajšek
+PublisherUrl: https://github.com/GaMa87
+PublisherSupportUrl: https://github.com/GaMa87/gall/issues
+Author: Matej Gajšek and Gall contributors
+PackageName: Gall
+PackageUrl: https://github.com/GaMa87/gall
+License: MIT
+LicenseUrl: https://github.com/GaMa87/gall/blob/v0.1.2/LICENSE
+Copyright: © 2026 Matej Gajšek and Gall contributors
+ShortDescription: Keyboard-first file manager with instant search and compare
+Description: |-
+  Gall is a fast, keyboard-first file manager with Miller columns, two side-by-side browsers and tabs.
+  It finds any file on the computer as you type, searches text inside files, compares text, spreadsheets,
+  images and folders, and has Vim keys, previews, Git status and undo for every file operation.
+Moniker: gall
+Tags:
+- dual-pane
+- file-explorer
+- file-manager
+- miller-columns
+- search
+- vim
+ReleaseNotesUrl: https://github.com/GaMa87/gall/releases/tag/v0.1.2
+ManifestType: defaultLocale
+ManifestVersion: 1.10.0

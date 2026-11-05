@@ -53,7 +53,8 @@ pub fn list_dir(dir: &Path, opts: ListOptions) -> Result<Vec<FileEntry>> {
             }
         };
         let path = item.path();
-        let meta = match std::fs::symlink_metadata(&path) {
+        // Inside WSL a name may end with a dot, which the plain path would lose.
+        let meta = match std::fs::symlink_metadata(super::wsl::io_path(&path)) {
             Ok(m) => m,
             Err(e) => {
                 log::warn!("cannot stat {}: {e}", path.display());

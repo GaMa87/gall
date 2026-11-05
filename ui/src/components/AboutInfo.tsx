@@ -4,16 +4,42 @@ import * as A from "../state/actions";
 import { useStore } from "../state/store";
 import { FolderLink } from "./FolderLink";
 import { Icon } from "./Icon";
-import { TipCard, TipsList } from "./Tips";
+import { FeaturedTips, TipCard, TipsList } from "./Tips";
 import { Logo } from "./TitleBar";
+import supportQr from "../../../docs/support/revtag.svg?url";
 
 const SOURCE_URL = "https://github.com/GaMa87/gall";
+const SUPPORT_URL = "https://revolut.me/gama87";
 
 function openUrl(url: string) {
   import("@tauri-apps/plugin-opener").then(({ openUrl }) => openUrl(url)).catch(() => {});
 }
 
 const PLATFORM: Record<string, string> = { linux: "Linux", windows: "Windows", macos: "macOS" };
+
+function SupportCard({ quiet = false }: { quiet?: boolean }) {
+  return (
+    <section className={`about-support${quiet ? " settings-support" : ""}`}>
+      <div className="about-support-copy">
+        <span className="about-support-label">Support Gall</span>
+        <b>Enjoying Gall?</b>
+        <p>Gall is free and built in spare time. If it saves you time, you can buy me a coffee.</p>
+        <button className="about-support-link" onClick={() => openUrl(SUPPORT_URL)}>
+          Buy me a coffee <span aria-hidden="true">·</span> Revolut
+        </button>
+        <span className="about-support-tag">revtag <code>@gama87</code></span>
+        <p className="about-support-thanks">Stars, bug reports and pull requests help just as much. Thank you!</p>
+      </div>
+      <button
+        className="about-support-qr"
+        onClick={() => openUrl(SUPPORT_URL)}
+        style={{ backgroundImage: `url("${supportQr}")` }}
+        title="Open Revolut @gama87"
+        aria-label="Open Revolut @gama87"
+      />
+    </section>
+  );
+}
 
 export function AboutInfo({ full = false }: { full?: boolean }) {
   const info = useStore((s) => s.info);
@@ -46,6 +72,16 @@ export function AboutInfo({ full = false }: { full?: boolean }) {
       {full ? (
         <>
           <h4 className="about-section">Tips & tricks</h4>
+          <FeaturedTips />
+        </>
+      ) : (
+        <SupportCard />
+      )}
+
+      {full ? (
+        <>
+          <SupportCard quiet />
+          <h4 className="about-section">More tips & tricks</h4>
           <TipsList />
         </>
       ) : (

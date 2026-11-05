@@ -5,7 +5,7 @@ import { api } from "../api/ipc";
 import type { TableDiffOptions, TableDiffResult } from "../api/types";
 import { basename, join, parent, splitExt } from "../core/path";
 import * as A from "../state/actions";
-import { useStore } from "../state/store";
+import { getState, useStore } from "../state/store";
 import { changeReport } from "../core/tableReport";
 import { Icon } from "./Icon";
 
@@ -70,6 +70,7 @@ export function TableDiff({ left, right, onText }: { left: string; right: string
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if (getState().overlay?.type === "dialog") return; // a dialog over the compare view has the keys
       if ((e.target as HTMLElement).tagName === "SELECT" || (e.target as HTMLElement).tagName === "INPUT") return;
       if (e.key === "n" || e.key === "]") go(1);
       else if (e.key === "N" || e.key === "[") go(-1);

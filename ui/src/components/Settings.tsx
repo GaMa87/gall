@@ -76,12 +76,12 @@ const SECTIONS: Section[] = [
     id: "search", title: "Search", icon: "search", desc: "Quick Open index and find in files.", groups: [
       { title: "Quick Open index (Ctrl+P)", opts: [
         { key: "indexRoots", label: "Indexed folders", hint: "Separate with ; — empty = the whole system (/ or every drive). Rebuilt in the background.", type: "list" },
-        { key: "indexExclude", label: "Never index or search", hint: "Comma separated names or globs (gitignore syntax), e.g. node_modules, *.iso", type: "list" },
+        { key: "indexExclude", label: "Never index or search", hint: "Comma separated names or globs (gitignore syntax), e.g. node_modules, *.iso. Applies to Quick Open, find in files and the name search (F3). Folders tagged as caches (CACHEDIR.TAG) are skipped too. Per project: a .gallignore file (gitignore syntax, also outside git) in a folder applies to it and everything below; right-click › Hide from search adds an item to it. Alt+I in a search includes all of these.", type: "list" },
         { key: "indexHidden", label: "Index hidden files and folders", type: "bool" },
         { key: "indexRespectGitignore", label: "Skip files ignored by .gitignore", type: "bool" },
         { key: "indexRefreshMinutes", label: "Re-index every (minutes)", hint: "0 = only when Quick Open finds the index older than a minute", type: "number", min: 0, max: 1440 },
       ] },
-      { title: "Find in files (Ctrl+F / Ctrl+Shift+F)", opts: [
+      { title: "Find in files and name search (Ctrl+F / Ctrl+Shift+F / F3)", opts: [
         { key: "searchRespectGitignore", label: "Skip files ignored by .gitignore", type: "bool" },
       ] },
     ],
@@ -137,7 +137,7 @@ const SECTIONS: Section[] = [
       ] },
       { title: "Other", opts: [
         { key: "notificationMs", label: "Notification duration (ms)", type: "number", min: 1000, max: 30000, step: 500 },
-        { key: "pathCopyFormat", label: "Default path copy format", type: "select", options: [["native", "As is"], ["nativeQuoted", "Quoted"], ["escaped", "Escaped backslashes"], ["forward", "Forward slashes"], ["forwardQuoted", "Forward slashes, quoted"], ["uri", "file:// URI"]] },
+        { key: "pathCopyFormat", label: "Default path copy format", type: "select", options: [["native", "As is"], ["nativeQuoted", "Quoted"], ["escaped", "Escaped backslashes"], ["forward", "Forward slashes"], ["forwardQuoted", "Forward slashes, quoted"], ["uri", "file:// URI"], ["linux", "Linux path (WSL on Windows)"]] },
       ] },
     ],
   },

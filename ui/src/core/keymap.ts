@@ -173,6 +173,12 @@ export function typedChar(e: KeyLike & { shiftKey?: boolean }, isShortcut: (chor
   return (!e.ctrlKey && !e.altKey && !e.metaKey) || altGrChar(e) || optionChar(e, isShortcut, mac);
 }
 
+/** Ctrl, or Cmd on macOS: the key that [`chordOf`] reads as "Ctrl". For windows that read
+ *  their own keys (Ctrl+Enter, Ctrl+S, Ctrl+click), so Cmd works there as in the shortcuts. */
+export function primaryMod(e: { ctrlKey: boolean; metaKey: boolean }): boolean {
+  return e.ctrlKey || e.metaKey;
+}
+
 /** Normalises a keyboard event to a chord string like "Ctrl+Shift+N". */
 export function chordOf(ev: KeyLike & { shiftKey: boolean }): string {
   // A character typed with AltGr is that character, without the Ctrl and Alt it came with.

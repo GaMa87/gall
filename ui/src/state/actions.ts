@@ -5,6 +5,7 @@ import type { ConflictInfo, ConflictPolicy, DiffSource, Drive, FileEntry, Layout
 import { etaSeconds, updateRate, type Rate } from "../core/eta";
 import { ancestors, backOutside, basename, isInside, join, parent, splitExt, tildify } from "../core/path";
 import { controller, emitFolderChanged, refreshAll } from "./controllers";
+import { bumpSearchHidden } from "./hooks";
 import { getState, setState, type DialogSpec, type FolderSize, type MenuItem, type NoteKind, type Overlay, type UiState } from "./store";
 import { formatSize } from "../core/format";
 
@@ -178,17 +179,23 @@ export function openOverlay(o: Overlay | null) {
 }
 
 export function dialog(spec: Omit<DialogSpec, "resolve">): Promise<{ button: string; value: string } | null> {
+  // Asked from a window (compare view, trash, settings): that window stays open under the
+  // dialog and is back once it is answered, instead of being closed (losing its state).
+  // A dialog still waiting is cancelled, so whoever awaits it is not left hanging.
+  const prev = getState().overlay;
+  if (prev?.type === "dialog") prev.dialog.resolve(null);
+  const cur = getState().overlay;
+  const under = cur?.type === "dialog" ? cur.under ?? null : cur;
   return new Promise((resolve) => {
-    openOverlay({
-      type: "dialog",
-      dialog: {
-        ...spec,
-        resolve: (r) => {
-          openOverlay(null);
-          resolve(r);
-        },
+    const d: DialogSpec = {
+      ...spec,
+      resolve: (r) => {
+        const o = getState().overlay;
+        if (o?.type === "dialog" && o.dialog === d) openOverlay(under);
+        resolve(r);
       },
-    });
+    };
+    openOverlay({ type: "dialog", dialog: d, under });
   });
 }
 
@@ -336,7 +343,7 @@ export async function mountVolume(v: Volume) {
   try {
     let mount: string | null = null;
     if (!v.locked) {
-      notify(`Mounting ${name}…`);
+      notify(`${v.fs === "wsl" ? "Starting" : "Mounting"} ${name}…`);
       mount = await api.volumeMount(v.id);
     } else if (getState().info?.platform === "windows") {
       await api.volumeUnlock(v.id, ""); // Windows asks in its own BitLocker dialog
@@ -361,7 +368,7 @@ export async function mountVolume(v: Volume) {
       }
     }
     await refreshDrives();
-    notify(`${v.locked ? "Unlocked" : "Mounted"} ${name}`, "success");
+    notify(`${v.locked ? "Unlocked" : v.fs === "wsl" ? "Started" : "Mounted"} ${name}`, "success");
     if (mount) navigate(activeBrowser(), mount);
   } catch (e) {
     fail(e);
@@ -394,10 +401,13 @@ async function leaveMountIn(b: number, mount: string) {
 
 /** Ejects a removable drive; browsers on it go back first. */
 export async function ejectDrive(d: Drive) {
+  // Stopping a WSL distribution ends every program in it, editors with unsaved work too.
+  if (d.fs === "wsl" && !(await confirm(`Stop ${d.short}?`,
+    `Every program running in the WSL distribution “${d.short}” is closed; unsaved work in them is lost.`, "Stop", true))) return;
   await leaveMount(d.mount);
   try {
     await api.eject(d.mount);
-    notify(`Ejected “${d.label || d.short}”`, "success");
+    notify(d.fs === "wsl" ? `Stopped “${d.short}” (WSL)` : `Ejected “${d.label || d.short}”`, "success");
   } catch (e) {
     fail(e);
   }
@@ -608,7 +618,8 @@ export function nextLayout() {
 }
 
 export async function goToTyped(b: number, input: string) {
-  const r = await api.pathResolve(input, activePath(b));
+  const r = await api.pathResolve(input, activePath(b)).catch((e) => (fail(e), null));
+  if (!r) return;
   if (!r.exists) return fail(`Path not found: ${r.path}`);
   if (r.isDir) navigate(b, r.path);
   else {
@@ -794,6 +805,65 @@ function pinSpots(path: string) {
 
 export function isPinned(path: string): boolean {
   return pinSpots(path).length > 0;
+}
+
+/** Hides files and folders from Quick Open, find in files and the name search via
+ *  the `.gallignore` next to each (gitignore syntax; works outside git too). */
+export async function hideFromSearch(paths: string[]) {
+  const home = getState().info?.home;
+  const added: string[] = [];
+  const files = new Set<string>();
+  for (const p of paths) {
+    try {
+      const file = await api.hideFromSearch(p);
+      if (file) { added.push(p); files.add(file); }
+    } catch (err) {
+      fail(err);
+    }
+  }
+  bumpSearchHidden();
+  if (!added.length) {
+    if (paths.length) notify(paths.length === 1 ? `“${basename(paths[0])}” is already hidden from search` : "Already hidden from search", "info");
+    return;
+  }
+  const what = added.length === 1 ? `“${basename(added[0])}”` : `${added.length} items`;
+  const where = files.size === 1 ? ` (in ${tildify([...files][0], home)})` : "";
+  notify(`${what} hidden from search${where}`, "success", {
+    label: "Undo",
+    run: () => void Promise.all(added.map((p) => api.showInSearch(p))).then(bumpSearchHidden).catch(fail),
+  });
+}
+
+/** Shows an item hidden by a `.gallignore` in search again (removes its line, or adds a ! exception). */
+export async function showInSearch(path: string) {
+  const home = getState().info?.home;
+  try {
+    const out = await api.showInSearch(path);
+    bumpSearchHidden();
+    const name = `“${basename(path)}”`;
+    switch (out.kind) {
+      case "removed":
+        notify(`${name} shows in search again`, "success", { label: "Undo", run: () => void hideFromSearch([path]) });
+        break;
+      case "excepted":
+        notify(`${name} shows in search again (a pattern hides it, so ${tildify(out.file, home)} got an exception for it)`, "success", {
+          label: "Edit list",
+          run: () => void api.openPath(out.file).catch(fail),
+        });
+        break;
+      case "insideHidden":
+        notify(`${name} is inside “${basename(out.folder)}”, which is hidden from search. Show that folder first.`, "warn", {
+          label: "Show it",
+          run: () => void showInSearch(out.folder),
+        });
+        break;
+      case "notHidden":
+        notify(`${name} is not hidden by a .gallignore`, "info");
+        break;
+    }
+  } catch (err) {
+    fail(err);
+  }
 }
 
 /** Pin a folder to the sidebar, or unpin it from every group it is in (with undo). */
@@ -1262,6 +1332,7 @@ export async function copyToClipboard(entries: FileEntry[], cut: boolean) {
     return fail(e);
   }
   setState({ clipboard: { paths, cut } });
+  movedClip = null;
   // Nothing is copied yet: say what is on the clipboard and what pasting will do,
   // so this does not read like the "Copied …" that a finished paste shows.
   notify(`${named(paths)} on the clipboard; paste to ${cut ? "move" : "copy"}`, "info");
@@ -1276,6 +1347,11 @@ export function items(n: number): string {
 export function named(paths: string[]): string {
   return paths.length === 1 ? `“${basename(paths[0])}”` : items(paths.length);
 }
+
+/** The items of the last paste of cut ones (one path per line), while the system
+ *  clipboard may still list them. */
+let movedClip: string | null = null;
+const lines = (t: string) => t.split(/\r?\n/).map((l) => l.trim()).filter(Boolean).join("\n");
 
 /** Ctrl+V: files from our clipboard, external paths, or text/image/URL → new file (O-10). */
 export async function paste(b: number) {
@@ -1293,7 +1369,18 @@ export async function paste(b: number) {
       const id = await api.clipPasteFiles(dir, choice.policy, undefined, choice.merge);
       if (clip.cut) cutPastes.set(id, clip.paths);
       if (replacing(choice.policy)) replaceRequests.set(id, { kind: clip.cut ? "move" : "copy", sources: clip.paths, dest: dir, merge: choice.merge });
-      if (clip.cut) setState({ clipboard: { paths: [], cut: false } });
+      if (clip.cut) {
+        setState({ clipboard: { paths: [], cut: false } });
+        movedClip = lines(clip.paths.join("\n"));
+      }
+      return;
+    }
+    // The system clipboard still lists items moved by a paste of cut ones (as paths while
+    // the move runs, as plain text once they are gone): pasting them again copied them a
+    // second time, or made a text file of their old paths.
+    const extText = ext.kind === "paths" ? ext.paths.join("\n") : ext.kind === "text" ? ext.text : null;
+    if (movedClip && extText !== null && lines(extText) === movedClip) {
+      notify(`${named(movedClip.split("\n"))} already moved; cut or copy again to paste`, "info");
       return;
     }
     switch (ext.kind) {
@@ -1340,17 +1427,25 @@ export async function pasteAsLinks(b: number) {
 
 export async function copyPaths(entries: FileEntry[], fallbackFolder: string) {
   const paths = entries.length ? entries.map((e) => e.path) : [fallbackFolder];
-  const formatted = await Promise.all(paths.map((p) => api.pathFormat(p)));
-  await api.clipSetText(formatted.join("\n")).catch(fail);
-  notify(paths.length === 1 ? `Copied path: ${formatted[0]}` : `Copied ${paths.length} paths`, "info");
+  try {
+    const formatted = await Promise.all(paths.map((p) => api.pathFormat(p)));
+    await api.clipSetText(formatted.join("\n"));
+    notify(paths.length === 1 ? `Copied path: ${formatted[0]}` : `Copied ${paths.length} paths`, "info");
+  } catch (e) {
+    fail(e);
+  }
 }
 
 export async function tabFromClipboard(b: number) {
   const c = await api.clipInspect().catch(() => null);
-  if (c?.kind === "paths") {
+  if (c?.kind !== "paths") return notify("Clipboard does not contain a path", "warn");
+  try {
     const r = await api.pathResolve(c.paths[0]);
+    if (!r.exists) return notify(`“${r.path}” does not exist`, "warn");
     sessionCmd({ op: "newTab", b, path: r.isDir ? r.path : parent(r.path) });
-  } else notify("Clipboard does not contain a path", "warn");
+  } catch (e) {
+    fail(e);
+  }
 }
 
 export async function addTemplateFrom(entry: FileEntry) {

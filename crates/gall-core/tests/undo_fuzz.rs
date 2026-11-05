@@ -45,10 +45,14 @@ fn snapshot(root: &Path) -> Tree {
                 .unwrap()
                 .to_string_lossy()
                 .into_owned();
-            let data = e
-                .file_type()
-                .is_file()
-                .then(|| std::fs::read(e.path()).unwrap());
+            let data = if e.file_type().is_symlink() {
+                let t = std::fs::read_link(e.path()).unwrap();
+                Some(format!("-> {}", t.display()).into_bytes())
+            } else {
+                e.file_type()
+                    .is_file()
+                    .then(|| std::fs::read(e.path()).unwrap())
+            };
             (rel, data)
         })
         .collect()
@@ -71,6 +75,46 @@ fn items(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
     (files, dirs)
 }
 
+/// [`snapshot`] of several roots, told apart by their index.
+fn snapshot_all(roots: &[PathBuf]) -> Tree {
+    roots
+        .iter()
+        .enumerate()
+        .flat_map(|(i, r)| {
+            snapshot(r)
+                .into_iter()
+                .map(move |(k, v)| (format!("{i}/{k}"), v))
+        })
+        .collect()
+}
+
+/// [`items`] of several roots; the roots come first in the folders.
+fn items_all(roots: &[PathBuf]) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let (mut files, mut dirs) = (vec![], roots.to_vec());
+    for r in roots {
+        let (f, d) = items(r);
+        files.extend(f);
+        dirs.extend(d.into_iter().skip(1));
+    }
+    (files, dirs)
+}
+
+/// A folder on another file system than `near` (/dev/shm), so that moves between the
+/// two copy and delete instead of renaming. None where there is none.
+fn other_file_system(near: &Path) -> Option<tempfile::TempDir> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let shm = Path::new("/dev/shm");
+        let dev = |p: &Path| std::fs::metadata(p).map(|m| m.dev()).ok();
+        if dev(shm).is_some() && dev(shm) != dev(near) {
+            return tempfile::tempdir_in(shm).ok();
+        }
+    }
+    let _ = near;
+    None
+}
+
 fn env(name: &str, default: u64) -> u64 {
     std::env::var(name)
         .ok()
@@ -86,25 +130,35 @@ fn random_operations_undo_completely() {
         env("GALL_FUZZ_STEPS", 40) as usize,
     );
     let base = tempfile::tempdir().unwrap();
+    let other = other_file_system(base.path());
     let mut failures = vec![];
     for seed in 1..=seeds {
         let mut r = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
         let root = base.path().join(format!("s{seed}"));
         std::fs::create_dir_all(&root).unwrap();
+        let mut roots = vec![root.clone()];
+        if let Some(o) = &other {
+            roots.push(o.path().join(format!("s{seed}")));
+            std::fs::create_dir_all(&roots[1]).unwrap();
+        }
         let names = ["a", "b", "c", "Photos", "x.txt", "y.txt", "A.TXT", "z"];
         for _ in 0..25 {
-            let (_, dirs) = items(&root);
+            let (_, dirs) = items_all(&roots);
             let p = r.pick(&dirs).join(r.pick(&names));
-            if p.exists() {
+            if p.symlink_metadata().is_ok() {
                 continue;
             }
             if r.one_in(3) {
                 std::fs::create_dir(&p).unwrap();
+            } else if cfg!(unix) && r.one_in(4) {
+                // Symlinks to a file, a folder or nothing (relative, as in real trees).
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(r.pick(&names), &p).unwrap();
             } else {
                 std::fs::write(&p, format!("{seed}-{}", r.next() % 1000)).unwrap();
             }
         }
-        let start = snapshot(&root);
+        let start = snapshot_all(&roots);
         let (tx, rx) = mpsc::channel::<String>();
         let tx = Mutex::new(tx);
         let journal = Arc::new(UndoJournal::default());
@@ -130,12 +184,16 @@ fn random_operations_undo_completely() {
         // Journal length before each operation, with the tree at that point.
         let mut checkpoints: Vec<(usize, Tree, usize)> = vec![];
         for _ in 0..steps {
-            let (files, dirs) = items(&root);
-            let all: Vec<PathBuf> = files.iter().chain(dirs.iter().skip(1)).cloned().collect();
+            let (files, dirs) = items_all(&roots);
+            let all: Vec<PathBuf> = files
+                .iter()
+                .chain(dirs.iter().skip(roots.len()))
+                .cloned()
+                .collect();
             if all.is_empty() {
                 break;
             }
-            checkpoints.push((journal.len(), snapshot(&root), log.len()));
+            checkpoints.push((journal.len(), snapshot_all(&roots), log.len()));
             match r.next() % 6 {
                 op @ (0 | 1) => {
                     let (src, dest) = (r.pick(&all), r.pick(&dirs));
@@ -200,7 +258,7 @@ fn random_operations_undo_completely() {
             }
             let n = journal.len();
             if let Some((_, tree, op)) = checkpoints.iter().rev().find(|(l, _, _)| *l == n) {
-                if snapshot(&root) != *tree {
+                if snapshot_all(&roots) != *tree {
                     problem = Some(format!(
                         "undo of '{desc}' did not restore the state before: {}",
                         log[*op]
@@ -209,7 +267,7 @@ fn random_operations_undo_completely() {
                 }
             }
         }
-        if problem.is_none() && snapshot(&root) != start {
+        if problem.is_none() && snapshot_all(&roots) != start {
             problem = Some("the tree differs after undoing everything".into());
         }
         if let Some(p) = problem {
@@ -220,7 +278,10 @@ fn random_operations_undo_completely() {
     let mine: Vec<_> = trash::os_limited::list()
         .unwrap_or_default()
         .into_iter()
-        .filter(|i| i.original_path().starts_with(base.path()))
+        .filter(|i| {
+            let p = i.original_path();
+            p.starts_with(base.path()) || other.as_ref().is_some_and(|o| p.starts_with(o.path()))
+        })
         .collect();
     let _ = trash::os_limited::purge_all(mine);
     assert!(

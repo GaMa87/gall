@@ -311,8 +311,22 @@ impl Term {
         }
         let path = t.contains(is_sep);
         if t.contains('*') || t.contains('?') {
+            // Path terms are matched against the path with `\` turned into `/`.
+            let mut pattern = if path {
+                t.replace('\\', "/")
+            } else {
+                t.to_string()
+            };
+            // Indexed paths are absolute: a relative pattern ("src/*.rs") matches from the
+            // start of any folder name in the path, not only from the root.
+            let b = pattern.as_bytes();
+            let absolute = b.first().is_some_and(|&c| c == b'/' || c == b'*')
+                || (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':');
+            if path && !absolute {
+                pattern.insert_str(0, "*/");
+            }
             return Some(Term {
-                kind: Kind::Glob(Wildcard::new(t)),
+                kind: Kind::Glob(Wildcard::new(&pattern)),
                 pat: vec![],
                 case_sensitive: false,
                 inverse,
@@ -638,6 +652,29 @@ mod tests {
         assert!(sc(r"comp\pane", "/src/components/FolderPane.tsx").is_some());
         assert!(sc("ui/ pane", r"C:\ui\src\FolderPane.tsx").is_some());
         assert!(sc("ui/ pane", r"C:\core\src\FolderPane.tsx").is_none());
+        // Wildcard path terms too, either separator on either side.
+        assert!(sc(r"*src\*.rs", r"C:\p\src\main.rs").is_some());
+        assert!(sc(r"*src\*.rs", "/p/src/main.rs").is_some());
+        assert!(sc(r"*src\*.rs", "/p/lib/main.rs").is_none());
+    }
+
+    /// Paths in the index are absolute; a relative wildcard path term names the end of one.
+    #[test]
+    fn wildcard_path_terms_match_inside_the_path() {
+        assert!(sc("src/*.rs", "/home/u/p/src/main.rs").is_some());
+        assert!(sc(r"src\*.rs", r"C:\p\src\main.rs").is_some());
+        assert!(sc("src/*.rs", "/home/u/p/src/main.ts").is_none());
+        assert!(
+            sc("src/*.rs", "/home/u/p/mysrc/main.rs").is_none(),
+            "whole folder name"
+        );
+        assert!(sc("/home/*.rs", "/home/u/p/src/main.rs").is_some());
+        assert!(
+            sc("/opt/*.rs", "/home/u/p/src/main.rs").is_none(),
+            "absolute stays anchored"
+        );
+        assert!(sc(r"C:\p\*.rs", r"C:\p\src\main.rs").is_some());
+        assert!(sc(r"D:\p\*.rs", r"C:\p\src\main.rs").is_none());
     }
 
     #[test]

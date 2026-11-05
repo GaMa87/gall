@@ -82,3 +82,33 @@ export function splitExt(name: string): [string, string] {
   const i = name.lastIndexOf(".");
   return i > 0 ? [name.slice(0, i), name.slice(i)] : [name, ""];
 }
+
+/** Inside a WSL distribution (`\\wsl.localhost\Ubuntu\home\u\…`, also `\\wsl$\…`), its
+ *  Linux home (`\\wsl.localhost\Ubuntu\home\u`; `…\root` for root, `…\home` outside
+ *  both), so "Home" searches there and not in the Windows home. Null elsewhere. */
+export function linuxHome(p: string): string | null {
+  const m = /^([\\/]{2}(?:\?[\\/]UNC[\\/])?wsl(?:\.localhost|\$)[\\/][^\\/]+)([\\/].*)?$/i.exec(p);
+  if (!m) return null;
+  const root = m[1].replace(/\//g, "\\");
+  const h = /^[\\/](home[\\/][^\\/]+|root)(?=[\\/]|$)/i.exec(m[2] ?? "");
+  return h ? `${root}\\${h[1].replace("/", "\\")}` : `${root}\\home`;
+}
+
+
+/** A Quick Open query (`ext:pdf`, `'exact`, `^start`, `end$`, `!not`, several terms, path
+ *  terms) as one pattern for the wildcard name search (F3, `*` and `?`), for Alt+I:
+ *  "rep ext:pdf" → "*rep*.pdf", "^src/main" → "main". Excluding terms are left out. */
+export function quickToWildcard(q: string): string {
+  let ext = "";
+  const terms: string[] = [];
+  for (const raw of q.trim().split(/\s+/)) {
+    if (!raw || raw.startsWith("!")) continue;
+    const e = /^ext:(.+)$/i.exec(raw);
+    if (e) { ext = e[1].replace(/^\./, ""); continue; }
+    let t = raw.replace(/^['^]+/, "").replace(/\$$/, "");
+    t = t.split(/[\\/]/).filter(Boolean).pop() ?? "";
+    if (t) terms.push(t);
+  }
+  if (!ext && terms.length <= 1) return terms[0] ?? "";
+  return `*${terms.join("*")}${terms.length ? "*" : ""}${ext ? `.${ext}` : ""}`.replace(/\*+/g, "*");
+}

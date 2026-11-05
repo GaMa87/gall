@@ -247,6 +247,9 @@ img { -webkit-user-drag: none; }
 .git-badge.g-untracked { color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); }
 .git-badge.g-conflict { color: var(--danger); background: color-mix(in srgb, var(--danger) 16%, transparent); }
 .row.git-ignored .name .txt, .grid-cell.git-ignored .gname { opacity: 0.55; }
+/* hidden from search by a .gallignore: dimmed and slanted, so it reads apart from git-ignored */
+.row.search-hidden .name .txt, .grid-cell.search-hidden .gname { opacity: 0.55; font-style: italic; }
+.fp-search-hidden { cursor: pointer; }
 .row .col.counting { color: var(--fg-faint); font-style: italic; }
 .fp-status .mod.git { max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row .note-check { margin: 0; }
@@ -625,6 +628,14 @@ kbd { border-color: var(--border); background: var(--bg-3); color: var(--fg-dim)
 .qo-input { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-bottom: 1px solid var(--border-soft); color: var(--fg-dim); }
 .qo-input input { flex: 1; border: none; background: transparent; font-size: 1.2em; padding: 4px 0; box-shadow: none; }
 .qo-input input:focus { box-shadow: none; }
+/* Quick Open scope: both choices shown, the active one highlighted; Tab switches */
+.qo-scope { display: inline-flex; align-items: center; gap: 0; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-3); font-size: 0.86em; white-space: nowrap; overflow: hidden; }
+.qo-scope button { display: inline-flex; align-items: center; gap: 5px; border: none; background: transparent; color: var(--fg-dim); padding: 3px 9px; cursor: pointer; max-width: 180px; overflow: hidden; text-overflow: ellipsis; }
+.qo-scope button.on { background: var(--accent-soft); color: var(--fg); box-shadow: inset 0 0 0 1px var(--accent-ring); }
+.qo-scope kbd { margin: 0 6px 0 4px; }
+.qo-row.qo-wider { color: var(--fg-dim); border-top: 1px dashed var(--border-soft); margin-top: 4px; }
+.qo-row.qo-wider:hover { color: var(--fg); background: var(--bg-3); }
+.qo-row.qo-wider .qo-name { flex: 1; max-width: none; color: inherit; }
 .qo-body { flex: 1; display: flex; min-height: 0; }
 .qo-list { flex: 1 1 60%; overflow-y: auto; padding: 6px; min-width: 0; }
 .qo-section { font-size: 0.76em; text-transform: uppercase; letter-spacing: 0.08em; color: var(--fg-faint); padding: 6px 10px 4px; font-weight: 650; }
@@ -1337,6 +1348,23 @@ input.switch:focus-visible { box-shadow: 0 0 0 3px var(--accent-soft); }
 .about-facts dt { color: var(--fg-dim); padding-right: 0; }
 .about-facts dd { padding-left: 0; }
 .about-facts dt:not(:first-of-type), .about-facts dd:not(:first-of-type) { border-top: 1px solid var(--border); }
+.about-support { display: flex; align-items: center; gap: 16px; padding: 14px; border: 1px solid var(--accent-ring); border-radius: var(--radius-lg); background: linear-gradient(120deg, var(--accent-soft), color-mix(in srgb, var(--bg-3) 68%, var(--bg-2))); }
+.about-support-copy { display: flex; flex: 1; flex-direction: column; align-items: flex-start; gap: 5px; min-width: 0; }
+.about-support-label { color: var(--accent); font-size: 0.72em; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; }
+.about-support-copy > b { font-size: 1.08em; }
+.about-support-copy p { margin: 0; color: var(--fg-dim); font-size: 0.88em; line-height: 1.5; }
+.about-support-link { display: inline-flex; align-items: center; gap: 6px; margin-top: 3px; padding: 6px 10px; border: 1px solid var(--accent-ring); border-radius: var(--radius); background: color-mix(in srgb, var(--accent) 12%, var(--bg-2)); color: var(--accent); cursor: pointer; font: inherit; font-size: 0.88em; font-weight: 650; }
+.about-support-link:hover { background: color-mix(in srgb, var(--accent) 20%, var(--bg-2)); }
+.about-support-tag { color: var(--fg-faint); font-size: 0.78em; }
+.about-support-tag code { padding: 1px 5px; border-radius: var(--radius); background: color-mix(in srgb, var(--bg-2) 75%, transparent); color: var(--fg-dim); font-family: var(--mono); }
+.about-support-copy p.about-support-thanks { margin-top: 3px; font-size: 0.8em; }
+.about-support-qr { width: 190px; height: 190px; flex: 0 0 auto; padding: 0; overflow: hidden; border: 0; border-radius: var(--radius-lg); background-color: var(--bg-2); background-position: center 74%; background-repeat: no-repeat; background-size: 139% 232%; box-shadow: 0 3px 14px color-mix(in srgb, #000 22%, transparent); cursor: pointer; }
+.about.full .about-support { padding: 18px; }
+.about.full .about-support-qr { width: 220px; height: 220px; }
+.about.full .settings-support { padding: 12px; border-color: var(--border); background: color-mix(in srgb, var(--bg-3) 58%, var(--bg-2)); }
+.about.full .settings-support .about-support-label { color: var(--fg-dim); }
+.about.full .settings-support .about-support-qr { width: 150px; height: 150px; box-shadow: none; }
+.about-support-qr:hover { filter: brightness(1.05); }
 .about-section { margin: 6px 0 -6px 2px; color: var(--fg-dim); font-size: 0.78em; font-weight: 650; text-transform: uppercase; letter-spacing: 0.08em; }
 .about p.about-note { margin: 0; color: var(--fg-faint); font-size: 0.82em; line-height: 1.5; }
 .about-win { width: min(520px, 92vw); position: relative; }

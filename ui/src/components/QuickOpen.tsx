@@ -4,9 +4,10 @@ import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { api, events } from "../api/ipc";
 import type { FileEntry, IndexHit, IndexStatus } from "../api/types";
 import { fuzzyMatch } from "../core/fuzzy";
-import { ACTION_LABELS, buildKeymap, type Action } from "../core/keymap";
-import { basename, isInside, parent, tildify } from "../core/path";
+import { ACTION_LABELS, buildKeymap, primaryMod, type Action } from "../core/keymap";
+import { basename, isInside, parent, quickToWildcard, tildify } from "../core/path";
 import { listBindings, treeForSettings, showKeys } from "../core/vim";
+import { archiveOf } from "../core/archive";
 import * as A from "../state/actions";
 import { controller } from "../state/controllers";
 import { run } from "../state/run";
@@ -46,30 +47,46 @@ function pseudoEntry(path: string, isDir: boolean): FileEntry {
   };
 }
 
-let querySeq = 0;
-
 export function QuickOpen({ initial }: { initial?: string }) {
   const settings = useStore((s) => s.settings)!;
   const recent = useStore((s) => s.recentFiles);
   const history = useStore((s) => s.history);
   const [q, setQ] = useState(initial ?? "");
-  const [scopeHere, setScopeHere] = useState(false);
+  // Starts in the open folder and below (what one looks for is usually in the project at
+  // hand); Tab switches to everywhere. Not inside an archive, which the index does not hold.
+  const [scopeHere, setScopeHere] = useState(() => {
+    const p = A.activePath(A.activeBrowser());
+    return !!p && !archiveOf(p);
+  });
   const [hits, setHits] = useState<IndexHit[]>([]);
-  const [stats, setStats] = useState<{ total: number; ms: number } | null>(null);
+  const [stats, setStats] = useState<{ total: number; ms: number; scanning: boolean } | null>(null);
+  // False in a folder the system index does not hold (a WSL distribution, a network
+  // share): Quick Open then searches this folder, which the backend scans itself.
+  const [covered, setCovered] = useState<boolean | null>(null);
+  const [scan, setScan] = useState<{ scanning: boolean; entries: number } | null>(null);
   const [status, setStatus] = useState<IndexStatus | null>(null);
   const [idx, setIdx] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const b = A.activeBrowser();
   const here = A.activePath(b);
+  const inArchive = !!archiveOf(here);
   const cmdMode = q.startsWith(">");
 
   useEffect(() => {
     inputRef.current?.focus();
+    const scope = () =>
+      inArchive ? Promise.resolve(true) : api.indexCovers(here).then((c) => {
+        setCovered(c.covered);
+        setScan(c.covered ? null : { scanning: c.scanning, entries: c.entries });
+        return c.covered;
+      });
+    scope().catch(() => {});
     api.indexStatus().then(setStatus).catch(() => {});
-    api.indexRefresh(false).then((started) => { if (started) api.indexStatus().then(setStatus); }).catch(() => {});
+    api.indexRefresh(false).then((started) => { if (started) return api.indexStatus().then(setStatus); }).catch(() => {});
     const un = events.indexUpdated((s) => {
       setStatus(s);
+      scope().catch(() => {});
       runQuery.current(true);
     });
     return () => void un.then((f) => f());
@@ -78,30 +95,31 @@ export function QuickOpen({ initial }: { initial?: string }) {
   // ───────── file query (debounced, stale responses dropped) ─────────
   // The highlighted file, so a refresh of the same query keeps it highlighted.
   const selectedPath = useRef<string | null>(null);
+  const querySeq = useRef(0);
   const runQuery = useRef((_keep?: boolean) => {});
   /** `keep`: the index changed under the same query (it is refreshed when Quick Open
    *  opens): the highlighted file stays highlighted, so Enter opens what was chosen. */
   runQuery.current = (keep = false) => {
+    const id = ++querySeq.current;
     if (cmdMode || !q.trim()) {
       setHits([]);
       setStats(null);
       return;
     }
-    const id = ++querySeq;
     api.indexQuery(q, scopeHere ? here : null, 200)
       .then((r) => {
-        if (id !== querySeq) return;
+        if (id !== querySeq.current) return;
         setHits(r.hits);
-        setStats({ total: r.total, ms: r.elapsedMs });
+        setStats({ total: r.total, ms: r.elapsedMs, scanning: r.scanning });
         const at = keep && selectedPath.current ? r.hits.findIndex((h) => h.path === selectedPath.current) : -1;
         setIdx(at >= 0 ? at : 0);
       })
-      .catch(A.fail);
+      .catch((e) => { if (id === querySeq.current) A.fail(e); });
   };
   useEffect(() => {
     const t = setTimeout(() => runQuery.current(), 25);
-    return () => clearTimeout(t);
-  }, [q, scopeHere]);
+    return () => { clearTimeout(t); ++querySeq.current; };
+  }, [q, scopeHere, here]);
 
   // ───────── command palette rows ─────────
   const commands = useMemo(() => {
@@ -169,7 +187,7 @@ export function QuickOpen({ initial }: { initial?: string }) {
       return;
     }
     const { path, isDir } = row.hit;
-    pushRecent(path);
+    if (!isDir) pushRecent(path);
     if (how === "reveal") return reveal(path, b);
     if (how === "other") {
       // No other browser on screen (Classic, a narrow window): this one.
@@ -188,6 +206,7 @@ export function QuickOpen({ initial }: { initial?: string }) {
 
   const onKey = (e: React.KeyboardEvent) => {
     e.stopPropagation();
+    if (e.nativeEvent.isComposing || e.keyCode === 229) return;
     const n = rows.length;
     const move = (d: number) => {
       e.preventDefault();
@@ -198,18 +217,30 @@ export function QuickOpen({ initial }: { initial?: string }) {
     if (e.key === "ArrowUp" || (e.ctrlKey && (e.key === "k" || e.key === "p"))) return move(-1);
     if (e.key === "PageDown") return move(10);
     if (e.key === "PageUp") return move(-10);
-    if (e.key === "Tab" && !cmdMode) {
+    if (e.key === "Tab" && !cmdMode && !inArchive) {
       e.preventDefault();
       setScopeHere((v) => !v);
       return;
     }
+    // Hidden and ignored files are not in the index: search them by name in this folder.
+    if (!cmdMode && !inArchive && e.altKey && !e.ctrlKey && !e.metaKey && e.key.toLowerCase() === "i") {
+      e.preventDefault();
+      A.openOverlay({ type: "search", root: here, pattern: quickToWildcard(q), everything: true });
+      return;
+    }
     if (e.key === "Enter") {
       e.preventDefault();
-      accept(cur, e.ctrlKey || e.altKey ? "reveal" : e.shiftKey ? "other" : "open");
+      accept(cur, primaryMod(e) || e.altKey ? "reveal" : e.shiftKey ? "other" : "open");
     }
   };
 
   const indexing = status?.building;
+  // This folder is searched directly (it is not in the system index: WSL, a network share).
+  const live = scopeHere && covered === false;
+  const liveName = basename(here) || here;
+  // The scope switch and the footer are narrow: a long folder name reads "this folder".
+  const shortName = liveName.length <= 16 ? liveName : "this folder";
+  const liveBusy = live && (scan?.scanning || stats?.scanning);
   const placeholder = cmdMode ? "Type a command…" : "Search files by name…  'exact  ^start  end$  !not  ext:pdf  src/";
 
   return (
@@ -219,10 +250,16 @@ export function QuickOpen({ initial }: { initial?: string }) {
           <Icon name={cmdMode ? "wand" : "search"} size={17} />
           <input ref={inputRef} value={q} spellCheck={false} placeholder={placeholder} onChange={(e) => { setQ(e.target.value); setIdx(0); }} />
           {!cmdMode && (
-            <button className={`chip ${scopeHere ? "on" : ""}`} title="Toggle scope (Tab)" onClick={() => { setScopeHere((v) => !v); inputRef.current?.focus(); }}>
-              {scopeHere ? <>in {basename(here) || here}</> : <>everywhere</>}
-              <kbd>Tab</kbd>
-            </button>
+            // Tab switches scopes when the current folder can be searched directly.
+            <div className="qo-scope" role="group" title={inArchive ? "Search scope" : "Tab switches between this folder and everywhere"}>
+              {!inArchive && <button aria-pressed={scopeHere} className={scopeHere ? "on" : ""} title={`${here} and its subfolders`} onClick={() => { setScopeHere(true); inputRef.current?.focus(); }}>
+                <Icon name="folder" size={12} /> {shortName}
+              </button>}
+              <button aria-pressed={!scopeHere} className={!scopeHere ? "on" : ""} onClick={() => { setScopeHere(false); inputRef.current?.focus(); }}>
+                <Icon name="drive" size={12} /> everywhere
+              </button>
+              {!inArchive && <kbd>Tab</kbd>}
+            </div>
           )}
         </div>
         <div className="qo-body">
@@ -239,12 +276,19 @@ export function QuickOpen({ initial }: { initial?: string }) {
                 </div>
               ) : (
                 <FileRow key={r.hit.path} hit={r.hit} on={i === idx} recent={r.recent}
-                  onHover={() => i !== idx && setIdx(i)} onClick={(e) => accept(r, e.ctrlKey ? "reveal" : "open")} />
+                  onHover={() => i !== idx && setIdx(i)} onClick={(e) => accept(r, primaryMod(e) ? "reveal" : "open")} />
               ),
+            )}
+            {scopeHere && !cmdMode && q.trim() && rows.length > 0 && (
+              <div className="qo-row qo-wider" onClick={() => { setScopeHere(false); inputRef.current?.focus(); }}>
+                <Icon name="drive" size={14} />
+                <span className="qo-name">Search everywhere for “{q.trim()}”</span>
+                <span className="qo-keys"><kbd>Tab</kbd></span>
+              </div>
             )}
             {rows.length === 0 && (
               <div className="qo-empty">
-                {cmdMode ? "No matching command" : !q.trim() ? "Start typing to search every file on this computer" : indexing && !status?.entries ? "Building the index…" : "No matches"}
+                {cmdMode ? "No matching command" : !q.trim() ? (live ? (liveBusy ? `Reading ${liveName}… you can start typing` : `Start typing to search ${liveName}`) : scopeHere ? <>Start typing to search {basename(here) || here} and below<br /><small><kbd>Tab</kbd> searches every file on this computer</small></> : "Start typing to search every file on this computer") : liveBusy && !hits.length ? `Reading ${liveName}…` : indexing && !status?.entries ? "Building the index…" : <>No matches{scopeHere ? <> in {basename(here) || here}</> : null}<br />{scopeHere && <><small><kbd>Tab</kbd> searches everywhere</small><br /></>}{!inArchive && <small>Hidden from search or ignored? <kbd>Alt+I</kbd> searches {basename(here) || here} by name including them</small>}</>}
               </div>
             )}
           </div>
@@ -257,15 +301,17 @@ export function QuickOpen({ initial }: { initial?: string }) {
         </div>
         <div className="qo-foot">
           <span className="qo-status">
-            {indexing && <span className="spinner" />}
+            {(live ? liveBusy : indexing) && <span className="spinner" />}
             {cmdMode
               ? `${rows.length} commands`
               : status
-                ? <>{status.entries.toLocaleString()} items indexed{indexing ? " · updating…" : ""}{stats ? <> · <b>{stats.total.toLocaleString()}</b> matches · {stats.ms} ms</> : null}</>
+                ? scopeHere && covered === false
+                  ? <span title="Folders in WSL, on network shares and outside Settings › Search › Indexed folders are not in the system index; Quick Open reads them when it opens there.">{liveBusy ? `Reading ${liveName}…` : `${(scan?.entries ?? 0).toLocaleString()} items in ${liveName}`}{stats ? <> · <b>{stats.total.toLocaleString()}</b> matches · {stats.ms} ms</> : null}</span>
+                  : <>{status.entries.toLocaleString()} items indexed{indexing ? " · updating…" : ""}{stats ? <> · <b>{stats.total.toLocaleString()}</b> matches · {stats.ms} ms</> : null}</>
                 : "Loading index…"}
           </span>
           <span className="qo-hints">
-            <kbd>↵</kbd> open <kbd>Ctrl ↵</kbd> reveal <kbd>⇧ ↵</kbd> other side {!cmdMode && <><kbd>&gt;</kbd> commands</>}
+            {!cmdMode && !inArchive && <><kbd>Tab</kbd> {scopeHere ? "search everywhere" : `search ${shortName}`} </>}<kbd>↵</kbd> open <kbd>Ctrl ↵</kbd> reveal <kbd>⇧ ↵</kbd> other side {!cmdMode && <><kbd>&gt;</kbd> commands</>}
           </span>
         </div>
       </div>

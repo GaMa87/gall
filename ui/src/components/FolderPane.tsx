@@ -7,14 +7,15 @@ import type { FileEntry, GitState, SortKey } from "../api/types";
 import { age, ageColor, ageTier, ageWords, AGE_TIERS } from "../core/age";
 import { hasNerdFont } from "../core/nerdFont";
 import { quickFilterMatches } from "../core/filter";
+import { focusAfterRemoval } from "../core/focus";
 import { formatDate, formatSize, formatTime, unixMode, windowsMode } from "../core/format";
-import { buildKeymap, typedChar, type Action } from "../core/keymap";
+import { buildKeymap, primaryMod, typedChar, type Action } from "../core/keymap";
 import { basename, parent, splitExt } from "../core/path";
 import { sortEntries, type SortSpec } from "../core/sort";
 import * as A from "../state/actions";
 import { controller, registerController } from "../state/controllers";
 import { draggedPaths, draggedSingle, dropInto, hintNoop, isFileDrag, onDragOverCompare, onDragOverTarget, startDrag } from "../state/dnd";
-import { bumpNonce, useDirList, useGitStatus, useNonce, usePrefs, useSize, useTags } from "../state/hooks";
+import { bumpNonce, useDirList, useGitStatus, useNonce, usePrefs, useSearchHidden, useSize, useTags } from "../state/hooks";
 import { getState, setState, useStore, type MenuItem } from "../state/store";
 import { useKeyLabels } from "../state/keyLabels";
 import { FileIcon, Icon, TAG_COLORS } from "./Icon";
@@ -91,6 +92,8 @@ export function FolderPane({ b, path, active, compact }: Props) {
   const isShortcut = (chord: string) => keymap.has(chord);
   // Git status badges and the branch (Settings › Files › Git status).
   const git = useGitStatus(path, settings.showGitStatus);
+  // Items a .gallignore hides from search are dimmed (Hide from search / Show in search again).
+  const searchHidden = useSearchHidden(path);
   // Git work tree of this folder (enables "Compare with Git HEAD").
   const [gitRoot, setGitRoot] = useState<string | null>(null);
   useEffect(() => {
@@ -239,6 +242,24 @@ export function FolderPane({ b, path, active, compact }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [indexOf]);
 
+  // The focused item vanished (trashed, moved, renamed elsewhere): the cursor goes to the
+  // item that took its place, selected when nothing selected is left (as in Explorer),
+  // instead of being lost (the next arrow key started again at the top, Delete did nothing).
+  const lastOrder = useRef<{ path: string; order: string[] }>({ path, order: [] });
+  useEffect(() => {
+    const prev = lastOrder.current;
+    lastOrder.current = { path, order: visible.map((e) => e.path) };
+    if (!focus || indexOf.has(focus) || prev.path !== path || !visible.length) return;
+    // Only hidden by the quick filter, not gone: the filter places the cursor itself.
+    if (dir.entries.some((e) => e.path === focus)) return;
+    const next = focusAfterRemoval(prev.order, focus, (p) => indexOf.has(p));
+    if (!next) return;
+    setFocus(next);
+    setAnchor(next);
+    if (![...sel].some((p) => indexOf.has(p))) setSel(new Set([next]));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [indexOf]);
+
   // ───────── geometry ─────────
   const rowH = Math.round(settings.fontSize * 1.45 + settings.rowPadding * 2);
   const isGrid = view === "grid";
@@ -276,10 +297,12 @@ export function FolderPane({ b, path, active, compact }: Props) {
       .filter((e) => !e.isDir && !e.cloudOnly && settings.excerptExts.includes(e.ext) && !excerpts.has(e.path))
       .map((e) => e.path);
     if (!want.length) return;
-    api.excerpts(want, settings.excerptLines).then((r) => {
+    // A failed request counts as "no excerpt" for these files: otherwise it was an
+    // unhandled rejection, asked again on every scroll step.
+    api.excerpts(want, settings.excerptLines).catch(() => want.map(() => null)).then((r) => {
       setExcerpts((m) => {
         const n = new Map(m);
-        want.forEach((p, i) => n.set(p, r[i]));
+        want.forEach((p, i) => n.set(p, r[i] ?? null));
         return n;
       });
     });
@@ -726,8 +749,8 @@ export function FolderPane({ b, path, active, compact }: Props) {
       const r = listRef.current!.getBoundingClientRect();
       const x = e.clientX - r.left;
       const y = e.clientY - r.top + listRef.current!.scrollTop;
-      const base = e.ctrlKey || e.shiftKey ? new Set(sel) : new Set<string>();
-      if (!e.ctrlKey && !e.shiftKey && e.button === 0) setSel(new Set());
+      const base = primaryMod(e) || e.shiftKey ? new Set(sel) : new Set<string>();
+      if (!primaryMod(e) && !e.shiftKey && e.button === 0) setSel(new Set());
       setRubber({ x0: x, y0: y, x1: x, y1: y, base });
     }
   };
@@ -795,6 +818,17 @@ export function FolderPane({ b, path, active, compact }: Props) {
       if (one?.isDir) items.push({ label: "Compare folder with other panel", icon: "compare", shortcut: "Ctrl+Shift+D", run: () => A.compareFolderWithOther(b, one) });
       if (one?.ext === "2do" || one?.ext === "2dx")
         items.push({ label: one.ext === "2do" ? "Mark done" : "Mark not done", run: () => api.toggleNote(one.path).catch(A.fail) });
+      if (!archiveOf(path)) {
+        if (searchHidden?.folder) {
+          const f = searchHidden.folder;
+          items.push({ label: f === path ? "Show this folder in search again" : `Show “${basename(f)}” in search again`, icon: "search", run: () => A.showInSearch(f) });
+        } else if (one && searchHidden?.entries[one.name]) {
+          items.push({ label: "Show in search again", icon: "search", run: () => A.showInSearch(one.path) });
+        } else {
+          const list = entries.filter((e) => !searchHidden?.entries[e.name]);
+          if (list.length) items.push({ label: list.length > 1 ? `Hide ${list.length} items from search` : "Hide from search", icon: "search", run: () => A.hideFromSearch(list.map((e) => e.path)) });
+        }
+      }
       items.push({ separator: true });
       items.push({ label: "Cut", icon: "cut", shortcut: "Ctrl+X", run: () => A.copyToClipboard(entries, true) });
       items.push({ label: "Copy", icon: "copy", shortcut: "Ctrl+C", run: () => A.copyToClipboard(entries, false) });
@@ -808,8 +842,8 @@ export function FolderPane({ b, path, active, compact }: Props) {
         label: "Copy path",
         shortcut: "Ctrl+Shift+C",
         submenu: (
-          [["native", "As is"], ["nativeQuoted", "Quoted"], ["escaped", "Escaped \\\\"], ["forward", "Forward slashes /"], ["forwardQuoted", "Forward, quoted"], ["uri", "file:// URI"]] as const
-        ).map(([f, l]) => ({
+          [["native", "As is"], ["nativeQuoted", "Quoted"], ["escaped", "Escaped \\\\"], ["forward", "Forward slashes /"], ["forwardQuoted", "Forward, quoted"], ["uri", "file:// URI"], ["linux", "Linux path (WSL)"]] as const
+        ).filter(([f]) => f !== "linux" || getState().info?.platform === "windows").map(([f, l]) => ({
           label: l,
           run: async () => {
             const t = await Promise.all(entries.map((e) => api.pathFormat(e.path, f)));
@@ -953,6 +987,7 @@ export function FolderPane({ b, path, active, compact }: Props) {
       isThumbs && "two-line",
       (entry.ext === "2do" || entry.ext === "2dx") && "note",
       gs === "ignored" && "git-ignored",
+      (searchHidden?.folder || searchHidden?.entries[entry.name]) && "search-hidden",
     ]
       .filter(Boolean)
       .join(" ");
@@ -1161,6 +1196,12 @@ export function FolderPane({ b, path, active, compact }: Props) {
             {visual && (
               <span className="fp-visual" title="Visual mode: j/k, gg/G extend the selection; y y, d d, D, m, C, M … act on it; Esc or v cancels">
                 -- VISUAL -- {sel.size}
+              </span>
+            )}
+            {searchHidden?.folder && searchHidden.folderRule && (
+              <span className="fp-archive fp-search-hidden" title={`Hidden from search by “${searchHidden.folderRule.line}” in ${searchHidden.folderRule.file}\nQuick Open, find in files and F3 skip this folder. Click to show it in search again.`}
+                onClick={() => A.showInSearch(searchHidden.folder!)}>
+                <Icon name="search" size={12} /> hidden from search
               </span>
             )}
             {archiveOf(path) && (

@@ -77,6 +77,20 @@ describe("paths", () => {
     expect(tildify("C:\\Users\\me\\Docs", "C:\\Users\\me")).toBe("~\\Docs");
     expect(tildify("C:\\Users\\meme", "C:\\Users\\me")).toBe("C:\\Users\\meme");
   });
+  it("WSL distribution roots (\\\\wsl.localhost, \\\\wsl$) work like a drive", () => {
+    const root = "\\\\wsl.localhost\\Ubuntu\\";
+    expect(ancestors("\\\\wsl.localhost\\Ubuntu\\home\\u")).toEqual([root, root + "home", root + "home\\u"]);
+    expect(ancestors(root)).toEqual([root]);
+    expect(parent(root)).toBe(null);
+    expect(parent(root + "home")).toBe(root);
+    expect(basename(root)).toBe("Ubuntu");
+    expect(basename("\\\\wsl$\\Debian\\etc")).toBe("etc");
+    expect(join(root, "etc")).toBe(root + "etc");
+    expect(isInside(root + "home\\u", root)).toBe(true);
+    expect(isInside("\\\\wsl.localhost\\Ubuntu-22.04\\x", root)).toBe(false);
+    // Leaving an uninstalled distribution goes back to a folder outside it.
+    expect(backOutside(["C:\\Users", root + "home"], root)).toEqual(["C:\\Users"]);
+  });
   it("relative joins and ~ (unix)", () => {
     expect(joinRel("/l", "sub/new.txt")).toBe("/l/sub/new.txt");
     expect(joinRel("/", "a/b")).toBe("/a/b");

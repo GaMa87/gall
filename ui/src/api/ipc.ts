@@ -97,12 +97,19 @@ export const api = {
   pathResolve: (input: string, base?: string) => invoke<{ path: string; isDir: boolean; exists: boolean }>("path_resolve", { input, base }),
   pathFormat: (path: string, format?: T.PathFormat) => invoke<string>("path_format", { path, format }),
 
-  searchStart: (id: number, root: string, pattern: string, includeHidden: boolean) =>
-    invoke<void>("search_start", { id, root, pattern, includeHidden }),
+  searchStart: (id: number, root: string, pattern: string, includeHidden: boolean, everything = false) =>
+    invoke<void>("search_start", { id, root, pattern, includeHidden, everything }),
   searchCancel: () => invoke<void>("search_cancel"),
 
   indexStatus: () => invoke<T.IndexStatus>("index_status"),
   indexRefresh: (force: boolean) => invoke<boolean>("index_refresh", { force }),
+  /** Adds the item to the `.gallignore` next to it; null when it was already there. */
+  hideFromSearch: (path: string) => invoke<string | null>("hide_from_search", { path }),
+  /** Undoes Hide from search, or adds a ! exception when a pattern hides the item. */
+  showInSearch: (path: string) => invoke<T.ShowOutcome>("show_in_search", { path }),
+  searchHidden: (dir: string) => invoke<T.HiddenState>("search_hidden", { dir }),
+  /** Whether the system index holds `path`; Quick Open scans other folders itself. */
+  indexCovers: (path: string) => invoke<{ covered: boolean; scanning: boolean; entries: number }>("index_covers", { path }),
   indexQuery: (query: string, scope: string | null, limit: number) =>
     invoke<T.IndexResult>("index_query", { query, scope, limit }),
   grepStart: (id: number, root: string, pattern: string, opts: Partial<T.GrepOptions>) =>
