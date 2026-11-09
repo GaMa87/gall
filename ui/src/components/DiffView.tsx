@@ -187,7 +187,7 @@ export function DiffView({ a: a0, b: b0, back }: { a: DiffSource; b: DiffSource;
     // it: a block applied now would be cut from those and silently undo that merge.
     if (!tx || loading) return;
     const target = dir === "toRight" ? 1 : 0;
-    if (!editable(target)) return A.notify(`The ${target ? "right" : "left"} side is read-only (${src[target].kind === "gitHead" ? "Git HEAD" : "clipboard"})`, "warn");
+    if (!editable(target)) return A.notify(`The ${target ? "right" : "left"} side is read-only`, "warn");
     const op = tx.ops.filter((o) => o.tag !== "equal")[k < 0 ? 0 : k];
     if (!op) return;
     const r = applyBlock(tx.leftLines, tx.rightLines, op, dir);
@@ -389,6 +389,7 @@ export function DiffView({ a: a0, b: b0, back }: { a: DiffSource; b: DiffSource;
       <b>{srcName(s)}</b>
       {edits[side === "l" ? 0 : 1] && <span className="dv-dirty" title="Changed here, not saved yet">● modified</span>}
       {s.kind === "gitHead" && <span className="dv-tag">HEAD</span>}
+      {s.kind === "gitCommit" && <span className="dv-tag" title={s.commit}>{s.commit.slice(0, 12)}</span>}
       {/* LRM marks keep the leading "/" in place: the path is right-to-left only so it ellipsizes from the left. */}
       <span className="dv-path">{srcPath(s) && "\u200e" + tildify(parent(srcPath(s)) ?? "", home) + "\u200e"}</span>
     </div>

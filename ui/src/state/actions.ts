@@ -8,6 +8,7 @@ import { controller, emitFolderChanged, refreshAll } from "./controllers";
 import { bumpSearchHidden } from "./hooks";
 import { getState, setState, type DialogSpec, type FolderSize, type MenuItem, type NoteKind, type Overlay, type UiState } from "./store";
 import { formatSize } from "../core/format";
+import { keyboardSettings } from "../core/keymap";
 
 let noteSeq = 1;
 /** Smoothed speed per running task, for the time-left estimate. */
@@ -229,7 +230,7 @@ export async function bootstrap() {
     timed("favorites", api.favoritesGet()), timed("history", api.historyGet()), timed("drives", api.listDrives()),
     timed("args", api.startupArgs()),
   ]);
-  setState({ info, settings, session, favorites, history, drives, sidebarVisible: true });
+  setState({ info, settings: keyboardSettings(settings), session, favorites, history, drives, sidebarVisible: true });
   if (info.startupNotice) notify(info.startupNotice, "warn");
   applyCliArgs(args);
   // First start: the welcome setup (not during self-tests, which start with fresh settings).
@@ -238,6 +239,7 @@ export async function bootstrap() {
 
   await events.fsChanged(({ path, storm }) => {
     if (storm) setStormNotice(path);
+    invalidateFolderSizes(path);
     emitFolderChanged(path, storm);
   });
   await events.task((ev) => {
@@ -288,11 +290,7 @@ export async function bootstrap() {
       api.historyGet().then((history) => setState({ history })).catch(() => {});
     }
   });
-  await events.folderSizeProgress(({ path, size }) => {
-    // Running totals only for calculations still on (a late event must not undo "done").
-    const cur = getState().folderSizes[path];
-    if (cur?.done === false) putFolderSize(path, { ...size, done: false, at: Date.now(), job: cur.job });
-  });
+  await events.folderSizeProgress(applyFolderSizeProgress);
   await events.secondInstance((a) => applyCliArgs(a));
   // Backend warnings and errors: never only in the log file.
   await events.backendLog((l) => notify(l.msg, l.level));
@@ -441,8 +439,9 @@ export async function refreshCloud() {
 export async function updateSettings(patch: Partial<Settings>) {
   const s = getState().settings;
   if (!s) return;
-  const next = { ...s, ...patch };
-  setState({ settings: next });
+  const next = keyboardSettings(s, patch);
+  const changedKeys = next.keyboardProfile !== s.keyboardProfile || next.leaderKey !== s.leaderKey || next.leaderKeyBasic !== s.leaderKeyBasic;
+  setState({ settings: next, ...(changedKeys ? { keySeq: [] } : {}) });
   try {
     await api.setSettings(next);
     setState({ settingsRev: getState().settingsRev + 1 });
@@ -470,7 +469,7 @@ export async function resetAllSettings() {
     "Reset", true))) return;
   try {
     const settings = await api.resetSettings();
-    setState({ settings, settingsRev: getState().settingsRev + 1 });
+    setState({ settings: keyboardSettings(settings), keySeq: [], settingsRev: getState().settingsRev + 1 });
     notify("Settings reset to defaults");
     // Back to first-start settings: the welcome setup again (it replaces the settings window).
     openOverlay({ type: "welcome" });
@@ -737,6 +736,7 @@ export function compareMenu(b: number, entry: FileEntry, inRepo: boolean): MenuI
         } },
       { label: "Clipboard", run: () => compareWithClipboard(entry.path) },
       { label: inRepo ? "Git HEAD (my changes)" : "Git HEAD (not in a repository)", disabled: !inRepo, run: () => compareWithGitHead(entry.path) },
+      { label: "Git commit…", disabled: !inRepo, run: () => openOverlay({ type: "gitCommits", path: entry.path }) },
       { separator: true },
       { label: "Choose file…", run: async () => {
           const { open } = await import("@tauri-apps/plugin-dialog");
@@ -1131,9 +1131,11 @@ export async function trashPaths(paths: string[]) {
   if (refuseInArchive(paths, "delete")) return;
   try {
     await api.trash(paths);
+    refreshAll();
     notify(`Moved ${named(paths)} to trash`, "info", { label: "Undo", run: undo });
     refreshUndo();
   } catch (e) {
+    refreshAll();
     refreshUndo(); // part of the items may be in the trash
     const msg = String(e);
     if (!msg.startsWith("trash:")) return fail(e);
@@ -1255,6 +1257,20 @@ export async function createFromTemplate(b: number, dir: string, template: strin
 }
 
 export async function openEntries(b: number, entries: FileEntry[]) {
+  if (!entries.length) return;
+  const resolved: FileEntry[] = [];
+  for (const entry of entries) {
+    if (entry.ext !== "lnk") {
+      resolved.push(entry);
+      continue;
+    }
+    try {
+      resolved.push(await withArchivePassword(() => api.shortcutResolve(entry.path)) ?? entry);
+    } catch (e) {
+      fail(e);
+    }
+  }
+  entries = resolved;
   if (!entries.length) return;
   const dirs = entries.filter((e) => e.isDir);
   const files = entries.filter((e) => !e.isDir);
@@ -1463,6 +1479,12 @@ export function joinPath(dir: string, name: string) {
 
 // ───────────── folder sizes (F-14) ─────────────
 
+/** Accept progress only from the calculation that currently owns the row. */
+export function applyFolderSizeProgress({ path, size, ticket }: { path: string; size: import("../api/types").DirSize; ticket: number }) {
+  const cur = getState().folderSizes[path];
+  if (cur?.done === false && cur.job === ticket) putFolderSize(path, { ...size, done: false, at: cur.at, job: ticket });
+}
+
 function putFolderSize(path: string, v: FolderSize | null) {
   setState((s) => {
     const folderSizes = { ...s.folderSizes };
@@ -1475,11 +1497,45 @@ function putFolderSize(path: string, v: FolderSize | null) {
 let sizeTicket = 0;
 /** Running calculation of each browser (or other owner, like the Properties window). */
 const sizeOwners = new Map<number | string, number>();
+const sizePending = new Map<number | string, string[]>();
+const sizePrevious = new Map<number, Map<string, FolderSize | undefined>>();
+// Interested owners await each row independently, then take over if its owner cancels.
+const sizeRows = new Map<string, { ticket: number; promise: Promise<boolean>; finish(success: boolean): void }>();
+
+const sizeRevisions = new Map<string, number>();
+let sizeRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+
+/** Watched changes invalidate cached totals for the changed folder and its ancestors. */
+export function invalidateFolderSizes(path: string) {
+  for (const [p, f] of Object.entries(getState().folderSizes)) {
+    if (!isInside(path, p)) continue;
+    sizeRevisions.set(p, (sizeRevisions.get(p) ?? 0) + 1);
+    putFolderSize(p, { ...f, at: 0 });
+  }
+  scheduleFolderSizeRefresh();
+}
+
+function scheduleFolderSizeRefresh() {
+  if (sizeRefreshTimer !== undefined) return;
+  sizeRefreshTimer = setTimeout(() => {
+    sizeRefreshTimer = undefined;
+    if (!getState().settings?.folderSizesAuto) return;
+    for (const b of [0, 1]) {
+      const c = controller(b);
+      if (c && !archiveOf(c.path())) void calcFolderSizes(b, c.entries().filter((e) => e.isDir && !e.isSymlink).map((e) => e.path), 120_000);
+    }
+  }, 300);
+}
 
 /** Calculates the total size of the folders `paths` for `owner` (a browser index or a
  *  window), two at a time; a new call replaces the owner's running one. Sizes stream
  *  into `folderSizes` as they are counted. `skipFresh`: keep sizes younger than that (ms). */
 export async function calcFolderSizes(owner: number | string, paths: string[], skipFresh = 0) {
+  // Listing refreshes must not interrupt a manual or automatic count already in flight.
+  if (skipFresh && sizeOwners.has(owner)) {
+    sizePending.set(owner, paths);
+    return;
+  }
   cancelFolderSizes(owner);
   const now = Date.now();
   const queue = paths.filter((p) => {
@@ -1489,38 +1545,98 @@ export async function calcFolderSizes(owner: number | string, paths: string[], s
   if (!queue.length) return;
   const ticket = ++sizeTicket;
   sizeOwners.set(owner, ticket);
+  const previous = new Map<string, FolderSize | undefined>();
+  sizePrevious.set(ticket, previous);
+  let changedWhileCounting = false;
   const worker = async () => {
     while (queue.length && sizeOwners.get(owner) === ticket) {
       const p = queue.shift()!;
+      let sharedDone = false;
+      while (sizeRows.has(p) && sizeOwners.get(owner) === ticket) {
+        if (await sizeRows.get(p)!.promise) {
+          sharedDone = true;
+          break;
+        }
+      }
+      if (sizeOwners.get(owner) !== ticket) break;
+      if (sharedDone) continue;
+      let finishRow!: (success: boolean) => void;
+      const promise = new Promise<boolean>((resolve) => { finishRow = resolve; });
+      const row = { ticket, promise, finish: finishRow };
+      sizeRows.set(p, row);
       const prev = getState().folderSizes[p];
       const known = prev?.done ? prev : undefined;
+      previous.set(p, known);
       putFolderSize(p, { bytes: 0, files: 0, dirs: 0, unreadable: 0, ...known, done: false, at: Date.now(), job: ticket });
+      const revision = sizeRevisions.get(p);
       const r = await api.folderSize(p, ticket).catch(() => null);
-      if (r) putFolderSize(p, { ...r, done: true, at: Date.now() });
+      const ownsRow = getState().folderSizes[p]?.job === ticket && sizeOwners.get(owner) === ticket;
+      if (sizeRows.get(p) === row) sizeRows.delete(p);
+      if (r && ownsRow) {
+        const changed = sizeRevisions.get(p) !== revision;
+        changedWhileCounting ||= changed;
+        putFolderSize(p, { ...r, done: true, at: changed ? 0 : Date.now() });
+      }
       // Cancelled or failed: back to what was known, unless a newer calculation took over.
-      else if (getState().folderSizes[p]?.job === ticket) putFolderSize(p, known ?? null);
+      else if (getState().folderSizes[p]?.job === ticket) putFolderSize(p, known ? { ...known, at: sizeRevisions.get(p) === revision ? known.at : 0 } : null);
+      finishRow(!!r && ownsRow);
     }
   };
   await Promise.all([worker(), worker()]);
-  if (sizeOwners.get(owner) === ticket) sizeOwners.delete(owner);
+  sizePrevious.delete(ticket);
+  if (sizeOwners.get(owner) === ticket) {
+    sizeOwners.delete(owner);
+    const pending = sizePending.get(owner);
+    sizePending.delete(owner);
+    if (pending && getState().settings?.folderSizesAuto) void calcFolderSizes(owner, pending, 120_000);
+    if (changedWhileCounting) scheduleFolderSizeRefresh();
+  }
 }
 
 /** Stops the folder size calculation of `owner`. */
 export function cancelFolderSizes(owner: number | string) {
+  sizePending.delete(owner);
   const t = sizeOwners.get(owner);
   if (t == null) return;
   sizeOwners.delete(owner);
+  for (const [path, row] of sizeRows) {
+    if (row.ticket === t) {
+      sizeRows.delete(path);
+      row.finish(false);
+    }
+  }
+  // Retire the UI job immediately; late results and progress no longer own the row.
+  for (const [path, f] of Object.entries(getState().folderSizes)) {
+    if (f.job === t) {
+      const known = sizePrevious.get(t)?.get(path);
+      putFolderSize(path, known ? { ...known, at: f.at === 0 ? 0 : known.at } : null);
+    }
+  }
   api.folderSizesCancel(t).catch(() => {});
 }
 
 /** "1.2 GB" for a calculated folder size ("1.2 GB…" while counting), else "". */
 export function folderSizeLabel(f: FolderSize | undefined): string {
   if (!f) return "";
+  if (f.virtualFs) return "—";
   return formatSize(f.bytes) + (f.done ? "" : "…");
 }
 
 export function folderSizeTitle(f: FolderSize | undefined): string {
   if (!f) return "";
+  if (f.virtualFs) return "Virtual filesystem; folder size is not applicable";
   const what = `${f.files.toLocaleString()} files, ${f.dirs.toLocaleString()} folders`;
   return `${f.bytes.toLocaleString()} bytes in ${what}${f.unreadable ? `; ${items(f.unreadable)} could not be read (the total is at least this)` : ""}${f.done ? "" : " (counting…)"}`;
+}
+
+/** Only completed, applicable totals participate in folder-size sorting. */
+export function folderSizeBytes(f: FolderSize | undefined): number | undefined {
+  return f?.done && !f.virtualFs ? f.bytes : undefined;
+}
+
+/** Properties text, without fabricated byte or item counts for virtual filesystems. */
+export function folderSizeDetails(f: FolderSize | undefined): string {
+  if (!f) return "counting…";
+  if (f.virtualFs) return `${folderSizeLabel(f)} ${folderSizeTitle(f)}`;
+  return `${folderSizeLabel(f)} (${f.bytes.toLocaleString()} bytes) in ${f.files.toLocaleString()} files, ${f.dirs.toLocaleString()} folders${f.unreadable ? `; ${items(f.unreadable)} unreadable` : ""}`;
 }

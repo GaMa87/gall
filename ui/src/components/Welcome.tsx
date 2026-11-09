@@ -8,13 +8,14 @@ import { useStore } from "../state/store";
 import { VIEWS } from "./FolderPane";
 import { Icon } from "./Icon";
 import { Logo } from "./TitleBar";
+import { keyboardProfile } from "../core/keymap";
 
 const ACCENTS = ["#3d8bfd", "#8b5cf6", "#14b8a6", "#22c55e", "#f59e0b", "#ef4444", "#ec4899"];
 
 const STEPS = [
   { title: "Look", heading: "Make it look right", desc: "Pick a theme and an accent colour. Both can be changed later in Settings › Appearance." },
   { title: "Layout", heading: "How many browsers?", desc: "Gall shows two folders at once by default. You can switch any time from the sidebar." },
-  { title: "Keyboard", heading: "How do you like your keys?", desc: "Vim keys turn letters into commands; standard keys let you type to filter. Settings › Vim keys switches back." },
+  { title: "Keyboard", heading: "How do you like your keys?", desc: "Choose familiar shortcuts; every profile includes Gall commands and ? for help. Change it later in Settings › Keyboard." },
   { title: "Files", heading: "Folder defaults", desc: "How a folder is shown and sorted until you change it for that folder." },
 ] as const;
 
@@ -151,16 +152,21 @@ export function Welcome() {
 
           {step === 2 && (
             <>
-              <div className="wc-choices two">
-                <Choice on={!s.vimKeys} onClick={() => set({ vimKeys: false })} title="Standard keys"
-                  sub={<>Type to filter · <kbd>Space</kbd> preview · <kbd>Ctrl</kbd> shortcuts · double <kbd>Ctrl</kbd> opens a menu of commands</>}>
-                  <div className="wc-keys"><kbd>Ctrl</kbd><kbd>C</kbd><kbd>F2</kbd><kbd>Del</kbd></div>
+              <div className="wc-choices three">
+                <Choice on={keyboardProfile(s) === "explorer"} onClick={() => set({ keyboardProfile: "explorer" })} title="Windows Explorer"
+                  sub={<>Type to filter · F2 rename · F3 search · F4 address · F5 refresh · F6 other browser</>}>
+                  <div className="wc-keys"><kbd>F2</kbd><kbd>F3</kbd><kbd>F5</kbd></div>
                 </Choice>
-                <Choice on={s.vimKeys} onClick={() => set({ vimKeys: true })} title="Vim keys"
+                <Choice on={keyboardProfile(s) === "totalCommander"} onClick={() => set({ keyboardProfile: "totalCommander" })} title="Total Commander"
+                  sub={<>F3 preview · F4 edit · F5 copy · F6 move · F7 folder · F8 trash · type to filter</>}>
+                  <div className="wc-keys"><kbd>F5</kbd><kbd>F6</kbd><kbd>F8</kbd></div>
+                </Choice>
+                <Choice on={keyboardProfile(s) === "vim"} onClick={() => set({ keyboardProfile: "vim" })} title="Vim"
                   sub={<><kbd>j</kbd>/<kbd>k</kbd> move · <kbd>h</kbd>/<kbd>l</kbd> out and in · <kbd>/</kbd> filter · <kbd>Space</kbd> opens a menu of commands · <kbd>?</kbd> all keys</>}>
                   <div className="wc-keys vim"><kbd>h</kbd><kbd>j</kbd><kbd>k</kbd><kbd>l</kbd></div>
                 </Choice>
               </div>
+              <p className="wc-desc">All profiles keep custom shortcuts and Gall features. Explorer and Commander: tap Ctrl twice for the full command menu. Vim: press Space.</p>
             </>
           )}
 

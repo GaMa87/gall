@@ -30,6 +30,7 @@ export interface FileEntry {
 export type DiffSource =
   | { kind: "file"; path: string }
   | { kind: "gitHead"; path: string }
+  | { kind: "gitCommit"; path: string; commit: string }
   | { kind: "text"; label: string; text: string };
 
 export interface DiffOptions {
@@ -278,6 +279,7 @@ export interface Settings {
   indexExclude: string[];
   indexRefreshMinutes: number;
   searchRespectGitignore: boolean;
+  keyboardProfile?: "explorer" | "totalCommander" | "vim" | null;
   vimKeys: boolean;
   leaderKey: string;
   leaderKeyBasic: string;
@@ -412,10 +414,19 @@ export type TaskKind = "copy" | "move" | "delete" | "compress" | "extract" | "du
 export type ConflictPolicy = "keepBoth" | "overwrite" | "skip" | "overwritePermanently" | "overwriteOlder";
 
 /** Total size of a folder (folder_size). */
-export interface DirSize { bytes: number; files: number; dirs: number; unreadable: number }
+export interface DirSize {
+  bytes: number;
+  files: number;
+  dirs: number;
+  unreadable: number;
+  /** Kernel virtual filesystem: totals are not applicable. Absent when false. */
+  virtualFs?: boolean;
+}
 
 export type GitState = "ignored" | "untracked" | "staged" | "modified" | "conflict";
 export interface GitStatus {
+  subject?: string | null;
+  containingBranches?: string[];
   root: string;
   branch: string | null;
   ahead: number;

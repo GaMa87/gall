@@ -2,6 +2,66 @@
 
 ## Unreleased
 
+## 0.2.0 — 2026-11-09
+
+- Fixed: on Windows, cloning a repository and creating a worktree no longer fail with "could not open … .git/HEAD" (the destination was passed to Git as a `\\?\` path).
+- Fixed: WezTerm is started as a new process, so "Terminal here" no longer asks an already running WezTerm (for example on another desktop) to open the window, which produced empty windows and needed a second keypress. A terminal command you saved earlier keeps its old text; edit it in Settings › Window or choose the terminal again with Ctrl+Enter.
+- Fixed: Linux packages (deb, rpm, AppImage) now declare Gall as a handler for folders (`inode/directory`) and as a file manager, so it appears in the File manager list of Plasma's Default Applications and can be chosen for Meta+E.
+- Improved: the commit context menu in the Git workspace now offers **Rebase current branch onto this commit…** (under Rewrite history) and **Merge this commit into current branch…** (under Integrate), as in Git Graph and GitLens. They have no key on a commit because lazygit has none there (rebase is `r` and merge `M` on a branch, `b` opens bisect options); commit-panel keys follow lazygit.
+- Improved: Git workspace menus have one job each. Right-click, `Shift+F10`/Menu key or a row's **⋯** button opens the menu of that commit or reference; the toolbar **Actions** button holds repository-wide actions (fetch, pull, push, force push with lease, stash, refresh, search, terminal, continue/skip/abort). The separate "Panel actions…" button is gone, because **+** already creates items.
+- Improved: the Git workspace footer shows the keys of the focused panel (like lazygit's options bar) and how to move around: `h`/`l` move between the sidebar, the commit list (with Working Changes as its first row) and the details, `[`/`]` switch sidebar tabs, and `Esc` returns to the commit list (also from Working Changes). An unsent commit message is kept when you leave Working Changes and come back. The panel with keyboard focus is outlined and named in the footer (Commits, Branches, Commit details, Working Changes), and the selection in the other panels is shown muted.
+- Improved: in the Git workspace `y` on a commit opens lazygit's copy menu (hash, abbreviated hash, subject, message body, full message, author, date, commit URL for GitHub, GitLab, Bitbucket and Codeberg remotes, whole-commit diff, tags). `l` or Enter opens the commit details, `b` opens the tools on bisect options, `w` on worktree options and `x` the repository tools (as in lazygit, `b` and `w` are bisect and worktree options); `Esc` or `h` returns from the tools to the commit list.
+- Fixed: Git workspace refreshes no longer freeze while a fetch, push or clone is running. Long transfers are stopped only after three to five minutes without output (instead of a fixed total time), and a failed or cancelled clone removes the folder it created so the same path can be used again.
+- Fixed: Git workspace tools no longer refuse repositories that only use the standard Git LFS filters (switching, pulling, interactive rebase and worktrees work again). A stale saved rebase plan no longer blocks later rewrites or leaves leftover plan folders, and cancelled remote jobs are always unregistered.
+- Added: a [Git workspace](README.md#git-graph-and-revision-switching) with commit details, changed-file patches, parent selection, historical contents, file history/blame, two-revision comparisons, search, reference filtering and incremental history loading. Reflog remains optional and off by default.
+- Added: branch/tag/stash/remote management; explicit checkout, merge/rebase/cherry-pick/revert/reset actions; resumable operation controls and a conflict inspection/resolution panel. Network fetch, fast-forward pull and push show cancellable progress; force push uses an explicit commit lease.
+- Added: [Working Changes](README.md#review-and-commit-selected-files) with staged/unstaged groups, file/all staging, supported text line/hunk selection, initial commits, amend, recoverable file discard and ignore/exclude rules.
+- Added: [history editing](README.md#edit-commit-history), with direct message rewording, fixup/squash/drop and commit movement, plus an interactive linear-range plan supporting pick, reword, squash, fixup, drop, edit stops and drag/keyboard reordering. Recovery references retain rewritten history.
+- Added: repository tools for worktrees, recorded submodules, manual bisect, patches, notes and initialization/cloning. See the [coverage matrix](docs/git-workspace-roadmap.md) for implemented boundaries and remaining workflows.
+- Improved: the Git workspace has grouped context menus (Rewrite history, Integrate, Remote, More), right-click selects without opening details, closes on click-away and offers checkout of a branch at a commit; a three-way conflict editor (Ours/Theirs/Both/Base with a live Result and manual edit), a banner naming the commit being merged or replayed, interactive rebase listing commits newest first like the graph (including rebasing onto a diverged branch), Ctrl+Enter to commit, a leave confirmation on Esc/`q`, ahead/behind counts, a clear hint to force push with lease after a rejected push, the current branch pinned and marked in References, and clearer error messages. Recovery refs are hidden unless Reflog is enabled; the graph reloads on window focus and no longer draws lines above branch tips.
+- Improved: contextual lazygit-inspired direct keys and `?` help inside the workspace; `g r` opens it from the file browser, `= g` chooses a file-comparison revision from the same graph, and `= h` compares with HEAD. `=` is now a prefix key, so the former single-key compare is `= =`. `+ +` focuses the other browser.
+- Fixed: graph browsing does not perform checkout or update working-file timestamps. Explicit checkout prepares dirty changes through stash/commit/confirmed discard; detached commits and discarded work retain recovery references or stashes. Git status shows the commit subject and current or containing local branches.
+
+- Improved: application updates have their own Settings section between About and Shortcuts, and the About report button sits at the top right.
+
+- Fixed (Windows): opening a filesystem `.lnk` shortcut follows its target through Gall's normal folder/file flow instead of handing folder navigation to Explorer. Program launchers and shortcuts with arguments keep their Windows shell behavior; broken targets report an error.
+- Fixed: PDF preview reports read/render failures instead of leaving a blank page, and cancels pending document loads when switching files.
+- Fixed: letter shortcuts now ignore Caps Lock; only holding Shift selects shifted-letter commands, as clarified in keyboard help.
+- Fixed: Quick Open filters deleted files and folders from cached search results and recent paths, and refreshes the open picker when watched folders change.
+- Added: Windows Explorer, Total Commander and Vim keyboard profiles in welcome setup and Settings › Keyboard, with saved selection and profile-aware help, menus, command palette and shortcut defaults. Commander uses F2 refresh, F3 preview, F4 edit, F5 copy, F6 move, F7 folder and F8 trash; Explorer uses F4 address and F6 pane focus. Existing custom shortcuts and leader choices are preserved across profiles. See [keyboard profiles](README.md#keyboard-profiles).
+- Added: Ctrl+Insert copy, Shift+Insert paste, shared Gall shortcuts for editing and long names, and a leader sort group with all sort directions in every profile.
+- Fixed: refresh file lists after moving items to trash, including partial failures, so F8 does not leave stale rows when a filesystem watcher misses the native operation.
+
+- Improved: keyboard help and the next-key picker use individual keycaps with distinct simultaneous (`+`), sequential (`→`) and alternative (`or`) notation, explicit Shift for uppercase Vim commands, a visual legend and a no-results state. `?` now opens help in both key modes without intercepting text-field typing.
+
+- Improved: keyboard help is directly available with `Shift+F1` / `Ctrl+/` even with Vim keys off, lists standard navigation and selection, and uses mode-aware hints. See [keyboard usage](README.md#usage).
+- Added: Commander-style aliases for trash, rename, name search, selection, pane focus and sorting, extended by the selectable profiles above; `Space b p` pins or unpins the current folder, alongside existing Vim `b` and plain `Ctrl+B`. Every keyboard action now has a Vim or leader sequence, including `Space v` to toggle selection and `Space o m` for the context menu.
+- Fixed: tab middle-click closes on release without activating an inactive tab or starting autoscroll, including older macOS WebViews without `auxclick`; Alt+middle-click transfer and reopening closed tabs remain available.
+
+- Fixed: the support QR code no longer shows the poster's colored frame or a drop shadow.
+
+- Added: a redesigned, local-first [bug reporter](README.md#report-a-problem) with optional reproduction details, screenshot capture, arrows/boxes/opaque redaction, silent short video clips, attachment previews and safe local exports. A separate review step leads to one **Copy & open GitHub** action; nothing is uploaded automatically.
+- Changed: copied GitHub reports contain only the description, essential environment (including installation type and window resolution) and latest error. Recent actions, UI context and logs are included by default through **Save report...**, can be excluded, and are never copied. The report explains public attachment visibility before the GitHub handoff; closing the dialog keeps the draft in memory for the current application session.
+
+- Improved: GitHub bug-report forms are filled in automatically with the short report, with a clipboard backup. A live encoded-link counter shows remaining space and recommends attaching a saved ZIP when the report is too long. Selected screenshots have a separate Copy screenshot action for pasting after the report.
+- Added: Save report creates one ZIP with the report and all current screenshots and videos; optional extra diagnostics remain saved-only.
+- Improved: suggested report filenames include a timestamp, successful saves return to the report automatically, and compact reports omit the unused Webview placeholder.
+- Fixed: Escape cancels report dialogs with Vim keys on or off; after a successful GitHub handoff, reopening the reporter starts a fresh draft without discarding attachments still available in the current window.
+
+- Fixed: GitHub bug reports retain the description, environment and latest error when the report exceeds the browser link limit.
+- Fixed: bug-report export uses a bounded in-app path form instead of the system save dialog and protects existing files from overwrite.
+
+- Improved: Report a bug is a distinct, themed button with a compact activity icon and no trailing arrow in About and Settings → About.
+
+- Added: local bug-report preparation in About, with recent diagnostic events, optional log review and screenshot selection, GitHub form handoff, and previous-session diagnostics after an irregular exit.
+
+- Improved: the update panel in Settings → About uses themed controls, clearer status messages and a responsive layout, with technical errors available on demand.
+
+- Added: stable-release update checks at startup and in Settings → About, with signed installation for supported bundles and manual upgrade guidance for portable or system-managed installations. Release builds require updater signing configuration.
+
+- Fixed: automatic folder-size calculation no longer interrupts Calculate now when the folder listing refreshes; obsolete progress and results cannot overwrite a newer calculation. Watched changes invalidate cached totals and, with Calculate automatically enabled, refresh visible folders.
+- Fixed (Linux): folder sizes no longer report misleading totals such as 128 TB for `/proc`. Kernel virtual filesystems are detected before scanning and show `—` with an explanation in the Size column and Properties; ordinary files on `tmpfs` are still counted.
+
 ## 0.1.3 — 2026-11-05
 - Usage: [search scope and exclusions](README.md#new-in-013-search-scope-and-exclusions) and [WSL browsing](README.md#windows-browse-wsl-distributions).
 - Added (Windows): browse installed WSL distributions from Drives, start stopped distributions, open a terminal there and copy Linux-format paths. File operations use the Linux trash where available; Stop terminates the distribution after confirmation.

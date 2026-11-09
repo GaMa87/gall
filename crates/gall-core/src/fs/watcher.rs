@@ -1,7 +1,10 @@
 //! Debounced folder watching (F-11) with an event-storm guard.
 
 use crate::Result;
-use notify::RecursiveMode;
+use notify::{
+    event::{AccessKind, AccessMode},
+    Event, EventKind, RecursiveMode,
+};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, RecommendedCache};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -38,6 +41,17 @@ pub struct FolderWatcher {
 
 /// More than this many debounced batches per second marks a storm.
 const STORM_BATCHES_PER_SEC: usize = 8;
+
+// Opening/reading a preview (or listing a folder) must not invalidate itself.
+// Keep close-after-write: it also signals that an interrupted write is ready to retry.
+fn changes_contents(event: &Event) -> bool {
+    event.need_rescan()
+        || match event.kind {
+            EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
+            EventKind::Access(_) => false,
+            _ => true,
+        }
+}
 
 impl FolderWatcher {
     pub fn new(debounce: Duration, on_change: Arc<ChangeFn>) -> Self {
@@ -77,7 +91,7 @@ impl FolderWatcher {
         let window: Mutex<Vec<Instant>> = Mutex::new(Vec::new());
         let mut debouncer = new_debouncer(self.debounce, None, move |res: DebounceEventResult| {
             if let Ok(events) = res {
-                if events.is_empty() {
+                if !events.iter().any(|event| changes_contents(event)) {
                     return;
                 }
                 let now = Instant::now();
@@ -219,6 +233,78 @@ mod tests {
         assert_eq!(w.watched().len(), 1);
         w.unwatch(d.path());
         assert!(w.watched().is_empty());
+    }
+
+    #[test]
+    fn detects_overwrite_and_atomic_replacement() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("image.png");
+        std::fs::write(&path, b"A").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let watcher = FolderWatcher::new(
+            Duration::from_millis(50),
+            Arc::new(move |_, _| {
+                let _ = tx.send(());
+            }),
+        );
+        watcher.watch(d.path()).unwrap();
+        std::fs::write(&path, b"B").unwrap();
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let temp = d.path().join("temporary.png");
+        std::fs::write(&temp, b"C").unwrap();
+        // Windows rename does not overwrite an existing destination.
+        #[cfg(windows)]
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(&temp, &path).unwrap();
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"C");
+        watcher.unwatch(d.path());
+        assert!(watcher.watched().is_empty());
+    }
+
+    #[test]
+    fn filters_read_access_but_keeps_completed_writes_and_renames() {
+        use notify::event::{ModifyKind, RenameMode};
+        for access in [
+            AccessKind::Open(AccessMode::Any),
+            AccessKind::Read,
+            AccessKind::Close(AccessMode::Read),
+            AccessKind::Any,
+        ] {
+            assert!(!changes_contents(&Event::new(EventKind::Access(access))));
+        }
+        assert!(changes_contents(&Event::new(EventKind::Access(
+            AccessKind::Close(AccessMode::Write)
+        ))));
+        assert!(changes_contents(&Event::new(EventKind::Modify(
+            ModifyKind::Name(RenameMode::Both)
+        ))));
+        assert!(changes_contents(&Event::new(EventKind::Remove(
+            notify::event::RemoveKind::File
+        ))));
+    }
+
+    #[test]
+    fn reading_a_preview_does_not_trigger_another_refresh() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("image.png");
+        std::fs::write(&path, b"image").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let watcher = FolderWatcher::new(
+            Duration::from_millis(50),
+            Arc::new(move |_, _| {
+                let _ = tx.send(());
+            }),
+        );
+        watcher.watch(d.path()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"image");
+        assert!(
+            rx.recv_timeout(Duration::from_millis(400)).is_err(),
+            "reading the preview must not invalidate itself"
+        );
+        std::fs::write(&path, b"updated").unwrap();
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        watcher.unwatch(d.path());
     }
 
     fn quiet() -> FolderWatcher {

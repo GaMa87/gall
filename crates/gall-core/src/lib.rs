@@ -4,10 +4,12 @@
 //! (sorting, filtering, navigation history, settings safety, file operations)
 //! can be unit-tested in isolation.
 
+pub mod diagnostics;
 pub mod error;
 pub mod fs;
 pub mod nav;
 pub mod preview;
+pub mod report_bundle;
 pub mod storage;
 pub mod sysmon;
 pub mod util;

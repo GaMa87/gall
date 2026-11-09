@@ -13,7 +13,7 @@ permissions:
 jobs:
   build:
     # Only on the public repo: the private development repo runs no CI/CD.
-    if: github.repository == 'GaMa87/gall'
+    if: github.repository == 'GaMa87/gall' && startsWith(github.ref, 'refs/tags/v')
     strategy:
       fail-fast: false
       matrix:
@@ -47,16 +47,35 @@ jobs:
             package-lock.json
             ui/package-lock.json
       - run: npm ci && npm ci --prefix ui
+      - name: Prepare signed updater build
+        id: updater
+        shell: bash
+        env:
+          GALL_UPDATER_PUBLIC_KEY: ${{ vars.GALL_UPDATER_PUBLIC_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [[ -z "$GALL_UPDATER_PUBLIC_KEY" || -z "$TAURI_SIGNING_PRIVATE_KEY" ]]; then
+            echo "Configure GALL_UPDATER_PUBLIC_KEY and TAURI_SIGNING_PRIVATE_KEY before releasing." >&2
+            exit 1
+          fi
+          node -e 'require("fs").writeFileSync(".updater-release.json", JSON.stringify({bundle:{createUpdaterArtifacts:true}}))'
+          echo "config=$(pwd)/.updater-release.json" >> "$GITHUB_OUTPUT"
       - uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GALL_UPDATER_PUBLIC_KEY: ${{ vars.GALL_UPDATER_PUBLIC_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: 'Gall ${{ github.ref_name }}'
           releaseBody: 'See CHANGELOG.md for details. Linux and Windows are fully supported; macOS builds are experimental.'
           releaseDraft: true
-          prerelease: true
-          args: ${{ matrix.args }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          uploadUpdaterJson: true
+          uploadUpdaterSignatures: true
+          updaterJsonPreferNsis: true
+          args: ${{ matrix.args }} --config "${{ steps.updater.outputs.config }}"
       # Portable Windows zip: the exe tauri-action just built, plus a `portable` marker.
       - name: Portable zip (Windows)
         if: startsWith(matrix.platform, 'windows')

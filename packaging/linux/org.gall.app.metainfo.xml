@@ -34,5 +34,5 @@
     <screenshot><caption>Every shortcut in one searchable sheet</caption><image>https://raw.githubusercontent.com/GaMa87/gall/main/docs/screenshots/key-sheet.png</image></screenshot>
     <screenshot><caption>Light theme with a thumbnail grid</caption><image>https://raw.githubusercontent.com/GaMa87/gall/main/docs/screenshots/light-grid.png</image></screenshot>
   </screenshots>
-  <releases><release version="0.1.3" date="2026-11-05"/><release version="0.1.2" date="2026-11-04"/><release version="0.1.1" date="2026-11-03"/><release version="0.1.0" date="2026-10-31"/></releases>
+  <releases><release version="0.2.0" date="2026-11-09"/><release version="0.1.3" date="2026-11-05"/><release version="0.1.2" date="2026-11-04"/><release version="0.1.1" date="2026-11-03"/><release version="0.1.0" date="2026-10-31"/></releases>
 </component>

@@ -4,7 +4,7 @@ import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { api, events } from "../api/ipc";
 import type { FileEntry, IndexHit, IndexStatus } from "../api/types";
 import { fuzzyMatch } from "../core/fuzzy";
-import { ACTION_LABELS, buildKeymap, primaryMod, type Action } from "../core/keymap";
+import { ACTION_LABELS, buildKeymap, keyboardProfile, primaryMod, type Action } from "../core/keymap";
 import { basename, isInside, parent, quickToWildcard, tildify } from "../core/path";
 import { listBindings, treeForSettings, showKeys } from "../core/vim";
 import { archiveOf } from "../core/archive";
@@ -66,6 +66,8 @@ export function QuickOpen({ initial }: { initial?: string }) {
   const [scan, setScan] = useState<{ scanning: boolean; entries: number } | null>(null);
   const [status, setStatus] = useState<IndexStatus | null>(null);
   const [idx, setIdx] = useState(0);
+  const [revision, setRevision] = useState(0);
+  const [existingRecent, setExistingRecent] = useState<Set<string>>(new Set());
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const b = A.activeBrowser();
@@ -87,10 +89,28 @@ export function QuickOpen({ initial }: { initial?: string }) {
     const un = events.indexUpdated((s) => {
       setStatus(s);
       scope().catch(() => {});
+      setRevision((v) => v + 1);
       runQuery.current(true);
     });
-    return () => void un.then((f) => f());
+    const unFs = events.fsChanged(() => {
+      setRevision((v) => v + 1);
+      runQuery.current(true);
+    });
+    return () => {
+      void un.then((f) => f());
+      void unFs.then((f) => f());
+    };
   }, []);
+
+  useEffect(() => {
+    let active = true;
+    const paths = [...new Set([...recent, ...history])]
+      .filter((p) => !scopeHere || isInside(p, here));
+    api.findExisting(paths).then((paths) => {
+      if (active) setExistingRecent(new Set(paths));
+    }).catch(() => {});
+    return () => { active = false; };
+  }, [recent, history, scopeHere, here, revision]);
 
   // ───────── file query (debounced, stale responses dropped) ─────────
   // The highlighted file, so a refresh of the same query keeps it highlighted.
@@ -123,7 +143,7 @@ export function QuickOpen({ initial }: { initial?: string }) {
 
   // ───────── command palette rows ─────────
   const commands = useMemo(() => {
-    const km = buildKeymap(settings.shortcuts);
+    const km = buildKeymap(settings.shortcuts, keyboardProfile(settings));
     const chords = new Map<Action, string>();
     for (const [c, a] of km) if (!chords.has(a)) chords.set(a, c);
     const vim = new Map<Action, string>();
@@ -147,7 +167,7 @@ export function QuickOpen({ initial }: { initial?: string }) {
       const seen = new Set<string>();
       const list: Row[] = [];
       for (const p of [...recent, ...history]) {
-        if (seen.has(p) || (scopeHere && !isInside(p, here))) continue;
+        if (!existingRecent.has(p) || seen.has(p) || (scopeHere && !isInside(p, here))) continue;
         seen.add(p);
         const isDir = !recent.includes(p);
         list.push({ kind: "file", recent: true, hit: { path: p, name: basename(p), isDir, score: 0, positions: [] } });
@@ -156,16 +176,17 @@ export function QuickOpen({ initial }: { initial?: string }) {
       return list;
     }
     return hits.map((hit) => ({ kind: "file" as const, hit }));
-  }, [cmdMode, q, commands, hits, recent, history, scopeHere, here]);
+  }, [cmdMode, q, commands, hits, recent, history, scopeHere, here, existingRecent]);
 
-  const cur = rows[Math.min(idx, rows.length - 1)];
+  const activeIdx = Math.min(idx, rows.length - 1);
+  const cur = rows[activeIdx];
   selectedPath.current = cur?.kind === "file" ? cur.hit.path : null;
   const curEntry = cur?.kind === "file" ? pseudoEntry(cur.hit.path, cur.hit.isDir) : null;
   const info = usePreviewInfo(curEntry);
 
   useEffect(() => {
     listRef.current?.querySelector(".qo-row.on")?.scrollIntoView({ block: "nearest" });
-  }, [idx]);
+  }, [idx, rows.length]);
 
   // ───────── actions ─────────
   const close = () => A.openOverlay(null);
@@ -267,7 +288,7 @@ export function QuickOpen({ initial }: { initial?: string }) {
             {!cmdMode && !q.trim() && rows.length > 0 && <div className="qo-section">Recent</div>}
             {rows.map((r, i) =>
               r.kind === "cmd" ? (
-                <div key={r.action} className={`qo-row cmd ${i === idx ? "on" : ""}`} onMouseMove={() => i !== idx && setIdx(i)} onClick={() => accept(r, "open")}>
+                <div key={r.action} className={`qo-row cmd ${i === activeIdx ? "on" : ""}`} onMouseMove={() => i !== idx && setIdx(i)} onClick={() => accept(r, "open")}>
                   <span className="qo-name"><Highlight text={r.label} positions={r.positions} /></span>
                   <span className="qo-keys">
                     {r.vim && <kbd className="vim">{r.vim}</kbd>}
@@ -275,7 +296,7 @@ export function QuickOpen({ initial }: { initial?: string }) {
                   </span>
                 </div>
               ) : (
-                <FileRow key={r.hit.path} hit={r.hit} on={i === idx} recent={r.recent}
+                <FileRow key={r.hit.path} hit={r.hit} on={i === activeIdx} recent={r.recent}
                   onHover={() => i !== idx && setIdx(i)} onClick={(e) => accept(r, primaryMod(e) ? "reveal" : "open")} />
               ),
             )}

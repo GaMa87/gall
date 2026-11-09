@@ -1,6 +1,8 @@
+import { BugReport } from "./BugReport";
 // Modal overlays, context menu, notifications and task progress.
 import { createPortal } from "react-dom";
 import { DiffView } from "./DiffView";
+import { GitGraph } from "./GitGraph";
 import { DirCompare } from "./DirCompare";
 import { SimilarityMatrix } from "./SimilarityMatrix";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
@@ -211,7 +213,7 @@ function dialogKey(d: DialogSpec): number {
 
 function Dialog({ d }: { d: DialogSpec }) {
   const [value, setValue] = useState(d.input?.value ?? "");
-  const inputRef = useRef<HTMLInputElement>(null);
+  const inputRef = useRef<HTMLInputElement | HTMLTextAreaElement>(null);
   const toggle = useRef(0);
   // The window the dialog was asked from (it stays open beneath) gets the keyboard back.
   useEffect(() => {
@@ -256,6 +258,7 @@ function Dialog({ d }: { d: DialogSpec }) {
             e.preventDefault();
             finish(accel.id);
           } else if (e.key === "Enter") {
+            if (d.input?.multiline && e.target === inputRef.current && !e.ctrlKey && !e.metaKey) return;
             e.preventDefault();
             const fb = focusedButton();
             if (fb && plain) finish(fb.dataset.id!);
@@ -273,7 +276,7 @@ function Dialog({ d }: { d: DialogSpec }) {
         <h3>{d.title}</h3>
         <div className="body">
           {d.message && <p>{d.message}</p>}
-          {d.input && <input ref={inputRef} type={d.input.password ? "password" : "text"} autoComplete="off" value={value} placeholder={d.input.placeholder} onChange={(e) => setValue(e.target.value)} spellCheck={false} />}
+          {d.input && (d.input.multiline ? <><textarea ref={(element) => { inputRef.current = element; }} className="dialog-multiline" aria-label={d.title} value={value} placeholder={d.input.placeholder} onChange={(e) => setValue(e.target.value)} spellCheck={false} /><small>Ctrl+Enter saves · Escape cancels</small></> : <input ref={(element) => { inputRef.current = element; }} type={d.input.password ? "password" : "text"} autoComplete="off" value={value} placeholder={d.input.placeholder} onChange={(e) => setValue(e.target.value)} spellCheck={false} />)}
         </div>
         <div className="buttons" ref={buttonsRef}>
           {d.buttons.map((b) => (
@@ -575,7 +578,7 @@ function Properties({ entry }: { entry: FileEntry }) {
               {!entry.isDir && <tr><td>Size</td><td>{formatSize(entry.size)} ({entry.size.toLocaleString()} bytes)</td></tr>}
               {entry.isDir && (
                 <tr><td>Size</td><td title={A.folderSizeTitle(total)}>
-                  {total ? `${A.folderSizeLabel(total)} (${total.bytes.toLocaleString()} bytes) in ${total.files.toLocaleString()} files, ${total.dirs.toLocaleString()} folders${total.unreadable ? `; ${A.items(total.unreadable)} unreadable` : ""}` : "counting…"}
+                  {A.folderSizeDetails(total)}
                 </td></tr>
               )}
               {entry.isDir && info?.folderItems != null && <tr><td>Contents</td><td>{A.items(info.folderItems)} directly inside</td></tr>}
@@ -772,6 +775,7 @@ const dialogOnTop = () => getState().overlay?.type === "dialog";
 function OverlayWindow({ o }: { o: Overlay }) {
   switch (o.type) {
     case "dialog": return null;
+    case "bugReport": return <BugReport previous={o.previous} resume={o.resume} />;
     case "pathEdit": return <PathEdit b={o.b} />;
     case "templates": return <Templates dir={o.dir} b={o.b} />;
     case "note": return <NoteEditor dir={o.dir} path={o.path} text={o.text} overlay={o} />;
@@ -784,6 +788,8 @@ function OverlayWindow({ o }: { o: Overlay }) {
     case "quickOpen": return <QuickOpen initial={o.initial} />;
     case "grep": return <FindInFiles root={o.root} scope={o.scope} />;
     case "keys": return <KeyHelp />;
+    case "gitGraph": return <GitGraph path={o.path} />;
+    case "gitCommits": return <GitGraph path={o.path} compareFile={o.path} />;
     case "settings": return <SettingsDialog section={o.section} />;
     case "about": return <About />;
     case "welcome": return <Welcome />;
@@ -831,6 +837,7 @@ export function Notifications() {
             <span className="ti"><Icon name={NOTE_ICON[n.kind]} size={n.kind === "error" ? 18 : 16} /></span>
             <span className="t">{n.text}</span>
             {n.action && <button onClick={(e) => { e.stopPropagation(); n.action!.run(); A.dismiss(n.id); }}>{n.action.label}</button>}
+            {n.kind === "error" && <button onClick={(e) => { e.stopPropagation(); A.openOverlay({ type: "bugReport" }); }}>Report a bug</button>}
             {n.kind === "error" && <span className="tx" title="Dismiss"><Icon name="close" size={12} /></span>}
           </div>
         ))}

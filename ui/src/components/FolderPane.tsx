@@ -185,11 +185,11 @@ export function FolderPane({ b, path, active, compact }: Props) {
   // not jump around while folders are being counted.
   const folderSizes = useStore((s) => s.folderSizes);
   const doneSizes = spec.key === "size"
-    ? Object.entries(folderSizes).filter(([, f]) => f.done).map(([p, f]) => `${p}:${f.bytes}`).join("|")
+    ? Object.entries(folderSizes).filter(([, f]) => f.done && !f.virtualFs).map(([p, f]) => `${p}:${f.bytes}`).join("|")
     : "";
   const visible = useMemo(() => {
     const filtered = filter ? dir.entries.filter((e) => quickFilterMatches(e.name, filter)) : dir.entries;
-    const sizeOf = (p: string) => { const f = getState().folderSizes[p]; return f?.done ? f.bytes : undefined; };
+    const sizeOf = (p: string) => A.folderSizeBytes(getState().folderSizes[p]);
     return sortEntries(filtered, spec, spec.key === "size" ? sizeOf : undefined);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dir.entries, filter, spec.key, spec.descending, spec.foldersOnTop, spec.foldersByName, doneSizes]);
@@ -1311,9 +1311,9 @@ export function FolderPane({ b, path, active, compact }: Props) {
         {filter && <span className="mod accent" title={`Filtered from ${dir.entries.length}`}><Glyph nf={"\u{F0B0}"} icon="search" />{filter}</span>}
         <span style={{ flex: 1 }} />
         {git && (
-          <span className="mod git" title={`Git: ${git.branch ? `branch ${git.branch}` : "detached HEAD"}${git.ahead ? `, ${git.ahead} to push` : ""}${git.behind ? `, ${git.behind} to pull` : ""} · ${git.root}`}>
-            <Glyph nf={"\u{E0A0}"} icon="code" />{git.branch ?? "detached"}{git.ahead ? ` ↑${git.ahead}` : ""}{git.behind ? ` ↓${git.behind}` : ""}
-          </span>
+          <button className="mod git" onClick={() => A.openOverlay({ type: "gitGraph", path: git.root })} title={`Git: ${git.branch ? `branch ${git.branch}` : "detached HEAD"}${git.ahead ? `, ${git.ahead} to push` : ""}${git.behind ? `, ${git.behind} to pull` : ""}${git.containingBranches?.length ? `, contained in ${git.containingBranches.join(", ")}` : ""}${git.subject ? ` · ${git.subject}` : ""} · ${git.root}`}>
+            <Glyph nf={"\u{E0A0}"} icon="code" />{git.branch ?? (git.containingBranches?.length ? git.containingBranches.join(", ") : "detached")}{git.subject ? ` · ${git.subject}` : ""}{git.ahead ? ` ↑${git.ahead}` : ""}{git.behind ? ` ↓${git.behind}` : ""}
+          </button>
         )}
         {sel.size > 0 && <span className="mod accent"><Glyph nf={"\u{F14A}"} icon="check" />{sel.size}{selBytes ? ` · ${formatSize(selBytes)}` : ""}</span>}
       </div>

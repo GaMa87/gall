@@ -5,8 +5,8 @@ import "./styles/app.css";
 import { api } from "./api/ipc";
 
 // Forward UI errors to the backend log file for diagnosis.
-window.addEventListener("error", (e) => api.uiLog("error", `${e.message} @ ${e.filename}:${e.lineno}`).catch(() => {}));
-window.addEventListener("unhandledrejection", (e) => api.uiLog("error", `unhandled: ${String(e.reason)}`).catch(() => {}));
+window.addEventListener("error", (e) => api.uiLog("error", `${e.message} @ ${e.filename}:${e.lineno}\n${e.error?.stack ?? ""}`).catch(() => {}));
+window.addEventListener("unhandledrejection", (e) => api.uiLog("error", `unhandled: ${(e.reason instanceof Error ? e.reason.stack ?? e.reason.message : String(e.reason))}`).catch(() => {}));
 
 // While an input method composes text (Japanese, Chinese, Korean, Vietnamese …), Enter,
 // Esc, the arrows and letters belong to it: Enter picks the characters and must not also

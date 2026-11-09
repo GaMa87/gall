@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildKeymap } from "./keymap";
+import { buildKeymap, DEFAULT_KEYMAP, type Action, type KeyboardProfile } from "./keymap";
 import { buildLeaderTree, buildVimTree, CTRL_TAP, keysForAction, leaderToken, listBindings, resolve, shadowedByVim, shortcutLabel, splitKeys, treeForSettings, vimToken, type KeyNode } from "./vim";
 
 describe("vim keys", () => {
@@ -24,6 +24,13 @@ describe("vim keys", () => {
     expect(resolve(tree, ["z", "x"])).toEqual({ kind: "action", action: "extractHere" });
     expect(resolve(tree, ["d", "D"])).toEqual({ kind: "action", action: "deletePermanent" });
     expect(resolve(tree, ["g", "z"]).kind).toBe("none");
+    expect(resolve(tree, ["="]).kind).toBe("pending");
+    expect(resolve(tree, ["=", "="])).toEqual({ kind: "action", action: "compare" });
+    expect(resolve(tree, ["=", "h"])).toEqual({ kind: "action", action: "compareGitHead" });
+    expect(resolve(tree, ["=", "r"]).kind).toBe("none");
+    expect(resolve(tree, ["g", "r"])).toEqual({ kind: "action", action: "gitGraph" });
+    expect(resolve(tree, ["=", "g"])).toEqual({ kind: "action", action: "compareGitCommit" });
+    expect(resolve(tree, ["+", "+"])).toEqual({ kind: "action", action: "focusOther" });
   });
 
   it("leader menu with groups", () => {
@@ -33,6 +40,22 @@ describe("vim keys", () => {
     expect(resolve(tree, ["Space", "Space"])).toEqual({ kind: "action", action: "quickOpen" });
     expect(resolve(tree, ["Space", "f", "f"])).toEqual({ kind: "action", action: "quickOpen" });
     expect(resolve(tree, ["Space", "s", "G"])).toEqual({ kind: "action", action: "grepRoot" });
+  });
+
+  it("pins and unpins through the normal key or discoverable buffer leader group", () => {
+    expect(resolve(tree, ["b"])).toEqual({ kind: "action", action: "togglePin" });
+    expect(resolve(tree, ["Space", "b", "p"])).toEqual({ kind: "action", action: "togglePin" });
+    expect(resolve(buildLeaderTree(CTRL_TAP), [CTRL_TAP, "b", "p"])).toEqual({ kind: "action", action: "togglePin" });
+    expect(resolve(buildVimTree(";"), [";", "b", "p"])).toEqual({ kind: "action", action: "togglePin" });
+  });
+
+  it("offers a vim or leader sequence for every keyboard action", () => {
+    const actions = new Set(listBindings(tree).map((binding) => binding.action));
+    const missing = (Object.keys(DEFAULT_KEYMAP) as Action[]).filter((action) => !actions.has(action));
+    expect(missing).toEqual([]);
+    expect(resolve(tree, ["v"])).toEqual({ kind: "action", action: "visualMode" });
+    expect(resolve(tree, ["Space", "v"])).toEqual({ kind: "action", action: "toggleSelect" });
+    expect(resolve(tree, ["Space", "o", "m"])).toEqual({ kind: "action", action: "contextMenu" });
   });
 
   it("custom leader", () => {
@@ -83,6 +106,23 @@ describe("vim keys", () => {
     expect(shortcutLabel("\\", bs)).toBe("Alt+D");
     expect(keysForAction("editPath", bs)).toBe("Alt+D");
   });
+  it("shows each profile's effective keys for legacy menu hints", () => {
+    for (const profile of ["explorer", "totalCommander", "vim"] as KeyboardProfile[]) {
+      const ctx = { vim: profile === "vim", keymap: buildKeymap({}, profile), leader: profile === "vim" ? "Space" : "Ctrl Ctrl" };
+      expect(shortcutLabel("F4", ctx)).toBe(profile === "vim" ? "e" : profile === "explorer" ? "Ctrl+Alt+E" : "F4");
+      expect(shortcutLabel("F5", ctx)).toBe(profile === "vim" ? "R" : profile === "totalCommander" ? "F2" : "F5");
+      expect(keysForAction("copyToOther", ctx)).toBe(profile === "vim" ? "C" : profile === "totalCommander" ? "F5" : "Alt+C");
+      expect(keysForAction("longNames", ctx)).not.toBeNull();
+    }
+  });
+  it("keeps every non-motion Gall command accessible in all three profiles", () => {
+    const motions = new Set<Action>(["cursorDown", "cursorUp", "cursorTop", "cursorBottom", "halfPageDown", "halfPageUp", "enter", "filter", "tab1", "tab2", "tab3", "tab4", "tab5", "tab6", "tab7", "tab8", "tab9", "visualMode"]);
+    for (const profile of ["explorer", "totalCommander", "vim"] as KeyboardProfile[]) {
+      const ctx = { vim: profile === "vim", keymap: buildKeymap({}, profile), leader: profile === "vim" ? "Space" : "Ctrl Ctrl" };
+      const missing = (Object.keys(DEFAULT_KEYMAP) as Action[]).filter((a) => !motions.has(a) && !keysForAction(a, ctx));
+      expect(missing).toEqual([]);
+    }
+  });
 
   it("Ctrl tap / double tap as leader", () => {
     expect(leaderToken("Ctrl")).toBe(CTRL_TAP);
@@ -112,10 +152,10 @@ describe("vim keys", () => {
     for (const l of ["Space", ";", "\\", CTRL_TAP]) expect(walk(buildVimTree(l), [])).toEqual([]);
   });
 
-  it("tokens are case-sensitive and ignore Alt", () => {
+  it("tokens use Shift for case and ignore Alt", () => {
     const ev = (key: string, m: Partial<{ ctrlKey: boolean; altKey: boolean; shiftKey: boolean }> = {}) =>
       vimToken({ key, ctrlKey: false, metaKey: false, altKey: false, ...m });
-    expect(ev("G")).toBe("G");
+    expect(ev("g", { shiftKey: true })).toBe("G");
     expect(ev(" ")).toBe("Space");
     expect(ev("D", { ctrlKey: true })).toBe("Ctrl+d");
     // Ctrl+Shift+D is "compare", not vim's half page down; same for Ctrl+Shift+L.
@@ -124,6 +164,15 @@ describe("vim keys", () => {
     expect(ev("x", { altKey: true })).toBeNull();
     expect(ev("Shift")).toBeNull();
     expect(ev("ArrowDown")).toBeNull();
+  });
+
+  it("uses Shift rather than Caps Lock letter casing for Vim keys", () => {
+    const ev = (key: string, shiftKey = false) =>
+      vimToken({ key, ctrlKey: false, metaKey: false, altKey: false, shiftKey });
+    expect(ev("j")).toBe("j");
+    expect(ev("J")).toBe("j");
+    expect(ev("J", true)).toBe("J");
+    expect(ev("j", true)).toBe("J");
   });
 
   it("every binding is reachable and unique", () => {

@@ -43,6 +43,9 @@ function SupportCard({ quiet = false }: { quiet?: boolean }) {
 
 export function AboutInfo({ full = false }: { full?: boolean }) {
   const info = useStore((s) => s.info);
+  const reportButton = <button className="btn about-report-button" onClick={() => A.openOverlay({ type: "bugReport" })}>
+    <span className="about-report-icon"><Icon name="activity" size={15} /></span><span>Report a bug</span>
+  </button>;
   return (
     <div className={`about ${full ? "full" : "compact"}`}>
       <header className="about-hero">
@@ -51,6 +54,7 @@ export function AboutInfo({ full = false }: { full?: boolean }) {
           <div><b>Gall</b>{info?.version && <span className="about-ver">v{info.version}</span>}</div>
           <span className="about-sub">Open-source Miller-column, dual-pane file manager</span>
           <div className="about-links">
+            {!full && reportButton}
             <button className="link-btn" onClick={() => openUrl(SOURCE_URL)}><Icon name="code" size={13} />Source code</button>
             <span className="about-dot">·</span>
             <span>MIT licence</span>
@@ -60,7 +64,9 @@ export function AboutInfo({ full = false }: { full?: boolean }) {
             <button className="link-btn" onClick={() => A.openOverlay({ type: "welcome" })}><Icon name="wand" size={13} />Welcome setup</button>
           </div>
         </div>
+        {full && reportButton}
       </header>
+
 
       <dl className="about-facts">
         <dt>Version</dt><dd>{info?.version}</dd>

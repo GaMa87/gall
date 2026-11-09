@@ -4,11 +4,12 @@ import { api } from "../api/ipc";
 import { FolderLink } from "./FolderLink";
 import type { FontFamily, OpenRule, Settings } from "../api/types";
 import { ruleLabel } from "../core/openRules";
-import { ACTION_LABELS, DEFAULT_KEYMAP, buildKeymap, normalizeChord, type Action } from "../core/keymap";
+import { ACTION_LABELS, DEFAULT_KEYMAP, KEYBOARD_PROFILES, buildKeymap, defaultKeymap, keyboardProfile, normalizeChord, type Action, type KeyboardProfile } from "../core/keymap";
 import * as A from "../state/actions";
 import { getState, useStore } from "../state/store";
 import { useKeyLabels } from "../state/keyLabels";
 import { AboutInfo } from "./AboutInfo";
+import { Updates } from "./Updates";
 import { join } from "../core/path";
 import { BUILTIN_THEMES } from "../themes";
 import { Icon } from "./Icon";
@@ -76,22 +77,24 @@ const SECTIONS: Section[] = [
     id: "search", title: "Search", icon: "search", desc: "Quick Open index and find in files.", groups: [
       { title: "Quick Open index (Ctrl+P)", opts: [
         { key: "indexRoots", label: "Indexed folders", hint: "Separate with ; — empty = the whole system (/ or every drive). Rebuilt in the background.", type: "list" },
-        { key: "indexExclude", label: "Never index or search", hint: "Comma separated names or globs (gitignore syntax), e.g. node_modules, *.iso. Applies to Quick Open, find in files and the name search (F3). Folders tagged as caches (CACHEDIR.TAG) are skipped too. Per project: a .gallignore file (gitignore syntax, also outside git) in a folder applies to it and everything below; right-click › Hide from search adds an item to it. Alt+I in a search includes all of these.", type: "list" },
+        { key: "indexExclude", label: "Never index or search", hint: "Comma separated names or globs (gitignore syntax), e.g. node_modules, *.iso. Applies to Quick Open, find in files and name search. Folders tagged as caches (CACHEDIR.TAG) are skipped too. Per project: a .gallignore file (gitignore syntax, also outside git) in a folder applies to it and everything below; right-click › Hide from search adds an item to it. Alt+I in a search includes all of these.", type: "list" },
         { key: "indexHidden", label: "Index hidden files and folders", type: "bool" },
         { key: "indexRespectGitignore", label: "Skip files ignored by .gitignore", type: "bool" },
         { key: "indexRefreshMinutes", label: "Re-index every (minutes)", hint: "0 = only when Quick Open finds the index older than a minute", type: "number", min: 0, max: 1440 },
       ] },
-      { title: "Find in files and name search (Ctrl+F / Ctrl+Shift+F / F3)", opts: [
+      { title: "Find in files and name search", opts: [
         { key: "searchRespectGitignore", label: "Skip files ignored by .gitignore", type: "bool" },
       ] },
     ],
   },
   {
-    id: "keyboard-vim", title: "Vim keys", icon: "code", desc: "Vim-style keys and the leader-key menu.", groups: [
-      { title: "Vim-style navigation", opts: [
-        { key: "vimKeys", label: "Enable vim keys in the file list", hint: "j/k/h/l, gg/G, Ctrl+D/U, yy/dd/p, / to filter, ? for the full list. Typing to filter then needs /.", type: "bool" },
-        { key: "leaderKey", label: "Leader key (vim keys on)", hint: "Opens the which-key menu. Space Space = go to file, as in LazyVim.", type: "select", options: [["Space", "Space (default)"], ["\\", "\\ (backslash, Vim's default)"], [";", "; (semicolon)"], ["Ctrl", "Ctrl once"], ["Ctrl Ctrl", "Ctrl twice"]] },
-        { key: "leaderKeyBasic", label: "Leader key (vim keys off)", hint: "Opens the same menu without vim keys. Space and letters keep their usual meaning (preview, type to filter).", type: "select", options: [["Ctrl Ctrl", "Ctrl twice (default)"], ["Ctrl", "Ctrl once"], ["\\", "\\ (backslash)"], [";", "; (semicolon)"], ["", "None"]] },
+    id: "keyboard-vim", title: "Keyboard", icon: "code", desc: "Three keyboard profiles with all Gall commands, searchable help and custom shortcuts.", groups: [
+      { title: "Keyboard profile", opts: [
+        { key: "keyboardProfile", label: "Keyboard profile", hint: "Choose familiar shortcuts; every profile keeps all Gall commands. ? opens this profile's help. Custom shortcuts apply to all profiles.", type: "select", options: Object.entries(KEYBOARD_PROFILES) as [KeyboardProfile, string][] },
+      ] },
+      { title: "Command menu", opts: [
+        { key: "leaderKey", label: "Leader key (Vim)", hint: "Opens the which-key menu. Space Space = go to file, as in LazyVim.", type: "select", options: [["Space", "Space (default)"], ["\\", "\\ (backslash, Vim's default)"], [";", "; (semicolon)"], ["Ctrl", "Ctrl once"], ["Ctrl Ctrl", "Ctrl twice"]] },
+        { key: "leaderKeyBasic", label: "Leader key (Explorer / Commander)", hint: "Opens the same menu for all Gall commands. Letters still type to filter; Space previews.", type: "select", options: [["Ctrl Ctrl", "Ctrl twice (default)"], ["Ctrl", "Ctrl once"], ["\\", "\\ (backslash)"], [";", "; (semicolon)"], ["", "None"]] },
       ] },
     ],
   },
@@ -206,7 +209,7 @@ function DraftInput({ saved, commit, live, ...rest }: {
 }
 
 function OptRow({ o, s }: { o: Opt; s: Settings }) {
-  const v = s[o.key] as unknown;
+  const v = o.key === "keyboardProfile" ? keyboardProfile(s) : s[o.key] as unknown;
   const set = (val: unknown) => A.updateSettings({ [o.key]: val } as Partial<Settings>);
   const keys = useKeyLabels();
   let ctl: React.ReactNode;
@@ -340,10 +343,11 @@ function OpenRulesList({ rules, set, label, hint }: { rules: OpenRule[]; set: (v
 
 function Shortcuts({ s, q }: { s: Settings; q: string }) {
   const actions = (Object.keys(DEFAULT_KEYMAP) as Action[]).filter((a) => !q || ACTION_LABELS[a].toLowerCase().includes(q));
-  const keymap = useMemo(() => buildKeymap(s.shortcuts), [s.shortcuts]);
+  const profile = keyboardProfile(s);
+  const keymap = useMemo(() => buildKeymap(s.shortcuts, profile), [s.shortcuts, profile]);
   return (
     <>
-      {!q && <p className="section-note">Comma-separate several chords, e.g. <kbd>F5</kbd>, <kbd>Ctrl+R</kbd>. Enter or leaving the field saves; an empty field restores the default.</p>}
+      {!q && <p className="section-note">Profile: <b>{KEYBOARD_PROFILES[profile]}</b>. Custom shortcuts apply to all profiles. Comma-separate several chords, e.g. <kbd>F5</kbd>, <kbd>Ctrl+R</kbd>. Enter or leaving the field saves; an empty field restores this profile's default.</p>}
       <div className="scard kb-card">
       {actions.map((a) => <ShortcutRow key={a} a={a} s={s} keymap={keymap} />)}
       </div>
@@ -354,13 +358,14 @@ function Shortcuts({ s, q }: { s: Settings; q: string }) {
 /** One action's chords: edited as text and saved on Enter or blur (not on every key, so
  *  clearing the field to type a new chord does not snap back to the default). */
 function ShortcutRow({ a, s, keymap }: { a: Action; s: Settings; keymap: Map<string, Action> }) {
-  const saved = s.shortcuts[a] ?? DEFAULT_KEYMAP[a].join(", ");
+  const defaults = defaultKeymap(keyboardProfile(s))[a].join(", ");
+  const saved = s.shortcuts[a] ?? defaults;
   const [text, setText] = useState(saved);
   useEffect(() => setText(saved), [saved]);
   const commit = (t = text) => {
     const sc = { ...getState().settings!.shortcuts };
     const v = t.trim();
-    if (v === "" || v === DEFAULT_KEYMAP[a].join(", ")) delete sc[a];
+    if (v === "" || v === defaults) delete sc[a];
     else sc[a] = v;
     if (JSON.stringify(sc) !== JSON.stringify(getState().settings!.shortcuts)) A.updateSettings({ shortcuts: sc });
     else setText(saved);
@@ -397,8 +402,9 @@ function Group({ title, children }: { title: string; children: React.ReactNode }
 }
 
 const EXTRA_NAV = [
-  { id: "shortcuts", title: "Shortcuts", icon: "list", desc: "Rebind any action. Vim keys and the leader menu are listed in the key sheet." },
   { id: "about", title: "About", icon: "info", desc: "" },
+  { id: "updates", title: "Updates", icon: "info", desc: "" },
+  { id: "shortcuts", title: "Shortcuts", icon: "list", desc: "Rebind any action. Vim keys and the leader menu are listed in the key sheet." },
 ];
 
 export function SettingsDialog({ section: initial }: { section?: string }) {
@@ -461,7 +467,9 @@ export function SettingsDialog({ section: initial }: { section?: string }) {
                   <h2>{cur?.title ?? extra?.title}</h2>
                   {(cur?.desc ?? extra?.desc) && <p>{cur?.desc ?? extra?.desc}</p>}
                 </div>
-                {section === "shortcuts" ? (
+                {section === "updates" ? (
+                  <Updates />
+                ) : section === "shortcuts" ? (
                   <Shortcuts s={s} q="" />
                 ) : (
                   cur?.groups.map((g) => <Group key={g.title} title={g.title}>{g.opts.map((o) => <OptRow key={o.key} o={o} s={s} />)}</Group>)

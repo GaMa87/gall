@@ -31,7 +31,11 @@ const KNOWN: &[(&str, &str, &str)] = &[
         "xfce4-terminal",
         "xfce4-terminal --working-directory={dir}",
     ),
-    ("WezTerm", "wezterm", "wezterm start --cwd {dir}"),
+    (
+        "WezTerm",
+        "wezterm",
+        "wezterm start --always-new-process --cwd {dir}",
+    ),
     ("Kitty", "kitty", "kitty --directory {dir}"),
     ("Ghostty", "ghostty", "ghostty --working-directory={dir}"),
     (
@@ -62,7 +66,11 @@ const KNOWN: &[(&str, &str, &str)] = &[
         "/Applications/Ghostty.app",
         "open -a Ghostty {dir}",
     ),
-    ("WezTerm", "wezterm", "wezterm start --cwd {dir}"),
+    (
+        "WezTerm",
+        "wezterm",
+        "wezterm start --always-new-process --cwd {dir}",
+    ),
     ("Kitty", "kitty", "kitty --directory {dir}"),
     (
         "Alacritty",
@@ -79,7 +87,11 @@ const KNOWN: &[(&str, &str, &str)] = &[
     ("PowerShell 7", "pwsh", "pwsh.exe -NoLogo"),
     ("Windows PowerShell", "powershell", "powershell.exe -NoLogo"),
     ("Command Prompt", "cmd", "cmd.exe"),
-    ("WezTerm", "wezterm", "wezterm.exe start --cwd {dir}"),
+    (
+        "WezTerm",
+        "wezterm",
+        "wezterm.exe start --always-new-process --cwd {dir}",
+    ),
     (
         "Alacritty",
         "alacritty",

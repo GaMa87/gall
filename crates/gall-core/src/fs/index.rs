@@ -425,8 +425,43 @@ impl FileIndex {
 
     /// Runs `query`, optionally limited to paths under `scope`.
     pub fn query(&self, query: &str, scope: Option<&Path>, limit: usize) -> IndexResult {
-        let t0 = Instant::now();
+        let started = Instant::now();
         let snap = self.snap.read().unwrap().clone();
+        let limit = limit.max(1);
+        let mut candidates = limit;
+        let mut checked = std::collections::HashMap::new();
+        loop {
+            let mut result = self.query_cached(&snap, query, scope, candidates);
+            let exhausted = result.hits.len() < candidates || result.hits.len() == result.total;
+            result.hits.retain(|hit| {
+                *checked.entry(hit.path.clone()).or_insert_with(|| {
+                    // Only confirmed absence is grounds for hiding a result.
+                    // Permission and transient network errors must not erase it.
+                    !matches!(std::fs::symlink_metadata(&hit.path), Err(e)
+                        if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory))
+                })
+            });
+            if result.hits.len() >= limit || exhausted {
+                result.hits.truncate(limit);
+                result.total = result
+                    .total
+                    .saturating_sub(checked.values().filter(|v| !**v).count());
+                result.elapsed_ms = started.elapsed().as_millis() as u64;
+                return result;
+            }
+            // Validate ranked candidates, not every indexed path on every keystroke.
+            candidates = candidates.saturating_mul(2);
+        }
+    }
+
+    fn query_cached(
+        &self,
+        snap: &Snapshot,
+        query: &str,
+        scope: Option<&Path>,
+        limit: usize,
+    ) -> IndexResult {
+        let t0 = Instant::now();
         let q = Query::parse(query);
         let scope = scope.map(|p| {
             let mut s = p.to_string_lossy().into_owned();
@@ -814,6 +849,40 @@ mod tests {
         );
         assert!(r.hits.iter().any(|h| h.name == "src"));
         assert_eq!(idx.query("fpane/", None, 10).total, 0);
+    }
+
+    #[test]
+    fn deleted_matches_are_filtered_and_live_results_fill_the_limit() {
+        let d = tree();
+        let idx = FileIndex::new();
+        idx.rebuild(
+            &[d.path().to_path_buf()],
+            &IndexOptions::default(),
+            &AtomicBool::new(false),
+        );
+        std::fs::remove_file(d.path().join("src/main.rs")).unwrap();
+        std::fs::remove_dir_all(d.path().join("ui")).unwrap();
+
+        assert_eq!(
+            idx.query_cached(&idx.snap.read().unwrap(), "'main.rs", None, 10)
+                .total,
+            1,
+            "the cached snapshot still contains the deleted file"
+        );
+        assert_eq!(idx.query("'main.rs", None, 10).total, 0);
+        assert!(idx.query("ext:tsx", None, 10).hits.is_empty());
+        assert!(idx
+            .query("'ui/", Some(&d.path().join("ui")), 10)
+            .hits
+            .is_empty());
+        let result = idx.query("ext:rs", None, 1);
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].name, "index.rs");
+        assert_eq!(result.total, 1);
+
+        // A path recreated before the next rebuild is searchable again.
+        std::fs::write(d.path().join("src/main.rs"), "").unwrap();
+        assert_eq!(idx.query("'main.rs", None, 10).hits.len(), 1);
     }
 
     #[test]

@@ -1,10 +1,34 @@
+import type { ReportSections } from "../core/bugReport";
 // Typed wrappers over Tauri commands. One function per Rust command.
 import type { ArchiveFormat } from "../core/archive";
-import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { invoke as rawInvoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type * as T from "./types";
 
+// Never record arguments or successful results; error messages are sanitized by the backend.
+function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  const start = performance.now();
+  const record = !command.startsWith("bug_report_") && !command.startsWith("selftest_") && command !== "ui_log";
+  return rawInvoke<T>(command, args).then((value) => {
+    if (record) void rawInvoke("bug_report_record", { kind: "command", message: `${command} ok ${Math.round(performance.now() - start)}ms` }).catch(() => {});
+    return value;
+  }, (error) => {
+    if (record) void rawInvoke("bug_report_record", { kind: "command", message: `${command} failed ${Math.round(performance.now() - start)}ms` }).catch(() => {});
+    if (record) void rawInvoke("bug_report_record", { kind: "error", message: `${command} failed: ${String(error).slice(0, 1000)}` }).catch(() => {});
+    throw error;
+  });
+}
+
 export const api = {
+  bugReportPrepare: (description: string, includeLog: boolean, snapshot: { viewMode?: string; activeDialog?: string; tabCount?: number; paneCount?: number; taskCount?: number }, previous: boolean) => invoke<ReportSections & { title: string; body: string; fullBody: string; log: string; previousUnclean: boolean }>("bug_report_prepare", { description, includeLog, snapshot, previous }),
+  bugReportRecord: (kind: string, message: string) => invoke<void>("bug_report_record", { kind, message }),
+  bugReportStatus: () => invoke<boolean>("bug_report_status"),
+  bugReportDismiss: () => invoke<void>("bug_report_dismiss"),
+  bugReportCopyText: (text: string) => invoke<void>("bug_report_copy_text", { text }),
+  bugReportCopyScreenshot: (png: number[]) => invoke<{ width: number; height: number }>("bug_report_copy_screenshot", { png }),
+  bugReportExport: (path: string, body: string, attachments: { name: string; bytes: number[]; mime: string }[]) => invoke<void>("bug_report_export", { path, body, attachments }),
+  bugReportCapture: () => invoke<number[]>("bug_report_capture"),
+  bugReportSaveMedia: (path: string, bytes: number[], mime: string) => invoke<void>("bug_report_save_media", { path, bytes, mime }),
   appInfo: () => invoke<T.AppInfo>("app_info"),
   windowReady: () => invoke<void>("window_ready"),
   getSettings: () => invoke<T.Settings>("get_settings"),
@@ -60,6 +84,7 @@ export const api = {
   folderSize: (path: string, ticket: number) => invoke<T.DirSize | null>("folder_size", { path, ticket }),
   folderSizesCancel: (ticket: number) => invoke<void>("folder_sizes_cancel", { ticket }),
   gitStatus: (dir: string) => invoke<T.GitStatus | null>("git_status", { dir }),
+  gitCommits: (path: string) => invoke<{ id: string; subject: string }[]>("git_commits", { path }),
   /** Renames all items as one undo step (swaps allowed); resolves to the new paths. */
   batchRename: (items: [string, string][]) => invoke<string[]>("batch_rename", { items }),
   createDir: (parent: string, name: string) => invoke<string>("create_dir", { parent, name }),
@@ -79,6 +104,7 @@ export const api = {
   undoPeek: () => invoke<string | null>("undo_peek"),
   undoIn: (dir: string, permanent = false) => invoke<string>("undo_in", { dir, permanent }),
   undoPeekIn: (dir: string) => invoke<string | null>("undo_peek_in", { dir }),
+  shortcutResolve: (path: string) => invoke<T.FileEntry | null>("shortcut_resolve", { path }),
   openPath: (path: string) => invoke<void>("open_path", { path }),
   revealPath: (path: string) => invoke<void>("reveal_path", { path }),
   trashList: () => invoke<T.TrashEntry[]>("trash_list"),
@@ -192,8 +218,8 @@ export const events = {
   grepDone: (cb: (p: { id: number; stats: T.GrepStats; cancelled: boolean; error: string | null }) => void) =>
     listen<{ id: number; stats: T.GrepStats; cancelled: boolean; error: string | null }>("grep-done", (e) => cb(e.payload)),
   secondInstance: (cb: (a: T.CliArgs) => void) => listen<T.CliArgs>("second-instance", (e) => cb(e.payload)),
-  folderSizeProgress: (cb: (p: { path: string; size: T.DirSize }) => void) =>
-    listen<{ path: string; size: T.DirSize }>("folder-size-progress", (e) => cb(e.payload)),
+  folderSizeProgress: (cb: (p: { path: string; size: T.DirSize; ticket: number }) => void) =>
+    listen<{ path: string; size: T.DirSize; ticket: number }>("folder-size-progress", (e) => cb(e.payload)),
   backendLog: (cb: (l: BackendLog) => void) => listen<BackendLog>("backend-log", (e) => cb(e.payload)),
 };
 

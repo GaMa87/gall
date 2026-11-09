@@ -42,6 +42,8 @@ const mocks = vi.hoisted(() => ({
   state: { settings: { shortcuts: {} }, recentFiles: [] as string[], history: [] as string[] },
   indexQuery: vi.fn(),
   indexCovers: vi.fn(),
+  findExisting: vi.fn(),
+  fsChanged: null as null | (() => void),
   openOverlay: vi.fn(),
   navigate: vi.fn(),
   openEntries: vi.fn(),
@@ -51,9 +53,13 @@ const mocks = vi.hoisted(() => ({
 vi.mock("../api/ipc", () => ({
   api: {
     indexQuery: mocks.indexQuery, indexCovers: mocks.indexCovers,
+    findExisting: mocks.findExisting,
     indexStatus: () => Promise.resolve(null), indexRefresh: () => Promise.resolve(false),
   },
-  events: { indexUpdated: () => Promise.resolve(() => {}) },
+  events: {
+    indexUpdated: () => Promise.resolve(() => {}),
+    fsChanged: (cb: () => void) => { mocks.fsChanged = cb; return Promise.resolve(() => {}); },
+  },
 }));
 vi.mock("../state/store", () => ({
   useStore: (select: (s: typeof mocks.state) => unknown) => select(mocks.state),
@@ -74,6 +80,7 @@ type Props = {
   children?: unknown;
   className?: string;
   hit?: IndexHit;
+  on?: boolean;
   onKeyDown?: (e: KeyboardEvent) => void;
   onClick?: () => void;
   onChange?: (e: { target: { value: string } }) => void;
@@ -120,6 +127,7 @@ beforeEach(() => {
   mocks.path = "C:\\project";
   mocks.state.history = [];
   mocks.state.recentFiles = [];
+  mocks.findExisting.mockImplementation((paths: string[]) => Promise.resolve(paths));
   mocks.indexCovers.mockResolvedValue({ covered: true, scanning: false, entries: 0 });
   mocks.indexQuery.mockResolvedValue(result("C:\\project\\report.txt"));
 });
@@ -129,6 +137,51 @@ afterEach(() => {
 });
 
 describe("Quick Open archive and async regressions", () => {
+  it("omits deleted recent files and folders before they can be opened", async () => {
+    mocks.state.recentFiles = ["C:\\project\\deleted.txt", "C:\\project\\live.txt"];
+    mocks.state.history = ["C:\\project\\gone"];
+    mocks.findExisting.mockResolvedValue(["C:\\project\\live.txt"]);
+    render("");
+    await flush();
+    const paths = elements(render("")).flatMap((n) => n.props.hit ? [n.props.hit.path] : []);
+    expect(paths).toEqual(["C:\\project\\live.txt"]);
+    key("Enter");
+    expect(mocks.openEntries).toHaveBeenCalledWith(0, [expect.objectContaining({ path: "C:\\project\\live.txt" })]);
+  });
+
+  it("rechecks recent paths and the active search after a filesystem change", async () => {
+    mocks.state.recentFiles = ["C:\\project\\report.txt"];
+    render("");
+    await flush();
+    expect(elements(render("")).some((n) => n.props.hit)).toBe(true);
+    mocks.findExisting.mockResolvedValue([]);
+    mocks.fsChanged!();
+    render("");
+    await flush();
+    expect(elements(render("")).some((n) => n.props.hit)).toBe(false);
+    change("report");
+    await vi.advanceTimersByTimeAsync(25);
+    mocks.indexQuery.mockResolvedValue({ ...result(""), hits: [], total: 0 });
+    mocks.fsChanged!();
+    await flush();
+    expect(elements(render()).some((n) => n.props.hit)).toBe(false);
+  });
+
+  it("keeps the row Enter opens highlighted when earlier recent paths disappear", async () => {
+    mocks.state.recentFiles = ["C:\\project\\deleted.txt", "C:\\project\\live.txt"];
+    render("");
+    await flush();
+    key("ArrowDown");
+    mocks.findExisting.mockResolvedValue(["C:\\project\\live.txt"]);
+    mocks.fsChanged!();
+    render("");
+    await flush();
+    const row = elements(render("")).find((n) => n.props.hit);
+    expect(row?.props.on).toBe(true);
+    key("Enter");
+    expect(mocks.openEntries).toHaveBeenCalledWith(0, [expect.objectContaining({ path: "C:\\project\\live.txt" })]);
+  });
+
   it("does not offer or activate filesystem-only searches inside archives", async () => {
     mocks.path = "C:\\project\\photos.zip\\2026";
     const tree = render();

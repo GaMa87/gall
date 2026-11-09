@@ -31,12 +31,15 @@ export interface MenuItem {
 }
 
 export type Overlay =
+  | { type: "bugReport"; previous?: boolean; resume?: boolean }
   | { type: "pathEdit"; b: number }
   | { type: "search"; root: string; pattern?: string; everything?: boolean }
   | { type: "trash" }
   | { type: "quickOpen"; initial?: string }
   | { type: "grep"; root: string; scope: "folder" | "home" | "root" }
   | { type: "keys" }
+  | { type: "gitCommits"; path: string }
+  | { type: "gitGraph"; path: string }
   | { type: "settings"; section?: string }
   | { type: "about" }
   | { type: "welcome" }
@@ -64,7 +67,7 @@ export interface FolderSize extends DirSize {
 export interface DialogSpec {
   title: string;
   message?: string;
-  input?: { value: string; select?: [number, number]; placeholder?: string; toggleSelections?: [number, number][]; password?: boolean };
+  input?: { value: string; select?: [number, number]; placeholder?: string; toggleSelections?: [number, number][]; password?: boolean; multiline?: boolean };
   /** `key`: single-letter accelerator (lower case), underlined in the label; only without `input`. */
   buttons: { id: string; label: string; primary?: boolean; danger?: boolean; hint?: string; key?: string }[];
   resolve: (r: { button: string; value: string } | null) => void;

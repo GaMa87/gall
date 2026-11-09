@@ -1,0 +1,31 @@
+.git-advanced { display: flex; flex-direction: column; flex: 1; min-height: 0; min-width: 0; outline: none; }
+.ga-header { display: flex; align-items: center; gap: 8px; padding: 10px 16px; border-bottom: 1px solid var(--border-soft); font-size: 12px; }
+.ga-header strong { flex: 1; }.ga-header button { font-size: 11px; padding: 3px 8px; }
+.ga-tabs { display: flex; gap: 4px; padding: 8px 12px; overflow-x: auto; border-bottom: 1px solid var(--border-soft); flex-shrink: 0; }
+.ga-tabs button { display: inline-flex; gap: 6px; align-items: center; flex-shrink: 0; font-size: 11px; padding: 5px 8px; }
+.ga-tabs button.on { background: var(--accent-soft); border-color: var(--accent-ring); color: var(--accent); }
+.ga-tabs kbd { font-size: 10px; opacity: .7; padding: 0 3px; }
+.ga-content { flex: 1; min-height: 0; overflow: auto; }
+.ga-description { margin: 0; padding: 12px 16px; color: var(--fg-dim); font-size: 11px; line-height: 1.5; }
+.ga-list { padding: 0 16px; }
+.ga-item { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 10px 0; border-bottom: 1px solid var(--border-soft); }
+.ga-item > div:first-child { min-width: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; font-size: 11px; }
+.ga-item > div:first-child > b { font-size: 12px; }.ga-item code { color: var(--accent); font-size: 11px; }
+.ga-item small { flex-basis: 100%; color: var(--fg-dim); overflow-wrap: anywhere; font-size: 11px; }
+.ga-path { display: block; flex-basis: 100%; min-width: 0; overflow-wrap: anywhere; font-size: 11px; color: var(--fg-dim); }
+.ga-item-actions, .ga-buttons { display: flex; flex-shrink: 0; gap: 6px; flex-wrap: wrap; }.ga-item button { font-size: 11px; padding: 4px 7px; }
+.ga-badge { border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; color: var(--fg-dim); font-size: 10px; }
+.ga-form { display: flex; flex-direction: column; gap: 10px; padding: 14px 16px; max-width: 800px; box-sizing: border-box; }
+.ga-form h3 { margin: 0; font-size: 12px; }.ga-form label { display: flex; flex-direction: column; gap: 5px; font-size: 11px; color: var(--fg-dim); }
+.ga-form input, .ga-form textarea { width: 100%; box-sizing: border-box; min-width: 0; padding: 7px 9px; font-size: 12px; color: var(--fg); }
+.ga-form textarea { min-height: 110px; resize: vertical; }.ga-form > button { align-self: flex-start; font-size: 11px; }
+.ga-input-row { display: flex; gap: 8px; }.ga-input-row input { flex: 1; }.ga-input-row button { flex-shrink: 0; }
+.ga-bisect-state { padding: 0 16px 12px; font-size: 12px; }.ga-bisect-state .ga-buttons { margin: 12px 0; }
+.ga-bisect-state pre { font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--fg-dim); }
+.ga-error { margin: 0; padding: 10px 16px; color: var(--warn); font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.ga-notice, .ga-help { margin: 0; padding: 12px 16px; color: var(--fg-dim); font-size: 11px; }
+.ga-help { border-bottom: 1px solid var(--border-soft); color: var(--accent); }
+.ga-output { max-height: 32%; flex-shrink: 0; overflow: auto; padding: 9px 16px; border-top: 1px solid var(--border-soft); }
+.ga-output > div { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 11px; }
+.ga-output button { padding: 3px 7px; font-size: 11px; }.ga-output pre { margin: 8px 0 0; font-size: 10px; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--fg-dim); }
+@media (max-width: 800px) { .ga-item { flex-direction: column; align-items: stretch; gap: 8px; }.ga-item-actions { justify-content: flex-end; }.ga-form { width: 100%; }.ga-tabs { padding-left: 8px; padding-right: 8px; } }

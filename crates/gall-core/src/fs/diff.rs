@@ -25,6 +25,11 @@ pub enum DiffSource {
     GitHead {
         path: PathBuf,
     },
+    /// The file at a specific commit, identified by its full object ID.
+    GitCommit {
+        path: PathBuf,
+        commit: String,
+    },
     /// Text supplied by the caller (e.g. the clipboard, read by the app).
     Text {
         label: String,
@@ -162,11 +167,29 @@ fn load(src: &DiffSource) -> Result<Loaded> {
                 stream: None,
             })
         }
-        DiffSource::GitHead { path } => {
-            let bytes = git_head_bytes(path)?;
+        DiffSource::GitHead { path } | DiffSource::GitCommit { path, .. } => {
+            let revision = match src {
+                DiffSource::GitCommit { commit, .. } => commit.as_str(),
+                _ => "HEAD",
+            };
+            if revision != "HEAD"
+                && !((revision.len() == 40 || revision.len() == 64)
+                    && revision.bytes().all(|b| b.is_ascii_hexdigit()))
+            {
+                return Err(CoreError::Other("invalid commit ID".into()));
+            }
+            let bytes = git_revision_bytes(path, revision)?;
             Ok(Loaded {
                 side: Side {
-                    label: format!("{} (HEAD)", label_of(path)),
+                    label: format!(
+                        "{} ({})",
+                        label_of(path),
+                        if revision == "HEAD" {
+                            revision
+                        } else {
+                            &revision[..12]
+                        }
+                    ),
                     path: Some(path.clone()),
                     size: bytes.len() as u64,
                     crlf: false,
@@ -784,7 +807,7 @@ pub fn git_root(path: &Path) -> Option<PathBuf> {
     (!s.is_empty()).then(|| PathBuf::from(s))
 }
 
-fn git_head_bytes(path: &Path) -> Result<Vec<u8>> {
+fn git_revision_bytes(path: &Path, revision: &str) -> Result<Vec<u8>> {
     let root =
         git_root(path).ok_or_else(|| CoreError::Other("not inside a Git repository".into()))?;
     let canon = path.canonicalize().ctx("resolve", path)?;
@@ -793,8 +816,46 @@ fn git_head_bytes(path: &Path) -> Result<Vec<u8>> {
         .strip_prefix(&root)
         .map_err(|_| CoreError::Other("file is outside the repository".into()))?;
     let rel = rel.to_string_lossy().replace('\\', "/");
-    git(&root, &["show", &format!("HEAD:{rel}")])
-        .map_err(|e| CoreError::Other(format!("not in HEAD: {e}")))
+    git(&root, &["show", &format!("{revision}:{rel}")])
+        .map_err(|e| CoreError::Other(format!("file is not in the selected revision: {e}")))
+}
+
+#[derive(Serialize)]
+pub struct GitCommitInfo {
+    pub id: String,
+    pub subject: String,
+}
+
+/// Recent commits reachable from HEAD; does not alter the work tree.
+pub fn git_commits(path: &Path) -> Result<Vec<GitCommitInfo>> {
+    let root =
+        git_root(path).ok_or_else(|| CoreError::Other("not inside a Git repository".into()))?;
+    let out = git(
+        &root,
+        &[
+            "log",
+            "--no-show-signature",
+            "-100",
+            "--format=%H%x00%s%x00",
+        ],
+    )?;
+    let fields: Vec<&[u8]> = out.split(|b| *b == 0).collect();
+    Ok(fields
+        .chunks(2)
+        .filter_map(|pair| {
+            if pair.len() != 2 {
+                return None;
+            }
+            let id = String::from_utf8_lossy(pair[0]).trim().to_string();
+            if id.len() != 40 && id.len() != 64 {
+                return None;
+            }
+            Some(GitCommitInfo {
+                id,
+                subject: String::from_utf8_lossy(pair[1]).into_owned(),
+            })
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -1002,6 +1063,33 @@ mod tests {
         let tx = r.text.unwrap();
         assert_eq!(tx.left_lines, ["old"]);
         assert_eq!(tx.right_lines, ["new"]);
+        assert!(ok(&["add", "f.txt"]));
+        assert!(ok(&["commit", "-qm", "second"]));
+        std::fs::write(d.join("f.txt"), "working\n").unwrap();
+        let p = d.join("f.txt");
+        let commits = git_commits(&p).unwrap();
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[1].subject, "x");
+        let result = compare(
+            &DiffSource::GitCommit {
+                path: p.clone(),
+                commit: commits[1].id.clone(),
+            },
+            &DiffSource::File { path: p.clone() },
+            DiffOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(result.text.unwrap().left_lines, ["old"]);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "working\n");
+        assert!(compare(
+            &DiffSource::GitCommit {
+                path: p.clone(),
+                commit: "-".repeat(40)
+            },
+            &DiffSource::File { path: p },
+            DiffOptions::default()
+        )
+        .is_err());
     }
 }
 

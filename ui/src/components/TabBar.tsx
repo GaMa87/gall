@@ -5,14 +5,17 @@ import { basename } from "../core/path";
 import * as A from "../state/actions";
 import { draggedTab, dropInto, isFileDrag, onDragOverTarget, startTabDrag } from "../state/dnd";
 import { useStore } from "../state/store";
+import { useKeyLabels } from "../state/keyLabels";
 import { Icon } from "./Icon";
 
 
 export function TabBar({ b, browser, right }: { b: number; browser: BrowserState; right?: React.ReactNode }) {
   const settings = useStore((s) => s.settings)!;
+  const keys = useKeyLabels();
   const [armed, setArmed] = useState<number | null>(null);
   const [drop, setDrop] = useState<string | null>(null);
   const armTimer = useRef<number | null>(null);
+  const middlePressed = useRef<number | null>(null);
   useEffect(() => () => { if (armTimer.current) clearTimeout(armTimer.current); }, []);
 
   const tabMenu = (e: React.MouseEvent, idx: number) => {
@@ -65,13 +68,31 @@ export function TabBar({ b, browser, right }: { b: number; browser: BrowserState
             }}
             onMouseLeave={() => {
               if (armTimer.current) clearTimeout(armTimer.current);
+              if (middlePressed.current === t.id) middlePressed.current = null;
               setArmed(null);
             }}
             onMouseDown={(e) => {
+              middlePressed.current = e.button === 1 ? t.id : null;
               if (e.button === 1) {
                 e.preventDefault();
+                e.stopPropagation();
+              }
+            }}
+            onMouseUp={(e) => {
+              if (e.button === 1) {
+                e.preventDefault();
+                e.stopPropagation();
+                const pressed = middlePressed.current;
+                middlePressed.current = null;
+                if (pressed !== t.id) return;
                 if (e.altKey) A.sessionCmd({ op: "transfer", b, idx, copy: false });
                 else A.sessionCmd({ op: "close", b, idx });
+              }
+            }}
+            onAuxClick={(e) => {
+              if (e.button === 1) {
+                e.preventDefault();
+                e.stopPropagation();
               }
             }}
             onClick={() => {
@@ -103,7 +124,7 @@ export function TabBar({ b, browser, right }: { b: number; browser: BrowserState
             {browser.tabs.length > 1 && (
               <button
                 className={`close ${armed === t.id || idx === browser.active ? "armed" : ""}`}
-                title="Close tab (Ctrl+W)"
+                title={`Close tab${keys.action("closeTab") ? ` (${keys.action("closeTab")})` : ""} — middle-click tab`}
                 onClick={(e) => {
                   e.stopPropagation();
                   A.sessionCmd({ op: "close", b, idx });

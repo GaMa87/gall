@@ -1,8 +1,11 @@
 //! Gall desktop application (Tauri shell).
 
+mod bug_report;
 mod cli;
 mod commands;
+mod report_capture;
 mod state;
+mod updates;
 #[cfg(windows)]
 mod windrop;
 
@@ -56,6 +59,7 @@ fn ui_log_target() -> tauri_plugin_log::fern::Dispatch {
                 .split_once(&tag)
                 .map_or(full.as_str(), |(_, m)| m)
                 .to_string();
+            bug_report::record(level, &msg);
             let line = UiLogLine { level, msg };
             match APP.get() {
                 Some(app) if UI_READY.load(Ordering::Acquire) => {
@@ -143,8 +147,14 @@ pub fn run() {
         .plugin(log.build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(
+            tauri_plugin_updater::Builder::new()
+                .pubkey(option_env!("GALL_UPDATER_PUBLIC_KEY").unwrap_or(""))
+                .build(),
+        )
         .manage(args)
         .setup(move |app| {
+            bug_report::init(&dirs);
             log::info!("startup: setup at {} ms", startup_ms());
             let handle = app.handle().clone();
             let _ = APP.set(handle.clone());
@@ -253,6 +263,9 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            updates::update_support,
+            updates::update_ready,
+            updates::install_update,
             commands::app_info,
             commands::window_ready,
             commands::log_backlog,
@@ -269,6 +282,32 @@ pub fn run() {
             commands::open_with_command,
             commands::system_stats,
             commands::diff_compare,
+            commands::git_commits,
+            commands::git_graph,
+            commands::git_switch,
+            commands::git_workspace,
+            commands::git_index_action,
+            commands::git_file_patch,
+            commands::git_commit_details,
+            commands::git_commit_diff,
+            commands::git_commit_patch,
+            commands::git_file_history,
+            commands::git_blame,
+            commands::git_commit_content,
+            commands::git_conflict,
+            commands::git_repository,
+            commands::git_repository_action,
+            commands::git_patch_selection,
+            commands::git_apply_selection,
+            commands::git_network,
+            commands::git_network_cancel,
+            commands::git_advanced,
+            commands::git_advanced_action,
+            commands::git_advanced_cancel,
+            commands::git_rebase_plan,
+            commands::git_rebase_execute,
+            commands::git_reword,
+            commands::git_commit_edit,
             commands::diff_patch,
             commands::diff_highlight,
             commands::diff_save_patch,
@@ -317,6 +356,7 @@ pub fn run() {
             commands::undo_peek,
             commands::undo_in,
             commands::undo_peek_in,
+            commands::shortcut_resolve,
             commands::open_path,
             commands::archive_materialize,
             commands::archive_password,
@@ -369,9 +409,23 @@ pub fn run() {
             commands::hex_diff,
             commands::hex_diff_cancel,
             commands::read_bytes,
+            bug_report::bug_report_prepare,
+            bug_report::bug_report_record,
+            bug_report::bug_report_status,
+            bug_report::bug_report_dismiss,
+            bug_report::bug_report_export,
+            bug_report::bug_report_copy_screenshot,
+            bug_report::bug_report_copy_text,
+            report_capture::bug_report_capture,
+            report_capture::bug_report_save_media,
             commands::selftest_shot,
             commands::selftest_done,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Gall");
+        .build(tauri::generate_context!())
+        .expect("error while building Gall")
+        .run(|_, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                bug_report::clean();
+            }
+        });
 }

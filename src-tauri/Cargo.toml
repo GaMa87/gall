@@ -32,6 +32,7 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock", "s
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 dirs = "7.0.0"
 crossbeam-channel = "0.5.17"
+tauri-plugin-updater = "2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gdk = "0.18"
@@ -40,7 +41,7 @@ gdk = "0.18"
 # Paths of files dropped from other apps (WebView2 hands them to the host); the versions
 # Tauri's wry uses, so the types are the same.
 webview2-com = "0.39.1"
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Com"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage"] }
 
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 # Dragging files out to other apps as real files (Explorer / Finder, mail): a web page's

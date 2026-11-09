@@ -2,6 +2,8 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { api, fileSrc } from "../api/ipc";
 import type { FileEntry, PreviewInfo, SyntaxHighlight, VideoProbe } from "../api/types";
+import { imageRefresh, loadImageSnapshot } from "../core/imageRefresh";
+import { onFolderChanged } from "../state/controllers";
 import { segments } from "../core/diffRows";
 import { isBrowsableArchive } from "../core/archive";
 import { formatSize } from "../core/format";
@@ -16,7 +18,7 @@ export function usePreviewInfo(entry: FileEntry | null): PreviewInfo | null {
     if (!entry) return setInfo(null);
     let alive = true;
     const t = setTimeout(() => {
-      api.previewInfo(entry.path).then((i) => alive && setInfo(i)).catch(() => alive && setInfo(null));
+      api.previewInfo(entry.path).then((i) => alive && setInfo(i)).catch(() => alive && setInfo((previous) => previous?.kind === "image" ? previous : null)); // retain images through write/rename gaps
     }, 60); // debounce while arrowing through a list
     return () => {
       alive = false;
@@ -64,7 +66,7 @@ export function Preview({ entry, info, big }: { entry: FileEntry; info: PreviewI
   const src = info.localPath ?? entry.path;
   switch (kind) {
     case "image":
-      return <ImagePreview key={entry.path} src={fileSrc(src)} w={info.width} h={info.height} />;
+      return <ImagePreview key={entry.path} path={src} w={info.width} h={info.height} />;
     case "video":
     case "audio":
       return <MediaPreview key={entry.path} path={src} kind={kind} big={big} />;
@@ -169,7 +171,25 @@ function MarkdownPreview({ entry, fallback }: { entry: FileEntry; fallback: stri
 }
 
 /** Zoom toward the cursor with the wheel, pan by dragging (P-02). */
-function ImagePreview({ src, w, h }: { src: string; w: number | null; h: number | null }) {
+function ImagePreview({ path, w, h }: { path: string; w: number | null; h: number | null }) {
+  const [src, setSrc] = useState<string | undefined>();
+  useEffect(() => {
+    const snapshots = imageRefresh(
+      (signal) => loadImageSnapshot(fileSrc(path), signal),
+      setSrc,
+      URL.revokeObjectURL,
+    );
+    const dir = parent(path);
+    const off = dir ? onFolderChanged(dir, snapshots.refresh) : () => {};
+    // Subscribe first; read again after watch registration to close its startup gap.
+    if (dir) api.watch(dir).then(snapshots.refresh).catch(() => {});
+    snapshots.refresh();
+    return () => {
+      off();
+      snapshots.stop();
+      if (dir) api.unwatch(dir).catch(() => {});
+    };
+  }, [path]);
   const box = useRef<HTMLDivElement>(null);
   const [nat, setNat] = useState<{ w: number; h: number } | null>(w && h ? { w, h } : null);
   const [view, setView] = useState<{ s: number; x: number; y: number } | null>(null);
@@ -249,7 +269,7 @@ function ImagePreview({ src, w, h }: { src: string; w: number | null; h: number 
         draggable={false}
         onLoad={(e) => {
           const i = e.currentTarget;
-          if (!nat || nat.w !== i.naturalWidth) setNat({ w: i.naturalWidth, h: i.naturalHeight });
+          if (!nat || nat.w !== i.naturalWidth || nat.h !== i.naturalHeight) setNat({ w: i.naturalWidth, h: i.naturalHeight });
         }}
         style={view && nat ? { width: nat.w, height: nat.h, transform: `translate(${view.x}px, ${view.y}px) scale(${view.s})` } : { opacity: 0 }}
       />
@@ -377,25 +397,32 @@ function PdfPreview({ path }: { path: string }) {
 
   useEffect(() => {
     let alive = true;
-    let loaded: any = null;
+    const request = new AbortController();
+    let loading: import("pdfjs-dist").PDFDocumentLoadingTask | undefined;
+    setDoc(null);
+    setErr(null);
     (async () => {
       try {
         const pdfjs = await import("pdfjs-dist");
-        const worker = (await import("pdfjs-dist/build/pdf.worker.min.mjs?url")).default;
+        const worker = new URL("pdfjs-dist/build/pdf.worker.min.mjs", import.meta.url).href;
+        if (!alive) return;
         pdfjs.GlobalWorkerOptions.workerSrc = worker;
-        const data = await fetch(fileSrc(path)).then((r) => r.arrayBuffer());
-        loaded = await pdfjs.getDocument({ data }).promise;
+        const response = await fetch(fileSrc(path), { signal: request.signal, cache: "no-store" });
+        if (!response.ok) throw new Error(`PDF could not be read (${response.status} ${response.statusText})`);
+        const data = await response.arrayBuffer();
+        if (!alive) return;
+        loading = pdfjs.getDocument({ data });
+        const loaded = await loading.promise;
         if (alive) setDoc(loaded);
-        // Another file was chosen while this one loaded: the cleanup ran before there was
-        // a document to destroy, so it is destroyed here (else its worker memory stays).
-        else loaded.destroy?.();
       } catch (e) {
         if (alive) setErr(String(e));
       }
     })();
     return () => {
       alive = false;
-      loaded?.destroy?.();
+      request.abort();
+      // The loading task owns the worker, including while parsing is still pending.
+      void loading?.destroy().catch(() => {});
     };
   }, [path]);
 
@@ -421,6 +448,9 @@ function PdfPreview({ path }: { path: string }) {
       c.style.width = `${vp.width / dpr}px`;
       c.style.height = `${vp.height / dpr}px`;
       task = p.render({ canvasContext: c.getContext("2d")!, viewport: vp, canvas: c });
+      const rendered = task.promise.catch((e: unknown) => {
+        if (!stale) setErr(String(e));
+      });
       const tb = textBox.current;
       if (tb) {
         tb.replaceChildren();
@@ -430,12 +460,14 @@ function PdfPreview({ path }: { path: string }) {
         text = new TextLayer({ textContentSource: p.streamTextContent(), container: tb, viewport: p.getViewport({ scale }) });
         text.render().catch(() => {});
       }
-      await task.promise.catch(() => {});
-    })();
+      await rendered;
+    })().catch((e) => {
+      if (!stale) setErr(String(e));
+    });
     return () => { stale = true; task?.cancel?.(); text?.cancel?.(); };
   }, [doc, page, fitWidth, zoom]);
 
-  if (err) return <div className="pv-icon"><Icon name="pdf" size={56} /><span>PDF preview failed</span></div>;
+  if (err) return <div className="pv-icon pv-pdf-error" title={err}><Icon name="pdf" size={56} /><span>PDF preview failed</span><small>{err}</small></div>;
   return (
     // The page scrolls inside; the controls stay in the corner.
     <div className="pv-pdf-wrap">

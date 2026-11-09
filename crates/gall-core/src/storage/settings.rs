@@ -84,6 +84,14 @@ pub enum VideoSeek {
     Fraction,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum KeyboardProfile {
+    Explorer,
+    TotalCommander,
+    Vim,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
@@ -185,7 +193,10 @@ pub struct Settings {
     pub index_refresh_minutes: u32,
     pub search_respect_gitignore: bool,
 
-    // Vim-style keys (j/k, gg/G, leader sequences)
+    // Missing in older settings: the UI derives the profile from vim_keys.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keyboard_profile: Option<KeyboardProfile>,
+    // Compatibility flag, kept in sync with the selected keyboard profile.
     pub vim_keys: bool,
     /// Leader key for multi-key sequences in vim mode: "Space", ";", "\\",
     /// "Ctrl" (tap) or "Ctrl Ctrl" (double tap).
@@ -277,6 +288,7 @@ impl Default for Settings {
             index_refresh_minutes: 15,
             search_respect_gitignore: true,
 
+            keyboard_profile: None,
             vim_keys: true,
             leader_key: "Space".into(),
             leader_key_basic: "Ctrl Ctrl".into(),
@@ -348,5 +360,34 @@ mod tests {
             serde_json::from_str(r#"{"fontSize": 15, "unknownFutureKey": true}"#).unwrap();
         assert_eq!(s.font_size, 15.0);
         assert_eq!(s.notification_ms, 6000);
+    }
+
+    #[test]
+    fn legacy_keyboard_settings_remain_available_for_migration() {
+        let s: Settings =
+            serde_json::from_str(r#"{"vimKeys": false, "shortcuts": {"copyToOther": "F9"}}"#)
+                .unwrap();
+        assert_eq!(s.keyboard_profile, None);
+        assert!(!s.vim_keys);
+        assert_eq!(s.shortcuts.get("copyToOther").unwrap(), "F9");
+    }
+
+    #[test]
+    fn keyboard_profiles_roundtrip_without_losing_custom_shortcuts() {
+        for profile in [
+            KeyboardProfile::Explorer,
+            KeyboardProfile::TotalCommander,
+            KeyboardProfile::Vim,
+        ] {
+            let s = Settings {
+                keyboard_profile: Some(profile),
+                vim_keys: profile == KeyboardProfile::Vim,
+                shortcuts: BTreeMap::from([("copyToOther".into(), "F9".into())]),
+                ..Settings::default()
+            };
+            let saved = serde_json::to_string(&s).unwrap();
+            let restored: Settings = serde_json::from_str(&saved).unwrap();
+            assert_eq!(restored, s);
+        }
     }
 }

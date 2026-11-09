@@ -1,7 +1,7 @@
 {
   "name": "gall",
   "private": true,
-  "version": "0.1.3",
+  "version": "0.2.0",
   "description": "Open-source Miller-column, dual-pane file manager for Linux (Tauri + Rust + React)",
   "license": "MIT",
   "repository": {

@@ -32,7 +32,7 @@ and it adds instant search across the whole computer, a built-in compare tool an
 - **Git built in:** status letters next to every file, the branch with ahead/behind, and a diff of any file against `HEAD`.
 - **Previews that help:** source code with syntax highlighting, Markdown, PDF, images, video, audio and archives, right next to the file list.
 - **Undo for every file operation:** copy, move, rename, batch rename and delete to trash are undone with `Ctrl+Z`.
-- **Keyboard all the way:** Vim keys, a which-key menu on `Space`, every shortcut rebindable. The mouse works too, with drag & drop that says what it will do before you let go.
+- **Keyboard all the way:** Windows Explorer, Total Commander and Vim profiles, a discoverable command menu, every shortcut rebindable. The mouse works too, with drag & drop that says what it will do before you let go.
 - **Machine monitor in the sidebar:** CPU, GPU and memory with temperatures, network and disk throughput, free space on every drive.
 - **Light on your machine:** a native Rust core in a small Tauri app (no bundled Chromium), with a portable Windows build that runs from a USB stick.
 
@@ -78,7 +78,7 @@ of each match. Case, whole-word, regex and include/exclude filters are available
 
 ### ↔️ Compare anything: text, spreadsheets, images, folders
 
-Select two files and press `Ctrl+Shift+D` (or `=`), or drop one file onto another.
+Select two files and press `Ctrl+Shift+D` (or `= =` in Vim mode), or drop one file onto another.
 
 - **Text and code:** side by side or unified, word-level highlights, syntax colouring, moved
   blocks detected. Edit, merge changes across and save.
@@ -86,7 +86,15 @@ Select two files and press `Ctrl+Shift+D` (or `=`), or drop one file onto anothe
   added or removed rows and columns are listed.
 - **Images:** side by side, swipe, onion skin, or a pixel difference with the share of pixels changed.
 - **Folders:** compare two folders and sync them. Select many files to get a similarity matrix
-  that finds the odd one out. You can also compare a file with the clipboard or with its Git `HEAD` version.
+  that finds the odd one out. You can also compare a file with the clipboard or a Git revision.
+
+For Git comparisons, select a file and choose **Compare with › Git commit** from its context
+menu, or type `= g` in Vim mode. Select a commit with the mouse or arrow keys (Vim `j`/`k`
+also work) and press Enter. The graph initially loads 200 commits; **Load 200 more** extends the history, and **Reflog** includes commits without a branch. `= h` compares directly with `HEAD`. The file is looked up by its current path:
+if it did not exist at that path in the selected commit, the comparison reports an error.
+Opening the comparison does not switch branches or modify files; the working side can still
+be edited and saved in the comparison view. Type `+ +` in Vim mode
+to focus the other browser; `=` and `+` show their available next keys.
 
 <table>
 <tr>
@@ -99,12 +107,22 @@ Select two files and press `Ctrl+Shift+D` (or `=`), or drop one file onto anothe
 </tr>
 </table>
 
-### ⌨️ Vim keys, and `Space` shows you the rest
+### ⌨️ Familiar keys, and a menu shows you the rest
 
-`j` `k` move, `h` `l` go up and into folders, `gg` `G` jump, `yy` `dd` `p` copy, cut and paste,
+Choose **Windows Explorer**, **Total Commander** or **Vim** in welcome setup or
+**Settings › Keyboard**. [The profile table](#keyboard-profiles) lists their function keys.
+Every profile keeps Gall's search, comparison, archives, pins, tabs and other commands.
+
+With Vim selected, `j` `k` move, `h` `l` go up and into folders, `gg` `G` jump, `yy` `dd` `p` copy, cut and paste,
 `/` filters. Press `Space` and a which-key menu lists every command, grouped LazyVim-style
 (`Space s g` greps, `Space d d` compares, `Space t n` opens a tab). Press `?` for a searchable
-sheet of every shortcut. Prefer plain shortcuts? Turn Vim keys off and tap `Ctrl` twice for the same menu.
+sheet of every shortcut. Prefer plain shortcuts? Choose Explorer or Commander: the same `?` opens
+the searchable keyboard reference, including standard navigation and selection keys.
+`Shift+F1` and `Ctrl+/` work in every profile too; `?` still types normally in text fields.
+Tap `Ctrl` twice for the command menu. Pin or unpin the current folder with `Ctrl+B`,
+or with Vim keys on, `b` or `Space b p`.
+`Space v` toggles the focused item's selection without moving; `Space o m` opens its
+context menu. Plain `v` still starts visual selection.
 
 <table>
 <tr>
@@ -147,7 +165,7 @@ is unit-tested on all three systems in CI.
 | 🗂 **Tabs** | Per pane. Clone, reopen closed (`Ctrl+Shift+T`), aliases, drag between panes, close stale. Restored on start. |
 | 📄 **File list** | Natural sort remembered per folder, folders on top, colour-coded age, type-to-filter (`.pdf` filters by extension), rubber-band selection, 5 views inherited by subfolders. |
 | 👁 **Previews** | Images (zoom to cursor, pan), PDF, video/audio (frame-step), text/code, zip archives, notes. A large preview is one key away. |
-| 📏 **Folder sizes** | `Ctrl+Alt+S` (or automatically) counts everything inside each folder and shows it in the Size column, so sorting by size finds what fills the disk. Running totals while it counts; it stays on one drive and counts hard links once. |
+| 📏 **Folder sizes** | `Ctrl+Alt+S` counts the selected folders, or all folders in the current view if no folders are selected, and shows their totals in the Size column. Enable **Calculate automatically** in the **Folder sizes** menu to count folders in the background. Running totals while it counts; it stays on one drive and counts hard links once. Sorting by size uses completed totals. On Linux, kernel virtual filesystems such as `/proc` and `/sys` are not scanned and show `—` because their folder size is not applicable. |
 | 🌿 **Git status** | Letters next to names in a repository (`M` modified, `S` staged, `U` new, `!` conflict; folders show what is inside), ignored files dimmed, and the branch with ↑ ahead / ↓ behind in the status bar. Safe in downloaded repositories: none of their configured commands run. |
 | ✏️ **Batch rename** | `F2` on several items: a name template (`Trip {n:2}`, `{date}`, `{folder}`), find & replace with regular expressions, case changes, or edit all names as text. A live preview flags clashes; one `Ctrl+Z` undoes it all. |
 | ↩️ **Undo everything** | Copy, move, rename, create, delete-to-trash: `Ctrl+Z` (until Gall is closed). Background task queue with progress, time left, cancel and conflict handling. |
@@ -221,9 +239,53 @@ gall -o PATH --newtab   send PATH to the running instance, in a new tab
 ```
 
 Some shortcuts: `Ctrl+P` find a file · `Ctrl+F` / `Ctrl+Shift+F` find text · `Ctrl+Shift+D` compare ·
-`?` all shortcuts · `F2` rename · `Alt+C`/`Alt+M` copy/move to the other pane · `Ctrl+Shift+N` new folder ·
-`F3` search · `F10` terminal here · `Alt+P` preview pane · `Alt+S` sidebar · `Ctrl+H` hidden files ·
-`Ctrl+,` settings. All are listed and editable in *Settings › Shortcuts*.
+`?` all shortcuts · `Shift+F6` rename · `Alt+C`/`Alt+M` copy/move to the other pane · `Ctrl+Shift+N` new folder ·
+`Alt+F7` name search · `F10` terminal here · `Alt+P` preview pane · `Alt+S` sidebar ·
+`Ctrl+,` settings. Vim letters take precedence over a few Ctrl chords; `?` shows the keys
+that actually work. Chord shortcuts are editable in *Settings › Shortcuts*.
+
+### Keyboard profiles
+
+Select a profile in **Settings › Keyboard**, or during welcome setup:
+
+| Key | Windows Explorer | Total Commander | Vim |
+|-----|------------------|-----------------|-----|
+| `F1` | Keyboard help | Keyboard help | Command palette |
+| `F2` | Rename | Refresh | Rename |
+| `F3` | Name search | Preview | Name search |
+| `F4` | Edit address | Edit file | Edit file |
+| `F5` | Refresh | Copy to other pane | Refresh |
+| `F6` | Other pane | Move to other pane | Move to other pane |
+| `F7` | Show long names | New folder | Show long names |
+| `F8` | Move to trash | Move to trash | Move to trash |
+
+These profiles adapt familiar workflows to Gall, rather than emulate every command
+of another application. Gall additions remain available in all profiles:
+`Ctrl+R` refresh, `Ctrl+Alt+E` edit file, `Ctrl+Alt+L` long names,
+`Shift+F4` choose editor, `F10` terminal, `Ctrl+B` pin (Vim: `b`),
+and `Ctrl+Shift+P` the full command palette. `Ctrl+Insert` also copies and
+`Shift+Insert` pastes. `Ctrl+F3`/`F4`/`F5`/`F6` sort by name/type/modification date/size
+(ascending); the leader's `,` group offers every sort direction.
+
+Explorer and Commander let you type to filter; `Tab` switches panes, `Space` previews,
+and `Insert` marks an item and advances. Tap `Ctrl` twice for the grouped Gall command
+menu. Vim keeps its normal motions, `yy`/`dd`/`p`, `/` to filter and `Space` as leader.
+`?`, `Shift+F1` and `Ctrl+/` show profile-aware help in all three.
+
+The selected profile is saved. Older settings with Vim enabled select Vim; with it
+disabled they select Windows Explorer. Existing custom shortcuts and leaders are
+preserved. **Custom chord overrides apply to all profiles and win over profile
+defaults.** Clearing a shortcut field in Settings restores the current profile's default.
+
+The keyboard reference uses individual keycaps and a three-part legend: **`+` means hold
+together**, **`→` means press in order, releasing between steps**, and **`or` means choose
+one shortcut**. For example, `Ctrl + C` is simultaneous; `g → g` is two presses.
+Uppercase Vim commands are explicit (`Shift + g`, not an unexplained `G`), and the basic
+leader appears as `Ctrl → Ctrl`, not a held combination. Search-query examples are
+shown as literal text rather than keyboard shortcuts.
+
+Middle-click a tab to close it (the last tab stays open); `Ctrl+Shift+T` reopens it.
+`Alt+Middle-click` still moves a tab to the other pane.
 
 ### New in 0.1.3: search scope and exclusions
 
@@ -287,7 +349,7 @@ copying a normally named folder within WSL can preserve such names inside it.
 
 The eject button **Stop … (WSL)** terminates the whole distribution, not just Gall's view.
 Save work in its other programs before confirming. If external changes do not appear,
-press `F5` to refresh.
+press `Ctrl+R` to refresh in any keyboard profile.
 
 More details and a manual verification checklist: [WSL support](docs/wsl-manual-test.md).
 The [0.1.3 changelog](CHANGELOG.md#013--2026-11-05) lists the accompanying fixes.
@@ -327,6 +389,72 @@ Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) and the
 [clean-room policy](docs/00-clean-room-policy.md). Report bugs with the issue templates and
 security problems via [SECURITY.md](SECURITY.md).
 
+### Report a problem
+
+Choose **Report a bug** in **About** or **Settings → About**. A short description is
+enough; reproduction steps and expected behavior are optional. Your draft stays in
+memory while Gall is open, including when you close the dialog to reproduce a problem.
+`Esc` closes the report, or cancels an open save/annotation step; it works with Vim
+keys on or off. After a successful GitHub handoff, the next report starts fresh.
+The current report stays open so you can still copy or save its attachments.
+
+- **Capture Gall** hides the report and counts down three seconds before capturing
+  Gall's own webview, not your desktop or other apps. **Annotate** adds arrows, boxes
+  and opaque redactions. Use **Add mark**, then arrow keys to position a mark
+  (`Shift` resizes); `h/j/k/l` also work when Vim keys are enabled. **Apply changes**
+  permanently flattens redactions into the image; no original is exported alongside it.
+- **Record a clip** records Gall for up to 20 seconds, without microphone, camera or
+  system audio. Reproduce the problem, then choose **Stop recording**. Play the clip
+  back before sharing: screenshot redactions do not apply to recordings. Clips are
+  intentionally lightweight (up to 4 frames per second, 1280 × 800), not full-motion
+  desktop recordings. Encoding uses MP4 or WebM, depending on the installed webview.
+  You can stop from anywhere in Gall with `Ctrl+Shift+Enter` or cancel with
+  `Ctrl+Shift+Backspace` (`Cmd` also works on macOS). Capture completion never
+  replaces another open dialog or editor; the attachment waits in your report.
+- **Add a file** accepts PNG, JPEG, WebP, MP4 and WebM. Up to three attachments,
+  8 MiB each. If built-in capture or encoding is unavailable, use your system's
+  screenshot/recording tool and add the resulting file instead.
+  Built-in capture uses WebView2 on Windows and WebKitGTK on Linux; macOS currently
+  requires importing a capture made with the system tools.
+
+The copied report contains your description, basic environment information
+(including installation type and Gall's window resolution in physical pixels)
+and **only the latest recorded error**, not the action history. **Session** means
+the current session or the previous irregular exit. If no error was recorded,
+the report says so. Expand **Preview GitHub report** before sharing, and check
+captures and error text for private details. Nothing is automatically uploaded.
+
+**Save report...** creates one ZIP containing `report.md` and every retained
+screenshot or video. Only the finalized images are included, never the originals
+behind applied redactions. Attach the ZIP to your GitHub issue to share everything
+together. The suggested name includes a UTC timestamp. After a successful save,
+the save form closes and returns to your report; if saving fails, the form stays
+open so you can correct the path or retry. Creating the ZIP does not upload it.
+
+**Save report...** enables **Include extra diagnostics** by default.
+This adds recent actions, UI context and sanitized log excerpts
+to the **saved file only**, never to **Copy report** or **Copy & open GitHub**.
+Uncheck the option to save just the compact report and your attachments.
+Automatic redaction can miss private details;
+review **Preview saved diagnostics** before sharing a saved file.
+
+Choose **Review report**, then **Copy & open GitHub**. The short report and title are
+sent in the browser URL and the GitHub form is already filled in. Gall also copies
+the report as a backup. The live counter below your description shows the remaining
+characters in the encoded GitHub link, including the title and environment.
+Accents, emoji and special characters use more space than ordinary letters.
+If the link is too long, Gall recommends saving a ZIP and attaching it to the issue
+instead; your full description is preserved in the saved report.
+For images, return to Gall and choose **Copy screenshot**, then paste below the
+report. Copying an image replaces the clipboard text. For videos, use **Save
+attachment** and drag the file into GitHub.
+GitHub uploads attachments immediately when added; a public issue and its uploaded
+attachments can be seen by others. A GitHub account and final browser submission
+are required. Finish or cancel any active capture before opening GitHub.
+**Save report...** and **Save attachment** create new local files
+using an editable absolute path; existing files are never replaced.
+After an irregular exit, Gall can offer diagnostics from the previous session.
+
 ## Support
 
 Gall is free and built in spare time. If it saves you time, you can buy me a coffee:
@@ -342,3 +470,163 @@ Third-party components and their licences are listed in [THIRD-PARTY-NOTICES.md]
 All are permissive or weak file-level copyleft (MPL-2.0, unmodified). This is enforced in CI with [`cargo-deny`](deny.toml).
 
 <sub>Keywords: file manager, file explorer, Miller columns, column view, dual pane, orthodox file manager, fuzzy file search, find in files, ripgrep, diff, file compare, Excel compare, image diff, vim, which-key, Nerd Font, Tauri, Rust, Linux, Windows, macOS, KDE, GNOME, Wayland.</sub>
+
+### Git graph and revision switching
+
+Click the bottom Git status, or type `g r` in Vim mode, to open the Git workspace.
+The status shows the commit subject and current branch. For detached HEAD it lists
+local branches containing that commit, or `detached` if none do; the tooltip still
+identifies detached HEAD explicitly. A containing branch does not attach HEAD to it.
+
+The graph starts with 200 commits. **Load 200 more** extends it up to 20,000 commits;
+search matches the loaded commit hashes, messages, authors and reference names.
+The reference selector narrows history to a branch or tag. **Reflog**, available
+with **All references**, includes otherwise unreachable commits and is off by default.
+Selecting commits, searching, filtering and opening diffs do not change HEAD or files.
+
+Select a commit to inspect its full message, author, committer, dates, parents and
+changed files below the graph. Select a file for its colored patch, historical
+contents, rename-aware history or line blame. For merge commits, choose the parent
+to compare against. Parent buttons and blamed lines navigate to their commits.
+Shift-click a second commit to compare the two revisions;
+alternatively mark a comparison base with `W`, select another commit and press `W` again.
+The ordinary file comparison menu and `= g` use the same graph as a read-only
+revision picker for the selected working file.
+
+Right-click a commit or reference (or focus it and press `Shift+F10` or the Menu key, or
+click its **⋯** button) for the actions of that item, grouped into submenus: Rewrite
+history, Integrate and more. **Actions** in the toolbar holds the repository-wide ones:
+fetch, pull, push, force push with lease, stash, refresh, search and a terminal. In Vim
+mode `?` lists the keys of the focused panel, which follow lazygit, and the footer always
+shows the most useful ones. Move between panels with `h` and `l` (sidebar, commit list,
+details; Working Changes is the first commit row, so `l` there opens it), switch sidebar
+tabs with `[` and `]`, and press `Esc` to close details and return to the commit list.
+Without Vim keys, `Tab` and `Shift+Tab` move between panels. On a commit, `l` or `Enter`
+opens its details, `y` opens a menu of things to copy (hash, subject, message, author,
+date, URL, whole diff, tags), and `b`, `w` and `x` open the repository tools on bisect,
+worktrees and the default tab; `Esc` or `h` returns to the commit list. The panel with keyboard focus
+has an accent outline and is named in the footer, and the other panels show their selection muted. Plain rebase and
+merge on a commit are menu-only; on a branch they are `r` and `M`. The current branch is listed first and marked, with
+its ahead/behind counts. During a merge or rebase conflict the panel names the commit
+being applied; choose Ours, Theirs or Both (click a side to pick it) and watch the live
+Result, or press **Edit** to change it by hand before confirming. Esc or `q` asks
+before leaving the workspace. If a push is rejected, use **Actions → Force
+push with explicit lease…** after checking the remote commits.
+
+**Checkout…** is an explicit action. Select a commit or a local branch, then choose
+Checkout; selecting a branch alone does not switch files. With local changes,
+choose **Stash**, **Commit**, or **Discard**. Stash includes untracked files and is
+not automatically reapplied. The preparation commit stages all tracked and
+untracked changes. Discard requires a second confirmation and retains a recovery
+stash named `Gall recovery before discard`; ignored files are preserved.
+Switching does not force overwritten files. Errors leave any created stash or
+commit available for inspection.
+
+Explicit checkout replaces working files and can update filesystem modification
+times. The file browser reports those real disk timestamps; the graph reports
+commit dates. Gall does not change timestamps to make checkout look like an old edit.
+Before leaving detached HEAD, Gall retains it under `refs/gall/recovery/`; detached
+commits created by Gall are retained there too and labeled **Saved commit**.
+
+### Review and commit selected files
+
+Select the **Working Changes** row connected above HEAD. Staged and unstaged
+changes appear separately below the graph. **Stage file** and **Unstage file**
+change the index while preserving the working contents; **Stage all** and
+**Unstage all** operate on the whole change list. A partially staged file appears
+in both groups. Enter a message and choose **Commit staged** to commit only the index.
+A new repository can make its first commit here.
+
+For ordinary tracked text files, select changed lines with their checkboxes, or
+select a whole hunk with its ± button, then choose **Stage selection** or
+**Unstage selection**. Additions, deletions, renames, binary or mode changes, very
+large patches and files without a final newline use whole-file staging instead.
+A stale HEAD, index or file snapshot cancels the action and asks you to refresh.
+
+**Amend latest commit** pre-fills an empty message with the previous message and
+replaces the latest commit using the index; the original commit is retained for
+recovery. **File actions…** offers confirmed discard of unstaged changes, with a
+recovery stash, and ignore rules for untracked files in `.gitignore` or the local
+`.git/info/exclude`. Discard preserves staged changes and unrelated files.
+
+### Branches, stashes, remotes and conflicts
+
+The side panel lists local/remote branches, tags, stashes, remotes and conflicted
+files. Select an item and use its context menu (right-click, `Shift+F10` or **⋯**) or
+`?` for the commands available there; **+** creates a new item. You can create and rename branches, delete merged local branches,
+set upstreams, create lightweight or annotated tags, and delete local tags.
+Stashes can be saved, inspected, applied, popped or dropped; conflicting pop keeps
+the stash, and dropped stashes retain a recovery reference.
+
+Reference actions include merge, rebase, cherry-pick, revert and soft/mixed/hard
+reset. Confirmations name the target. History rewrites retain the previous HEAD;
+hard reset also preserves tracked edits and refuses untracked or ignored files.
+An in-progress operation stays visible with **Continue**, **Skip** and **Abort**.
+The Conflicts panel shows base, current Git side, incoming Git side and working
+result. Choose a side for the whole file, edit it manually, or mark the current
+result resolved. During rebase, Git's ours/theirs meanings differ from a merge;
+the confirmation explains them. A merge cannot be skipped.
+
+Remotes can be added, renamed, removed or given a new fetch URL. **Fetch** updates
+remote history; **Pull** only fast-forwards, so diverged work must be merged or
+rebased explicitly after fetching. **Push** publishes the current branch and sets
+its upstream. Force push requires an explicit, reviewed remote commit lease.
+Network progress has a Cancel action; cancellation cannot undo a completed push.
+Configured credentials are used without interactive prompts. Complete interactive
+login or SSH setup in the terminal before retrying.
+
+### Edit commit history
+
+With history focused, `r` opens a message-only reword dialog for the selected commit.
+Rewording HEAD preserves staged changes; rewriting an older commit requires a clean,
+linear history through HEAD. Descendant IDs change, and Gall retains the original HEAD.
+
+`f` fixes up the selected commit into its preceding commit, `s` squashes their
+messages, and `d` drops the selected commit. Ctrl+j/Ctrl+k or Alt+Down/Alt+Up
+move it earlier/later in the linear history after confirmation. These direct actions
+use the same recovery and conflict handling as the interactive editor.
+
+`i` opens **Edit commits through HEAD**, including the selected commit and its
+following commits. The **Unchanged base (exclusive)** is their parent and stays
+unchanged. Select pick, reword, squash, fixup, drop or edit for each row; reorder rows
+by dragging, using their arrow buttons, or pressing `J`/`K`, Ctrl+j/Ctrl+k or
+Alt+Up/Alt+Down. Reword and squash rows expose their messages. **Start rebase…**
+confirms the exact range. An edit action pauses: stage changes in Working Changes,
+amend that commit, then Continue. Conflicts and edit stops can be resumed after restart.
+The editor accepts at most 1,000 linear commits and does not rewrite the root or
+preserve merge topology. Use an external Git client for those cases.
+
+### Git keyboard controls and repository tools
+
+Outside the workspace, `g r` opens it and `= g` compares a file with a commit.
+Inside, commands use direct contextual keys inspired by lazygit, without an extra
+`g` prefix. `?` shows the focused panel's commands; menus and buttons remain available
+with Vim keys disabled. `j`/`k` navigate, and typing in fields always stays ordinary typing.
+
+| Focus | Useful Vim keys |
+| --- | --- |
+| History | `r` reword, `i` interactive rebase, `f` fixup, `s` squash, `d` drop, Space checkout, `n` branch, `T` tag, `C` copy for cherry-pick, `V` cherry-pick, `t` revert, `g` reset, `W` comparison base, `/` search |
+| Working Changes | Space stage/unstage, `a` stage/unstage all, `c` message, `A` amend, `d` discard, `i` ignore/exclude, `s` stash, `l` diff, `h` files |
+| Diff selection | Space select a changed line, Enter apply selection, `u` unstage selected changes |
+| Commit details | `d` diff, `v` file, `f` history, `b` blame, `y` copy path, `e` edit working file, `h`/`l` focus files/preview |
+| References | Space checkout, `n` branch, `R` rename, `d` delete merged branch, `M` merge, `r` rebase, `u` upstream |
+| Stashes | Space apply, `g` pop, `d` drop, `s` save |
+| Remotes | `n` add, `e` edit URL, `r` rename, `d` remove |
+
+Open **Tools** (or **Repository setup…** after opening `g r` outside a repository)
+and choose a tab. **Repository** initializes the current folder or clones into a
+new destination. The other tabs provide worktree creation/opening/locking/removal, recorded-submodule
+initialization/update, manual bisect, patch export/application and commit notes. Tool tabs have direct Vim keys shown beside
+their names and in **Keys ?**. A worktree is created at a full commit ID, optionally
+on a new branch; removal requires a clean unlocked worktree. Submodule updates do
+not recurse and refuse local changes. Bisect records good/bad/skip results and
+**Finish / reset** returns to the starting revision. Patch application checks and
+stages a patch in a clean repository; export never overwrites an existing file.
+Failed or cancelled clones retain their partial destination for inspection.
+
+Gall creates unsigned commits and disables repository hooks. Content-filter/LFS
+repositories and submodule worktrees remain restricted for index changes, checkout
+and history operations, even though inspection and dedicated submodule tools are
+available. This is not full parity with GitLens, Git Graph, Git Extensions or lazygit.
+See the [Git workspace coverage matrix](docs/git-workspace-roadmap.md) for concrete
+limits, external workflows and focused validation commands.

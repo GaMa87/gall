@@ -1,7 +1,10 @@
+import { PreviousBugReport } from "./components/BugReport";
+import { ReportCapture } from "./components/ReportCapture";
+import { checkUpdates } from "./state/updates";
 // Root component: theme application, global shortcuts, layout shell.
 import { useEffect, useMemo } from "react";
 import { api, fileSrc } from "./api/ipc";
-import { buildKeymap, chordOf, type Action } from "./core/keymap";
+import { buildKeymap, chordOf, keyboardProfile, type Action } from "./core/keymap";
 import { controller } from "./state/controllers";
 import { buildLeaderTree, buildVimTree, CTRL_TAP, leaderToken, resolve, vimToken } from "./core/vim";
 import { run } from "./state/run";
@@ -98,7 +101,8 @@ let booted = false;
 export function App() {
   const ready = useStore((s) => !!s.session && !!s.settings);
   const shortcuts = useStore((s) => s.settings?.shortcuts);
-  const keymap = useMemo(() => buildKeymap(shortcuts ?? {}), [shortcuts]);
+  const profile = useStore((s) => keyboardProfile(s.settings));
+  const keymap = useMemo(() => buildKeymap(shortcuts ?? {}, profile), [shortcuts, profile]);
   const vimOn = useStore((s) => s.settings?.vimKeys ?? false);
   const leaderSetting = useStore((s) => (s.settings ? (s.settings.vimKeys ? s.settings.leaderKey || "Space" : s.settings.leaderKeyBasic ?? "Ctrl Ctrl") : ""));
   const leaderTok = leaderToken(leaderSetting);
@@ -117,7 +121,7 @@ export function App() {
     const t0 = performance.now();
     api.uiLog("info", `startup: UI script running ${Math.round(t0)} ms after page start`).catch(() => {});
     A.bootstrap()
-      .then(() => api.uiLog("info", `startup: bootstrap took ${Math.round(performance.now() - t0)} ms`).catch(() => {})).catch((e) => A.fail(`Startup failed: ${e}`)).finally(reveal);
+      .then(() => api.uiLog("info", `startup: bootstrap took ${Math.round(performance.now() - t0)} ms`).catch(() => {})).catch((e) => A.fail(`Startup failed: ${e}`)).finally(() => { reveal(); if (!import.meta.env.DEV) void checkUpdates(false); });
   }, []);
 
   useEffect(() => {
@@ -275,7 +279,7 @@ export function App() {
         <Workspace />
         <Notifications />
       </div>
-      <Overlays />
+      <Overlays /><PreviousBugReport /><ReportCapture />
       <ContextMenu />
       <DragHintLabel />
       <WhichKey tree={vimTree} />

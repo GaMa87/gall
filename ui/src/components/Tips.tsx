@@ -19,12 +19,12 @@ const TIP_GROUPS: { title: string; icon: string; tips: Tip[] }[] = [
   {
     title: "Getting around", icon: "forward", tips: [
       { title: "Go to any file", body: (k) => <>{k("quickOpen")} searches the open folder and below; <kbd>Tab</kbd> switches to everywhere in the index. Unindexed folders are read on demand. Inside archives, only index search is available. End the query with <code>/</code> to list only folders; <code>ext:md</code>, <code>^start</code>, <code>end$</code>, <code>'exact</code> and <code>!skip</code> narrow it down.</> },
-      { title: "Hide search noise", body: () => <>Right-click › Hide from search adds an item to <code>.gallignore</code>; Show in search again brings it back. Rules also apply to subfolders, find in files and F3, without changing Git's rules.</> },
+      { title: "Hide search noise", body: () => <>Right-click › Hide from search adds an item to <code>.gallignore</code>; Show in search again brings it back. Rules also apply to subfolders, find in files and name search, without changing Git's rules.</> },
       { title: "Find ignored files", body: () => <><kbd>Alt+I</kbd> includes ignored files in find in files and the name search. In Quick Open it opens the name search in the current folder, including ignored files (not available inside archives).</> },
       { title: "Browse WSL on Windows", body: (k) => <>Open a distribution from Drives › Not mounted to start it. {k("terminal")} opens its Linux shell here. Delete uses its Linux trash where available; Gall's Trash window only shows the Windows Recycle Bin. Stop terminates every program in the distribution.</> },
       { title: "Type to filter", body: () => <>Start typing in a folder to filter it (with vim keys on, press <kbd>/</kbd> first). <kbd>Esc</kbd> clears the filter.</> },
       { title: "Every action by name", body: (k) => <>{k("commandPalette")} opens the command palette: search any action and see its keys.</> },
-      { title: "A menu instead of shortcuts", body: (_k, leader) => leader ? <>Press <kbd>{leader}</kbd> (the leader key) for a menu of grouped actions; each letter leads one level deeper.</> : <>Set a leader key in Settings › Vim keys for a menu of grouped actions instead of shortcuts.</> },
+      { title: "A menu instead of shortcuts", body: (_k, leader) => leader ? <>Press <kbd>{leader}</kbd> (the leader key) for a menu of grouped actions; each letter leads one level deeper.</> : <>Set a leader key in Settings › Keyboard for a menu of grouped actions instead of shortcuts.</> },
       { title: "Type a path", body: (k) => <>{k("editPath")} turns the folder path into a text field; <code>~</code> works.</> },
     ],
   },
@@ -61,7 +61,7 @@ const TIP_GROUPS: { title: string; icon: string; tips: Tip[] }[] = [
   },
   {
     title: "Make it yours", icon: "wand", tips: [
-      { title: "Vim keys", body: () => <>Turn them on in Settings › Vim keys: <kbd>j</kbd>/<kbd>k</kbd>, <kbd>gg</kbd>/<kbd>G</kbd>, <kbd>v</kbd> for visual mode and <kbd>?</kbd> for every key.</> },
+      { title: "Keyboard profiles", body: () => <>Choose Windows Explorer, Total Commander or Vim in Settings › Keyboard. Commander uses F5 copy, F6 move, F7 folder and F8 trash. Vim uses <kbd>j</kbd>/<kbd>k</kbd>, <kbd>gg</kbd>/<kbd>G</kbd> and <kbd>v</kbd> for visual mode. <kbd>?</kbd> shows the active profile's keys.</> },
       { title: "Your own shortcuts", body: () => <>Rebind any action in Settings › Shortcuts; menus and these tips show your keys.</> },
       { title: "Themes", body: (k) => <>Put a CSS file in the themes folder (Settings › Appearance) and pick it; {k("reloadTheme")} reloads it while you edit.</> },
       { title: "Portable", body: () => <>An empty file named <code>portable</code> next to the program keeps settings and data in a <code>UserData</code> folder beside it.</> },

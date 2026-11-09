@@ -38,6 +38,9 @@ pub struct GitStatus {
     pub root: PathBuf,
     /// Current branch; None when the HEAD is detached.
     pub branch: Option<String>,
+    /// Local branches whose history contains HEAD, including detached revisions.
+    pub containing_branches: Vec<String>,
+    pub subject: Option<String>,
     pub ahead: u32,
     pub behind: u32,
     /// State of each item of the folder that has one, by name.
@@ -145,6 +148,24 @@ pub fn status(dir: &Path) -> Option<GitStatus> {
         prefix.push('/');
     }
     let mut st = parse(&out, &prefix);
+    let mut summary = git(dir, &off);
+    summary.args(["log", "--no-show-signature", "-1", "--format=%s", "HEAD"]);
+    st.subject = output(summary).map(|out| String::from_utf8_lossy(&out).trim_end().to_string());
+    if st.branch.is_none() {
+        let mut branches = git(dir, &off);
+        branches.args([
+            "for-each-ref",
+            "--contains=HEAD",
+            "--format=%(refname:short)",
+            "refs/heads/",
+        ]);
+        st.containing_branches = output(branches)
+            .unwrap_or_default()
+            .split(|b| *b == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| String::from_utf8_lossy(line).into_owned())
+            .collect();
+    }
     st.root = root;
     Some(st)
 }
@@ -350,6 +371,20 @@ mod tests {
         assert_eq!(st.entries.get("new.txt"), Some(&GitState::Untracked));
         assert_eq!(st.entries.get("build"), Some(&GitState::Ignored));
         assert!(st.branch.is_some());
+        assert_eq!(st.subject.as_deref(), Some("init"));
+        assert!(run(&[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "filter.evil.clean=",
+            "checkout",
+            "--detach",
+            "HEAD"
+        ]));
+        let detached = status(&r).unwrap();
+        assert!(detached.branch.is_none());
+        assert!(!detached.containing_branches.is_empty());
+        assert_eq!(detached.subject.as_deref(), Some("init"));
         assert!(!marker.exists(), "a command from the repository ran");
     }
 }

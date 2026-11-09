@@ -6,5 +6,6 @@ pub mod cmdline;
 pub mod fonts;
 pub mod notes;
 pub mod openwith;
+pub mod shortcut;
 pub mod templates;
 pub mod terminal;

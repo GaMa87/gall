@@ -8,6 +8,7 @@ import * as A from "../state/actions";
 import { refreshAll } from "../state/controllers";
 import { draggedFav, draggedPaths, dropInto, isFileDrag, onDragOverTarget, startFavDrag } from "../state/dnd";
 import { setState, useStore } from "../state/store";
+import { useKeyLabels } from "../state/keyLabels";
 import { FileIcon, Icon } from "./Icon";
 import { PanePick } from "./PanePick";
 import { Splitter, useStoredSize } from "./Splitter";
@@ -315,6 +316,7 @@ function HistoryGroup({ current }: { current: string }) {
 }
 
 export function MainToolbar() {
+  const keys = useKeyLabels();
   const showLog = useStore((s) => s.showNotificationLog);
   const monitor = useStore((s) => s.settings?.showSystemMonitor ?? true);
   return (
@@ -323,7 +325,7 @@ export function MainToolbar() {
       <button className="icon-btn" title="About" onClick={() => A.openOverlay({ type: "about" })}><Icon name="info" /></button>
 
       <button className="icon-btn" title="Search names and tags (F3)" onClick={() => A.openOverlay({ type: "search", root: A.activePath(A.activeBrowser()) })}><Icon name="tag" /></button>
-      <button className="icon-btn" title="Keyboard shortcuts (?)" onClick={() => A.openOverlay({ type: "keys" })}><Icon name="wand" /></button>
+      <button className="icon-btn" title={`Keyboard shortcuts${keys.action("keyHelp") ? ` (${keys.action("keyHelp")})` : ""}`} onClick={() => A.openOverlay({ type: "keys" })}><Icon name="wand" /></button>
       <button className={`icon-btn ${monitor ? "active" : ""}`} title={monitor ? "Hide system monitor" : "Show system monitor"} onClick={() => A.updateSettings({ showSystemMonitor: !monitor })}><Icon name="activity" /></button>
       <button className={`icon-btn ${showLog ? "active" : ""}`} title="Notifications (~)" onClick={() => setState({ showNotificationLog: !showLog })}><Icon name="bell" /></button>
       <span className="spacer" />

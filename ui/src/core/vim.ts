@@ -24,6 +24,7 @@ export const NORMAL_KEYS: Spec[] = [
   ["-", "Parent folder", "parent"],
   ["g", "+go"],
   ["gg", "First item", "cursorTop"],
+  ["gr", "Git graph / switch revision", "gitGraph"],
   ["gh", "Home folder", "goHome"],
   ["g/", "File system root", "goRoot"],
   ["gp", "Edit path", "editPath"],
@@ -101,7 +102,17 @@ export const NORMAL_KEYS: Spec[] = [
   [",E", "Type ↓", "sortExtDesc"],
   [",c", "Created ↑", "sortCreated"],
   [",C", "Created ↓", "sortCreatedDesc"],
-  ["=", "Compare (2 selected / other panel)", "compare"],
+  ["=", "+compare"],
+  ["==", "Compare selection / other panel", "compare"],
+  ["=h", "Compare with Git HEAD", "compareGitHead"],
+  ["=g", "Compare with a Git commit", "compareGitCommit"],
+  ["=c", "Compare with clipboard", "compareClipboard"],
+  ["=f", "Compare panel folders", "compareFolders"],
+  ["+", "+windows"],
+  ["++", "Other browser", "focusOther"],
+  ["+h", "Left browser", "focusLeft"],
+  ["+l", "Right browser", "focusRight"],
+  ["+s", "Swap folders", "swapBrowsers"],
   ["R", "Refresh", "refresh"],
   ["!", "Terminal here", "terminal"],
   [":", "Command palette", "commandPalette"],
@@ -116,12 +127,14 @@ export const LEADER_KEYS: Spec[] = [
   ["e", "Toggle sidebar", "toggleSidebar"],
   ["*", "Pin / unpin folder", "togglePin"],
   ["?", "Keyboard shortcuts", "keyHelp"],
+  ["v", "Toggle selection", "toggleSelect"],
   ["o", "+open"],
   ["oo", "Open with…", "openWith"],
   ["ot", "Terminal here with…", "terminalWith"],
   ["oe", "Edit in editor", "edit"],
   ["oE", "Edit with…", "editWith"],
   ["od", "Default programs", "openWithSettings"],
+  ["om", "Context menu", "contextMenu"],
   ["f", "+file/find"],
   ["ff", "Go to file", "quickOpen"],
   ["fn", "New file", "newFile"],
@@ -148,11 +161,14 @@ export const LEADER_KEYS: Spec[] = [
   ["d", "+diff"],
   ["dd", "Compare selection / other panel", "compare"],
   ["dc", "Compare with clipboard", "compareClipboard"],
+  ["wr", "Git graph / switch revision", "gitGraph"],
   ["dg", "Compare with Git HEAD", "compareGitHead"],
+  ["dh", "Compare with a Git commit", "compareGitCommit"],
   ["df", "Compare panel folders", "compareFolders"],
   ["b", "+buffers (tabs)"],
   ["bd", "Close tab", "closeTab"],
   ["bb", "Previous tab", "prevTab"],
+  ["bp", "Pin / unpin folder", "togglePin"],
   ["t", "+tabs"],
   ["tn", "New tab", "newTab"],
   ["tc", "Close tab", "closeTab"],
@@ -186,6 +202,7 @@ export const LEADER_KEYS: Spec[] = [
   ["uf", "Folders on top", "toggleFoldersOnTop"],
   ["ur", "Reload theme", "reloadTheme"],
   ["us", "Settings", "settings"],
+  ...NORMAL_KEYS.filter(([keys]) => keys.startsWith(",")),
 ];
 
 /** Internal token for a tap of the Ctrl key (used as a leader). */
@@ -224,7 +241,7 @@ let defaultKeymap: Keymap | undefined;
 
 /** A chord that never reaches its action now: vim keys took it over, or it is the leader
  *  key (which opens the leader menu instead). */
-function shadowed(chord: string, c: KeyLabelCtx): boolean {
+export function shadowed(chord: string, c: KeyLabelCtx): boolean {
   if (c.vim && shadowedByVim(chord)) return true;
   const leader = leaderToken(c.leader);
   return !!leader && leader !== CTRL_TAP && normalizeChord(chord) === normalizeChord(leader);
@@ -248,7 +265,7 @@ export function keysForAction(action: Action, c: KeyLabelCtx): string | null {
 export function shortcutLabel(chord: string, c: KeyLabelCtx): string | null {
   // Menus are written with the default chords; the user may have rebound them.
   const k = normalizeChord(chord);
-  const a = (defaultKeymap ??= buildKeymap({})).get(k);
+  const a = (defaultKeymap ??= buildKeymap({}, "vim")).get(k);
   if (a) {
     // The written chord still does it and vim has no key of its own: keep it.
     const vimOwn = c.vim && NORMAL_KEYS.some(([, , x]) => x === a);
@@ -318,7 +335,7 @@ export function resolve(tree: KeyNode, seq: string[]): Resolved {
   return { kind: "none" };
 }
 
-/** Converts a keyboard event into a vim key token (case-sensitive). */
+/** Converts a keyboard event into a vim key token; letter case follows Shift, not Caps Lock. */
 export function vimToken(e: { key: string; code?: string; ctrlKey: boolean; metaKey: boolean; altKey: boolean; shiftKey?: boolean; getModifierState?: (k: "AltGraph") => boolean }): string | null {
   if (["Control", "Shift", "Alt", "Meta", "CapsLock", "AltGraph"].includes(e.key)) return null;
   // "[", "~" or "\" typed with AltGr (Ctrl+Alt on Windows) or Option (macOS) are those
@@ -334,6 +351,7 @@ export function vimToken(e: { key: string; code?: string; ctrlKey: boolean; meta
   }
   if (e.key === " ") return "Space";
   if (e.key === "Tab") return "Tab";
+  if (/^[a-z]$/i.test(e.key)) return e.shiftKey ? e.key.toUpperCase() : e.key.toLowerCase();
   return e.key.length === 1 ? e.key : null;
 }
 

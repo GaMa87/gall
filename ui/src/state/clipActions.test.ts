@@ -18,6 +18,7 @@ vi.stubGlobal("window", { setTimeout, clearTimeout });
 
 import * as A from "./actions";
 import { getState, setState } from "./store";
+import { onFolderChanged } from "./controllers";
 import type { FileEntry, Session } from "../api/types";
 
 const entry = (path: string) => ({ path, name: path.split("/").pop() } as FileEntry);
@@ -26,6 +27,75 @@ const texts = () => getState().notifications.map((n) => `${n.kind}: ${n.text}`);
 beforeEach(() => {
   calls.length = 0;
   setState({ notifications: [], notificationLog: [] });
+});
+
+describe("Windows shortcut activation", () => {
+  const shortcut = { path: "C:\\links\\target.lnk", name: "target.lnk", ext: "lnk", isDir: false } as FileEntry;
+  const session = { activeBrowser: 0, layout: "standard", browsers: [{ active: 0, tabs: [{ path: "C:\\links" }] }, { active: 0, tabs: [{ path: "C:\\" }] }] } as unknown as Session;
+
+  it("navigates to a folder target inside Gall instead of launching Explorer", async () => {
+    setState({ session });
+    handler = (cmd) => cmd === "shortcut_resolve"
+      ? { path: "C:\\Documents", name: "Documents", ext: "", isDir: true }
+      : session;
+    await A.openEntries(0, [shortcut]);
+    expect(calls.find((c) => c.cmd === "session_cmd")?.args.cmd).toEqual({ op: "navigate", b: 0, path: "C:\\Documents" });
+    expect(calls.some((c) => c.cmd === "open_path")).toBe(false);
+  });
+
+  it("uses the normal internal file flow for a note target", async () => {
+    setState({ session });
+    handler = (cmd) => {
+      if (cmd === "shortcut_resolve") return { path: "C:\\Documents\\note.2do", name: "note.2do", ext: "2do", isDir: false };
+      if (cmd === "preview_info") return { text: "My note" };
+      return null;
+    };
+    await A.openEntries(0, [shortcut]);
+    expect(getState().overlay).toMatchObject({ type: "note", path: "C:\\Documents\\note.2do", text: "My note" });
+    expect(calls.some((c) => c.cmd === "open_path")).toBe(false);
+  });
+
+  it("passes document targets to the normal opener and preserves program launchers", async () => {
+    for (const target of [{ path: "C:\\Documents\\file.txt", name: "file.txt", ext: "txt", isDir: false }, null]) {
+      calls.length = 0;
+      handler = (cmd) => cmd === "shortcut_resolve" ? target : null;
+      await A.openEntries(0, [shortcut]);
+      expect(calls.find((c) => c.cmd === "open_path")?.args.path).toBe(target?.path ?? shortcut.path);
+    }
+  });
+
+  it("reports broken targets and still opens independent selected files", async () => {
+    handler = (cmd) => {
+      if (cmd === "shortcut_resolve") throw "shortcut target does not exist";
+      return null;
+    };
+    await A.openEntries(0, [shortcut, { path: "C:\\file.txt", ext: "txt", name: "file.txt", isDir: false } as FileEntry]);
+    expect(texts()).toEqual(["error: shortcut target does not exist"]);
+    expect(calls.filter((c) => c.cmd === "open_path").map((c) => c.args.path)).toEqual(["C:\\file.txt"]);
+  });
+});
+
+describe("Trash file lists", () => {
+  it.each([["success", false], ["partial failure", true]] as const)(
+    "refreshes displayed entries after %s without a watcher event",
+    async (_, partialFailure) => {
+      let disk = ["/x/a.txt", "/x/b.txt"];
+      let displayed = [...disk];
+      const unsubscribe = onFolderChanged("/x", () => { displayed = [...disk]; });
+      handler = (cmd) => {
+        if (cmd === "trash") {
+          disk = partialFailure ? ["/x/b.txt"] : [];
+          if (partialFailure) throw "access denied";
+        }
+        return null;
+      };
+      try {
+        await A.trashPaths(["/x/a.txt", "/x/b.txt"]);
+        expect(displayed).toEqual(partialFailure ? ["/x/b.txt"] : []);
+        expect(getState().notifications.at(-1)?.kind).toBe(partialFailure ? "error" : "info");
+      } finally { unsubscribe(); }
+    },
+  );
 });
 
 describe("Copy path", () => {

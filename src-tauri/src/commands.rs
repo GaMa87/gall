@@ -26,6 +26,13 @@ fn e<E: std::fmt::Display>(err: E) -> String {
     err.to_string()
 }
 
+/// Holds off application replacement until a synchronous mutation finishes.
+fn mutation_guard() -> std::sync::MutexGuard<'static, ()> {
+    crate::updates::INSTALL_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 // ───────────────────────── app / settings ─────────────────────────
 
 #[derive(Serialize)]
@@ -127,6 +134,14 @@ pub async fn list_cloud_folders() -> R<Vec<gall_core::fs::cloud::CloudFolder>> {
 // ───────────────────────── compare ─────────────────────────
 
 #[tauri::command]
+pub async fn git_commits(path: PathBuf) -> R<Vec<gall_core::fs::diff::GitCommitInfo>> {
+    tauri::async_runtime::spawn_blocking(move || gall_core::fs::diff::git_commits(&path))
+        .await
+        .map_err(e)?
+        .map_err(e)
+}
+
+#[tauri::command]
 pub async fn diff_compare(
     a: gall_core::fs::diff::DiffSource,
     b: gall_core::fs::diff::DiffSource,
@@ -168,6 +183,7 @@ pub async fn diff_save_patch(
     dest: PathBuf,
 ) -> R<()> {
     tauri::async_runtime::spawn_blocking(move || -> R<()> {
+        let _update_gate = mutation_guard();
         let patch = gall_core::fs::diff::unified_patch(&a, &b).map_err(e)?;
         std::fs::write(&dest, patch).map_err(e)
     })
@@ -215,6 +231,7 @@ pub async fn sync_apply(
     let cancel = new_dircmp_cancel(&state);
     let journal = state.journal().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let _update_gate = mutation_guard();
         gall_core::fs::ops::apply_sync(&ops, &journal, &cancel)
     })
     .await
@@ -228,6 +245,7 @@ pub async fn sync_apply(
 pub async fn save_text(state: State<'_, AppState>, path: PathBuf, text: String) -> R<bool> {
     let journal = state.journal().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let _update_gate = mutation_guard();
         gall_core::fs::ops::save_text(&path, &text, &journal)
     })
     .await
@@ -758,6 +776,9 @@ pub async fn start_task(app: AppHandle, req: TaskRequest) -> R<u64> {
 }
 
 fn start_task_in(state: &AppState, req: TaskRequest) -> R<u64> {
+    let _update_gate = crate::updates::INSTALL_GATE
+        .lock()
+        .map_err(|e| e.to_string())?;
     if let (Some(dest), TaskKind::Copy | TaskKind::Move) = (&req.dest, req.kind) {
         let keep = state.settings.read().unwrap().recent_destinations;
         let _ = state.db.record_destination(&dest.to_string_lossy(), keep);
@@ -821,6 +842,7 @@ pub async fn find_existing(app: AppHandle, paths: Vec<PathBuf>) -> R<Vec<PathBuf
 #[tauri::command]
 pub async fn rename(app: AppHandle, path: String, new_name: String) -> R<String> {
     off_main(app, move |state| {
+        let _update_gate = mutation_guard();
         // Tags follow through the move hook (see lib.rs).
         ops::rename(Path::new(&path), &new_name, state.journal())
             .map(lossy)
@@ -842,6 +864,7 @@ static SIZE_CANCELLED: std::sync::Mutex<std::collections::VecDeque<u64>> =
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SizeProgress {
+    ticket: u64,
     path: String,
     size: gall_core::fs::dirsize::DirSize,
 }
@@ -856,9 +879,12 @@ pub async fn folder_size(
 ) -> R<Option<gall_core::fs::dirsize::DirSize>> {
     // A cancel can overtake this call (it runs on the main thread, this one on a worker):
     // then the calculation is over before it starts.
-    let cancelled = SIZE_CANCELLED.lock().unwrap().contains(&ticket);
-    let cancel = Arc::new(AtomicBool::new(cancelled));
-    SIZE_JOBS.lock().unwrap().push((ticket, cancel.clone()));
+    let cancel = {
+        let cancelled = SIZE_CANCELLED.lock().unwrap();
+        let cancel = Arc::new(AtomicBool::new(cancelled.contains(&ticket)));
+        SIZE_JOBS.lock().unwrap().push((ticket, cancel.clone()));
+        cancel
+    };
     let emitter = app.clone();
     let res = off_main(app, move |_| {
         let name = path.to_string_lossy().into_owned();
@@ -866,6 +892,7 @@ pub async fn folder_size(
             let _ = emitter.emit(
                 "folder-size-progress",
                 SizeProgress {
+                    ticket,
                     path: name.clone(),
                     size: *s,
                 },
@@ -910,6 +937,7 @@ pub async fn git_status(
 #[tauri::command]
 pub async fn batch_rename(app: AppHandle, items: Vec<(PathBuf, String)>) -> R<Vec<String>> {
     off_main(app, move |state| {
+        let _update_gate = mutation_guard();
         let out = ops::batch_rename(&items, state.journal()).map_err(e)?;
         Ok(out.into_iter().map(lossy).collect())
     })
@@ -919,6 +947,7 @@ pub async fn batch_rename(app: AppHandle, items: Vec<(PathBuf, String)>) -> R<Ve
 #[tauri::command]
 pub async fn create_dir(app: AppHandle, parent: String, name: String) -> R<String> {
     off_main(app, move |state| {
+        let _update_gate = mutation_guard();
         ops::create_dir(Path::new(&parent), &name, state.journal())
             .map(lossy)
             .map_err(e)
@@ -934,6 +963,7 @@ pub async fn create_file(
     template: Option<String>,
 ) -> R<String> {
     off_main(app, move |state| {
+        let _update_gate = mutation_guard();
         ops::create_file(
             Path::new(&parent),
             &name,
@@ -953,9 +983,9 @@ pub async fn create_file(
 pub async fn duplicate(app: AppHandle, paths: Vec<PathBuf>) -> R<Vec<String>> {
     off_main(app, move |state| {
         let targets = ops::duplicate_targets(&paths);
-        state
-            .tasks
-            .start(TaskRequest {
+        start_task_in(
+            state,
+            TaskRequest {
                 kind: TaskKind::Duplicate,
                 sources: paths,
                 dest: None,
@@ -965,8 +995,8 @@ pub async fn duplicate(app: AppHandle, paths: Vec<PathBuf>) -> R<Vec<String>> {
                 extract_mode: Default::default(),
                 trash_archive: false,
                 merge: false,
-            })
-            .map_err(e)?;
+            },
+        )?;
         Ok(targets.into_iter().map(lossy).collect())
     })
     .await
@@ -975,14 +1005,18 @@ pub async fn duplicate(app: AppHandle, paths: Vec<PathBuf>) -> R<Vec<String>> {
 #[tauri::command]
 pub async fn trash(state: State<'_, AppState>, paths: Vec<PathBuf>) -> R<()> {
     let journal = state.journal().clone();
-    tauri::async_runtime::spawn_blocking(move || ops::trash_items(&paths, &journal).map_err(e))
-        .await
-        .map_err(e)?
+    tauri::async_runtime::spawn_blocking(move || {
+        let _update_gate = mutation_guard();
+        ops::trash_items(&paths, &journal).map_err(e)
+    })
+    .await
+    .map_err(e)?
 }
 
 #[tauri::command]
 pub async fn symlink(app: AppHandle, target: String, dest_dir: String) -> R<String> {
     off_main(app, move |state| {
+        let _update_gate = mutation_guard();
         ops::symlink(Path::new(&target), Path::new(&dest_dir), state.journal())
             .map(lossy)
             .map_err(e)
@@ -995,6 +1029,7 @@ pub async fn symlink(app: AppHandle, target: String, dest_dir: String) -> R<Stri
 pub async fn undo(app: AppHandle, permanent: Option<bool>) -> R<String> {
     let permanent = permanent.unwrap_or(false);
     off_main(app, move |state| {
+        let _update_gate = mutation_guard();
         state.journal().undo_with(permanent).map_err(e)
     })
     .await
@@ -1010,6 +1045,7 @@ pub fn undo_peek(state: State<'_, AppState>) -> Option<String> {
 pub async fn undo_in(app: AppHandle, dir: String, permanent: Option<bool>) -> R<String> {
     let permanent = permanent.unwrap_or(false);
     off_main(app, move |state| {
+        let _update_gate = mutation_guard();
         state
             .journal()
             .undo_in_with(Path::new(&dir), permanent)
@@ -1043,6 +1079,16 @@ pub async fn archive_materialize(paths: Vec<PathBuf>) -> R<Vec<PathBuf>> {
 #[tauri::command]
 pub fn archive_password(path: PathBuf, password: String) {
     archive_view::set_password(&path, &password);
+}
+
+#[tauri::command]
+pub async fn shortcut_resolve(path: String) -> R<Option<FileEntry>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = real_path(Path::new(&path))?;
+        gall_core::util::shortcut::resolve(&path).map_err(e)
+    })
+    .await
+    .map_err(e)?
 }
 
 #[tauri::command]
@@ -1150,16 +1196,20 @@ pub async fn trash_list() -> R<Vec<gall_core::fs::trashbin::TrashEntry>> {
 /// Puts trash items back where they were deleted from.
 #[tauri::command]
 pub async fn trash_restore(ids: Vec<String>) -> R<()> {
-    tauri::async_runtime::spawn_blocking(move || gall_core::fs::trashbin::restore(&ids))
-        .await
-        .map_err(e)?
-        .map_err(e)
+    tauri::async_runtime::spawn_blocking(move || {
+        let _update_gate = mutation_guard();
+        gall_core::fs::trashbin::restore(&ids)
+    })
+    .await
+    .map_err(e)?
+    .map_err(e)
 }
 
 /// Deletes trash items for good (`ids` empty: empties the trash).
 #[tauri::command]
 pub async fn trash_purge(ids: Vec<String>) -> R<()> {
     tauri::async_runtime::spawn_blocking(move || {
+        let _update_gate = mutation_guard();
         if ids.is_empty() {
             gall_core::fs::trashbin::empty()
         } else {
@@ -1182,6 +1232,7 @@ pub fn open_terminal(state: State<'_, AppState>, dir: String) -> R<()> {
 #[tauri::command]
 pub async fn create_note(app: AppHandle, dir: String, text: String) -> R<String> {
     off_main(app, move |state| {
+        let _update_gate = mutation_guard();
         notes::create_note(Path::new(&dir), &text, state.journal())
             .map(lossy)
             .map_err(e)
@@ -1192,6 +1243,7 @@ pub async fn create_note(app: AppHandle, dir: String, text: String) -> R<String>
 #[tauri::command]
 pub async fn toggle_note(app: AppHandle, path: String) -> R<String> {
     off_main(app, move |state| {
+        let _update_gate = mutation_guard();
         notes::toggle_done(Path::new(&path), state.journal())
             .map(lossy)
             .map_err(e)
@@ -1202,6 +1254,7 @@ pub async fn toggle_note(app: AppHandle, path: String) -> R<String> {
 #[tauri::command]
 pub async fn update_note(app: AppHandle, path: String, text: String) -> R<()> {
     off_main(app, move |_| {
+        let _update_gate = mutation_guard();
         notes::update_note(Path::new(&path), &text).map_err(e)
     })
     .await
@@ -1218,6 +1271,7 @@ pub async fn templates_list(app: AppHandle) -> R<Vec<templates::Template>> {
 #[tauri::command]
 pub async fn template_add(app: AppHandle, file: String) -> R<String> {
     off_main(app, move |state| {
+        let _update_gate = mutation_guard();
         templates::add_from(&state.dirs.templates(), Path::new(&file))
             .map(lossy)
             .map_err(e)
@@ -1385,6 +1439,7 @@ pub fn search_cancel(state: State<'_, AppState>) {
 #[tauri::command]
 pub async fn hide_from_search(app: AppHandle, path: String) -> R<Option<String>> {
     tauri::async_runtime::spawn_blocking(move || {
+        let _update_gate = mutation_guard();
         let p = Path::new(&path);
         let (file, added) = gall_core::fs::ignorefile::hide_from_search(p).map_err(e)?;
         let st = app.state::<AppState>();
@@ -1418,6 +1473,7 @@ pub async fn show_in_search(
 ) -> R<gall_core::fs::ignorefile::ShowOutcome> {
     use gall_core::fs::ignorefile::ShowOutcome;
     tauri::async_runtime::spawn_blocking(move || {
+        let _update_gate = mutation_guard();
         let out = gall_core::fs::ignorefile::show_in_search(Path::new(&path)).map_err(e)?;
         if matches!(
             out,
@@ -1917,6 +1973,7 @@ pub async fn clip_paste_as_file(app: AppHandle, dir: String, as_kind: String) ->
 }
 
 fn paste_as_file(state: &AppState, dir: &str, as_kind: &str) -> R<String> {
+    let _update_gate = mutation_guard();
     let mut c = system_clipboard()?;
     let now = chrono::Local::now();
     let dirp = Path::new(dir);
@@ -2160,9 +2217,9 @@ fn selftest_dir() -> Option<PathBuf> {
     std::env::var_os("GALL_SELFTEST_DIR").map(PathBuf::from)
 }
 
-/// Captures the active window (our window during the self-test) with Spectacle.
+/// Captures the owned webview on Windows and the active test window on KDE.
 #[tauri::command]
-pub async fn selftest_shot(name: String) -> R<String> {
+pub async fn selftest_shot(window: tauri::WebviewWindow, name: String) -> R<String> {
     let dir = selftest_dir().ok_or("self-test not enabled")?;
     let safe: String = name
         .chars()
@@ -2175,6 +2232,11 @@ pub async fn selftest_shot(name: String) -> R<String> {
         })
         .collect();
     let out = dir.join(format!("{safe}.png"));
+    if cfg!(windows) {
+        let png = crate::report_capture::bug_report_capture(window).await?;
+        std::fs::write(&out, png).map_err(e)?;
+        return Ok(out.to_string_lossy().into_owned());
+    }
     let o = out.clone();
     let status = tauri::async_runtime::spawn_blocking(move || {
         let mut cmd = std::process::Command::new("spectacle");
@@ -2220,6 +2282,9 @@ pub fn selftest_done(app: AppHandle, report: String) -> R<()> {
 /// Writes a UI message into the application log (errors, DnD diagnostics).
 #[tauri::command]
 pub fn ui_log(level: String, msg: String) {
+    if matches!(level.as_str(), "error" | "warn") {
+        crate::bug_report::record(&level, &msg);
+    }
     match level.as_str() {
         "error" => log::error!(target: "ui", "{msg}"),
         "warn" => log::warn!(target: "ui", "{msg}"),
@@ -2243,6 +2308,54 @@ pub fn startup_args(args: State<'_, crate::cli::CliArgs>) -> crate::cli::CliArgs
 #[cfg(test)]
 mod tests {
     use super::{file_uri_path, windows_uri_path};
+
+    #[test]
+    fn patch_save_waits_until_application_replacement_finishes() {
+        use gall_core::fs::diff::DiffSource;
+        use std::sync::mpsc;
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+        let dest = std::env::temp_dir().join(format!(
+            "gall-update-gate-{}-{}.patch",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let gate = super::mutation_guard();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let output = dest.clone();
+        let worker = std::thread::spawn(move || {
+            let text = |text: &str| DiffSource::Text {
+                label: "test.txt".into(),
+                text: text.into(),
+            };
+            started_tx.send(()).unwrap();
+            let result = tauri::async_runtime::block_on(super::diff_save_patch(
+                text("before\n"),
+                text("after\n"),
+                output,
+            ));
+            done_tx.send(result).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        assert!(
+            !dest.exists(),
+            "A mutation must not write during replacement"
+        );
+        drop(gate);
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+        let patch = std::fs::read_to_string(&dest).unwrap();
+        std::fs::remove_file(dest).unwrap();
+        assert!(patch.contains("-before"));
+        assert!(patch.contains("+after"));
+    }
 
     #[test]
     fn windows_file_uris_become_native_paths() {
@@ -2272,4 +2385,416 @@ mod tests {
         assert_eq!(file_uri_path("/plain/path"), "/plain/path");
         assert_eq!(file_uri_path("file:///bad%2"), "/bad%2");
     }
+}
+
+#[tauri::command]
+pub async fn git_graph(
+    path: PathBuf,
+    comparison: Option<bool>,
+    reflog: Option<bool>,
+    limit: Option<usize>,
+    reference: Option<String>,
+) -> R<gall_core::fs::gitgraph::Graph> {
+    tauri::async_runtime::spawn_blocking(move || {
+        gall_core::fs::gitgraph::query_history(
+            &path,
+            comparison.unwrap_or(false),
+            reflog.unwrap_or(false),
+            limit.unwrap_or(200),
+            reference.as_deref(),
+        )
+    })
+    .await
+    .map_err(e)?
+    .map_err(e)
+}
+#[tauri::command]
+pub async fn git_switch(
+    path: PathBuf,
+    target: String,
+    branch: bool,
+    action: String,
+    message: String,
+    expected: Option<String>,
+) -> R<()> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _gate = mutation_guard();
+        if let Some(expected) = expected {
+            if gall_core::fs::gitrepository::snapshot(&path)?.token != expected {
+                return Err(gall_core::CoreError::Other(
+                    "Repository changed. Refresh and review checkout again.".into(),
+                ));
+            }
+        }
+        gall_core::fs::gitgraph::switch(&path, &target, branch, &action, &message)
+    })
+    .await
+    .map_err(e)?
+    .map_err(e)
+}
+
+#[tauri::command]
+pub async fn git_workspace(path: PathBuf) -> R<gall_core::fs::gitworktree::Workspace> {
+    tauri::async_runtime::spawn_blocking(move || gall_core::fs::gitworktree::workspace(&path))
+        .await
+        .map_err(e)?
+        .map_err(e)
+}
+#[tauri::command]
+pub async fn git_index_action(
+    path: PathBuf,
+    action: gall_core::fs::gitworktree::IndexAction,
+    file: Option<String>,
+    message: String,
+    expected: String,
+) -> R<()> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _gate = mutation_guard();
+        gall_core::fs::gitworktree::index_action(
+            &path,
+            action,
+            file.as_deref(),
+            &message,
+            &expected,
+        )
+    })
+    .await
+    .map_err(e)?
+    .map_err(e)
+}
+#[tauri::command]
+pub async fn git_file_patch(path: PathBuf, file: String, staged: bool) -> R<String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        gall_core::fs::gitworktree::patch(&path, &file, staged)
+    })
+    .await
+    .map_err(e)?
+    .map_err(e)
+}
+
+#[tauri::command]
+pub async fn git_commit_details(
+    path: PathBuf,
+    commit: String,
+    base: Option<String>,
+) -> R<gall_core::fs::gitinspect::Details> {
+    tauri::async_runtime::spawn_blocking(move || {
+        gall_core::fs::gitinspect::details(&path, &commit, base.as_deref())
+    })
+    .await
+    .map_err(e)?
+    .map_err(e)
+}
+#[tauri::command]
+pub async fn git_commit_diff(path: PathBuf, commit: String) -> R<String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        gall_core::fs::gitinspect::commit_diff(&path, &commit)
+    })
+    .await
+    .map_err(e)?
+    .map_err(e)
+}
+#[tauri::command]
+pub async fn git_commit_patch(
+    path: PathBuf,
+    commit: String,
+    base: Option<String>,
+    file: String,
+) -> R<String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        gall_core::fs::gitinspect::patch(&path, &commit, base.as_deref(), &file)
+    })
+    .await
+    .map_err(e)?
+    .map_err(e)
+}
+#[tauri::command]
+pub async fn git_file_history(
+    path: PathBuf,
+    file: String,
+    limit: Option<usize>,
+    commit: Option<String>,
+) -> R<Vec<gall_core::fs::gitinspect::HistoryEntry>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        gall_core::fs::gitinspect::file_history(
+            &path,
+            &file,
+            limit.unwrap_or(200),
+            commit.as_deref(),
+        )
+    })
+    .await
+    .map_err(e)?
+    .map_err(e)
+}
+#[tauri::command]
+pub async fn git_commit_content(path: PathBuf, commit: String, file: String) -> R<String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        gall_core::fs::gitinspect::content(&path, &commit, &file)
+    })
+    .await
+    .map_err(e)?
+    .map_err(e)
+}
+#[tauri::command]
+pub async fn git_conflict(
+    path: PathBuf,
+    file: String,
+) -> R<gall_core::fs::gitrepository::Conflict> {
+    tauri::async_runtime::spawn_blocking(move || {
+        gall_core::fs::gitrepository::conflict(&path, &file)
+    })
+    .await
+    .map_err(e)?
+    .map_err(e)
+}
+#[tauri::command]
+pub async fn git_blame(
+    path: PathBuf,
+    commit: String,
+    file: String,
+) -> R<Vec<gall_core::fs::gitinspect::BlameLine>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        gall_core::fs::gitinspect::blame(&path, &commit, &file)
+    })
+    .await
+    .map_err(e)?
+    .map_err(e)
+}
+#[tauri::command]
+pub async fn git_repository(path: PathBuf) -> R<gall_core::fs::gitrepository::Repository> {
+    // Read-only: must not wait on the update/mutation gate, which long
+    // network jobs hold for their whole duration.
+    tauri::async_runtime::spawn_blocking(move || gall_core::fs::gitrepository::snapshot(&path))
+        .await
+        .map_err(e)?
+        .map_err(e)
+}
+#[tauri::command]
+pub async fn git_repository_action(
+    path: PathBuf,
+    request: gall_core::fs::gitrepository::Request,
+    expected: String,
+) -> R<String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _gate = mutation_guard();
+        gall_core::fs::gitrepository::execute(&path, request, &expected)
+    })
+    .await
+    .map_err(e)?
+    .map_err(e)
+}
+#[tauri::command]
+pub async fn git_patch_selection(
+    path: PathBuf,
+    file: String,
+    staged: bool,
+) -> R<gall_core::fs::gitworktree::SelectionPatch> {
+    tauri::async_runtime::spawn_blocking(move || {
+        gall_core::fs::gitworktree::selection_patch(&path, &file, staged)
+    })
+    .await
+    .map_err(e)?
+    .map_err(e)
+}
+#[tauri::command]
+pub async fn git_apply_selection(
+    path: PathBuf,
+    file: String,
+    staged: bool,
+    selected: Vec<usize>,
+    expected: String,
+) -> R<()> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _gate = mutation_guard();
+        gall_core::fs::gitworktree::apply_selection(&path, &file, staged, &selected, &expected)
+    })
+    .await
+    .map_err(e)?
+    .map_err(e)
+}
+
+type NetworkJobs = std::sync::Mutex<std::collections::HashMap<String, Arc<AtomicBool>>>;
+static GIT_NETWORK_JOBS: std::sync::LazyLock<NetworkJobs> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Registers a cancellable job and unregisters it on drop, so the entry is
+/// removed even when the command future is dropped mid-await.
+struct JobGuard {
+    id: String,
+}
+
+impl JobGuard {
+    fn register(id: &str, busy: &str) -> Result<(Self, Arc<AtomicBool>), String> {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut jobs = GIT_NETWORK_JOBS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if jobs.contains_key(id) {
+            return Err(busy.into());
+        }
+        jobs.insert(id.to_owned(), cancel.clone());
+        Ok((Self { id: id.to_owned() }, cancel))
+    }
+}
+
+impl Drop for JobGuard {
+    fn drop(&mut self) {
+        GIT_NETWORK_JOBS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.id);
+    }
+}
+
+#[tauri::command]
+pub async fn git_network(
+    app: AppHandle,
+    path: PathBuf,
+    id: String,
+    remote: String,
+    action: gall_core::fs::gitnetwork::NetworkAction,
+    expected: String,
+    lease: Option<String>,
+) -> R<String> {
+    let (_registration, cancel) = JobGuard::register(&id, "Remote operation ID is already active")?;
+    let job = id.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _gate = mutation_guard();
+        gall_core::fs::gitnetwork::run(
+            &path,
+            &remote,
+            action,
+            &expected,
+            lease.as_deref(),
+            &cancel,
+            |text| {
+                let _ = app.emit(
+                    "git-network-progress",
+                    gall_core::fs::gitnetwork::Progress {
+                        id: job.clone(),
+                        text,
+                    },
+                );
+            },
+        )
+    })
+    .await
+    .map_err(e)
+    .and_then(|v| v.map_err(e))
+}
+#[tauri::command]
+pub fn git_network_cancel(id: String) {
+    if let Some(cancel) = GIT_NETWORK_JOBS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&id)
+    {
+        cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+#[tauri::command]
+pub async fn git_advanced(
+    path: PathBuf,
+    commit: Option<String>,
+) -> R<gall_core::fs::gitadvanced::AdvancedSnapshot> {
+    tauri::async_runtime::spawn_blocking(move || {
+        gall_core::fs::gitadvanced::snapshot(&path, commit.as_deref())
+    })
+    .await
+    .map_err(e)?
+    .map_err(e)
+}
+#[tauri::command]
+pub async fn git_advanced_action(
+    app: AppHandle,
+    path: PathBuf,
+    id: String,
+    request: gall_core::fs::gitadvanced::Request,
+    expected: String,
+) -> R<String> {
+    let (_registration, cancel) = JobGuard::register(&id, "Git operation ID is already active")?;
+    let job = id.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _gate = mutation_guard();
+        gall_core::fs::gitadvanced::execute(&path, request, &expected, &cancel, |text| {
+            let _ = app.emit(
+                "git-advanced-progress",
+                gall_core::fs::gitnetwork::Progress {
+                    id: job.clone(),
+                    text,
+                },
+            );
+        })
+    })
+    .await
+    .map_err(e)
+    .and_then(|v| v.map_err(e))
+}
+#[tauri::command]
+pub fn git_advanced_cancel(id: String) {
+    git_network_cancel(id);
+}
+#[tauri::command]
+pub async fn git_rebase_plan(
+    path: PathBuf,
+    base: String,
+) -> R<gall_core::fs::gitrewrite::RewritePlan> {
+    tauri::async_runtime::spawn_blocking(move || gall_core::fs::gitrewrite::plan(&path, &base))
+        .await
+        .map_err(e)?
+        .map_err(e)
+}
+#[tauri::command]
+pub async fn git_rebase_execute(
+    path: PathBuf,
+    entries: Vec<gall_core::fs::gitrewrite::RewriteEntry>,
+    base: String,
+    expected: String,
+) -> R<String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _gate = mutation_guard();
+        let executable =
+            std::env::current_exe().map_err(|e| gall_core::CoreError::Other(e.to_string()))?;
+        gall_core::fs::gitrewrite::execute(&path, entries, &base, &expected, &executable)
+    })
+    .await
+    .map_err(e)?
+    .map_err(e)
+}
+#[tauri::command]
+pub async fn git_reword(
+    path: PathBuf,
+    target: String,
+    message: String,
+    expected: String,
+) -> R<String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _gate = mutation_guard();
+        let executable =
+            std::env::current_exe().map_err(|e| gall_core::CoreError::Other(e.to_string()))?;
+        gall_core::fs::gitrewrite::reword(&path, &target, &message, &expected, &executable)
+    })
+    .await
+    .map_err(e)?
+    .map_err(e)
+}
+
+#[tauri::command]
+pub async fn git_commit_edit(
+    path: PathBuf,
+    target: String,
+    action: gall_core::fs::gitrewrite::QuickAction,
+    expected: String,
+) -> R<String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _gate = mutation_guard();
+        let executable =
+            std::env::current_exe().map_err(|e| gall_core::CoreError::Other(e.to_string()))?;
+        gall_core::fs::gitrewrite::quick_edit(&path, &target, action, &expected, &executable)
+    })
+    .await
+    .map_err(e)?
+    .map_err(e)
 }

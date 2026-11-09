@@ -157,7 +157,7 @@ export function OpenWith({ paths, mode }: { paths: string[]; mode: "file" | "ter
         <div className="qo-input">
           <Icon name={terminal ? "terminal" : editor ? "rename" : "open"} size={17} />
           <span className="ow-title">{terminal ? `Terminal in “${basename(paths[0]) || paths[0]}” with` : editor ? `Edit ${subject} with` : `Open ${subject} with`}</span>
-          <input ref={inputRef} value={q} spellCheck={false} placeholder={terminal ? "filter, or type a command: wezterm start --cwd {dir}" : "filter, or type a command: zed {path}"}
+          <input ref={inputRef} value={q} spellCheck={false} placeholder={terminal ? "filter, or type a command: wezterm start --always-new-process --cwd {dir}" : "filter, or type a command: zed {path}"}
             onChange={(e) => { setQ(e.target.value); setIdx(0); }} />
         </div>
         <div className="qo-list">

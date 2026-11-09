@@ -26,12 +26,15 @@ export function run(a: Action) {
     case "copyFolderPath": A.copyPaths([], path); break;
     case "togglePin": A.togglePin(path); break;
     case "compare": A.compareSelection(b); break;
+    case "gitGraph": A.openOverlay({ type: "gitGraph", path }); break;
     case "compareFolders": A.comparePanelFolders(b); break;
     case "compareClipboard":
+    case "compareGitCommit":
     case "compareGitHead": {
       const f = controller(b)?.focused();
       if (!f || f.isDir) { A.notify("Focus a file first", "warn"); break; }
       if (a === "compareClipboard") A.compareWithClipboard(f.path);
+      else if (a === "compareGitCommit") A.openOverlay({ type: "gitCommits", path: f.path });
       else A.compareWithGitHead(f.path);
       break;
     }

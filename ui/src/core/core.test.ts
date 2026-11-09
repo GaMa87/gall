@@ -4,10 +4,10 @@ import { quickFilterMatches as m } from "./filter";
 import { foldText, fuzzyMatch } from "./fuzzy";
 import { age } from "./age";
 import { ancestors, backOutside, basename, parent, join, splitExt, isInside, joinRel, tildify } from "./path";
-import { altGrChar, buildKeymap, chordOf, normalizeChord, optionChar, typedChar } from "./keymap";
+import { altGrChar, buildKeymap, chordOf, keyboardProfile, keyboardSettings, normalizeChord, optionChar, typedChar, type KeyboardProfile } from "./keymap";
 import { vimToken } from "./vim";
 import { formatSize, unixMode, windowsMode } from "./format";
-import type { FileEntry } from "../api/types";
+import type { FileEntry, Settings } from "../api/types";
 
 const e = (name: string, isDir: boolean, size = 0, modified = 0): FileEntry => ({
   name, path: "/" + name, kind: isDir ? "dir" : "file", isDir, isHidden: false, isSymlink: false,
@@ -105,14 +105,79 @@ describe("paths", () => {
 });
 
 describe("keymap", () => {
+  it("adds non-conflicting commander shortcuts and keeps established bindings", () => {
+    const km = buildKeymap({}, "vim");
+    for (const [chord, action] of [
+      ["F6", "moveToOther"], ["F8", "delete"], ["Shift+F6", "rename"],
+      ["Alt+F7", "search"], ["Tab", "focusOther"], ["Insert", "selectDown"],
+      ["Ctrl+F3", "sortName"], ["Ctrl+F4", "sortExt"],
+      ["Ctrl+F5", "sortModified"], ["Ctrl+F6", "sortSize"],
+      ["?", "keyHelp"], ["Ctrl+/", "keyHelp"], ["Shift+F1", "keyHelp"],
+      ["F5", "refresh"], ["F7", "longNames"], ["F3", "search"],
+      ["F1", "commandPalette"], ["Alt+C", "copyToOther"], ["Alt+M", "moveToOther"],
+    ]) expect(km.get(chord)).toBe(action);
+    const custom = buildKeymap({ keyHelp: "F6", moveToOther: "Alt+M", selectDown: "" });
+    expect(custom.get("F6")).toBe("keyHelp");
+    expect(custom.has("Ctrl+/")).toBe(false);
+    expect(custom.has("?")).toBe(false);
+    expect(custom.has("Insert")).toBe(false);
+  });
+  it.each([
+    ["explorer", ["keyHelp", "rename", "search", "editPath", "refresh", "focusOther", "longNames", "delete"]],
+    ["totalCommander", ["keyHelp", "refresh", "preview", "edit", "copyToOther", "moveToOther", "newFolder", "delete"]],
+    ["vim", ["commandPalette", "rename", "search", "edit", "refresh", "moveToOther", "longNames", "delete"]],
+  ] as const)("uses the %s profile's function keys without duplicate actions", (profile, expected) => {
+    const km = buildKeymap({}, profile);
+    expected.forEach((action, i) => expect(km.get(`F${i + 1}`)).toBe(action));
+    for (const [chord, action] of [
+      ["?", "keyHelp"], ["Ctrl+/", "keyHelp"], ["Shift+F1", "keyHelp"],
+      ["Ctrl+C", "copy"], ["Ctrl+Insert", "copy"], ["Shift+Insert", "paste"],
+      ["Ctrl+Shift+N", "newFolder"], ["Alt+F7", "search"], ["Alt+C", "copyToOther"],
+      ["Alt+M", "moveToOther"], ["Ctrl+Alt+L", "longNames"], ["Ctrl+Alt+E", "edit"],
+      ["Ctrl+Shift+P", "commandPalette"], ["Ctrl+B", "togglePin"],
+    ]) expect(km.get(chord)).toBe(action);
+  });
+  it("keeps explicit overrides authoritative across profile switches", () => {
+    for (const profile of ["explorer", "totalCommander", "vim"] as KeyboardProfile[]) {
+      const km = buildKeymap({ keyHelp: "F5", refresh: "", newFolder: "Ctrl+Alt+N" }, profile);
+      expect(km.get("F5")).toBe("keyHelp");
+      expect([...km.values()]).not.toContain("refresh");
+      expect(km.get("Ctrl+Alt+N")).toBe("newFolder");
+      expect(km.has("Ctrl+Shift+N")).toBe(false);
+    }
+  });
+  it("migrates the old Vim toggle and preserves custom settings when choosing profiles", () => {
+    const legacy = { vimKeys: false, shortcuts: { copyToOther: "F9" }, leaderKeyBasic: ";" } as unknown as Settings;
+    expect(keyboardProfile(legacy)).toBe("explorer");
+    expect(keyboardProfile({ vimKeys: true })).toBe("vim");
+    const commander = keyboardSettings(legacy, { keyboardProfile: "totalCommander" });
+    expect(commander.vimKeys).toBe(false);
+    expect(keyboardProfile(commander)).toBe("totalCommander");
+    expect(commander.shortcuts).toBe(legacy.shortcuts);
+    expect(commander.leaderKeyBasic).toBe(";");
+    expect(keyboardSettings(commander, { fontSize: 16 }).keyboardProfile).toBe("totalCommander");
+    expect(keyboardSettings(commander, { keyboardProfile: "vim" }).vimKeys).toBe(true);
+    expect(keyboardSettings(commander, { vimKeys: true }).keyboardProfile).toBe("vim");
+    expect(keyboardSettings({ ...legacy, keyboardProfile: "vim" }).vimKeys).toBe(true);
+  });
   it("chords", () => {
     const ev = (key: string, mods: Partial<{ ctrlKey: boolean; shiftKey: boolean; altKey: boolean; code: string }> = {}) =>
       chordOf({ key, ctrlKey: false, metaKey: false, altKey: false, shiftKey: false, ...mods });
     expect(ev("n", { ctrlKey: true, shiftKey: true })).toBe("Ctrl+Shift+N");
     expect(ev(" ")).toBe("Space");
     expect(ev("~", { shiftKey: true })).toBe("Shift+~");
+    expect(buildKeymap({}).get(ev("?", { shiftKey: true }))).toBe("keyHelp");
     expect(ev("ç", { altKey: true, code: "KeyC" })).toBe("Alt+C");
     expect(normalizeChord("shift+ctrl+n")).toBe("Ctrl+Shift+N");
+  });
+  it("uses Shift rather than Caps Lock letter casing for shortcut chords", () => {
+    const ev = (key: string, shiftKey = false) => chordOf({
+      key, ctrlKey: false, metaKey: false, altKey: false, shiftKey,
+    });
+    expect(ev("j")).toBe("J");
+    expect(ev("J")).toBe("J");
+    expect(ev("J", true)).toBe("Shift+J");
+    expect(ev("j", true)).toBe("Shift+J");
   });
   it("AltGr characters are characters, not Ctrl+Alt shortcuts (Windows)", () => {
     const altGr = (key: string, code: string) =>

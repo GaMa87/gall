@@ -1,5 +1,22 @@
 // Keyboard shortcuts (see docs/01-feature-inventory.md, M:shortcutkeys).
 // Users can override any action via settings.shortcuts (C-04).
+import type { Settings } from "../api/types";
+
+export type KeyboardProfile = NonNullable<Settings["keyboardProfile"]>;
+export const KEYBOARD_PROFILES: Record<KeyboardProfile, string> = {
+  explorer: "Windows Explorer", totalCommander: "Total Commander", vim: "Vim",
+};
+
+/** Older settings only recorded whether Vim keys were enabled. */
+export function keyboardProfile(s?: Pick<Settings, "keyboardProfile" | "vimKeys"> | null): KeyboardProfile {
+  return s?.keyboardProfile ?? (s?.vimKeys ? "vim" : "explorer");
+}
+
+export function keyboardSettings(s: Settings, patch: Partial<Settings> = {}): Settings {
+  const profile = patch.keyboardProfile ?? (patch.vimKeys === undefined
+    ? keyboardProfile(s) : patch.vimKeys ? "vim" : "explorer");
+  return { ...s, ...patch, keyboardProfile: profile, vimKeys: profile === "vim" };
+}
 
 export type Action =
   | "open" | "openWith" | "parent" | "back" | "forward" | "editPath" | "copyPath" | "copyFolderPath"
@@ -17,7 +34,7 @@ export type Action =
   | "focusLeft" | "focusRight"
   | "sortName" | "sortNameDesc" | "sortSize" | "sortSizeDesc" | "sortModified" | "sortModifiedDesc"
   | "sortExt" | "sortExtDesc" | "sortCreated" | "sortCreatedDesc"
-  | "compare" | "compareClipboard" | "compareGitHead" | "compareFolders"
+  | "gitGraph" | "compare" | "compareClipboard" | "compareGitHead" | "compareGitCommit" | "compareFolders"
   // Archives and the rest of the context menu (vim / leader keys; no chords by default)
   | "extractHere" | "extractToFolder" | "extractToOther" | "compressZip" | "compressAs"
   | "reveal" | "viewNext" | "toggleFoldersOnTop" | "visualMode" | "folderSizes";
@@ -31,15 +48,15 @@ export const DEFAULT_KEYMAP: Record<Action, string[]> = {
   editPath: ["\\", "Alt+D", "Ctrl+L"],
   copyPath: ["Ctrl+Shift+C"],
   copyFolderPath: ["Ctrl+Shift+Alt+C"],
-  rename: ["F2"],
+  rename: ["F2", "Shift+F6"],
   copyToOther: ["Alt+C"],
-  moveToOther: ["Alt+M"],
+  moveToOther: ["Alt+M", "F6"],
   duplicate: ["Ctrl+D"],
-  delete: ["Delete"],
+  delete: ["Delete", "F8"],
   deletePermanent: ["Shift+Delete"],
   properties: ["Ctrl+I", "Alt+Enter"],
   tag: ["Ctrl+Alt+T"],
-  longNames: ["F7"],
+  longNames: ["F7", "Ctrl+Alt+L"],
   newFile: ["Ctrl+N"],
   newFolder: ["Ctrl+Shift+N"],
   newNote: ["Alt+N"],
@@ -49,10 +66,10 @@ export const DEFAULT_KEYMAP: Record<Action, string[]> = {
   closeTab: ["Ctrl+W"],
   nextTab: ["Ctrl+Tab"],
   prevTab: ["Ctrl+Shift+Tab"],
-  focusOther: ["Alt+F"],
-  copy: ["Ctrl+C"],
+  focusOther: ["Alt+F", "Tab"],
+  copy: ["Ctrl+C", "Ctrl+Insert"],
   cut: ["Ctrl+X"],
-  paste: ["Ctrl+V"],
+  paste: ["Ctrl+V", "Shift+Insert"],
   pasteAsLinks: ["Ctrl+Shift+V"],
   preview: ["Space"],
   selectAll: ["Ctrl+A"],
@@ -65,12 +82,12 @@ export const DEFAULT_KEYMAP: Record<Action, string[]> = {
   // Total Commander's "swap panels".
   swapBrowsers: ["Ctrl+U"],
   notifications: ["Shift+~"],
-  search: ["F3"],
+  search: ["F3", "Alt+F7"],
   quickOpen: ["Ctrl+P", "Ctrl+E"],
   commandPalette: ["Ctrl+Shift+P", "F1"],
   grepFolder: ["Ctrl+F"],
   grepRoot: ["Ctrl+Shift+F"],
-  keyHelp: [],
+  keyHelp: ["?", "Ctrl+/", "Shift+F1"],
   togglePin: ["Ctrl+B"],
   cursorDown: [],
   cursorUp: [],
@@ -80,20 +97,20 @@ export const DEFAULT_KEYMAP: Record<Action, string[]> = {
   halfPageUp: [],
   enter: [],
   filter: [],
-  selectDown: [],
+  selectDown: ["Insert"],
   goHome: [],
   goRoot: [],
   tab1: [], tab2: [], tab3: [], tab4: [], tab5: [], tab6: [], tab7: [], tab8: [], tab9: [],
   focusLeft: [], focusRight: [],
-  sortName: [], sortNameDesc: [], sortSize: [], sortSizeDesc: [], sortModified: [], sortModifiedDesc: [],
-  sortExt: [], sortExtDesc: [], sortCreated: [], sortCreatedDesc: [],
-  compare: ["Ctrl+Shift+D"], compareClipboard: [], compareGitHead: [], compareFolders: ["Ctrl+Alt+D"],
+  sortName: ["Ctrl+F3"], sortNameDesc: [], sortSize: ["Ctrl+F6"], sortSizeDesc: [], sortModified: ["Ctrl+F5"], sortModifiedDesc: [],
+  sortExt: ["Ctrl+F4"], sortExtDesc: [], sortCreated: [], sortCreatedDesc: [],
+  gitGraph: [], compare: ["Ctrl+Shift+D"], compareClipboard: [], compareGitHead: [], compareGitCommit: [], compareFolders: ["Ctrl+Alt+D"],
   extractHere: [], extractToFolder: [], extractToOther: [], compressZip: [], compressAs: [],
   reveal: [], viewNext: [], toggleFoldersOnTop: [], visualMode: [],
   folderSizes: ["Ctrl+Alt+S"],
   terminal: ["F10"],
   terminalWith: ["Ctrl+F10"],
-  edit: ["F4"],
+  edit: ["F4", "Ctrl+Alt+E"],
   editWith: ["Shift+F4"],
   openWithSettings: [],
   undo: ["Ctrl+Z"],
@@ -102,6 +119,29 @@ export const DEFAULT_KEYMAP: Record<Action, string[]> = {
   layoutNext: ["Ctrl+Shift+L"],
   contextMenu: ["Shift+F10", "ContextMenu"],
 };
+
+export function defaultKeymap(profile: KeyboardProfile): Record<Action, string[]> {
+  const help = { commandPalette: ["Ctrl+Shift+P"], keyHelp: ["?", "F1", "Ctrl+/", "Shift+F1"] };
+  if (profile === "explorer") return {
+    ...DEFAULT_KEYMAP, ...help,
+    editPath: ["Alt+D", "Ctrl+L", "F4", "\\"],
+    edit: ["Ctrl+Alt+E"],
+    focusOther: ["F6", "Tab", "Alt+F"],
+    moveToOther: ["Alt+M"],
+  };
+  if (profile === "totalCommander") return {
+    ...DEFAULT_KEYMAP, ...help,
+    rename: ["Shift+F6"],
+    refresh: ["F2", "Ctrl+R"],
+    preview: ["F3", "Space"],
+    search: ["Alt+F7"],
+    copyToOther: ["F5", "Alt+C"],
+    moveToOther: ["F6", "Alt+M"],
+    newFolder: ["F7", "Ctrl+Shift+N"],
+    longNames: ["Ctrl+Alt+L"],
+  };
+  return DEFAULT_KEYMAP;
+}
 
 export const ACTION_LABELS: Record<Action, string> = {
   open: "Open", openWith: "Open with…", parent: "Parent folder", back: "Back", forward: "Forward",
@@ -134,6 +174,8 @@ export const ACTION_LABELS: Record<Action, string> = {
   sortCreated: "Sort by date created, oldest first", sortCreatedDesc: "Sort by date created, newest first",
   compare: "Compare files (two selected, or with the other panel)", compareClipboard: "Compare file with clipboard",
   compareGitHead: "Compare file with Git HEAD (my changes)",
+  compareGitCommit: "Compare file with a Git commit",
+  gitGraph: "Open Git graph",
   compareFolders: "Compare the folders of both panels (sync)",
   extractHere: "Extract here", extractToFolder: "Extract each archive to its own folder",
   extractToOther: "Extract to other browser", compressZip: "Compress to .zip", compressAs: "Compress: name and format…",
@@ -208,10 +250,10 @@ export function normalizeChord(c: string): string {
 export type Keymap = Map<string, Action>;
 
 /** Builds chord → action lookup. Overrides replace all default chords of that action. */
-export function buildKeymap(overrides: Record<string, string>): Keymap {
+export function buildKeymap(overrides: Record<string, string>, profile: KeyboardProfile = "explorer"): Keymap {
   const m: Keymap = new Map();
   const user = new Set<string>();
-  for (const [action, chords] of Object.entries(DEFAULT_KEYMAP) as [Action, string[]][]) {
+  for (const [action, chords] of Object.entries(defaultKeymap(profile)) as [Action, string[]][]) {
     const o = overrides[action];
     const list = o !== undefined ? o.split(",").map((s) => s.trim()).filter(Boolean) : chords;
     for (const c of list) {

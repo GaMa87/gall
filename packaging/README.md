@@ -8,6 +8,21 @@ Gall should reach, in order of priority, and what each one needs.
 **Want to help?** Packaging is one of the easiest ways to contribute. Open an issue to say which
 channel you are working on, so work is not done twice.
 
+## In-app updates
+
+Updater-enabled builds check the latest stable GitHub release at startup and from
+**Settings → Updates → Check for updates**. Signed in-app installation targets
+Windows installers, Linux AppImage and macOS application bundles. Portable Windows
+ZIPs and Linux system packages instead need a manual upgrade: download a new ZIP,
+or use the package manager that installed Gall. Preserve portable `UserData` when
+replacing application files. Do not replace a package-managed installation with an
+AppImage or Windows installer through the updater.
+
+Release signing setup, publication and the required real upgrade checks are in
+[CONTRIBUTING.md](../CONTRIBUTING.md#updater-signing-setup-one-time). Installation
+across all supported operating systems must be verified with signed release builds;
+local unit tests do not establish that a published upgrade works.
+
 ## Status
 
 | Channel | Platform | Status | Files here |
