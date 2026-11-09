@@ -59,12 +59,31 @@ jobs:
             echo "Configure GALL_UPDATER_PUBLIC_KEY and TAURI_SIGNING_PRIVATE_KEY before releasing." >&2
             exit 1
           fi
-          # Fail in seconds, not after the build: a stray character from copy and paste
-          # (such as the zsh prompt's trailing %) makes signing fail at the very end.
-          node -e 'for (const n of ["GALL_UPDATER_PUBLIC_KEY", "TAURI_SIGNING_PRIVATE_KEY"]) { if (!/^[A-Za-z0-9+\/=\s]+$/.test(process.env[n])) { console.error(n + " is not valid base64: remove stray characters such as a trailing %"); process.exit(1); } }'
-          node -e 'require("fs").writeFileSync(".updater-release.json", JSON.stringify({bundle:{createUpdaterArtifacts:true}}))'
+          # Fail in seconds, not after the build. A stray character from copy and paste
+          # (such as the zsh prompt's trailing %) or a wrong file makes signing fail at
+          # the very end. The key values are never printed.
+          # The overlay also carries the public key: after signing, the bundler checks
+          # plugins.updater.pubkey, which is empty in tauri.conf.json.
+          node -e '
+            const fs = require("fs");
+            const text = (n) => Buffer.from((process.env[n] || "").trim(), "base64").toString();
+            const expected = { GALL_UPDATER_PUBLIC_KEY: "public key", TAURI_SIGNING_PRIVATE_KEY: "secret key" };
+            for (const [n, kind] of Object.entries(expected)) {
+              const v = process.env[n] || "";
+              const first = text(n).split("\n")[0];
+              if (!/^[A-Za-z0-9+\/=\s]+$/.test(v) || !first.startsWith("untrusted comment:") || !first.includes(kind)) {
+                console.error(n + " is not a valid Tauri " + kind + ": copy it from the .key / .key.pub file without extra characters such as a trailing %");
+                process.exit(1);
+              }
+            }
+            fs.writeFileSync(".updater-release.json", JSON.stringify({
+              bundle: { createUpdaterArtifacts: true },
+              plugins: { updater: { pubkey: process.env.GALL_UPDATER_PUBLIC_KEY.trim() } },
+            }));
+          '
           # Not $(pwd): Git Bash on Windows gives /d/a/..., which tauri-action cannot open.
-          echo "config=$WORKSPACE/.updater-release.json" >> "$GITHUB_OUTPUT"
+          # Forward slashes: backslashes can be eaten when tauri-action splits its arguments.
+          echo "config=${WORKSPACE//\\//}/.updater-release.json" >> "$GITHUB_OUTPUT"
       - uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
