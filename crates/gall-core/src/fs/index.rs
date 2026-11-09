@@ -816,9 +816,12 @@ mod tests {
         // src, src/fs, ui, ui/src dirs + 5 files (hidden and node_modules excluded)
         assert_eq!(st.entries, 9, "{:?}", st);
 
+        // Matching is fuzzy over the whole path, so the random temp folder name (on macOS a
+        // long /var/folders/... path) can supply the letters for other files too. The
+        // intended file must rank first; do not assert that it is the only hit.
         let r = idx.query("fpane", None, 10);
-        assert_eq!(r.hits.len(), 1);
-        assert!(r.hits[0].path.ends_with("FolderPane.tsx"));
+        assert!(!r.hits.is_empty());
+        assert!(r.hits[0].path.ends_with("FolderPane.tsx"), "{:?}", r.hits);
         assert_eq!(r.hits[0].name, "FolderPane.tsx");
 
         let r = idx.query("ext:rs", None, 10);
@@ -848,7 +851,12 @@ mod tests {
             r.hits
         );
         assert!(r.hits.iter().any(|h| h.name == "src"));
-        assert_eq!(idx.query("fpane/", None, 10).total, 0);
+        // Files never appear with a trailing separator (the temp path may still match "fpane").
+        assert!(idx
+            .query("fpane/", None, 10)
+            .hits
+            .iter()
+            .all(|h| h.is_dir && h.name != "FolderPane.tsx"));
     }
 
     #[test]

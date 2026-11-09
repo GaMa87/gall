@@ -2,10 +2,19 @@ name: Release
 
 # Push a tag like v0.2.0 to build installers for Linux, Windows and macOS
 # and attach them to a draft GitHub release.
+#
+# Dry run: Actions > Release > Run workflow, branch main, "dry_run" ticked. Builds and signs
+# everything with the real keys but creates no release and touches no tag; the packages
+# stay as workflow artifacts. Do this before pushing a release tag.
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Build and sign only: no release, no upload, no checksums'
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -13,7 +22,7 @@ permissions:
 jobs:
   build:
     # Only on the public repo: the private development repo runs no CI/CD.
-    if: github.repository == 'GaMa87/gall' && startsWith(github.ref, 'refs/tags/v')
+    if: github.repository == 'GaMa87/gall' && (startsWith(github.ref, 'refs/tags/v') || inputs.dry_run)
     strategy:
       fail-fast: false
       matrix:
@@ -91,13 +100,14 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: 'Gall ${{ github.ref_name }}'
+          # Empty in a dry run: tauri-action then only builds and does not create a release.
+          tagName: ${{ inputs.dry_run != true && github.ref_name || '' }}
+          releaseName: ${{ inputs.dry_run != true && format('Gall {0}', github.ref_name) || '' }}
           releaseBody: 'See CHANGELOG.md for details. Linux and Windows are fully supported; macOS builds are experimental.'
           releaseDraft: true
           prerelease: ${{ contains(github.ref_name, '-') }}
-          uploadUpdaterJson: true
-          uploadUpdaterSignatures: true
+          uploadUpdaterJson: ${{ inputs.dry_run != true }}
+          uploadUpdaterSignatures: ${{ inputs.dry_run != true }}
           updaterJsonPreferNsis: true
           args: ${{ matrix.args }} --config "${{ steps.updater.outputs.config }}"
       # Portable Windows zip: the exe tauri-action just built, plus a `portable` marker.
@@ -106,11 +116,20 @@ jobs:
         shell: pwsh
         run: ./scripts/portable.ps1 -NoBuild
       - name: Attach portable zip to the release
-        if: startsWith(matrix.platform, 'windows') && startsWith(github.ref, 'refs/tags/')
+        if: startsWith(matrix.platform, 'windows') && startsWith(github.ref, 'refs/tags/') && inputs.dry_run != true
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release upload "${{ github.ref_name }}" (Get-Item dist/*.zip).FullName --clobber
+      - name: Keep the packages of a dry run as build artifacts
+        if: inputs.dry_run == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: dry-run-${{ matrix.platform }}-${{ strategy.job-index }}
+          path: |
+            target/release/bundle/**
+            target/*/release/bundle/**
+          if-no-files-found: error
       - name: Keep portable zip as a build artifact
         if: startsWith(matrix.platform, 'windows')
         uses: actions/upload-artifact@v4
@@ -121,7 +140,7 @@ jobs:
   # SHA256SUMS for packagers (Scoop, winget, AUR, Homebrew) and for users who verify downloads.
   checksums:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') && inputs.dry_run != true
     runs-on: ubuntu-latest
     steps:
       - name: Hash every release asset and attach SHA256SUMS
@@ -132,6 +151,6 @@ jobs:
           mkdir assets && cd assets
           gh release download "${{ github.ref_name }}" --pattern '*' --skip-existing
           rm -f SHA256SUMS
-          sha256sum * > SHA256SUMS
+          sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
           gh release upload "${{ github.ref_name }}" SHA256SUMS --clobber

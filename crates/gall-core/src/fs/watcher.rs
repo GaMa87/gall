@@ -297,6 +297,11 @@ mod tests {
             }),
         );
         watcher.watch(d.path()).unwrap();
+        // FSEvents on macOS can still deliver the creation of the file written just above
+        // after the stream started; let that settle so only the read is measured.
+        if cfg!(target_os = "macos") {
+            while rx.recv_timeout(Duration::from_millis(1000)).is_ok() {}
+        }
         assert_eq!(std::fs::read(&path).unwrap(), b"image");
         assert!(
             rx.recv_timeout(Duration::from_millis(400)).is_err(),

@@ -44,7 +44,15 @@ If you add a dependency, run `python3 scripts/third_party_notices.py`. Licences 
 ## Releases (maintainers)
 
 Bump the version in `Cargo.toml`, `package.json` and `ui/package.json` (Tauri inherits the Rust package version),
-move *Unreleased* in `CHANGELOG.md` under the new version, then tag: `git tag v0.2.0 && git push --tags`.
+move *Unreleased* in `CHANGELOG.md` under the new version. Then check the release without tagging:
+
+1. `scripts/release-dryrun.sh` builds the Linux packages in a container with a throwaway signing key
+   and checks the workflow, keys and desktop file (needs podman or docker; `--quick` skips the build).
+2. Run the *Release* workflow manually on `main` with **dry_run** ticked
+   (`gh workflow run release.yml --ref main -f dry_run=true`). It builds and signs Linux, Windows and
+   macOS but creates no release; the packages stay as workflow artifacts.
+
+Only then tag: `git tag v0.2.0 && git push --tags`.
 The *Release* workflow builds installers and creates a draft release.
 
 
@@ -71,7 +79,7 @@ need a signing key. To test a configured local build, export
 ### Publishing and checking an update
 
 Use tags such as `v0.2.0` for stable releases and `v0.2.0-beta.1` for prereleases.
-Manual workflow runs must select an existing version tag. The workflow keeps the
+Manual workflow runs without `dry_run` must select an existing version tag. The workflow keeps the
 release as a draft; after every platform build and the checksum job succeeds,
 inspect its assets, add meaningful release notes and publish it. Verify that
 `latest.json` contains Windows x86_64, Linux x86_64 and both macOS architectures,
