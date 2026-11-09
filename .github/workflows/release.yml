@@ -53,13 +53,18 @@ jobs:
         env:
           GALL_UPDATER_PUBLIC_KEY: ${{ vars.GALL_UPDATER_PUBLIC_KEY }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          WORKSPACE: ${{ github.workspace }}
         run: |
           if [[ -z "$GALL_UPDATER_PUBLIC_KEY" || -z "$TAURI_SIGNING_PRIVATE_KEY" ]]; then
             echo "Configure GALL_UPDATER_PUBLIC_KEY and TAURI_SIGNING_PRIVATE_KEY before releasing." >&2
             exit 1
           fi
+          # Fail in seconds, not after the build: a stray character from copy and paste
+          # (such as the zsh prompt's trailing %) makes signing fail at the very end.
+          node -e 'for (const n of ["GALL_UPDATER_PUBLIC_KEY", "TAURI_SIGNING_PRIVATE_KEY"]) { if (!/^[A-Za-z0-9+\/=\s]+$/.test(process.env[n])) { console.error(n + " is not valid base64: remove stray characters such as a trailing %"); process.exit(1); } }'
           node -e 'require("fs").writeFileSync(".updater-release.json", JSON.stringify({bundle:{createUpdaterArtifacts:true}}))'
-          echo "config=$(pwd)/.updater-release.json" >> "$GITHUB_OUTPUT"
+          # Not $(pwd): Git Bash on Windows gives /d/a/..., which tauri-action cannot open.
+          echo "config=$WORKSPACE/.updater-release.json" >> "$GITHUB_OUTPUT"
       - uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
