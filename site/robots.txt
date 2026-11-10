@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://gama87.github.io/gall/sitemap.xml

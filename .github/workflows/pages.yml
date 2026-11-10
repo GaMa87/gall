@@ -1,0 +1,47 @@
+name: Pages
+
+# Publishes the project web page (site/) to https://gama87.github.io/gall/.
+# One-time setup: Settings -> Pages -> Source: GitHub Actions.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - "docs/screenshots/**"
+      - "docs/social-preview.png"
+      - "assets/icon.png"
+      - ".github/workflows/pages.yml"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    # Only on the public repo: the private development repo runs no CI/CD.
+    if: github.repository == 'GaMa87/gall'
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Assemble the site
+        run: |
+          mkdir -p _site/screenshots
+          cp site/* _site/
+          cp assets/icon.png docs/social-preview.png _site/
+          cp docs/screenshots/main.png docs/screenshots/compare-excel.png _site/screenshots/
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4

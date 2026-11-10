@@ -1,0 +1,72 @@
+name: COPR
+
+# Uploads a published release to Fedora COPR (https://copr.fedorainfracloud.org/coprs/gama87/gall/).
+# It runs when a release is published, i.e. after the maintainer has checked the draft: the
+# assets of a draft are not public, and the SRPM is built from the public assets.
+# The version and SHA256 come from the release itself, so no spec change has to be committed.
+# Manual run: Actions -> COPR -> Run workflow, with a version such as 0.2.0.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release to upload, without the v (for example 0.2.0)"
+        required: true
+        type: string
+
+concurrency:
+  group: copr
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  copr:
+    # Only on the public repo: the private development repo runs no CI/CD.
+    # Pre-releases (tags with a dash) are not offered to Fedora users.
+    if: github.repository == 'GaMa87/gall' && (github.event_name == 'workflow_dispatch' || !github.event.release.prerelease)
+    name: Build the SRPM and submit it to COPR
+    runs-on: ubuntu-24.04
+    container: fedora:latest
+    timeout-minutes: 90
+    env:
+      COPR_PROJECT: gama87/gall
+      VERSION: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.version }}
+    steps:
+      - name: Install build tools
+        run: dnf -y install copr-cli rpm-build cpio curl gawk
+
+      # The default branch, not the tag: tags from before this workflow have no script.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Check the version
+        run: |
+          VERSION=${VERSION#v}
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "'$VERSION' is not a release version (expected X.Y.Z)"
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Write the COPR API token
+        env:
+          COPR_CONFIG: ${{ secrets.COPR_API_TOKEN }}
+        run: |
+          # The secret is the whole ~/.config/copr file. Nothing from it is printed.
+          if ! printf '%s' "$COPR_CONFIG" | grep -q '^\[copr-cli\]' || ! printf '%s' "$COPR_CONFIG" | grep -q '^token'; then
+            echo "COPR_API_TOKEN is missing or is not a copr-cli config file (see packaging/README.md)"
+            exit 1
+          fi
+          mkdir -p ~/.config
+          printf '%s\n' "$COPR_CONFIG" > ~/.config/copr
+          chmod 600 ~/.config/copr
+          # Fails here, before any build, if the token is wrong or expired (they last 180 days).
+          copr-cli whoami
+
+      - name: Build the SRPM and submit it
+        run: scripts/copr-build.sh "$VERSION" --submit

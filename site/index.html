@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gall file manager – keyboard-first, instant search, compare tool | Linux, Windows, macOS</title>
+<meta name="description" content="Gall is a free, open-source file manager for Linux, Windows and macOS: Miller columns and dual pane, instant search over the whole computer, a compare tool for text, Excel and images, Git status, Vim keys and undo.">
+<link rel="canonical" href="https://gama87.github.io/gall/">
+<link rel="icon" href="icon.png">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Gall file manager – keyboard-first, instant search, compare tool">
+<meta property="og:description" content="Free and open source. Find any file in milliseconds, search inside every file, compare code, Excel sheets and photos, use Vim keys, undo anything.">
+<meta property="og:url" content="https://gama87.github.io/gall/">
+<meta property="og:image" content="https://gama87.github.io/gall/social-preview.png">
+<meta name="twitter:card" content="summary_large_image">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "Gall",
+  "alternateName": "Gall file manager",
+  "applicationCategory": "UtilitiesApplication",
+  "operatingSystem": "Linux, Windows, macOS",
+  "description": "Keyboard-first file manager with Miller columns, dual pane, instant search over the whole computer, a compare tool for text, spreadsheets and images, Git status and Vim keys.",
+  "url": "https://gama87.github.io/gall/",
+  "downloadUrl": "https://github.com/GaMa87/gall/releases/latest",
+  "codeRepository": "https://github.com/GaMa87/gall",
+  "license": "https://opensource.org/licenses/MIT",
+  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "EUR" }
+}
+</script>
+<style>
+:root{color-scheme:dark;--bg:#1e1e2e;--fg:#cdd6f4;--dim:#a6adc8;--accent:#a6e3a1;--card:#313244}
+*{box-sizing:border-box}
+body{margin:0;font:17px/1.6 system-ui,sans-serif;background:var(--bg);color:var(--fg)}
+main{max-width:920px;margin:0 auto;padding:48px 20px}
+h1{font-size:2.4rem;line-height:1.2;margin:.4em 0}
+h2{margin-top:2.2em}
+a{color:var(--accent)}
+.lead{font-size:1.2rem;color:var(--dim)}
+.btn{display:inline-block;background:var(--accent);color:#11111b;padding:12px 22px;border-radius:8px;font-weight:600;text-decoration:none;margin:6px 8px 6px 0}
+.btn.alt{background:var(--card);color:var(--fg)}
+img.shot{width:100%;height:auto;border-radius:10px;margin:18px 0}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}
+.card{background:var(--card);padding:16px 18px;border-radius:10px}
+.card h3{margin:.1em 0 .3em}
+code{background:var(--card);padding:2px 6px;border-radius:4px}
+footer{color:var(--dim);margin-top:3em;font-size:.9rem}
+</style>
+</head>
+<body>
+<main>
+<img src="icon.png" width="80" height="80" alt="Gall icon">
+<h1>Gall – the file manager for keyboard lovers</h1>
+<p class="lead">Gall is a free, open-source file manager for Linux, Windows and macOS. Find any file in milliseconds, search inside every file, compare code, Excel sheets and photos, see Git status, use Vim keys and undo anything.</p>
+<p>
+<a class="btn" href="https://github.com/GaMa87/gall/releases/latest">Download Gall</a>
+<a class="btn alt" href="https://github.com/GaMa87/gall">Source on GitHub</a>
+</p>
+<img class="shot" src="screenshots/main.png" alt="Gall file manager with two browsers, Miller columns and file lists">
+
+<h2>Why a new file manager?</h2>
+<div class="grid">
+<div class="card"><h3>Instant search</h3><p>Fuzzy search over every file name on the computer as you type, plus ripgrep-powered search inside files.</p></div>
+<div class="card"><h3>Compare anything</h3><p>Text and code, Excel/ODS/CSV cell by cell, images (swipe, onion skin, pixel diff) and whole folders.</p></div>
+<div class="card"><h3>Miller columns + dual pane</h3><p>Finder-style columns and an orthodox two-pane layout in one app, with tabs.</p></div>
+<div class="card"><h3>Vim keys</h3><p>Explorer, Total Commander and Vim profiles, a which-key menu on <code>Space</code>, every shortcut rebindable.</p></div>
+<div class="card"><h3>Git built in</h3><p>Status letters next to files, branch with ahead/behind, diff against <code>HEAD</code> or any commit.</p></div>
+<div class="card"><h3>Undo for file operations</h3><p>Copy, move, rename, batch rename and delete to trash are undone with <code>Ctrl+Z</code>.</p></div>
+</div>
+
+<img class="shot" src="screenshots/compare-excel.png" alt="Comparing two Excel files cell by cell in Gall">
+
+<h2>Install</h2>
+<ul>
+<li><b>Fedora:</b> <code>sudo dnf copr enable gama87/gall &amp;&amp; sudo dnf install gall</code></li>
+<li><b>Linux, any distribution:</b> AppImage, <code>.deb</code> or <code>.rpm</code> from <a href="https://github.com/GaMa87/gall/releases/latest">GitHub Releases</a></li>
+<li><b>Windows:</b> installer, MSI or a portable zip that runs from a USB stick</li>
+<li><b>macOS:</b> <code>.dmg</code> for Apple silicon and Intel (experimental)</li>
+</ul>
+<p>Built with Rust, Tauri and React: a small native app without a bundled Chromium. MIT licensed. Gall is an independent, clean-room project.</p>
+
+<h2>Questions</h2>
+<p>Found a bug or missing a feature? <a href="https://github.com/GaMa87/gall/issues">Open an issue</a>. Read the <a href="https://github.com/GaMa87/gall#readme">full documentation</a> or the <a href="https://github.com/GaMa87/gall/blob/main/CHANGELOG.md">changelog</a>.</p>
+
+<footer>Gall file manager · <a href="https://github.com/GaMa87/gall">GaMa87/gall</a> · MIT license</footer>
+</main>
+</body>
+</html>

@@ -2,9 +2,9 @@
 
 <img src="assets/icon.png" width="96" alt="Gall icon">
 
-# Gall
+# Gall file manager
 
-**A fast, keyboard-first file manager: instant search over the whole computer, a compare tool for
+**Gall is a fast, keyboard-first file manager: instant search over the whole computer, a compare tool for
 text, spreadsheets and images, and Vim keys.**
 Open source (MIT) · Linux, Windows and macOS · Built with Rust, Tauri and React.
 
@@ -14,7 +14,7 @@ Open source (MIT) · Linux, Windows and macOS · Built with Rust, Tauri and Reac
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20macOS%20(experimental)-informational)](#install)
 [![Buy me a coffee](https://img.shields.io/badge/%E2%98%95%20buy%20me%20a%20coffee-revolut.me%2Fgama87-5b7f60)](https://revolut.me/gama87)
 
-**[Download](#install)** · [Features](#highlights) · [Shortcuts](#usage) · [Build from source](#build-from-source) · [Roadmap](#roadmap)
+**[Download](#install)** · [Website](https://gama87.github.io/gall/) · [Features](#highlights) · [Shortcuts](#usage) · [Build from source](#build-from-source) · [Roadmap](#roadmap)
 
 <img src="docs/screenshots/main.png" alt="Gall with two browsers, Miller columns and file lists" width="900">
 
@@ -195,6 +195,7 @@ Linux and Windows are equally well tested; macOS builds are experimental.
 | System | Package | Install |
 |---|---|---|
 | Any Linux | `Gall_<version>_amd64.AppImage` | `chmod +x Gall_*.AppImage && ./Gall_*.AppImage` |
+| Fedora (with updates) | [COPR](https://copr.fedorainfracloud.org/coprs/gama87/gall/) | `sudo dnf copr enable gama87/gall && sudo dnf install gall` |
 | Fedora, openSUSE | `Gall-<version>-1.x86_64.rpm` | `sudo dnf install ./Gall-*.rpm` |
 | Debian, Ubuntu, Mint | `Gall_<version>_amd64.deb` | `sudo apt install ./Gall_*.deb` |
 | Windows 10/11 | `Gall_<version>_x64-setup.exe` or `.msi` | run the installer |
@@ -203,7 +204,7 @@ Linux and Windows are equally well tested; macOS builds are experimental.
 
 The macOS build is not signed or notarised yet: if macOS refuses to open it, allow it in
 *System Settings › Privacy & Security › Open Anyway*.
-Flathub, AUR, Scoop, winget and Homebrew packages are planned; see [packaging](packaging/README.md)
+Flathub, AUR, Scoop, winget and Homebrew packages are in preparation; see [packaging](packaging/README.md)
 if you would like to help.
 
 **Portable (Windows):** `Gall-<version>-windows-x64-portable.zip` needs no installation. Unzip it

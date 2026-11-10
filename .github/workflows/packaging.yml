@@ -1,7 +1,7 @@
 name: Packaging
 
 # Checks the package manifests in packaging/ against the published release:
-# AUR gall-bin (Arch container), Scoop (portable zip) and winget (setup.exe + MSI).
+# AUR gall-bin (Arch container), Fedora COPR (Fedora container), Scoop (portable zip) and winget (setup.exe + MSI).
 # Nothing is submitted anywhere; the maintainer submits by hand (see packaging/README.md).
 
 on:
@@ -218,3 +218,43 @@ jobs:
           Test-Run "$env:ProgramFiles\Gall\gall.exe"
           winget uninstall --product-code '{F550EEEB-2219-4C9F-8AF1-9DE363579A62}' --silent --disable-interactivity --accept-source-agreements
           if ($LASTEXITCODE -ne 0) { throw "winget uninstall (MSI) failed ($LASTEXITCODE)" }
+
+  copr:
+    # Only on the public repo: the private development repo runs no CI/CD.
+    if: github.repository == 'GaMa87/gall'
+    name: Fedora COPR (SRPM, rebuild, install, rpmlint)
+    runs-on: ubuntu-24.04
+    container: fedora:latest
+    steps:
+      - name: Install build tools
+        run: dnf -y install rpm-build rpmlint cpio curl gawk git xorg-x11-server-Xvfb
+
+      - uses: actions/checkout@v7
+
+      - name: Build the SRPM and rebuild it from the release
+        run: scripts/copr-build.sh --rebuild
+
+      - name: rpmlint spec and SRPM
+        run: rpmlint packaging/copr/gall.spec target/copr/gall-*.src.rpm || true
+
+      - name: Install package
+        run: |
+          dnf -y install target/copr/gall-*.x86_64.rpm
+          rpm -qi gall
+          rpm -ql gall
+
+      - name: No missing shared libraries
+        run: |
+          ldd /usr/bin/gall | tee ldd.txt
+          ! grep -q 'not found' ldd.txt
+
+      - name: Binary starts (stays up 15 s under Xvfb)
+        run: |
+          set +e
+          useradd -m tester
+          su tester -c 'env WEBKIT_DISABLE_COMPOSITING_MODE=1 xvfb-run -a timeout 15 gall --version' > run.log 2>&1
+          rc=$?
+          set -e
+          cat run.log
+          if [ "$rc" -ne 124 ]; then echo "gall exited early with code $rc"; exit 1; fi
+          if grep -q 'panicked' run.log; then echo "gall panicked"; exit 1; fi

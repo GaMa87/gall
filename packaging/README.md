@@ -32,7 +32,7 @@ local unit tests do not establish that a published upgrade works.
 | winget | Windows | 🔜 planned | (generated with `wingetcreate`) |
 | AUR `gall-bin` | Arch, Manjaro, EndeavourOS | 📝 PKGBUILD drafted | [`aur/gall-bin/PKGBUILD`](aur/gall-bin/PKGBUILD) |
 | Flathub | all Linux | 🔜 planned | [`linux/org.gall.app.metainfo.xml`](linux/org.gall.app.metainfo.xml) |
-| Fedora COPR | Fedora, RHEL clones | 🔜 planned | |
+| Fedora COPR | Fedora, RHEL clones | ✅ available (`dnf copr enable gama87/gall`) | [`copr/gall.spec`](copr/gall.spec), [`scripts/copr-build.sh`](../scripts/copr-build.sh) |
 | AppImageHub | all Linux | 🔜 planned | |
 | openSUSE Build Service | openSUSE, Fedora, Debian, Ubuntu | 💡 idea | |
 | Homebrew (own tap) | macOS | 💡 idea | |
@@ -112,8 +112,47 @@ It is also the most work:
 ### Fedora COPR
 
 `sudo dnf copr enable gama87/gall && sudo dnf install gall`, with updates through `dnf upgrade`.
-Simplest start: a `.spec` that repackages the released `.rpm` (or builds from a source tarball with
-vendored crates and node modules). COPR can rebuild on its own via a GitHub webhook.
+
+[`copr/gall.spec`](copr/gall.spec) repackages the released `.rpm` (same approach as the AUR `gall-bin`),
+and checks it against the SHA256 from `SHA256SUMS`. [`scripts/copr-build.sh`](../scripts/copr-build.sh)
+downloads the release, builds a self-contained SRPM (COPR builds have no internet access) and uploads it.
+
+One-time setup:
+
+1. Log in at <https://copr.fedorainfracloud.org> with a Fedora Account (FAS) and accept the license terms.
+2. **New Project**: name `gall`, chroots `fedora-rawhide`, `fedora-45`, `fedora-44` and `fedora-43` (add newer ones as they appear),
+   architecture `x86_64`. Short description: *Keyboard-first file manager*. The project page needs a
+   homepage (`https://github.com/GaMa87/gall`) and a license (`MIT`).
+3. Create an API token at <https://copr.fedorainfracloud.org/api/> and save it as `~/.config/copr`.
+4. `sudo dnf install copr-cli rpm-build`.
+
+Releases go to COPR automatically: the [*COPR* workflow](../.github/workflows/copr.yml) runs when a GitHub
+release is **published** (not when the draft is created, because draft assets are not public), builds the SRPM
+from the release's own `.rpm` and `SHA256SUMS`, and submits it. Pre-releases are skipped. No spec change has to
+be committed for this; `copr/gall.spec` is only the template.
+
+One-time setup for the automation: store the API token as a secret, from the file (never paste it from the terminal):
+
+```sh
+gh secret set COPR_API_TOKEN --repo GaMa87/gall < ~/.config/copr
+```
+
+COPR API tokens expire after 180 days. When the workflow fails at *Write the COPR API token*, create a new token at
+<https://copr.fedorainfracloud.org/api/> and run the command again.
+
+Manual upload (for example a release that was published before the workflow existed, or a retry): *Actions → COPR →
+Run workflow* with the version, or locally:
+
+```sh
+scripts/copr-build.sh 0.3.0 --rebuild   # builds the SRPM and test-builds it locally
+scripts/copr-build.sh 0.3.0 --submit    # uploads the SRPM to gama87/gall (COPR_PROJECT overrides)
+```
+
+A local run with a new version also rewrites `copr/gall.spec`; commit that if you want the template to follow.
+
+The `copr` job of the *Packaging* workflow runs the same build on Fedora, installs the package and checks
+that it starts. The `.rpm` from Releases is built on Ubuntu, so it needs no more than the Fedora system
+libraries (`webkit2gtk4.1`, `gtk3`); if a release ever fails to start on Fedora, build from source in COPR instead.
 
 ### AppImageHub
 
