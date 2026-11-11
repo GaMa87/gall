@@ -82,8 +82,9 @@ export function layoutHistory(history: string) {
 
 const LANE_X = 18;
 const LANE_GAP = 18;
-const ROW_HEIGHT = 36;
-const ELBOW_RADIUS = 16;
+export const ROW_HEIGHT = 28;
+export const ROW_MID = ROW_HEIGHT / 2;
+const ELBOW_RADIUS = 12;
 
 /**
  * SVG path of one edge inside a single row. Lanes stay vertical; a lane change is a large rounded
@@ -93,7 +94,7 @@ const ELBOW_RADIUS = 16;
 export function edgePath(edge: { from: number; to: number }, rowLane: number) {
   const fx = LANE_X + edge.from * LANE_GAP;
   const tx = LANE_X + edge.to * LANE_GAP;
-  const mid = ROW_HEIGHT / 2;
+  const mid = ROW_MID;
   if (edge.from === edge.to) return `M ${fx} ${edge.from === rowLane ? mid : 0} V ${ROW_HEIGHT}`;
   const dir = Math.sign(tx - fx);
   const r = Math.min(Math.abs(tx - fx), ELBOW_RADIUS);

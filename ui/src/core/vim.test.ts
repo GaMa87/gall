@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildKeymap, DEFAULT_KEYMAP, type Action, type KeyboardProfile } from "./keymap";
-import { buildLeaderTree, buildVimTree, CTRL_TAP, keysForAction, leaderToken, listBindings, resolve, shadowedByVim, shortcutLabel, splitKeys, treeForSettings, vimToken, type KeyNode } from "./vim";
+import { buildLeaderTree, buildVimTree, CTRL_TAP, keysForAction, leaderToken, listBindings, physicalLetter, PREVIOUS_MARK, resolve, shadowedByVim, shortcutLabel, splitKeys, treeForSettings, vimToken, type KeyNode } from "./vim";
 
 describe("vim keys", () => {
   const tree = buildVimTree("Space");
@@ -173,6 +173,53 @@ describe("vim keys", () => {
     expect(ev("J")).toBe("j");
     expect(ev("J", true)).toBe("J");
     expect(ev("j", true)).toBe("J");
+  });
+
+  it("folder marks: m sets, ' and ` jump, dm deletes; c is the colour tag", () => {
+    const act = (...k: string[]) => resolve(tree, k);
+    expect(act("m").kind).toBe("pending");
+    expect(act("m", "a")).toEqual({ kind: "mark", op: "set", key: "a" });
+    expect(act("m", "A")).toEqual({ kind: "mark", op: "set", key: "A" });
+    expect(act("'", "a")).toEqual({ kind: "mark", op: "jump", key: "a" });
+    expect(act("`", "Z")).toEqual({ kind: "mark", op: "jumpItem", key: "Z" });
+    // '' and `` (also ' then `) go back to the folder before the last jump.
+    expect(act("'", "'")).toEqual({ kind: "mark", op: "jump", key: PREVIOUS_MARK });
+    expect(act("`", "`")).toEqual({ kind: "mark", op: "jumpItem", key: PREVIOUS_MARK });
+    expect(act("d", "m", "q")).toEqual({ kind: "mark", op: "delete", key: "q" });
+    expect(act("d", "d")).toEqual({ kind: "action", action: "cut" });
+    // Only letters name a mark; the previous-folder mark is not set or deleted by hand.
+    for (const bad of ["1", "'", "Space", "Ctrl+d"]) expect(act("m", bad).kind).toBe("none");
+    expect(act("d", "m", "'").kind).toBe("none");
+    expect(act("m", "a", "b").kind).toBe("none");
+    expect(act("c")).toEqual({ kind: "action", action: "tag" });
+    // Vim keys off: m, ' and ` stay free for typing to filter.
+    for (const k of ["m", "'", "`"]) expect(resolve(buildLeaderTree(CTRL_TAP), [k]).kind).toBe("none");
+    // No mark key hides an action or a group.
+    const walk = (n: KeyNode): boolean => [...(n.children ?? [])].every(([, c]) => (!c.mark || (!c.action && !c.children)) && walk(c));
+    expect(walk(tree)).toBe(true);
+  });
+
+  it("a plain key vim takes over is not offered as the shortcut (` toggled columns)", () => {
+    expect(shadowedByVim("`")).toBe(true);
+    expect(shadowedByVim(".")).toBe(true);
+    expect(shadowedByVim("Shift+G")).toBe(true);
+    expect(shadowedByVim("Shift+Y")).toBe(false);
+    expect(shadowedByVim("F4")).toBe(false);
+    const vim = { vim: true, keymap: buildKeymap({}, "vim"), leader: "Space" };
+    expect(keysForAction("toggleColumns", vim)).toBe("␣ w c");
+    expect(keysForAction("toggleColumns", { vim: false, keymap: buildKeymap({}), leader: "Ctrl Ctrl" })).toBe("`");
+  });
+
+  it("dead keys still reach the mark keys", () => {
+    const ev = (key: string, code: string, shiftKey = false) => ({ key, code, shiftKey, ctrlKey: false, metaKey: false, altKey: false });
+    expect(vimToken(ev("Dead", "Quote"))).toBe("'");
+    expect(vimToken(ev("Dead", "Backquote"))).toBe("`");
+    expect(vimToken(ev("Dead", "Quote", true))).toBeNull();
+    expect(vimToken(ev("Dead", "Equal"))).toBeNull();
+    // ' then a composes á: the mark name is the physical letter.
+    expect(physicalLetter(ev("á", "KeyA"))).toBe("a");
+    expect(physicalLetter(ev("Á", "KeyA", true))).toBe("A");
+    expect(physicalLetter(ev("č", "Semicolon"))).toBeNull();
   });
 
   it("every binding is reachable and unique", () => {

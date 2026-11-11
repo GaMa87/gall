@@ -142,6 +142,17 @@ describe("keyboard reference", () => {
     expect(html).toContain("Alt and C together");
   });
 
+  it("documents the keys of find in files, Quick Open, drag & drop and the Git workspace", () => {
+    const html = renderToStaticMarkup(KeyHelp());
+    expect(html).toContain("Find in files");
+    expect(html).toContain('aria-label="Tab, or Shift and Tab together"');
+    expect(html).toContain("whole word");
+    expect(html).toContain("name search here, including ignored files");
+    expect(html).toContain('aria-label="Ctrl and Drag together"');
+    expect(html).toContain("Git workspace");
+    expect(html).toContain("stop recording");
+  });
+
   it("explains an empty shortcut search while keeping the notation legend available", () => {
     mocks.query = "no-such-shortcut-xyz";
     const html = renderToStaticMarkup(KeyHelp());

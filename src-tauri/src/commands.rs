@@ -11,7 +11,7 @@ use gall_core::nav::session::Layout;
 use gall_core::nav::Session;
 use gall_core::preview::{self, PreviewInfo};
 use gall_core::storage::db::{FolderPrefs, ResolvedPrefs, Tagged};
-use gall_core::storage::{Favorites, Settings};
+use gall_core::storage::{Favorites, Marks, Settings};
 use gall_core::util::{clipname, notes, templates, terminal};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -49,6 +49,8 @@ pub struct AppInfo {
     startup_notice: Option<String>,
     /// First start (no settings file): show the welcome setup.
     first_run: bool,
+    /// URL prefix of the local media server (Linux); `None` means the asset protocol plays media.
+    media_base: Option<String>,
 }
 
 #[tauri::command]
@@ -69,6 +71,7 @@ pub fn app_info(state: State<'_, AppState>) -> AppInfo {
         trash_dir,
         startup_notice: state.startup_notice.lock().unwrap().take(),
         first_run: state.first_run,
+        media_base: crate::MEDIA_BASE.get().cloned(),
     }
 }
 
@@ -687,6 +690,44 @@ pub fn favorites_cmd(state: State<'_, AppState>, cmd: FavCmd) -> Favorites {
     };
     state.save_favorites();
     snap
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "op", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum MarkCmd {
+    Set {
+        key: String,
+        path: String,
+        item: Option<String>,
+    },
+    Remove {
+        key: String,
+    },
+}
+
+#[tauri::command]
+pub fn marks_get(state: State<'_, AppState>) -> Marks {
+    state.marks.lock().unwrap().clone()
+}
+
+/// Changes the vim folder marks and saves them; on an error nothing changes.
+#[tauri::command]
+pub fn marks_cmd(state: State<'_, AppState>, cmd: MarkCmd) -> R<Marks> {
+    let mut marks = state.marks.lock().unwrap();
+    let mut next = marks.clone();
+    match cmd {
+        MarkCmd::Set { key, path, item } => {
+            if !next.set(&key, &path, item) {
+                return Err(format!("Not a mark key: {key}"));
+            }
+        }
+        MarkCmd::Remove { key } => {
+            next.remove(&key);
+        }
+    }
+    state.save_marks(&next).map_err(e)?;
+    *marks = next.clone();
+    Ok(next)
 }
 
 /// The history, newest first, without folders that were deleted or renamed since
@@ -2402,6 +2443,29 @@ pub async fn git_graph(
             reflog.unwrap_or(false),
             limit.unwrap_or(200),
             reference.as_deref(),
+        )
+    })
+    .await
+    .map_err(e)?
+    .map_err(e)
+}
+/// History and repository state in one call, with the work tree status read once.
+/// Read-only: it must not wait on the mutation gate.
+#[tauri::command]
+pub async fn git_graph_view(
+    path: PathBuf,
+    comparison: Option<bool>,
+    reflog: Option<bool>,
+    limit: Option<usize>,
+    reference: Option<String>,
+) -> R<gall_core::fs::gitrepository::GraphView> {
+    tauri::async_runtime::spawn_blocking(move || {
+        gall_core::fs::gitrepository::graph_view(
+            &path,
+            comparison.unwrap_or(false),
+            reflog.unwrap_or(false),
+            limit.unwrap_or(200),
+            reference.as_deref().filter(|s| !s.is_empty()),
         )
     })
     .await

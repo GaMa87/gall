@@ -65,6 +65,8 @@ export const api = {
   sessionCmd: (cmd: SessionCmd) => invoke<T.Session>("session_cmd", { cmd }),
   favoritesGet: () => invoke<T.Favorites>("favorites_get"),
   favoritesCmd: (cmd: FavCmd) => invoke<T.Favorites>("favorites_cmd", { cmd }),
+  marksGet: () => invoke<T.Marks>("marks_get"),
+  marksCmd: (cmd: MarkCmd) => invoke<T.Marks>("marks_cmd", { cmd }),
   historyGet: () => invoke<string[]>("history_get"),
   historyRemove: (path: string | null) => invoke<void>("history_remove", { path }),
 
@@ -204,6 +206,10 @@ export type FavCmd =
   | { op: "moveItem"; fromGroup: number; fromIndex: number; toGroup: number; toIndex: number }
   | { op: "restoreDefault" };
 
+export type MarkCmd =
+  | { op: "set"; key: string; path: string; item: string | null }
+  | { op: "remove"; key: string };
+
 export const events = {
   fsChanged: (cb: (p: { path: string; storm: boolean }) => void): Promise<UnlistenFn> =>
     listen<{ path: string; storm: boolean }>("fs-changed", (e) => cb(e.payload)),
@@ -227,3 +233,12 @@ export const events = {
 export interface BackendLog { level: "warn" | "error"; msg: string }
 
 export const fileSrc = (path: string) => convertFileSrc(path);
+
+/** URL prefix of the backend's local media server (Linux), set from `AppInfo` at startup. */
+let mediaBase: string | null = null;
+export const setMediaBase = (base: string | null | undefined) => { mediaBase = base ?? null; };
+
+/** Source for `<video>`/`<audio>`. WebKitGTK cannot play media from the asset protocol, so on
+ *  Linux it comes from the loopback media server; elsewhere it is the asset URL. */
+export const mediaSrc = (path: string) =>
+  mediaBase ? mediaBase + path.split("/").map(encodeURIComponent).join("/").replace(/^\//, "") : fileSrc(path);

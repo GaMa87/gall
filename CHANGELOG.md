@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+## 0.2.1 — 2026-11-11
+
+- Fixed: the **Load more commits** button in the Git graph was almost invisible (grey system button with accent-coloured text). Every button now gets the application's button look, and faint, success, warning and danger text meets the 4.5:1 contrast ratio in the dark and light themes.
+- Fixed: a video opened in the preview window has keyboard focus at once, so `k`, the arrow keys and `[` `]` work without clicking the player first.
+- Fixed: video and audio previews on Linux failed with "format or codec not supported" for every file, even with all codecs installed (WebKitGTK cannot play media from Tauri's `asset://` scheme). Media now plays from a small local server that only listens on the loopback interface and uses a random token in every address.
+- Added: STL files preview as a 3D model, in the details pane and the preview window: drag to rotate, wheel to zoom, double-click to reset.
+
+- Added: Vim folder marks. With Vim keys on, `m` and a letter remembers the current folder, `'` and the letter opens it again, `` ` `` and the letter also selects the item that was focused when it was marked, `''` returns to the folder before the last jump and `d m` and the letter deletes a mark. Lower- and uppercase letters are separate marks, all of them are kept between sessions, and the which-key popup lists them with their folders. A mark whose folder is gone offers to delete it.
+- Changed: with Vim keys, the colour tag is now `c` (was `m`, which now sets a folder mark), and columns ⇄ breadcrumbs is `Space w c` (`` ` `` now goes to a mark). Menus, tips and the `?` sheet no longer offer a plain key that Vim keys take over.
+
+- Improved: the whole application now uses the look of the Git workspace. Buttons, dialogs, menus, tabs, badges, notifications, the quick filter and the selection in every list share the same rounded corners, raised buttons, gradient main action and fading accent selection with a bar on its left. Custom themes keep working; the rounding and the shared button, selection and bar styles are variables a theme can change (see [themes](docs/themes/README.md#size-and-shape)).
+
+- Improved: in find in files, `Tab` switches the scope between the folder, Home and the whole drive (`Shift+Tab` goes back), as `Tab` does in Quick Open; both windows show `Tab` as a key next to their scope buttons. See [find text inside files](README.md#-find-text-inside-files).
+- Fixed: with *Calculate automatically* on, folder sizes are refreshed after a copy, move or other file task finishes, also for a listed subfolder that received new files.
+- Improved: the `?` keyboard sheet now also lists the keys of find in files, Quick Open's Enter variants, the preview window's zoom and video keys, Open with, the compare views, new-folder and rename dialogs, `q` to close windows, mouse gestures, drag & drop and bug-report clips. Tips & tricks cover the Git workspace, folder marks, batch rename, folder sizes, title-bar panel controls, favourites groups, the Trash window and more, and the README describes every feature (see [everything else](README.md#everything-else)).
+- Fixed: the welcome setup said the layout is switched from the sidebar (it is the title bar), and several hints named keys that differ by keyboard profile (`F4` edit, `F2` rename, `` ` ``, `Ctrl+U`, `O`).
+- Added: a [Fedora COPR repository](https://copr.fedorainfracloud.org/coprs/gama87/gall/) (`sudo dnf copr enable gama87/gall && sudo dnf install gall`), updated automatically with each release.
+
+- Improved: the Git workspace opens and refreshes several times faster (about a quarter of the previous time on Windows), and Git status badges in the file list arrive sooner. Gall now starts the real Git program directly instead of going through launchers on `PATH` (Git for Windows' `cmd\git.exe`, Scoop shims), reads HEAD, remotes and the configuration with fewer Git processes, and runs the remaining queries side by side.
+
 ## 0.2.0 — 2026-11-09
 
 - Fixed: on Windows, cloning a repository and creating a worktree no longer fail with "could not open … .git/HEAD" (the destination was passed to Git as a `\\?\` path).

@@ -21,6 +21,8 @@ pub enum PreviewKind {
     Text,
     Archive,
     Note,
+    /// A 3D model the UI draws itself (STL).
+    Model,
     None,
 }
 
@@ -107,6 +109,8 @@ pub fn classify(entry: &FileEntry) -> PreviewKind {
     match ext {
         "2do" | "2dx" => PreviewKind::Note,
         "pdf" => PreviewKind::Pdf,
+        // Before the text rules: ASCII STL is text, but the model view is what is wanted.
+        "stl" => PreviewKind::Model,
         e if IMAGE.contains(&e) => PreviewKind::Image,
         e if VIDEO.contains(&e) => PreviewKind::Video,
         e if AUDIO.contains(&e) => PreviewKind::Audio,
@@ -353,6 +357,21 @@ pub fn excerpt(path: &Path, lines: usize) -> Option<String> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn stl_is_a_model_even_when_ascii() {
+        let d = tempfile::tempdir().unwrap();
+        for (name, body) in [
+            ("a.stl", &b"solid x\nendsolid x\n"[..]),
+            ("b.STL", &[0u8; 84][..]),
+        ] {
+            let p = d.path().join(name);
+            std::fs::write(&p, body).unwrap();
+            let i = preview_info(&p, 1000).unwrap();
+            assert_eq!(i.kind, Some(PreviewKind::Model), "{name}");
+            assert!(i.text.is_none());
+        }
+    }
 
     #[test]
     fn classify_and_text() {

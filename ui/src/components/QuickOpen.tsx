@@ -272,6 +272,7 @@ export function QuickOpen({ initial }: { initial?: string }) {
           <input ref={inputRef} value={q} spellCheck={false} placeholder={placeholder} onChange={(e) => { setQ(e.target.value); setIdx(0); }} />
           {!cmdMode && (
             // Tab switches scopes when the current folder can be searched directly.
+            <div className="qo-scope-wrap">
             <div className="qo-scope" role="group" title={inArchive ? "Search scope" : "Tab switches between this folder and everywhere"}>
               {!inArchive && <button aria-pressed={scopeHere} className={scopeHere ? "on" : ""} title={`${here} and its subfolders`} onClick={() => { setScopeHere(true); inputRef.current?.focus(); }}>
                 <Icon name="folder" size={12} /> {shortName}
@@ -279,7 +280,8 @@ export function QuickOpen({ initial }: { initial?: string }) {
               <button aria-pressed={!scopeHere} className={!scopeHere ? "on" : ""} onClick={() => { setScopeHere(false); inputRef.current?.focus(); }}>
                 <Icon name="drive" size={12} /> everywhere
               </button>
-              {!inArchive && <kbd>Tab</kbd>}
+            </div>
+            {!inArchive && <kbd className="scope-key" title="Switch scope">Tab</kbd>}
             </div>
           )}
         </div>

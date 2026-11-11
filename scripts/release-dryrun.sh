@@ -110,6 +110,8 @@ export WORKSPACE=/work/src GITHUB_OUTPUT=/work/out.txt
 bash -e -o pipefail /work/steps/prepare.sh
 config=$(sed -n 's/^config=//p' "$GITHUB_OUTPUT")
 echo "building with --config $config"
+# The target volume is kept between runs: packages of an earlier version would fail the count below.
+rm -rf target/release/bundle
 # Same command tauri-action runs.
 npm run tauri build -- --config "$config"
 

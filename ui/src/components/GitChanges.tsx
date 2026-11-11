@@ -20,8 +20,9 @@ export function GitChanges({ path, onBusy, onChanged, onBack, onClose }: { path:
   const [line, setLine] = useState(0);
   const [selectedLines, setSelectedLines] = useState<Set<number>>(new Set());
   const [message, setMessage] = useState(() => drafts.get(path) ?? "");
-  const writeMessage = (value: string) => { setMessage(value); if (value) drafts.set(path, value); else drafts.delete(path); };
   const [amend, setAmend] = useState(false);
+  // An amended message belongs to that commit, not to the repository's draft: it is never stored.
+  const writeMessage = (value: string) => { setMessage(value); if (amend) return; if (value) drafts.set(path, value); else drafts.delete(path); };
   const [busy, setBusy] = useState(false);
   const gate = useRef(false);
   const loadTicket = useRef(0);
@@ -95,7 +96,11 @@ export function GitChanges({ path, onBusy, onChanged, onBack, onClose }: { path:
   };
   const canCommit = !!state && !!message.trim() && (amend || (!!stagedCount && !state.editStop));
   const commitNow = () => { if (canCommit && !busy) void act(amend ? "amend" : "commit"); };
-  const toggleAmend = (value: boolean) => { setAmend(value); if (value && !message) setMessage(state?.message ?? ""); };
+  const toggleAmend = (value: boolean) => {
+    setAmend(value);
+    if (value) { if (!message) setMessage(state?.message ?? ""); }
+    else if (!state?.editStop) setMessage(drafts.get(path) ?? "");
+  };
   command.current = (key) => {
     if (busy) return;
     if (key === " ") void act(current?.staged ? "unstage" : "stage");

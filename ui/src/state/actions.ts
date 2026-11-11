@@ -1,6 +1,6 @@
 // Application actions: everything that changes state or touches the backend.
 import { archiveOf, createFormatFor, isBrowsableArchive, type ArchiveFormat } from "../core/archive";
-import { api, events, type FavCmd, type SessionCmd } from "../api/ipc";
+import { api, events, setMediaBase, type FavCmd, type MarkCmd, type SessionCmd } from "../api/ipc";
 import type { ConflictInfo, ConflictPolicy, DiffSource, Drive, FileEntry, Layout, Settings, TaskKind, Volume } from "../api/types";
 import { etaSeconds, updateRate, type Rate } from "../core/eta";
 import { ancestors, backOutside, basename, isInside, join, parent, splitExt, tildify } from "../core/path";
@@ -9,6 +9,7 @@ import { bumpSearchHidden } from "./hooks";
 import { getState, setState, type DialogSpec, type FolderSize, type MenuItem, type NoteKind, type Overlay, type UiState } from "./store";
 import { formatSize } from "../core/format";
 import { keyboardSettings } from "../core/keymap";
+import { PREVIOUS_MARK, type MarkOp } from "../core/vim";
 
 let noteSeq = 1;
 /** Smoothed speed per running task, for the time-left estimate. */
@@ -225,12 +226,13 @@ export async function bootstrap() {
       if (ms > 50) api.uiLog("info", `startup: ${name} took ${Math.round(ms)} ms`).catch(() => {});
     });
   };
-  const [info, settings, session, favorites, history, drives, args] = await Promise.all([
+  const [info, settings, session, favorites, marks, history, drives, args] = await Promise.all([
     timed("appInfo", api.appInfo()), timed("settings", api.getSettings()), timed("session", api.sessionGet()),
-    timed("favorites", api.favoritesGet()), timed("history", api.historyGet()), timed("drives", api.listDrives()),
-    timed("args", api.startupArgs()),
+    timed("favorites", api.favoritesGet()), timed("marks", api.marksGet()), timed("history", api.historyGet()),
+    timed("drives", api.listDrives()), timed("args", api.startupArgs()),
   ]);
-  setState({ info, settings: keyboardSettings(settings), session, favorites, history, drives, sidebarVisible: true });
+  setMediaBase(info.mediaBase);
+  setState({ info, settings: keyboardSettings(settings), session, favorites, marks, history, drives, sidebarVisible: true });
   if (info.startupNotice) notify(info.startupNotice, "warn");
   applyCliArgs(args);
   // First start: the welcome setup (not during self-tests, which start with fresh settings).
@@ -285,6 +287,7 @@ export async function bootstrap() {
     }
     else notify(`${ev.kind} cancelled`, "warn");
     refreshUndo();
+    invalidateAllFolderSizes();
     // A folder deleted or moved away leaves the history (the backend drops gone folders).
     if (ev.kind === "delete" || ev.kind === "move") {
       api.historyGet().then((history) => setState({ history })).catch(() => {});
@@ -626,6 +629,101 @@ export async function goToTyped(b: number, input: string) {
     if (p) navigate(b, p);
     setTimeout(() => controller(b)?.select([r.path], r.path), 150);
   }
+}
+
+// ───────────── vim folder marks ─────────────
+
+/** Mark key as shown to the user: ' (the previous folder) reads as '' like in Vim. */
+const markName = (key: string) => (key === PREVIOUS_MARK ? "''" : key);
+
+async function markCmd(cmd: MarkCmd): Promise<boolean> {
+  try {
+    setState({ marks: await api.marksCmd(cmd) });
+    return true;
+  } catch (e) {
+    fail(e);
+    return false;
+  }
+}
+
+/** Does the marked folder still exist? Inside an archive the archive file must. */
+async function markReachable(path: string): Promise<boolean> {
+  if (path.startsWith("trash:")) return true;
+  const arc = archiveOf(path);
+  const r = await api.pathResolve(arc ?? path).catch(() => null);
+  return !!r?.exists && (arc ? true : r.isDir);
+}
+
+/** Runs a folder-mark key sequence (vim keys: m{x}, '{x}, `{x}, dm{x}). */
+export function runMark(op: MarkOp, key: string) {
+  if (op === "set") void setMark(key);
+  else if (op === "delete") void deleteMark(key);
+  else void jumpToMark(key, op === "jumpItem");
+}
+
+/** m{x}: remembers the active browser's folder and its focused item under `key`. */
+export async function setMark(key: string) {
+  const b = activeBrowser();
+  const path = activePath(b);
+  const item = controller(b)?.focused()?.path ?? null;
+  const prev = getState().marks.marks[key];
+  if (!(await markCmd({ op: "set", key, path, item }))) return;
+  const home = getState().info?.home;
+  if (prev && prev.path !== path) {
+    notify(`Mark ${key}: ${tildify(path, home)} (was ${tildify(prev.path, home)})`, "info", {
+      label: "Undo", run: () => void markCmd({ op: "set", key, path: prev.path, item: prev.item }),
+    });
+  } else notify(`Mark ${key}: ${tildify(path, home)}`);
+}
+
+/** '{x} / `{x}: opens the marked folder in the active browser; `{x} also selects the item
+ *  that was focused when the mark was set. The folder left behind becomes mark '. */
+export async function jumpToMark(key: string, withItem: boolean) {
+  const m = getState().marks.marks[key];
+  const home = getState().info?.home;
+  if (!m) {
+    notify(key === PREVIOUS_MARK ? "No earlier folder to go back to yet" : `Mark ${key} is not set (m ${key} marks this folder)`, "warn");
+    return;
+  }
+  const b = activeBrowser();
+  const from = activePath(b);
+  const fromItem = controller(b)?.focused()?.path ?? null;
+  const tab = () => { const br = getState().session?.browsers[b]; return br?.tabs[br.active]?.id; };
+  const startTab = tab();
+  // The item is checked too: a select of a missing item would wait and fire if it came back.
+  const [reachable, item] = await Promise.all([
+    markReachable(m.path),
+    withItem && m.item ? api.pathResolve(m.item).then((r) => r.exists, () => false) : Promise.resolve(false),
+  ]);
+  // A slow check (a disconnected network share): the user went on meanwhile, so do nothing.
+  if (activePath(b) !== from || tab() !== startTab) return;
+  if (!reachable) {
+    notify(`Mark ${markName(key)}: ${tildify(m.path, home)} is not available`, "warn", {
+      label: "Delete mark", run: () => void deleteMark(key),
+    });
+    return;
+  }
+  if (from !== m.path) {
+    navigate(b, m.path);
+    void markCmd({ op: "set", key: PREVIOUS_MARK, path: from, item: fromItem });
+  }
+  if (withItem && m.item) {
+    if (item) controller(b)?.select([m.item], m.item);
+    else notify(`Mark ${markName(key)}: ${basename(m.item)} is no longer in that folder`, "warn");
+  }
+}
+
+/** dm{x}: forgets a mark (with undo). */
+export async function deleteMark(key: string) {
+  const prev = getState().marks.marks[key];
+  if (!prev) {
+    notify(`Mark ${markName(key)} is not set`, "warn");
+    return;
+  }
+  if (!(await markCmd({ op: "remove", key }))) return;
+  notify(`Mark ${markName(key)} deleted`, "info", {
+    label: "Undo", run: () => void markCmd({ op: "set", key, path: prev.path, item: prev.item }),
+  });
 }
 
 // ───────────── favourites ─────────────
@@ -1507,8 +1605,18 @@ let sizeRefreshTimer: ReturnType<typeof setTimeout> | undefined;
 
 /** Watched changes invalidate cached totals for the changed folder and its ancestors. */
 export function invalidateFolderSizes(path: string) {
+  staleFolderSizes((p) => isInside(path, p));
+}
+
+/** A finished file task changed folders the watcher does not see (only the visible folders
+ *  are watched, not the subfolders listed in them), so every cached total goes stale. */
+export function invalidateAllFolderSizes() {
+  staleFolderSizes(() => true);
+}
+
+function staleFolderSizes(affects: (path: string) => boolean) {
   for (const [p, f] of Object.entries(getState().folderSizes)) {
-    if (!isInside(path, p)) continue;
+    if (!affects(p)) continue;
     sizeRevisions.set(p, (sizeRevisions.get(p) ?? 0) + 1);
     putFolderSize(p, { ...f, at: 0 });
   }

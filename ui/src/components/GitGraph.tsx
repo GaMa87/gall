@@ -7,7 +7,7 @@ import { GitRebase } from "./GitRebase";
 import { GitMergeEditor } from "./GitMerge";
 import { targetCommit, useGitRepositoryActions, type GitTarget } from "./useGitRepositoryActions";
 import * as A from "../state/actions";
-import { edgePath, layoutHistory } from "../core/gitGraph";
+import { ROW_HEIGHT, ROW_MID, edgePath, layoutHistory } from "../core/gitGraph";
 import { gitActionEnabled, gitCommandForKey, gitCommands, gitContextHint, gitMenuGroup, gitMenuGroups, gitNavigationHint, gitPanelOf, type GitContext, type GitReference, type GitSubmodule, type Repository } from "../core/gitRepository";
 import { commitUrl, copyChoices, type CopyChoice } from "../core/gitCopy";
 import { basename } from "../core/path";
@@ -41,7 +41,7 @@ export function GitGraph({ path: initialPath, compareFile }: { path: string; com
   const load = useCallback(async () => {
     const ticket = ++request.current; setLoading(true);
     try {
-      const [value, repo] = await Promise.all([invoke<Graph>("git_graph", { path, comparison: !!compareFile, reflog, limit, reference: reference || null }), invoke<Repository>("git_repository", { path })]);
+      const { graph: value, repository: repo } = await invoke<{ graph: Graph; repository: Repository }>("git_graph_view", { path, comparison: !!compareFile, reflog, limit, reference: reference || null });
       if (ticket === request.current) { setGraph(value); setRepository(repo); setError(""); setTarget((current) => current?.kind === "conflict" && !repo.conflicts.includes(current.file) ? { kind: "working" } : current); if (compareFile) { const first = layoutHistory(value.history)[0]; setTarget(first ? { kind: "commit", id: first.id } : null); } }
     } catch (e) { if (ticket === request.current) setError(String(e)); }
     finally { if (ticket === request.current) setLoading(false); }
@@ -160,17 +160,24 @@ export function GitGraph({ path: initialPath, compareFile }: { path: string; com
     const row = root.current?.querySelector<HTMLElement>(".gg-side-row.selected") ?? root.current?.querySelector<HTMLElement>(".gg-side-row");
     (row ?? root.current?.querySelector<HTMLElement>(".gg-side-tabs [aria-pressed='true']"))?.focus();
   };
+  /** Timers for deferred focus; all of them are cleared when the workspace closes. */
+  const timers = useRef(new Set<number>());
+  useEffect(() => { const pending = timers.current; return () => { pending.forEach((id) => window.clearTimeout(id)); pending.clear(); }; }, []);
+  const later = (run: () => void, ms: number) => {
+    const id = window.setTimeout(() => { timers.current.delete(id); run(); }, ms);
+    timers.current.add(id);
+  };
   /** Focuses a panel that is about to render; retries briefly instead of trusting a fixed delay. */
   const focusSoon = (selector: string, tries = 20) => {
     const element = root.current?.querySelector<HTMLElement>(selector);
-    if (element) element.focus(); else if (tries > 0) window.setTimeout(() => focusSoon(selector, tries - 1), 30);
+    if (element) element.focus(); else if (tries > 0) later(() => focusSoon(selector, tries - 1), 30);
   };
   /** Opens the Tools panel (lazygit: `w` worktrees, `b` bisect; `x` is Gall's generic opener) and moves keyboard focus into it. */
   const openTools = (tab?: string) => {
     if (compareFile) return;
     setAdvancedTab(tab); setShowAdvanced(true); setShowRebase(false); setInspected(null); setShowChanges(false);
     // After the re-render: changing the tab remounts the panel, which would drop focus set on the old one.
-    window.setTimeout(() => focusSoon(".git-advanced"), 60);
+    later(() => focusSoon(".git-advanced"), 60);
   };
   /** `y` on a commit: a menu of attributes to copy (hash, subject, message, author, date, URL, diff, tags). */
   const copyMenu = async (selection: GitTarget | null) => {
@@ -196,7 +203,7 @@ export function GitGraph({ path: initialPath, compareFile }: { path: string; com
   };
   const switchSideTab = (step: number) => {
     const at = sideTabs.indexOf(sidebar), next = sideTabs[(Math.max(0, at) + step + sideTabs.length) % sideTabs.length];
-    setSidebar(next); setContext(next); window.setTimeout(focusSidebar, 40);
+    setSidebar(next); setContext(next); later(focusSidebar, 40);
   };
   const working = () => { setTarget({ kind: "working" }); setInspected(null); setShowAdvanced(false); setShowRebase(false); setShowChanges((value) => !value); setContext("files"); };
   const canRun = (action: string, selection = target) => gitActionEnabled(action, {
@@ -366,10 +373,10 @@ export function GitGraph({ path: initialPath, compareFile }: { path: string; com
           {!graph ? <div className="gg-empty" role="status">{loading ? "Loading history…" : <><p>History could not be loaded.</p><button onClick={() => { setShowAdvanced(true); setError(""); }}>Repository setup…</button></>}</div> : <div className="git-graph-lines" tabIndex={-1} onFocus={() => setContext("history")}>
             <div className="gg-columns" style={{ gridTemplateColumns: grid }}><span>Graph</span><span>Commit</span><span>Author</span><span>Date</span><span>Hash</span><span /></div>
             {items.map((row, index) => row === null ? <button key="working" disabled={busy || loading || !!graph.readOnlyReason || (!!repository?.operation && !repository.editStop) || !!repository?.bisectActive} className={`gg-row gg-working ${target?.kind === "working" ? "selected" : ""} ${showChanges ? "expanded" : ""}`} style={{ gridTemplateColumns: grid }} onFocus={() => { setSelected(index); setContext("history"); setTarget({ kind: "working" }); }} onClick={working} aria-expanded={showChanges}>
-              <svg width={graphWidth} height="36" aria-hidden="true" className="gg-lanes">{[...new Set([...(headRow?.edges.map((edge) => edge.from) ?? []), headRow?.lane ?? 0])].filter((lane) => lane !== headRow?.lane || !headRow.tip).map((lane) => <path key={lane} className={`gg-color-${(lane === headRow?.lane ? headRow.color : headRow?.edges.find((e) => e.from === lane)?.color ?? 0) % 6}`} d={`M ${18 + lane * 18} 0 V 36`} />)}<path className={`gg-color-${(headRow?.color ?? 0) % 6}`} d={`M ${18 + workingLane * 18} 18 V 36`} /><circle className={`gg-color-${(headRow?.color ?? 0) % 6} gg-working-dot`} cx={18 + workingLane * 18} cy="18" r="6" /></svg>
+              <svg width={graphWidth} height={ROW_HEIGHT} aria-hidden="true" className="gg-lanes">{[...new Set([...(headRow?.edges.map((edge) => edge.from) ?? []), headRow?.lane ?? 0])].filter((lane) => lane !== headRow?.lane || !headRow.tip).map((lane) => <path key={lane} className={`gg-color-${(lane === headRow?.lane ? headRow.color : headRow?.edges.find((e) => e.from === lane)?.color ?? 0) % 6}`} d={`M ${18 + lane * 18} 0 V ${ROW_HEIGHT}`} />)}<path className={`gg-color-${(headRow?.color ?? 0) % 6}`} d={`M ${18 + workingLane * 18} ${ROW_MID} V ${ROW_HEIGHT}`} /><circle className={`gg-color-${(headRow?.color ?? 0) % 6} gg-working-dot`} cx={18 + workingLane * 18} cy={ROW_MID} r="6" /></svg>
               <span className="gg-message"><b>Working Changes</b><span className="gg-badge">{graph.changes ? `${graph.changes.trimEnd().split("\n").length} changed` : "Clean"}</span></span><span className="gg-muted">Local</span><span /><span className="gg-muted">{showChanges ? "Collapse" : "Review"}</span><span />
             </button> : <button key={row.id} data-commit={row.id} disabled={busy || loading} className={`gg-row ${targetCommit(target) === row.id ? "selected" : ""}`} style={{ gridTemplateColumns: grid }} onFocus={() => { setSelected(index); setContext("history"); setTarget({ kind: "commit", id: row.id }); }} onClick={(e) => { if (e.shiftKey && !compareFile && (compareBase || inspected)) { setRangeBase(compareBase ?? inspected); inspect(row.id); setCompareBase(null); } else choose(row.id); }} onContextMenu={(e) => { e.preventDefault(); setTarget({ kind: "commit", id: row.id }); setSelected(index); openMenu("history", { kind: "commit", id: row.id }, e); }} title={`${row.subject}\n${row.id}`}>
-              <svg width={graphWidth} height="36" aria-hidden="true" className="gg-lanes">{!compareFile && row.id === graph.head && <path className={`gg-working-link gg-color-${row.color % 6}`} d={`M ${18 + workingLane * 18} 0 Q ${18 + workingLane * 18} 18 ${18 + row.lane * 18} 18`} />}{row.edges.map((edge, j) => <path key={j} className={`gg-color-${edge.color % 6}`} d={edgePath(edge, row.lane)} />)}{!row.tip && <path className={`gg-color-${row.color % 6}`} d={`M ${18 + row.lane * 18} 0 V 18`} />}<circle className={`gg-color-${row.color % 6}`} cx={18 + row.lane * 18} cy="18" r={row.id === graph.head ? 6 : 4} /></svg>
+              <svg width={graphWidth} height={ROW_HEIGHT} aria-hidden="true" className="gg-lanes">{!compareFile && row.id === graph.head && <path className={`gg-working-link gg-color-${row.color % 6}`} d={`M ${18 + workingLane * 18} 0 Q ${18 + workingLane * 18} ${ROW_MID} ${18 + row.lane * 18} ${ROW_MID}`} />}{row.edges.map((edge, j) => <path key={j} className={`gg-color-${edge.color % 6}`} d={edgePath(edge, row.lane)} />)}{!row.tip && <path className={`gg-color-${row.color % 6}`} d={`M ${18 + row.lane * 18} 0 V ${ROW_MID}`} />}<circle className={`gg-color-${row.color % 6}`} cx={18 + row.lane * 18} cy={ROW_MID} r={row.id === graph.head ? 6 : 4} /></svg>
               <span className="gg-message">{row.id === graph.head && <span className="gg-badge head">HEAD</span>}{row.refs.filter((r) => r !== "HEAD").map((ref) => <span className={`gg-badge ${ref.startsWith("tag: ") ? "tag" : ref.startsWith("refs/gall/recovery/") ? "saved" : repository?.refs.some((r) => r.kind === "remote" && r.name === ref) ? "remote" : ref.startsWith("HEAD -> ") ? "current" : ""}`} key={ref} onDoubleClick={(e) => { const name = ref.replace("HEAD -> ", ""); const found = repository?.refs.find((r) => r.kind === "branch" && r.name === name); if (found && !compareFile) { e.stopPropagation(); run("checkout", { kind: "reference", ref: found }); } }}>{ref.startsWith("refs/gall/recovery/") ? "Saved commit" : ref.replace("HEAD -> ", "")}</span>)}<span>{row.subject}</span></span><span className="gg-muted">{row.author}</span><time className="gg-muted" title={row.date}>{row.date?.slice(0, 10)}</time><code className="gg-hash">{row.id.slice(0, 8)}</code><span aria-hidden="true" title="Commit actions (right-click or Shift+F10)" className="gg-row-more" onClick={(e) => { e.stopPropagation(); setTarget({ kind: "commit", id: row.id }); setSelected(index); openMenu("history", { kind: "commit", id: row.id }, e); }}>⋯</span>
             </button>)}
             {!items.length && <p className="gg-empty">{search ? "No matching loaded commits. Clear the search or load more history." : "No commits on this reference."}</p>}

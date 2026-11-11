@@ -3,6 +3,8 @@
 mod bug_report;
 mod cli;
 mod commands;
+#[cfg(target_os = "linux")]
+mod media_server;
 mod report_capture;
 mod state;
 mod updates;
@@ -33,6 +35,8 @@ pub struct UiLogLine {
 }
 
 static APP: OnceLock<AppHandle> = OnceLock::new();
+/// URL prefix of the loopback media server (Linux only, see `media_server`).
+pub(crate) static MEDIA_BASE: OnceLock<String> = OnceLock::new();
 /// Set once the UI listens for "backend-log"; until then lines wait in `BACKLOG`.
 static UI_READY: AtomicBool = AtomicBool::new(false);
 static BACKLOG: Mutex<Vec<UiLogLine>> = Mutex::new(Vec::new());
@@ -156,6 +160,15 @@ pub fn run() {
         .setup(move |app| {
             bug_report::init(&dirs);
             log::info!("startup: setup at {} ms", startup_ms());
+            // Video and audio previews play from a loopback HTTP server: WebKitGTK cannot
+            // play media from the asset:// scheme.
+            #[cfg(target_os = "linux")]
+            match media_server::start() {
+                Ok(base) => {
+                    let _ = MEDIA_BASE.set(base);
+                }
+                Err(e) => log::warn!("media server not started: {e}"),
+            }
             let handle = app.handle().clone();
             let _ = APP.set(handle.clone());
             let (boot, _): (gall_core::storage::Settings, _) =
@@ -284,6 +297,7 @@ pub fn run() {
             commands::diff_compare,
             commands::git_commits,
             commands::git_graph,
+            commands::git_graph_view,
             commands::git_switch,
             commands::git_workspace,
             commands::git_index_action,
@@ -330,6 +344,8 @@ pub fn run() {
             commands::session_cmd,
             commands::favorites_get,
             commands::favorites_cmd,
+            commands::marks_get,
+            commands::marks_cmd,
             commands::history_get,
             commands::history_remove,
             commands::preview_info,

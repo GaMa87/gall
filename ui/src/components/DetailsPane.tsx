@@ -49,7 +49,7 @@ export function DetailsPane({ b, path, showToolbar = true }: { b: number; path: 
           <div className="props-toolbar">
             <button className="icon-btn" title="Cut (Ctrl+X)" onClick={() => A.copyToClipboard([entry], true)}><Icon name="cut" /></button>
             <button className="icon-btn" title="Copy (Ctrl+C)" onClick={() => A.copyToClipboard([entry], false)}><Icon name="copy" /></button>
-            <button className="icon-btn" title="Rename (F2)" onClick={() => A.renameEntry(b, entry)}><Icon name="rename" /></button>
+            <button className="icon-btn" title="Rename" onClick={() => A.renameEntry(b, entry)}><Icon name="rename" /></button>
             <button className="icon-btn" title="Move to trash (Del)" onClick={() => A.trashPaths([entry.path])}><Icon name="trash" /></button>
             <button className="icon-btn" title="Colour tag (Ctrl+Alt+T)" onClick={() => A.openOverlay({ type: "tag", paths: [entry.path] })}><Icon name="tag" /></button>
           </div>

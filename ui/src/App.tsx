@@ -6,7 +6,7 @@ import { useEffect, useMemo } from "react";
 import { api, fileSrc } from "./api/ipc";
 import { buildKeymap, chordOf, keyboardProfile, type Action } from "./core/keymap";
 import { controller } from "./state/controllers";
-import { buildLeaderTree, buildVimTree, CTRL_TAP, leaderToken, resolve, vimToken } from "./core/vim";
+import { buildLeaderTree, buildVimTree, CTRL_TAP, leaderToken, physicalLetter, resolve, vimToken } from "./core/vim";
 import { run } from "./state/run";
 import { join } from "./core/path";
 import * as A from "./state/actions";
@@ -157,7 +157,13 @@ export function App() {
           setState({ keySeq: [] });
           return;
         }
-        const tok = vimToken(e);
+        let tok = vimToken(e);
+        // After a mark key a dead key may have composed the letter (' then a → á): use the
+        // physical letter as the mark's name.
+        const at = seq.length ? resolve(vimTree, seq) : null;
+        if (at?.kind === "pending" && at.node.mark && (tok === null || resolve(vimTree, [...seq, tok]).kind === "none")) {
+          tok = physicalLetter(e) ?? tok;
+        }
         if (tok === null && seq.length && ["Shift", "Control", "Alt", "Meta", "CapsLock"].includes(e.key)) return;
         // Visual mode: y yanks and d / x cut the selection at once, as in Vim.
         const VISUAL_KEYS: Record<string, Action> = { y: "copy", d: "cut", x: "cut" };
@@ -176,6 +182,7 @@ export function App() {
             else {
               setState({ keySeq: [] });
               if (r.kind === "action") run(r.action);
+              else if (r.kind === "mark") A.runMark(r.op, r.key);
             }
             return;
           }

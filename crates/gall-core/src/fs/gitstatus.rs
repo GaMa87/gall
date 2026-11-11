@@ -13,7 +13,8 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::sync::OnceLock;
+use std::time::Duration;
 
 /// What Git says about an item; for a folder, the most important state inside it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -64,10 +65,48 @@ pub fn work_tree(dir: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
+/// The Git program to start for queries: the real executable from Git's own program folder
+/// (`git --exec-path`), found once, or plain `git` from `PATH` when that fails.
+///
+/// The `git` on `PATH` is often only a launcher that starts the real program: `cmd\git.exe`
+/// of Git for Windows, a Scoop shim in front of it, `xcrun` on macOS. Every hop is one more
+/// process, which about doubles the cost of a call on Windows, and a view makes dozens of
+/// them. The real program sets up its own environment (helper folders on `PATH`), so the
+/// result is the same. If it disappears (Git was updated while the app runs), `git` from
+/// `PATH` is used again.
+pub(super) fn program() -> &'static Path {
+    static REAL: OnceLock<Option<PathBuf>> = OnceLock::new();
+    match REAL.get_or_init(real_program) {
+        Some(real) if real.is_file() => real,
+        _ => Path::new("git"),
+    }
+}
+
+fn real_program() -> Option<PathBuf> {
+    let mut cmd = Command::new("git");
+    cmd.arg("--exec-path")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let out = cmd.output().ok().filter(|out| out.status.success())?;
+    let dir = PathBuf::from(
+        String::from_utf8(out.stdout)
+            .ok()?
+            .trim_end_matches(['\r', '\n']),
+    );
+    let real = dir.join(format!("git{}", std::env::consts::EXE_SUFFIX));
+    (dir.is_absolute() && real.is_file()).then_some(real)
+}
+
 /// A git command with the protections described in the module docs; `overrides` are
 /// more `-c key=value` settings.
 fn git(dir: &Path, overrides: &[String]) -> Command {
-    let mut cmd = Command::new("git");
+    let mut cmd = Command::new(program());
     cmd.env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
         .args(["-c", "core.fsmonitor=false", "-c"])
@@ -95,23 +134,19 @@ fn git(dir: &Path, overrides: &[String]) -> Command {
 fn output(mut cmd: Command) -> Option<Vec<u8>> {
     let mut child = cmd.stdout(Stdio::piped()).spawn().ok()?;
     let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
+    // The reader reports the end of the output, so the result is there the moment git
+    // finishes; polling the process added up to a sleep interval to every call.
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut buf = Vec::new();
-        stdout.read_to_end(&mut buf).map(|_| buf)
+        let _ = done.send(stdout.read_to_end(&mut buf).map(|_| buf));
     });
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let out = reader.join().ok()?.ok()?;
-                return status.success().then_some(out);
-            }
-            Ok(None) if start.elapsed() < TIMEOUT => std::thread::sleep(Duration::from_millis(15)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
+    match finished.recv_timeout(TIMEOUT) {
+        Ok(Ok(out)) => child.wait().ok()?.success().then_some(out),
+        _ => {
+            let _ = child.kill();
+            let _ = child.wait();
+            None
         }
     }
 }

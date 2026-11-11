@@ -1,13 +1,4 @@
 .gg-workspace { width: min(1460px, 97vw); height: 91vh; position: relative; }
-.modal .dialog-multiline { width: 100%; min-height: 160px; resize: vertical; font: inherit; box-sizing: border-box; }
-.modal:has(.dialog-multiline) { width: min(660px, 92vw); min-width: min(380px, 92vw); border-radius: 16px; border-color: var(--border-soft); background: linear-gradient(145deg, color-mix(in srgb, var(--accent) 5%, var(--bg-2)), var(--bg-2) 55%); }
-.modal:has(.dialog-multiline) h3 { padding: 23px 24px 16px; font-size: 17px; letter-spacing: -.02em; border-bottom: 1px solid var(--border-soft); }
-.modal:has(.dialog-multiline) .body { padding: 18px 24px; }
-.modal:has(.dialog-multiline) .body p { font-size: 12px; line-height: 1.6; margin-bottom: 16px; }
-.modal:has(.dialog-multiline) .dialog-multiline { min-height: 190px; padding: 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg); line-height: 1.65; outline: none; }
-.modal:has(.dialog-multiline) .dialog-multiline:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
-.modal:has(.dialog-multiline) .body > small { display: block; margin-top: 10px; color: var(--fg-dim); font-size: 11px; }
-.modal:has(.dialog-multiline) .buttons { padding: 14px 24px 20px; border-top: 1px solid var(--border-soft); background: color-mix(in srgb, var(--bg) 30%, transparent); }
 .gg-header-actions { display: flex; gap: 8px; }
 .gg-workspace .gg-toolbar { flex-wrap: wrap; gap: 8px; padding: 9px 14px; }
 .gg-workspace .gg-toolbar button { flex-shrink: 0; font-size: 12px; }
@@ -17,7 +8,7 @@
 .gg-sidebar { width: 210px; flex-shrink: 0; display: flex; flex-direction: column; border-right: 1px solid var(--border-soft); background: var(--bg); overflow: hidden; }
 .gg-side-tabs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 2px; padding: 5px; border-bottom: 1px solid var(--border-soft); }
 .gg-side-tabs button { font-size: 11px; padding: 5px; background: transparent; border: 0; }
-.gg-side-tabs button[aria-pressed=true] { background: var(--accent-soft); color: var(--accent); }
+.gg-side-tabs button[aria-pressed=true] { background: var(--accent-soft); color: var(--accent-text); }
 .gg-side-tools { display: flex; align-items: center; justify-content: space-between; font-size: 12px; padding: 10px; }
 .gg-side-tools button { padding: 0 7px; font-size: 15px; }
 .gg-side-list { flex: 1; overflow: auto; min-height: 0; }
@@ -37,17 +28,19 @@
 .gg-error { color: var(--danger, #e16e6e); padding: 9px 16px; border-bottom: 1px solid var(--border-soft); max-height: 90px; overflow: auto; white-space: pre-wrap; font-size: 12px; }
 .gg-read-only { padding: 8px 14px; font-size: 11px; color: var(--fg-dim); }
 .gg-operation { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 8px 14px; background: var(--accent-soft); font-size: 12px; border-bottom: 1px solid var(--border-soft); }
-.gg-operation strong { color: var(--accent); }
+.gg-operation strong { color: var(--accent-text); }
 .gg-operation span { margin-right: auto; }
 .gg-operation button { font-size: 11px; }
 .gg-operation .gg-applying { margin-right: 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.git-graph-lines .gg-load-more { text-align: center; padding: 10px; font-size: 12px; color: var(--accent); }
+.git-graph-lines .gg-load-more { display: block; width: calc(100% - 24px); margin: 8px 12px; text-align: center; padding: 8px; font-size: 12px; font-weight: 600; color: var(--accent-text); background: var(--accent-soft); border: 1px solid var(--accent-ring); }
+.git-graph-lines .gg-load-more:hover:not(:disabled) { border-color: var(--accent-text); }
+.git-graph-lines .gg-load-more:disabled { opacity: 0.6; }
 .gg-conflict { min-height: 0; flex: 1; display: flex; flex-direction: column; border-top: 1px solid var(--border-soft); }
 .gg-conflict .gg-working-title { gap: 8px; flex-wrap: wrap; overflow-wrap: anywhere; }
 .gg-conflict .gg-working-title > div { display: flex; gap: 6px; flex-wrap: wrap; }
 .gg-conflict button { font-size: 11px; }
 .gg-conflict-commit { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; padding: 6px 14px; background: var(--accent-soft); border-bottom: 1px solid var(--border-soft); font-size: 12px; }
-.gg-conflict-commit > span { color: var(--accent); font-weight: 600; }
+.gg-conflict-commit > span { color: var(--accent-text); font-weight: 600; }
 .gg-conflict-commit strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .gg-conflict-commit small { opacity: 0.7; margin-left: auto; }
 .gg-conflict-sides { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); grid-template-rows: repeat(2,minmax(0,1fr)); min-height: 0; flex: 1; }
@@ -74,63 +67,63 @@
 .gg-color-0 { color: var(--accent); }.gg-color-1 { color: #b48af5; }.gg-color-2 { color: #50bba1; }.gg-color-3 { color: #e5a255; }.gg-color-4 { color: #dc779e; }.gg-color-5 { color: #73b5d8; }
 .gg-lanes circle[class*="gg-color"] { stroke: currentColor; }
 .git-graph-lines .gg-row { position: relative; transition: background .12s ease; border-bottom-color: color-mix(in srgb, var(--border-soft) 30%, transparent); }
-.git-graph-lines .gg-row:hover { background: color-mix(in srgb, var(--accent) 7%, transparent); }
-.git-graph-lines .gg-row.selected { background: linear-gradient(90deg, color-mix(in srgb, var(--accent) 16%, transparent), color-mix(in srgb, var(--accent) 5%, transparent)); box-shadow: inset 3px 0 var(--accent); }
+.git-graph-lines .gg-row:hover { background: var(--row-hover); }
+.git-graph-lines .gg-row.selected { background: var(--sel-gradient); box-shadow: var(--sel-bar); }
 .gg-columns { letter-spacing: .08em; font-size: 10px; text-transform: uppercase; color: var(--fg-dim); }
-.gg-hash { font-size: 11px; opacity: .8; padding: 1px 6px; border-radius: 6px; background: color-mix(in srgb, var(--fg) 6%, transparent); }
+.gg-hash { justify-self: start; font-size: 11px; opacity: .8; padding: 1px 8px; border-radius: var(--radius-sm); background: color-mix(in srgb, var(--fg) 6%, transparent); }
 .gg-message { gap: 6px; }
-.gg-badge { display: inline-flex; align-items: center; gap: 4px; border-radius: 999px; padding: 1px 9px; font-size: 10.5px; font-weight: 600; letter-spacing: .01em; border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent); background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--accent); transition: transform .12s ease, box-shadow .12s ease; }
+.gg-badge { display: inline-flex; align-items: center; gap: 4px; border-radius: var(--radius-pill); padding: 1px 9px; font-size: 10.5px; font-weight: 600; letter-spacing: .01em; border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent); background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--accent-text); transition: transform .12s ease, box-shadow .12s ease; }
 .gg-badge:hover { border-color: color-mix(in srgb, var(--accent) 60%, transparent); }
-.gg-badge.head { background: linear-gradient(135deg, var(--accent), color-mix(in srgb, var(--accent) 65%, #b48af5)); color: #fff; border-color: transparent; box-shadow: 0 1px 3px rgb(0 0 0 / 25%); }
+.gg-badge.head { background: var(--primary-gradient); color: #fff; border-color: transparent; box-shadow: 0 1px 3px rgb(0 0 0 / 25%); }
 .gg-badge.current { background: color-mix(in srgb, var(--accent) 22%, transparent); border-color: var(--accent); }
 .gg-badge.remote { color: #8f9bb3; border-color: color-mix(in srgb, #8f9bb3 35%, transparent); background: color-mix(in srgb, #8f9bb3 10%, transparent); font-weight: 500; }
 .gg-badge.tag { color: #e5a255; border-color: color-mix(in srgb, #e5a255 40%, transparent); background: color-mix(in srgb, #e5a255 12%, transparent); }
 .gg-badge.saved { color: var(--fg-dim); border-style: dashed; background: transparent; font-weight: 500; }
-.gg-workspace .gg-toolbar { border-bottom: 1px solid var(--border-soft); background: color-mix(in srgb, var(--bg) 55%, var(--bg-2)); }
+.gg-workspace .gg-toolbar { border-bottom: 1px solid var(--border-soft); background: var(--bar-bg); }
 .gg-workspace .gg-toolbar button:hover:not(:disabled) { border-color: var(--accent-ring); background: var(--accent-soft); }
 .gg-search:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
 .gg-sidebar { background: linear-gradient(180deg, color-mix(in srgb, var(--bg) 85%, var(--bg-2)), var(--bg)); }
-.gg-side-tabs { background: color-mix(in srgb, var(--fg) 4%, transparent); border-radius: 12px; margin: 8px; padding: 3px; border-bottom: 0; }
-.gg-side-tabs button { border-radius: 9px; transition: background .12s ease, color .12s ease; }
+.gg-side-tabs { background: var(--well-bg); border-radius: var(--radius-lg); margin: 8px; padding: 3px; border-bottom: 0; }
+.gg-side-tabs button { border-radius: var(--radius); transition: background .12s ease, color .12s ease; }
 .gg-side-tabs button[aria-pressed=true] { background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent-ring); font-weight: 600; }
 .gg-side-list h3 { letter-spacing: .1em; }
-.gg-side-row { border-radius: 9px; margin: 1px 6px; width: calc(100% - 12px); transition: background .12s ease; }
-.gg-side-row.selected { box-shadow: inset 3px 0 var(--accent); border-radius: 4px 9px 9px 4px; }
+.gg-side-row { border-radius: var(--radius); margin: 1px 6px; width: calc(100% - 12px); transition: background .12s ease; }
+.gg-side-row.selected { background: var(--sel-gradient); box-shadow: var(--sel-bar); border-radius: 4px var(--radius) var(--radius) 4px; }
 .gg-operation { background: linear-gradient(90deg, color-mix(in srgb, var(--accent) 22%, transparent), color-mix(in srgb, var(--accent) 6%, transparent)); border-bottom: 1px solid var(--accent-ring); }
 .gg-conflict-commit { background: linear-gradient(90deg, color-mix(in srgb, var(--accent) 18%, transparent), transparent); border-left: 3px solid var(--accent); }
-.gg-conflict-commit code { padding: 1px 7px; border-radius: 6px; background: color-mix(in srgb, var(--fg) 8%, transparent); }
+.gg-conflict-commit code { padding: 1px 7px; border-radius: var(--radius-sm); background: color-mix(in srgb, var(--fg) 8%, transparent); }
 .gg-working-title { border-bottom: 1px solid var(--border-soft); }
-.gg-key-help { border-radius: 14px; backdrop-filter: blur(6px); }
-.git-graph footer { opacity: .75; background: color-mix(in srgb, var(--bg) 40%, transparent); }
+.gg-key-help { border-radius: var(--radius-lg); backdrop-filter: blur(6px); }
+.git-graph footer { opacity: .75; background: var(--foot-bg); }
 
 /* Explicitly styled buttons: native buttons render differently per platform once any property is overridden. */
 .gg-workspace .gg-toolbar button, .gg-operation button, .gg-conflict button, .gg-working-title button, .gg-workspace > header button, .gg-side-tools button, .gg-output summary button,
 .gm-actions button, .gm-bar button, .git-commit-details button, .git-changes button:not(.gc-file), .gc-tools button {
-  appearance: none; cursor: pointer; color: var(--fg); background: linear-gradient(180deg, color-mix(in srgb, var(--fg) 7%, var(--bg-2)), color-mix(in srgb, var(--fg) 3%, var(--bg-2)));
-  border: 1px solid var(--border); border-radius: 9px; padding: 5px 12px; line-height: 1.3;
-  box-shadow: 0 1px 0 color-mix(in srgb, #fff 6%, transparent) inset, 0 1px 2px rgb(0 0 0 / 18%);
+  appearance: none; cursor: pointer; color: var(--fg); background: var(--btn-bg);
+  border: 1px solid var(--border); border-radius: var(--radius); padding: 5px 12px; line-height: 1.3;
+  box-shadow: var(--btn-shadow);
   transition: background .14s ease, border-color .14s ease, box-shadow .14s ease, transform .08s ease;
 }
 .gg-workspace .gg-toolbar button:hover:not(:disabled), .gg-operation button:hover:not(:disabled), .gg-conflict button:hover:not(:disabled), .gg-working-title button:hover:not(:disabled), .gg-workspace > header button:hover:not(:disabled),.gg-side-tools button:hover:not(:disabled),
 .gm-actions button:hover:not(:disabled), .gm-bar button:hover:not(:disabled), .git-commit-details button:hover:not(:disabled), .git-changes button:not(.gc-file):hover:not(:disabled), .gc-tools button:hover:not(:disabled) {
-  background: linear-gradient(180deg, color-mix(in srgb, var(--accent) 22%, var(--bg-2)), color-mix(in srgb, var(--accent) 10%, var(--bg-2))); border-color: var(--accent-ring); box-shadow: 0 1px 3px rgb(0 0 0 / 22%);
+  background: var(--btn-bg-hover); border-color: var(--accent-ring); box-shadow: var(--btn-shadow-hover);
 }
 .gg-workspace .gg-toolbar button:active:not(:disabled), .gg-operation button:active:not(:disabled), .gg-conflict button:active:not(:disabled), .gm-actions button:active:not(:disabled), .gc-tools button:active:not(:disabled) { transform: translateY(1px); }
 .gg-workspace .gg-toolbar button:disabled, .gg-operation button:disabled, .gg-conflict button:disabled, .gg-working-title button:disabled, .gm-actions button:disabled, .gc-tools button:disabled, .gm-bar button:disabled { opacity: .45; cursor: default; box-shadow: none; }
 .gg-workspace .gg-toolbar button:focus-visible, .gg-operation button:focus-visible, .gg-conflict button:focus-visible, .gm-actions button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.gm-confirm, .gg-operation button:first-of-type:not(:disabled) { background: linear-gradient(135deg, var(--accent), color-mix(in srgb, var(--accent) 65%, #b48af5)); color: #fff; border-color: transparent; font-weight: 600; }
-.gg-output summary button { padding: 0 7px; border-radius: 7px; }
-.gg-side-row.current { background: linear-gradient(90deg, color-mix(in srgb, var(--accent) 20%, transparent), color-mix(in srgb, var(--accent) 6%, transparent)); box-shadow: inset 3px 0 var(--accent); font-weight: 700; }
-.gg-side-row.current small { color: var(--accent); }
-.gg-current-pill { margin-left: 8px; padding: 1px 8px; border-radius: 999px; font-size: 9.5px; font-style: normal; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: #fff; background: linear-gradient(135deg, var(--accent), color-mix(in srgb, var(--accent) 65%, #b48af5)); box-shadow: none; }
+.gm-actions button.gm-confirm:not(:disabled), .gg-operation button:first-of-type:not(:disabled) { background: var(--primary-gradient); color: #fff; border-color: transparent; font-weight: 600; }
+.gg-output summary button { padding: 0 7px; border-radius: var(--radius-sm); }
+.gg-side-row.current { background: var(--sel-gradient); box-shadow: var(--sel-bar); font-weight: 700; }
+.gg-side-row.current small { color: var(--accent-text); }
+.gg-current-pill { margin-left: 8px; padding: 1px 8px; border-radius: var(--radius-pill); font-size: 9.5px; font-style: normal; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: #fff; background: var(--primary-gradient); box-shadow: none; }
 
-.gg-track { margin-left: 8px; padding: 0 6px; border-radius: 999px; font-size: 10.5px; font-weight: 700; font-style: normal; color: var(--fg); background: color-mix(in srgb, var(--accent) 14%, transparent); border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent); white-space: nowrap; }
+.gg-track { margin-left: 8px; padding: 0 6px; border-radius: var(--radius-pill); font-size: 10.5px; font-weight: 700; font-style: normal; color: var(--fg); background: color-mix(in srgb, var(--accent) 14%, transparent); border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent); white-space: nowrap; }
 .gg-subtitle .gg-track { margin-left: 6px; }
 .gg-side-tabs .gg-conflicts-tab { grid-column: 1 / -1; background: color-mix(in srgb, var(--danger, #e16e6e) 18%, transparent); color: var(--danger, #e16e6e); font-weight: 700; box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--danger, #e16e6e) 55%, transparent); }
 .gg-side-tabs .gg-conflicts-tab[aria-pressed=true] { background: color-mix(in srgb, var(--danger, #e16e6e) 28%, transparent); color: var(--danger, #e16e6e); }
 
 /* Row action button: the same menu as a right-click, shown where the pointer or selection is. */
-.gg-row-more { display: grid; place-items: center; justify-self: center; width: 22px; height: 22px; border-radius: 6px; color: var(--fg-dim); font-size: 16px; line-height: 1; cursor: pointer; opacity: 0; }
+.gg-row-more { display: grid; place-items: center; justify-self: center; width: 22px; height: 22px; border-radius: var(--radius-sm); color: var(--fg-dim); font-size: 16px; line-height: 1; cursor: pointer; opacity: 0; }
 .gg-row:hover .gg-row-more, .gg-row.selected .gg-row-more, .gg-row:focus-visible .gg-row-more,
 .gg-side-row:hover .gg-row-more, .gg-side-row.selected .gg-row-more, .gg-side-row:focus-visible .gg-row-more { opacity: 1; }
 .gg-row-more:hover { background: var(--accent-soft); color: var(--fg); }
@@ -150,4 +143,4 @@
 .gg-focus-tools .git-advanced { outline: 2px solid color-mix(in srgb, var(--accent) 80%, transparent); outline-offset: -2px; }
 .git-graph:not(.gg-focus-history) .git-graph-lines .gg-row.selected,
 .git-graph:not(.gg-focus-sidebar) .gg-side-row.selected { background: color-mix(in srgb, var(--fg) 8%, transparent); box-shadow: inset 3px 0 color-mix(in srgb, var(--fg) 35%, transparent); }
-.gg-panel-name { display: inline-block; margin-right: 10px; padding: 1px 9px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); font-weight: 600; letter-spacing: .02em; }
+.gg-panel-name { display: inline-block; margin-right: 10px; padding: 1px 9px; border-radius: var(--radius-pill); background: var(--accent-soft); color: var(--accent-text); font-weight: 600; letter-spacing: .02em; }

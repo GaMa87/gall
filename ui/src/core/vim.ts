@@ -10,9 +10,33 @@ export interface KeyNode {
   label: string;
   action?: Action;
   children?: Map<string, KeyNode>;
+  /** The next key names a folder mark (m{letter}, '{letter} …) instead of a child. */
+  mark?: MarkOp;
 }
 
 type Spec = [keys: string, label: string, action?: Action];
+
+/** What a folder-mark key does with the letter typed after it. */
+export type MarkOp = "set" | "jump" | "jumpItem" | "delete";
+
+/** Key of the automatic mark that holds the folder left by the last jump ('' / ``). */
+export const PREVIOUS_MARK = "'";
+
+/** Vim folder marks: m{a-zA-Z} sets, '{x} goes there, `{x} also selects the marked item,
+ *  '' / `` go back to the folder before the last jump, dm{x} deletes a mark. */
+export const MARK_KEYS: [keys: string, label: string, op: MarkOp][] = [
+  ["m", "Mark this folder", "set"],
+  ["'", "Go to mark", "jump"],
+  ["`", "Go to mark, select the marked item", "jumpItem"],
+  ["dm", "Delete mark", "delete"],
+];
+
+/** The mark key a typed letter stands for, or null when `op` does not take it. */
+export function markKey(op: MarkOp, tok: string): string | null {
+  if (/^[a-z]$/i.test(tok)) return tok;
+  if ((op === "jump" || op === "jumpItem") && (tok === "'" || tok === "`")) return PREVIOUS_MARK;
+  return null;
+}
 
 /** Keys typed directly on the file list (no leader). Conventions follow Vim, yazi/ranger
  *  (file managers), lazygit ([ ] tabs, / filter) and LazyVim (leader groups). */
@@ -36,7 +60,7 @@ export const NORMAL_KEYS: Spec[] = [
   ["H", "Back", "back"],
   ["L", "Forward", "forward"],
   ["/", "Filter this folder", "filter"],
-  ["v", "Visual mode: j/k select, then y/d/D/m…; Esc ends", "visualMode"],
+  ["v", "Visual mode: j/k select, then y/d/D/c…; Esc ends", "visualMode"],
   ["s", "Toggle selection, move down", "selectDown"],
   ["V", "Select all", "selectAll"],
   ["y", "+yank"],
@@ -70,7 +94,8 @@ export const NORMAL_KEYS: Spec[] = [
   ["I", "Properties", "properties"],
   ["C", "Copy to other browser", "copyToOther"],
   ["M", "Move to other browser", "moveToOther"],
-  ["m", "Colour tag", "tag"],
+  // m is Vim's mark key (MARK_KEYS); c for colour.
+  ["c", "Colour tag", "tag"],
   ["b", "Pin / unpin folder in the sidebar", "togglePin"],
   ["f", "Search names / tags", "search"],
   ["F", "Find in files (this folder)", "grepFolder"],
@@ -220,13 +245,26 @@ export function splitKeys(spec: string): string[] {
   return [...spec];
 }
 
-const VIM_CTRL = new Set(NORMAL_KEYS.map(([k]) => splitKeys(k)[0]).filter((t) => t.startsWith("Ctrl+")));
+const VIM_FIRST = new Set([...NORMAL_KEYS, ...MARK_KEYS].map(([k]) => splitKeys(k)[0]));
 
-/** A chord shortcut (`Ctrl+H`) that vim keys take over (`Ctrl+h` = left browser), so it
- *  never reaches the shortcut map while vim keys are on. */
+/** A chord shortcut that vim keys take over, so it never reaches the shortcut map while
+ *  vim keys are on: `Ctrl+H` (`Ctrl+h` = left browser) or a plain character a vim key or
+ *  prefix starts with (`` ` `` = go to mark, `.` = hidden files). */
 export function shadowedByVim(chord: string): boolean {
-  const m = /^Ctrl\+(.)$/i.exec(chord);
-  return !!m && VIM_CTRL.has(`Ctrl+${m[1].toLowerCase()}`);
+  const ctrl = /^Ctrl\+(.)$/i.exec(chord);
+  if (ctrl) return VIM_FIRST.has(`Ctrl+${ctrl[1].toLowerCase()}`);
+  const shifted = /^Shift\+([a-z])$/i.exec(chord);
+  if (shifted) return VIM_FIRST.has(shifted[1].toUpperCase());
+  if (chord.length !== 1) return false;
+  return VIM_FIRST.has(/[a-z]/i.test(chord) ? chord.toLowerCase() : chord);
+}
+
+/** The physical letter of a key (`KeyA` → `a`, with Shift `A`), for a mark name typed on a
+ *  layout that composes it with a dead key before it (`'` then `a` → `á`). */
+export function physicalLetter(e: { code?: string; shiftKey?: boolean; ctrlKey: boolean; metaKey: boolean; altKey: boolean }): string | null {
+  const m = /^Key([A-Z])$/.exec(e.code ?? "");
+  if (!m || e.ctrlKey || e.metaKey || e.altKey) return null;
+  return e.shiftKey ? m[1] : m[1].toLowerCase();
 }
 
 export interface KeyLabelCtx {
@@ -297,6 +335,16 @@ function build(specs: Spec[], leader?: string): KeyNode {
 /** Builds the full key tree for a leader token (e.g. "Space", ";" or CTRL_TAP). */
 export function buildVimTree(leader: string): KeyNode {
   const tree = build(NORMAL_KEYS);
+  for (const [keys, label, op] of MARK_KEYS) {
+    let n = tree;
+    for (const t of splitKeys(keys)) {
+      let c = n.children?.get(t);
+      if (!c) (n.children ??= new Map()).set(t, (c = { label: "" }));
+      n = c;
+    }
+    n.label = label;
+    n.mark = op;
+  }
   if (leader) tree.children!.set(leader, leaderNode(leader));
   return tree;
 }
@@ -322,15 +370,21 @@ export function treeForSettings(s: { vimKeys: boolean; leaderKey: string; leader
 export type Resolved =
   | { kind: "action"; action: Action }
   | { kind: "pending"; node: KeyNode }
+  | { kind: "mark"; op: MarkOp; key: string }
   | { kind: "none" };
 
 export function resolve(tree: KeyNode, seq: string[]): Resolved {
   let n: KeyNode | undefined = tree;
-  for (const t of seq) {
-    n = n.children?.get(t);
+  for (let i = 0; i < seq.length; i++) {
+    if (n.mark) {
+      // The key after a mark key is the mark's name and ends the sequence.
+      const key = i === seq.length - 1 ? markKey(n.mark, seq[i]) : null;
+      return key ? { kind: "mark", op: n.mark, key } : { kind: "none" };
+    }
+    n = n.children?.get(seq[i]);
     if (!n) return { kind: "none" };
   }
-  if (n.children?.size) return { kind: "pending", node: n };
+  if (n.children?.size || n.mark) return { kind: "pending", node: n };
   if (n.action) return { kind: "action", action: n.action };
   return { kind: "none" };
 }
@@ -351,6 +405,9 @@ export function vimToken(e: { key: string; code?: string; ctrlKey: boolean; meta
   }
   if (e.key === " ") return "Space";
   if (e.key === "Tab") return "Tab";
+  // A dead key (US International ' and `, the key left of 1 on many European layouts)
+  // types nothing by itself: the mark keys ' and ` follow the physical key there.
+  if (e.key === "Dead" && !e.shiftKey) return e.code === "Quote" ? "'" : e.code === "Backquote" ? "`" : null;
   if (/^[a-z]$/i.test(e.key)) return e.shiftKey ? e.key.toUpperCase() : e.key.toLowerCase();
   return e.key.length === 1 ? e.key : null;
 }

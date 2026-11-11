@@ -5,7 +5,7 @@ use gall_core::fs::ops::{TaskManager, UndoJournal};
 use gall_core::fs::watcher::FolderWatcher;
 use gall_core::nav::Session;
 use gall_core::storage::json_store::LoadedFrom;
-use gall_core::storage::{Db, Favorites, JsonStore, Settings};
+use gall_core::storage::{Db, Favorites, JsonStore, Marks, Settings};
 use gall_core::util::appdirs::AppDirs;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -25,6 +25,9 @@ pub struct AppState {
     pub settings_store: JsonStore,
     pub favorites: Mutex<Favorites>,
     pub favorites_store: JsonStore,
+    /// Vim folder marks (`m{letter}` / `'{letter}`).
+    pub marks: Mutex<Marks>,
+    pub marks_store: JsonStore,
     pub session: Mutex<Session>,
     pub session_store: JsonStore,
     pub db: Db,
@@ -102,6 +105,10 @@ impl AppState {
         }
         favorites.sanitize();
 
+        let marks_store = JsonStore::new(dirs.marks());
+        let (mut marks, _): (Marks, _) = marks_store.load();
+        marks.sanitize();
+
         let session_store = JsonStore::new(dirs.session());
         let (session, _): (Option<Session>, _) = session_store.load();
         let h = home();
@@ -136,6 +143,8 @@ impl AppState {
             settings_store,
             favorites: Mutex::new(favorites),
             favorites_store,
+            marks: Mutex::new(marks),
+            marks_store,
             session: Mutex::new(session),
             session_store,
             db,
@@ -169,5 +178,9 @@ impl AppState {
         if let Err(e) = self.favorites_store.save(&f) {
             log::error!("saving favorites: {e}");
         }
+    }
+
+    pub fn save_marks(&self, m: &Marks) -> gall_core::error::Result<()> {
+        self.marks_store.save(m)
     }
 }

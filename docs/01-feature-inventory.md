@@ -115,6 +115,7 @@ Platform column: how the Windows behaviour maps to Linux, or `N/A` when it canno
 | P-08 | Email (.msg/.eml) preview | O | Recipients and attachments. | `RN:3.107.1` |
 | P-09 | Pane divider | I | Resizable split between preview and properties. | `M:detailspane` |
 | P-10 | Folder preview | I | Folder thumbnail artwork. | screenshot `M:mainwindow` |
+| P-11 | STL model preview | O | Binary and ASCII STL files are drawn as a shaded 3D model (Z up). Drag rotates, wheel zooms, double-click resets; the triangle count and size are shown below. Models over 256 MB are not loaded. | Gall |
 
 ## 8. File operations
 

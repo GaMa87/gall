@@ -189,6 +189,13 @@ export function FindInFiles({ root, scope: initialScope }: { root: string; scope
       return;
     }
     const k = e.key;
+    if (k === "Tab" && !e.ctrlKey && !e.altKey && !e.metaKey) {
+      // Tab cycles the search scope (Shift+Tab goes back), like Quick Open's Tab.
+      e.preventDefault();
+      const order: Scope[] = ["folder", "home", "root"];
+      setScope(order[(order.indexOf(scope) + (e.shiftKey ? 2 : 1)) % order.length]);
+      return;
+    }
     if (k === "ArrowDown" || (k === "F4" && !e.shiftKey) || (e.ctrlKey && (k === "j" || k === "n"))) { e.preventDefault(); step(1); return; }
     if (k === "ArrowUp" || (k === "F4" && e.shiftKey) || (e.ctrlKey && (k === "k" || k === "p"))) { e.preventDefault(); step(-1); return; }
     if (k === "Enter" && (e.target as HTMLElement).tagName === "INPUT" && (e.target as HTMLElement).dataset.role !== "query") return;
@@ -218,6 +225,7 @@ export function FindInFiles({ root, scope: initialScope }: { root: string; scope
             <button className={`tgl ${opts.everything ? "on" : ""}`} title="Also search ignored files: node_modules and the other excluded folders, .gitignore, .gallignore, cache folders (Alt+I)" onClick={() => setOpts((o) => ({ ...o, everything: !o.everything }))}><Icon name="eye" size={15} /></button>
             <button className={`tgl ${showFilters || include || exclude ? "on" : ""}`} title="Include / exclude files" onClick={() => setShowFilters((v) => !v)}><Icon name="more" size={15} /></button>
           </div>
+          <div className="qo-scope-wrap">
           <div className="seg" role="tablist">
             {(["folder", "home", "root"] as Scope[]).map((s) => (
               <button key={s} className={scope === s ? "on" : ""} title={roots[s]} onClick={() => { setScope(s); inputRef.current?.focus(); }}>
@@ -225,6 +233,8 @@ export function FindInFiles({ root, scope: initialScope }: { root: string; scope
                 {s === "folder" ? tilde(root) : s === "home" ? "Home" : roots.root}
               </button>
             ))}
+          </div>
+          <kbd className="scope-key" title="Switch scope (Shift+Tab goes back)">Tab</kbd>
           </div>
           {showFilters && (
             <div className="fif-filters">

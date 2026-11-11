@@ -212,6 +212,16 @@ export interface Favorites {
   groups: FavoriteGroup[];
 }
 
+/** A vim folder mark: the folder, and the item focused in it when it was set. */
+export interface Mark {
+  path: string;
+  item: string | null;
+}
+/** Mark key (a–z, A–Z, or ' for the folder before the last jump) → mark. */
+export interface Marks {
+  marks: Record<string, Mark>;
+}
+
 export interface Settings {
   theme: ThemeMode;
   customTheme: string;
@@ -385,7 +395,7 @@ export interface ResolvedPrefs {
   viewSource: string | null;
 }
 
-export type PreviewKind = "folder" | "image" | "video" | "audio" | "pdf" | "text" | "archive" | "note" | "none";
+export type PreviewKind = "folder" | "image" | "video" | "audio" | "pdf" | "text" | "archive" | "note" | "model" | "none";
 
 export interface PreviewInfo {
   kind: PreviewKind | null;
@@ -500,6 +510,8 @@ export interface AppInfo {
   startupNotice: string | null;
   /** First start (no settings file yet): the welcome setup is shown. */
   firstRun: boolean;
+  /** Linux: URL prefix of the local media server that video/audio play from. */
+  mediaBase: string | null;
 }
 
 export type ClipContent =

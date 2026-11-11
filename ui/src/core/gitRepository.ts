@@ -96,7 +96,7 @@ const commands: Record<GitContext, GitCommand[]> = {
     { key: "f", label: "File history", action: "detail:f" },
   ],
 };
-/** Short key hints for the footer bar, like lazygit's options bar. Every key must exist in `commands[context]`. */
+/** Short key hints for the footer bar, like lazygit's options bar. Every key must exist in `commands[context]`, except in `details` and `tools`, whose panels handle their own keys (a test enforces the rest). */
 export const contextHints: Record<GitContext, [key: string, label: string][]> = {
   history: [["r", "reword"], ["f", "fixup"], ["s", "squash"], ["d", "drop"], ["i", "interactive"], ["y", "copy"], ["x", "tools"], [" ", "checkout"]],
   files: [[" ", "stage"], ["a", "stage all"], ["c", "commit"], ["d", "discard"], ["e", "edit"], ["s", "stash"]],

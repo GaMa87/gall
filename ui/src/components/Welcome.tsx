@@ -14,7 +14,7 @@ const ACCENTS = ["#3d8bfd", "#8b5cf6", "#14b8a6", "#22c55e", "#f59e0b", "#ef4444
 
 const STEPS = [
   { title: "Look", heading: "Make it look right", desc: "Pick a theme and an accent colour. Both can be changed later in Settings › Appearance." },
-  { title: "Layout", heading: "How many browsers?", desc: "Gall shows two folders at once by default. You can switch any time from the sidebar." },
+  { title: "Layout", heading: "How many browsers?", desc: "Gall shows two folders at once by default. You can switch any time with the layout buttons in the title bar." },
   { title: "Keyboard", heading: "How do you like your keys?", desc: "Choose familiar shortcuts; every profile includes Gall commands and ? for help. Change it later in Settings › Keyboard." },
   { title: "Files", heading: "Folder defaults", desc: "How a folder is shown and sorted until you change it for that folder." },
 ] as const;
@@ -144,7 +144,7 @@ export function Welcome() {
                 <Choice on={layout === "classic"} onClick={() => A.setLayout("classic")} title="Single" sub="One browser, more room"><LayoutPic layout="classic" /></Choice>
               </div>
               <div className="wc-rows">
-                <Toggle label="Miller columns above the list" hint="Side by side layout; off: a breadcrumb bar instead. ` switches it per browser in any layout." checked={s.showNavColumns} set={(v) => set({ showNavColumns: v })} />
+                <Toggle label="Miller columns above the list" hint="Side by side layout; off: a breadcrumb bar instead. The button in a tab bar switches it per browser in any layout." checked={s.showNavColumns} set={(v) => set({ showNavColumns: v })} />
                 <Toggle label="Preview & details pane" hint="Shows the selected file next to the list; Alt+P toggles it per browser." checked={s.showDetailsPane} set={(v) => set({ showDetailsPane: v })} />
               </div>
             </>

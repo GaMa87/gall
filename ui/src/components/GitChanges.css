@@ -14,7 +14,7 @@
 .gc-diff-line.chosen { background: var(--accent-soft); }
 .gc-diff-line > input { flex-shrink: 0; width: 13px; height: 13px; margin: 0 9px 0 0; accent-color: var(--accent); }
 .gc-line-spacer { display: inline-block; width: 22px; flex-shrink: 0; }
-.gc-diff-line .gc-hunk { background: var(--accent-soft); color: var(--accent); border: 0; border-radius: 3px; padding: 0; width: 16px; height: 18px; margin-right: 6px; flex-shrink: 0; }
+.gc-diff-line .gc-hunk { background: var(--accent-soft); color: var(--accent-text); border: 0; border-radius: 3px; padding: 0; width: 16px; height: 18px; margin-right: 6px; flex-shrink: 0; }
 .gc-commit .gc-message { display: flex; flex-direction: column; flex: 1; gap: 5px; min-width: 0; }
 .gc-message textarea { width: 100%; box-sizing: border-box; }
 .gc-amend { display: flex; align-items: center; gap: 5px; font-size: 10px; color: var(--fg-dim); }
@@ -28,4 +28,4 @@
   .gc-key-help { display: none; }
 }
 
-.gc-edit-stop { padding: 7px 12px; font-size: 11px; color: var(--accent); background: var(--accent-soft); border-bottom: 1px solid var(--border-soft); }
+.gc-edit-stop { padding: 7px 12px; font-size: 11px; color: var(--accent-text); background: var(--accent-soft); border-bottom: 1px solid var(--border-soft); }

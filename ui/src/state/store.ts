@@ -1,7 +1,7 @@
 // Tiny external store (no dependency) consumed with useSyncExternalStore.
 import { useSyncExternalStore } from "react";
 import type { Action } from "../core/keymap";
-import type { AppInfo, CloudFolder, DiffSource, DirSize, Drive, Volume,Favorites, FileEntry, Session, Settings, TaskProgress } from "../api/types";
+import type { AppInfo, CloudFolder, DiffSource, DirSize, Drive, Volume, Favorites, FileEntry, Marks, Session, Settings, TaskProgress } from "../api/types";
 
 export type NoteKind = "info" | "success" | "warn" | "error";
 export interface Notification {
@@ -80,6 +80,8 @@ export interface UiState {
   settingsRev: number;
   session: Session | null;
   favorites: Favorites;
+  /** Vim folder marks (m{letter} / '{letter}). */
+  marks: Marks;
   history: string[];
   drives: Drive[];
   /** Volumes not mounted yet (sidebar "Not mounted"). */
@@ -118,6 +120,7 @@ let state: UiState = {
   settingsRev: 0,
   session: null,
   favorites: { groups: [] },
+  marks: { marks: {} },
   history: [],
   drives: [],
   volumes: [],

@@ -55,6 +55,9 @@ impl AppDirs {
     pub fn favorites(&self) -> PathBuf {
         self.config.join("favorites.json")
     }
+    pub fn marks(&self) -> PathBuf {
+        self.config.join("marks.json")
+    }
     pub fn session(&self) -> PathBuf {
         self.config.join("session.json")
     }

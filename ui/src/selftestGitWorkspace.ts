@@ -314,7 +314,28 @@ export async function runGitWorkspaceSelfTest(h: typeof import("./selftest").git
     const patchWorkspace = await invoke<{changes:{path:string;index:string}[]}>("git_workspace", { path: emptyPath });
     log(!$(".ga-error") && patchWorkspace.changes.some((change) => change.path === "alpha.txt" && change.index === "A") && (await h.api.pathResolve(emptyPath + "/alpha.txt")).exists, "checked patch application updates actual working file and index");
     await shot("workspace-patch-applied");
+    // The "Load more commits" button must stay readable in both themes (it once fell back to
+    // the platform's grey button face with accent-coloured text).
+    // A canvas turns any CSS colour (rgb(), color(srgb …), color-mix results) into sRGB bytes.
+    const canvas = document.createElement("canvas"); canvas.width = canvas.height = 1;
+    const context = canvas.getContext("2d", { willReadFrequently: true })!;
+    const rgba = (colour: string): number[] => { context.clearRect(0, 0, 1, 1); context.fillStyle = "#000"; context.fillStyle = colour; context.fillRect(0, 0, 1, 1); const [r, g, b, a] = context.getImageData(0, 0, 1, 1).data; return [r, g, b, a / 255]; };
+    // The colour the user sees behind an element: its own background blended over its ancestors'.
+    const backdrop = (element: Element): number[] => { let result = [0, 0, 0]; const layers: number[][] = []; for (let node: Element | null = element; node; node = node.parentElement) layers.push(rgba(getComputedStyle(node).backgroundColor)); for (const [r, g, b, a] of layers.reverse()) result = [r * a + result[0] * (1 - a), g * a + result[1] * (1 - a), b * a + result[2] * (1 - a)]; return result; };
+    const luminance = ([r, g, b]: number[]) => { const [lr, lg, lb] = [r, g, b].map((v) => { const c = v / 255; return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; }); return 0.2126 * lr + 0.7152 * lg + 0.0722 * lb; };
+    const contrast = (a: number[], b: number[]) => { const [hi, lo] = [luminance(a), luminance(b)].sort((x, y) => y - x); return (hi + 0.05) / (lo + 0.05); };
+    for (const theme of ["dark", "light"] as const) {
+      await h.updateSettings({ theme });
+      A.openOverlay(null); await sleep(100); A.openOverlay({ type: "gitGraph", path: parent + "/many-commits" });
+      const more = await until(() => $<HTMLButtonElement>(".gg-load-more"), 12000);
+      const style = more ? getComputedStyle(more) : null;
+      const ratio = more ? contrast(rgba(style!.color), backdrop(more)) : 0;
+      log(!!more && style!.appearance === "none" && ratio >= 4.5, `Load more commits is readable in the ${theme} theme`, more ? `contrast ${ratio.toFixed(2)}:1, appearance ${style!.appearance}` : "button missing");
+      more?.scrollIntoView({ block: "center" }); await sleep(120);
+      await shot(`workspace-load-more-${theme}`);
+    }
     await h.updateSettings({ keyboardProfile: "explorer", theme: "light" });
+    A.openOverlay(null); await sleep(100); A.openOverlay({ type: "gitGraph", path: emptyPath });
     await getCurrentWindow().setSize(new LogicalSize(760, 680));
     await shot("workspace-tools-narrow-light");
     const beforeDisabled = await invoke<Repository>("git_repository", { path: emptyPath }); key("P", {}, $(".git-graph")); await sleep(100);

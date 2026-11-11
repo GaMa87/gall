@@ -103,7 +103,7 @@ export function OpenWith({ paths, mode }: { paths: string[]; mode: "file" | "ter
     if (editor) {
       if (always) {
         A.updateSettings({ editor: command });
-        A.notify(`Edit (F4) now opens ${name}`, "success");
+        A.notify(`Edit in editor now opens ${name}`, "success");
       }
       api.openWithRun(paths, command).catch(A.fail);
       return;
@@ -180,7 +180,7 @@ export function OpenWith({ paths, mode }: { paths: string[]; mode: "file" | "ter
           {apps !== null && rows.length === 0 && <div className="qo-empty">No match. Type a full command to run it.</div>}
         </div>
         <div className="qo-foot">
-          <span className="qo-status">{!q ? "j/k move · 1–9 pick · " : ""}{terminal ? "Terminal here (F10) uses ★" : editor ? "Edit (F4) uses ★" : rule ? `★ opens these on Enter (${ruleScope})` : "Enter on a file uses the system default"}</span>
+          <span className="qo-status">{!q ? "j/k move · 1–9 pick · " : ""}{terminal ? "Terminal here (F10) uses ★" : editor ? "Edit in editor uses ★" : rule ? `★ opens these on Enter (${ruleScope})` : "Enter on a file uses the system default"}</span>
           <span className="qo-hints">
             <kbd>↵</kbd> open <kbd>Ctrl ↵</kbd> {alwaysHint}
             {scope && (

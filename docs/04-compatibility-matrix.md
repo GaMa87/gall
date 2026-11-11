@@ -25,8 +25,8 @@ the original is still against the manual only (`M:`), not against live observati
 | N-01 | Miller columns | E | ✅ | build | |
 | N-02 | Drives column | E | ✅ | build | |
 | N-03 | Compression + hover expand | I | ✅ | manual | Expand delay is configurable. F8 toggle missing |
-| N-04 | Breadcrumbs ⇄ columns | E | ✅ | manual | `` ` `` key, button, drag divider up |
-| N-05 | Keyboard navigation | E | ✅ | unit; self-test (Windows) | Standard arrows, selection, Tab between panes; Vim motions and leader menu. Focused runner: `scripts/selftest.sh --keyboard`. Linux/macOS graphical checks pending. |
+| N-04 | Breadcrumbs ⇄ columns | E | ✅ | manual | `` ` `` key (Vim: `Space w c`), button, drag divider up |
+| N-05 | Keyboard navigation | E | ✅ | unit; self-test (Windows) | Standard arrows, selection, Tab between panes; Vim motions and leader menu; Vim folder marks (`m`/`'`/`` ` ``/`dm`, saved in `marks.json`). Focused runner: `scripts/selftest.sh --keyboard`. Linux/macOS graphical checks pending. |
 | N-06 | Click behaviour | E | ✅ | manual | Single-click option |
 | N-07 | Per-tab history | E | ✅ | unit | Alt+←/→, mouse buttons 4/5 |
 | N-08 | Up button | E | ✅ | manual | Reselects the folder you came from |
@@ -62,11 +62,12 @@ the original is still against the manual only (`M:`), not against live observati
 | P-02 | Image zoom/pan | E | ✅ | manual | GPS locate ❌ (needs EXIF) |
 | P-03 | Text preview | E | ✅ | unit | |
 | P-04 | PDF preview | I | ✅ | manual | pdf.js |
-| P-05 | Video/audio | I | ✅ | manual | Depends on GStreamer codecs |
+| P-05 | Video/audio | I | ✅ | unit (Linux media server), manual | Depends on GStreamer codecs. On Linux media plays from a loopback HTTP server because WebKitGTK cannot play from the asset protocol |
 | P-06 | Preview window (Space) | I | ✅ | manual | External viewers ➖ |
-| P-07 | Archive listing | O | 🟡 | unit | Zip-family only |
+| P-07 | Archive listing | O | ✅ | unit | zip, 7z and tar (gz/xz/bz2/zst) open as read-only folders; encrypted zip/7z ask for the password (memory only) |
 | P-08 | Email preview | O | ❌ | | |
-| O-01 | Open | E | 🟡 | manual | Open-with chooser and run-with-args ❌ |
+| P-11 | STL model preview | O | ✅ | unit (parser), manual | Binary and ASCII STL, own WebGL viewer: drag rotates, wheel zooms, double-click resets |
+| O-01 | Open | E | 🟡 | manual | Open-with chooser ✅ (Ctrl+Enter; remember per type, project, folder or file). Run-with-args ❌ |
 | O-02 | Clipboard copy/cut/paste | E | 🟡 | manual | Inside Gall ✅. Interop with other file managers is text paths only |
 | O-03 | Copy/move to other browser | E | ✅ | unit, self-test | Conflicts: skip, replace (to the trash), keep both, merge folders with replace older / replace / skip / keep both for the files in both |
 | O-04 | Rename popup, F2 cycling | E | ✅ | unit, self-test | Multi-file → batch rename ✅: template tokens, find & replace (regex), case, counter, edit as text; swaps allowed; one undo |
@@ -80,17 +81,17 @@ the original is still against the manual only (`M:`), not against live observati
 | O-12 | Copy paths | I | ✅ | manual | |
 | O-13 | Properties dialog | I | ✅ | manual | |
 | O-14 | Colour tags | I | ✅ | unit | Stored in Gall DB, not in file metadata |
-| O-15 | Undo | I | ✅ | unit | Create, move, rename, trash |
+| O-15 | Undo | I | ✅ | unit | Create, copy, move, rename, batch rename, folder merge, extract, trash |
 | O-16 | Task queue with progress | I | ✅ | unit | |
 | O-17 | Paste as links | O | ✅ | unit | Symlinks |
-| O-18 | Archives compress/extract | O | ❌ | | |
+| O-18 | Archives compress/extract | O | ✅ | unit | Compress to zip, tar.gz or 7z; extract zip, tar (gz/xz/bz2/zst), 7z and single gz/xz/bz2/zst files here, per archive or to the other browser; undoable |
 | O-19 | URL video download | O | ❌ | | |
 | O-20 | Symlink | O | ✅ | unit | Hard links ❌ |
 | O-21 | Context menus | E | ✅ | manual | Own menu; desktop service menus ❌ |
 | S-01…S-04 | Sidebar | E | ✅ | build | Map network drive ➖ (use system mounts) |
 | Q-01 | Search | I | ✅ | unit | Skips the excluded folders, `.gitignore` (setting) and `.gallignore` like Quick Open and find in files |
 | Q-02 | Tag search | O | ✅ | unit | |
-| Q-03 | Indexed instant search | A | ❌ | | |
+| Q-03 | Indexed instant search | A | ✅ | unit | Quick Open (Ctrl+P): Gall's own parallel name index, not a SQLite search host; unindexed folders are read on demand |
 | A-01 | Themes | I | 🟡 | build | Dark/light/system + CSS themes. Named theme pack ❌ |
 | A-02 | Accent colour | I | ✅ | manual | |
 | A-03 | Font / size / padding | I | ✅ | manual | |
@@ -107,7 +108,7 @@ the original is still against the manual only (`M:`), not against live observati
 | X-02 | Terminal here | I | ✅ | manual | Elevated ❌ |
 | X-03 | Scripts menu | A | ❌ | | |
 | X-04 | Batch tools | A | ❌ | | Next milestone |
-| X-05…X-08 | Admin, default FM, Open/Save dialog integration, MTP | O | ➖/❌ | | |
+| X-05…X-08 | Admin, default FM, Open/Save dialog integration, MTP | O | ➖/❌ (X-06 🟡 on Linux) | manual | Linux: the deb/rpm declare `inode/directory`, so Gall can be chosen as the default file manager; no Windows default-FM hook |
 
 **Essential features: 34 of 41 ✅, 7 🟡, 0 ❌.** The 🟡 items are listed above.
 Nothing in this table claims parity with the original until the `manual` and `OBS:` checks are done.

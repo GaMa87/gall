@@ -709,6 +709,7 @@ function PreviewHints({ kind, vim }: { kind: string | null; vim: boolean }) {
   }
   if (kind === "pdf") hints.push([["←", "→"], "page"]);
   if (kind === "video" || kind === "audio") hints.push([["←", "→"], "seek"], [["[", "]"], "frame"], [["k"], "play / pause"]);
+  if (kind === "model") hints.push([["drag"], "rotate"], [["wheel"], "zoom"], [["double-click"], "reset"]);
   hints.push([["Esc", "q"], "close"]);
   return (
     <div className="pw-foot">

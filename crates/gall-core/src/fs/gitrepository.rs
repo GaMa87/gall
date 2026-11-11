@@ -2,7 +2,7 @@
 //!
 //! The caller serializes mutations and supplies a freshly reviewed snapshot token.
 //! Git still checks its own locks; a token cannot lock out another Git application.
-use super::gitgraph::{git, has_content_filters, retain_detached, root};
+use super::gitgraph::{git, has_content_filters, joined, retain_detached, root};
 use crate::{CoreError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
@@ -305,7 +305,37 @@ fn checked_text(value: String) -> Result<String> {
     }
 }
 
+/// The per-worktree Git directory read from `.git` (a folder, or a `gitdir:` file for linked
+/// worktrees and submodules), without starting a process.
+fn worktree_git_dir(path: &Path) -> Option<PathBuf> {
+    let dot = path.join(".git");
+    if dot.is_dir() {
+        return Some(dot);
+    }
+    let text = std::fs::read_to_string(&dot).ok()?;
+    let target = Path::new(text.lines().next()?.strip_prefix("gitdir:")?.trim());
+    Some(path.join(target))
+}
+
 fn git_path(path: &Path, name: &str) -> Result<PathBuf> {
+    // These live in the per-worktree Git directory, so no `rev-parse` is needed. Each lookup used
+    // to be a process of its own, and a repository snapshot made dozens of them.
+    const PER_WORKTREE: [&str; 9] = [
+        "MERGE_HEAD",
+        "MERGE_MSG",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "REBASE_HEAD",
+        "BISECT_START",
+        "rebase-merge",
+        "rebase-apply",
+        "sequencer",
+    ];
+    if PER_WORKTREE.contains(&name.split('/').next().unwrap_or(name)) {
+        if let Some(dir) = worktree_git_dir(path) {
+            return Ok(dir.join(name));
+        }
+    }
     let value = git(path, &["rev-parse", "--git-path", name])?;
     Ok(path.join(value.trim()))
 }
@@ -384,17 +414,51 @@ fn head(path: &Path) -> String {
         .into()
 }
 
-fn status(path: &Path) -> Result<String> {
-    checked_text(git(
+/// Where HEAD is.
+#[derive(Hash)]
+struct Head {
+    /// The commit; empty before the first commit.
+    id: String,
+    /// The reference HEAD points to (`refs/heads/main`); `HEAD` or empty when detached.
+    reference: String,
+    /// The current branch as Git shortens its name; `None` when detached.
+    branch: Option<String>,
+}
+
+/// Reads HEAD with one process. A load needs it in several places and reads it again for the
+/// final check, which used to be a `rev-parse` or `symbolic-ref` for every one of them.
+fn read_head(path: &Path) -> Head {
+    let all = git(
         path,
         &[
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=all",
-            "--ignore-submodules=all",
+            "rev-parse",
+            "HEAD",
+            "--symbolic-full-name",
+            "HEAD",
+            "--abbrev-ref",
+            "HEAD",
         ],
-    )?)
+    );
+    if let Ok(all) = &all {
+        if let [id, reference, branch] = all.lines().collect::<Vec<_>>()[..] {
+            return Head {
+                id: id.into(),
+                reference: reference.into(),
+                branch: (reference != "HEAD").then(|| branch.into()),
+            };
+        }
+    }
+    // Before the first commit that command fails as a whole: ask for each part.
+    let symbolic = |args: &[&str]| git(path, args).ok().map(|s| s.trim().to_owned());
+    Head {
+        id: head(path),
+        reference: symbolic(&["symbolic-ref", "-q", "HEAD"]).unwrap_or_default(),
+        branch: symbolic(&["symbolic-ref", "--short", "-q", "HEAD"]),
+    }
+}
+
+fn status(path: &Path) -> Result<String> {
+    checked_text(super::gitgraph::status_z(path)?)
 }
 
 fn conflicts(path: &Path) -> Result<Vec<String>> {
@@ -479,50 +543,69 @@ fn stashes(path: &Path) -> Result<Vec<Stash>> {
 }
 
 fn remotes(path: &Path) -> Result<Vec<Remote>> {
-    checked_text(git(path, &["remote"])?)?
-        .lines()
-        .map(|name| {
-            Ok(Remote {
-                name: name.into(),
-                fetch_url: git(path, &["remote", "get-url", "--", name])?.trim().into(),
-                push_url: git(path, &["remote", "get-url", "--push", "--", name])?
-                    .trim()
-                    .into(),
-            })
-        })
-        .collect()
+    Ok(parse_remotes(&checked_text(git(path, &["remote", "-v"])?)?))
 }
 
-/// Token covers references, index, tracked changes and untracked file metadata.
-/// External Git clients must still be treated as concurrent writers after validation.
-fn token(path: &Path) -> Result<String> {
-    let mut h = DefaultHasher::new();
-    head(path).hash(&mut h);
-    git(path, &["symbolic-ref", "-q", "HEAD"])
-        .unwrap_or_default()
-        .hash(&mut h);
-    git(path, &["for-each-ref", "--format=%(refname) %(objectname)"])?.hash(&mut h);
-    git(path, &["ls-files", "--stage", "-z"])?.hash(&mut h);
-    // Even status/diff may execute a configured clean filter. Filter repositories
-    // are browsable, but working-tree mutations are refused by worktree_guard.
-    if !has_filters(path) {
-        status(path)?.hash(&mut h);
-        git(
-            path,
-            &[
-                "diff",
-                "--binary",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--no-color",
-                "--ignore-submodules=all",
-            ],
-        )?
-        .hash(&mut h);
+/// Remotes from `git remote -v` (`name<TAB>url (fetch)`, `name<TAB>url (push)`, in newer Git
+/// followed by a note such as ` [blob:none]`): one process for all of them, with the same
+/// rewritten URLs `remote get-url` prints. A remote with several URLs shows its first one.
+fn parse_remotes(listing: &str) -> Vec<Remote> {
+    let mut remotes: Vec<Remote> = Vec::new();
+    for line in listing.lines() {
+        let (name, rest) = line.split_once('\t').unwrap_or((line, ""));
+        let (url, push) = match (rest.rfind(" (fetch)"), rest.rfind(" (push)")) {
+            (Some(fetch), push) if push.is_none_or(|push| fetch > push) => (&rest[..fetch], false),
+            (_, Some(push)) => (&rest[..push], true),
+            _ => (rest, false),
+        };
+        if remotes.last().is_none_or(|last| last.name != name) {
+            remotes.push(Remote {
+                name: name.into(),
+                fetch_url: String::new(),
+                push_url: String::new(),
+            });
+        }
+        let Some(remote) = remotes.last_mut() else {
+            continue;
+        };
+        let slot = if push {
+            &mut remote.push_url
+        } else {
+            &mut remote.fetch_url
+        };
+        if slot.is_empty() {
+            *slot = url.into();
+        }
     }
-    git(path, &["config", "--local", "--list", "-z"])?.hash(&mut h);
-    git(path, &["stash", "list", "--format=%H%x00%gd"])?.hash(&mut h);
-    operation(path)?.hash(&mut h);
+    remotes
+}
+
+/// Hashes what describes the repository itself: HEAD, references, local configuration, stashes
+/// and the state of a running operation. Shared by the light and the full token.
+fn repository_hash(path: &Path) -> Result<u64> {
+    repository_parts(path).map(|(hash, _)| hash)
+}
+
+/// `repository_hash` together with the HEAD it read, for a caller that shows it.
+fn repository_parts(path: &Path) -> Result<(u64, Head)> {
+    // Every load computes this twice (before and after), so the Git queries run side by side;
+    // the results are hashed in a fixed order.
+    let (head, refs, config, stashes) = std::thread::scope(|scope| {
+        let head = scope.spawn(|| read_head(path));
+        let refs =
+            scope.spawn(|| git(path, &["for-each-ref", "--format=%(refname) %(objectname)"]));
+        let config = scope.spawn(|| git(path, &["config", "--local", "--list", "-z"]));
+        let stashes = git(path, &["stash", "list", "--format=%H%x00%gd"]);
+        (joined(head), joined(refs), joined(config), stashes)
+    });
+    let head = head?;
+    let mut hasher = DefaultHasher::new();
+    let h = &mut hasher;
+    head.hash(h);
+    refs??.hash(h);
+    config??.hash(h);
+    stashes?.hash(h);
+    operation(path)?.hash(h);
     for marker in [
         "MERGE_HEAD",
         "MERGE_MSG",
@@ -533,49 +616,299 @@ fn token(path: &Path) -> Result<String> {
         "rebase-apply/next",
         "BISECT_START",
     ] {
-        std::fs::read(git_path(path, marker)?).ok().hash(&mut h);
+        std::fs::read(git_path(path, marker)?).ok().hash(h);
     }
-    for name in checked_text(git(
-        path,
-        &["ls-files", "--others", "--exclude-standard", "-z"],
-    )?)?
-    .split('\0')
-    .filter(|s| !s.is_empty())
+    Ok((hasher.finish(), head))
+}
+
+/// Files up to this size are hashed by content, until `CONTENT_BUDGET` is used up.
+const CONTENT_LIMIT: u64 = 256 * 1024;
+const CONTENT_BUDGET: u64 = 16 * 1024 * 1024;
+
+/// Fingerprint of a changed file: size, modification time and, on Unix, change time (which a
+/// restored modification time cannot hide). Small files are also hashed by content, so two edits
+/// of the same size within one timestamp tick still differ; the budget keeps the cost bounded
+/// when thousands of files changed. The result depends only on the file and the order of the
+/// calls, never on the current time: a token must stay the same until something changes.
+fn hash_metadata(file: &Path, h: &mut DefaultHasher, budget: &mut u64) {
+    let Ok(meta) = file.symlink_metadata() else {
+        return;
+    };
+    meta.len().hash(h);
+    meta.modified().ok().hash(h);
+    #[cfg(unix)]
     {
-        name.hash(&mut h);
-        if let Ok(meta) = path.join(name).symlink_metadata() {
-            meta.len().hash(&mut h);
-            meta.modified().ok().hash(&mut h);
+        use std::os::unix::fs::MetadataExt;
+        (meta.ctime(), meta.ctime_nsec()).hash(h);
+    }
+    if !meta.is_file() {
+        return;
+    }
+    if meta.len() <= CONTENT_LIMIT {
+        if meta.len() <= *budget {
+            *budget -= meta.len();
+            std::fs::read(file).ok().hash(h);
         }
+    } else if 2 * SAMPLE <= *budget {
+        // A large file is not read whole, but its two ends are: an edit of the same size with a
+        // restored modification time (Windows has no change time to expose it) that touches
+        // either end still changes the token.
+        *budget -= 2 * SAMPLE;
+        sample_ends(file, meta.len()).ok().hash(h);
+    }
+}
+
+/// How much of the start and of the end of a large file goes into the token.
+const SAMPLE: u64 = 64 * 1024;
+
+fn sample_ends(file: &Path, len: u64) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(file)?;
+    let mut read = |from: u64| -> std::io::Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        f.seek(SeekFrom::Start(from))?;
+        (&mut f).take(SAMPLE).read_to_end(&mut buf)?;
+        Ok(buf)
+    };
+    Ok((read(0)?, read(len.saturating_sub(SAMPLE))?))
+}
+
+/// Cheap token for the part of the state a snapshot reads (references, stashes, remotes,
+/// operation, conflicts). It does not look at working files, so it costs a few processes and no
+/// scan of the work tree. `snapshot` uses it to notice a change while it was loading.
+fn light_token(path: &Path) -> Result<String> {
+    light_parts(path).map(|light| light.token)
+}
+
+/// The light token together with what was read for it, so a caller that needs those parts
+/// does not start the Git processes behind them twice.
+struct Light {
+    token: String,
+    /// The `repository_hash` inside the token.
+    repository: u64,
+    head: Head,
+}
+
+fn light_parts(path: &Path) -> Result<Light> {
+    let (repository, head) = repository_parts(path)?;
+    let mut h = DefaultHasher::new();
+    repository.hash(&mut h);
+    if let Some(dir) = worktree_git_dir(path) {
+        hash_metadata(&dir.join("index"), &mut h, &mut 0);
+    }
+    Ok(Light {
+        token: format!("{:016x}", h.finish()),
+        repository,
+        head,
+    })
+}
+
+/// The part of the token that does not need the work tree status: the repository state and
+/// the index. It can be computed while `status` runs. `repository` is the `repository_hash`
+/// read at the start of a load; if the state moved since, the final check of the load fails.
+fn token_base(path: &Path, repository: u64) -> Result<u64> {
+    let mut h = DefaultHasher::new();
+    repository.hash(&mut h);
+    git(path, &["ls-files", "--stage", "-z"])?.hash(&mut h);
+    Ok(h.finish())
+}
+
+/// The work tree status for the token, or `None` when a repository with content filters must
+/// not run `status` (even status may execute a configured clean filter). Filter repositories
+/// are browsable, but working-tree mutations are refused by worktree_guard.
+fn current_status(path: &Path) -> Result<Option<String>> {
+    status_unless(path, has_filters(path))
+}
+
+/// `current_status` for a caller that already knows whether the repository has filters.
+fn status_unless(path: &Path, filtered: bool) -> Result<Option<String>> {
+    if filtered {
+        Ok(None)
+    } else {
+        status(path).map(Some)
+    }
+}
+
+/// Completes a token from `token_base` and the status read at about the same time.
+/// A changed file is recognised by its size and modification time; its content is not read, so
+/// the cost does not grow with the size of the changes.
+fn token_finish(path: &Path, base: u64, status: Option<&str>) -> Result<String> {
+    let mut h = DefaultHasher::new();
+    base.hash(&mut h);
+    let changed: Vec<String> = match status {
+        // `status --untracked-files=all` lists tracked changes and untracked files in one pass.
+        Some(status) => {
+            status.hash(&mut h);
+            super::gitgraph::status_entries(status)
+                .into_iter()
+                .map(|entry| entry.name.to_owned())
+                .collect()
+        }
+        // Without status, list untracked files directly (this does not run content filters).
+        None => checked_text(git(
+            path,
+            &["ls-files", "--others", "--exclude-standard", "-z"],
+        )?)?
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect(),
+    };
+    let mut budget = CONTENT_BUDGET;
+    for name in &changed {
+        name.hash(&mut h);
+        hash_metadata(&path.join(name), &mut h, &mut budget);
     }
     Ok(format!("{:016x}", h.finish()))
 }
 
+/// Token covers references, index, tracked changes and untracked file metadata.
+/// External Git clients must still be treated as concurrent writers after validation.
+fn token(path: &Path) -> Result<String> {
+    let repository = repository_hash(path)?;
+    let (base, status) = std::thread::scope(|scope| {
+        let base = scope.spawn(|| token_base(path, repository));
+        let status = current_status(path);
+        (joined(base), status)
+    });
+    token_finish(path, base??, status?.as_deref())
+}
+
+/// Runs `read` with the light token taken before it (and what was read for it) and checks the
+/// token again afterwards. A load that passes the check may show the HEAD read for the token. Another Git client rewriting the index or a reference while loading
+/// is common, so one change is retried; a second one in a row is reported.
+///
+/// `prepare` reads what does not change between attempts (the effective configuration); it runs
+/// once, alongside the first token.
+fn load_consistently<P: Send, T>(
+    p: &Path,
+    prepare: impl FnOnce() -> P + Send,
+    read: impl Fn(&Light, &P) -> Result<T>,
+) -> Result<T> {
+    let (first, prepared) = std::thread::scope(|scope| {
+        let prepared = scope.spawn(prepare);
+        (light_parts(p), joined(prepared))
+    });
+    let (prepared, mut first) = (prepared?, Some(first));
+    for attempt in 0..2 {
+        let before = match first.take() {
+            Some(parts) => parts?,
+            None => light_parts(p)?,
+        };
+        let value = read(&before, &prepared)?;
+        if before.token == light_token(p)? {
+            return Ok(value);
+        }
+        if attempt == 1 {
+            break;
+        }
+    }
+    Err(fail(
+        "The repository changed while loading. Refresh to review its current state",
+    ))
+}
+
+/// Reads the repository state without a token. The independent Git queries run concurrently.
+fn read_state(p: &Path, head: &Head) -> Result<Repository> {
+    std::thread::scope(|scope| {
+        let refs = scope.spawn(|| refs(p));
+        let stashes = scope.spawn(|| stashes(p));
+        let remotes = scope.spawn(|| remotes(p));
+        let conflicts = scope.spawn(|| conflicts(p));
+        let operation_commit = scope.spawn(|| operation_commit(p));
+        Ok::<_, CoreError>(Repository {
+            root: p.to_string_lossy().into_owned(),
+            head: head.id.clone(),
+            branch: head.branch.clone(),
+            refs: joined(refs)??,
+            stashes: joined(stashes)??,
+            remotes: joined(remotes)??,
+            operation: operation(p)?,
+            operation_commit: joined(operation_commit)?,
+            edit_stop: super::gitrewrite::is_edit_stop(p),
+            bisect_active: git_path(p, "BISECT_START")?.exists(),
+            conflicts: joined(conflicts)??,
+            token: String::new(),
+        })
+    })
+}
+
 pub fn snapshot(path: &Path) -> Result<Repository> {
     let p = root(path)?;
-    let before = token(&p)?;
-    let state = Repository {
-        root: p.to_string_lossy().into_owned(),
-        head: head(&p),
-        branch: git(&p, &["symbolic-ref", "--short", "-q", "HEAD"])
-            .ok()
-            .map(|s| s.trim().into()),
-        refs: refs(&p)?,
-        stashes: stashes(&p)?,
-        remotes: remotes(&p)?,
-        operation: operation(&p)?,
-        operation_commit: operation_commit(&p),
-        edit_stop: super::gitrewrite::is_edit_stop(&p),
-        bisect_active: git_path(&p, "BISECT_START")?.exists(),
-        conflicts: conflicts(&p)?,
-        token: token(&p)?,
+    load_consistently(
+        &p,
+        || has_filters(&p),
+        |light, &filtered| {
+            let (state, base, status) = std::thread::scope(|scope| {
+                let base = scope.spawn(|| token_base(&p, light.repository));
+                let status = scope.spawn(|| status_unless(&p, filtered));
+                let state = read_state(&p, &light.head);
+                (state, joined(base), joined(status))
+            });
+            let mut state = state?;
+            state.token = token_finish(&p, base??, status??.as_deref())?;
+            Ok(state)
+        },
+    )
+}
+
+/// What the graph view shows: history and repository state, read in one pass. The work tree
+/// status is read once and shared by the list of changes and the token.
+#[derive(Serialize)]
+pub struct GraphView {
+    pub graph: super::gitgraph::Graph,
+    pub repository: Repository,
+}
+
+pub fn graph_view(
+    path: &Path,
+    comparison: bool,
+    reflog: bool,
+    limit: usize,
+    reference: Option<&str>,
+) -> Result<GraphView> {
+    let p = root(path)?;
+    // The two configuration lookups run next to the first token instead of before it.
+    let prepare = || {
+        std::thread::scope(|scope| {
+            let escape = scope.spawn(|| super::gitgraph::quote_non_ascii(&p));
+            (has_filters(&p), joined(escape))
+        })
     };
-    if before != state.token {
-        return Err(fail(
-            "The repository changed while loading. Refresh to review its current state",
-        ));
-    }
-    Ok(state)
+    load_consistently(&p, prepare, |light, (filtered, escape)| {
+        let filtered = *filtered;
+        let (graph, branches, state, base, status) = std::thread::scope(|scope| {
+            let status = scope.spawn(|| status_unless(&p, filtered));
+            let base = scope.spawn(|| token_base(&p, light.repository));
+            let state = scope.spawn(|| read_state(&p, &light.head));
+            let branches = scope.spawn(|| super::gitgraph::branches(&p));
+            let graph =
+                super::gitgraph::history_part(&p, reflog, limit, reference, Some(&light.head.id));
+            (
+                graph,
+                joined(branches),
+                joined(state),
+                joined(base),
+                joined(status),
+            )
+        });
+        let (mut graph, mut state) = (graph?, state??);
+        graph.branches = branches??;
+        graph.read_only_reason = super::gitgraph::read_only_reason(filtered);
+        let status = status??;
+        state.token = token_finish(&p, base??, status.as_deref())?;
+        if !comparison {
+            if let Some(status) = &status {
+                // Git escapes non-ASCII names unless told otherwise; a failed lookup means that.
+                let escape = *escape.as_ref().unwrap_or(&true);
+                graph.changes = super::gitgraph::changes_text(status, escape);
+            }
+        }
+        Ok(GraphView {
+            graph,
+            repository: state,
+        })
+    })
 }
 
 fn commit_id(path: &Path, value: &str) -> Result<()> {
@@ -1228,6 +1561,231 @@ mod tests {
 
     fn act(path: &Path, request: Request) -> Result<String> {
         execute(path, request, &snapshot(path)?.token)
+    }
+
+    #[test]
+    fn remotes_come_from_one_listing() {
+        let listing = "origin\thttps://example.com/a (b).git (fetch)\n\
+                       origin\tssh://push.example.com/a.git (push)\n\
+                       origin\tssh://second.example.com/a.git (push)\n\
+                       partial\thttps://example.com/p.git (fetch) [blob:none]\n\
+                       partial\thttps://example.com/p.git (push)\n\
+                       bare\n";
+        let found: Vec<_> = parse_remotes(listing)
+            .into_iter()
+            .map(|r| (r.name, r.fetch_url, r.push_url))
+            .collect();
+        let row = |name: &str, fetch: &str, push: &str| (name.into(), fetch.into(), push.into());
+        assert_eq!(
+            found,
+            [
+                row(
+                    "origin",
+                    "https://example.com/a (b).git",
+                    "ssh://push.example.com/a.git"
+                ),
+                row(
+                    "partial",
+                    "https://example.com/p.git",
+                    "https://example.com/p.git"
+                ),
+                row("bare", "", ""),
+            ]
+        );
+
+        // The listing agrees with `remote get-url`, including rewritten and push-only URLs.
+        let d = repository();
+        let p = d.path();
+        git(p, &["remote", "add", "origin", "short:team/project.git"]).unwrap();
+        git(p, &["remote", "add", "second", "https://example.com/s.git"]).unwrap();
+        let rewrite = "url.https://example.com/.insteadOf";
+        git(p, &["config", rewrite, "short:"]).unwrap();
+        let push = "ssh://push.example.com/s.git";
+        git(p, &["remote", "set-url", "--push", "second", push]).unwrap();
+        let listed = remotes(p).unwrap();
+        assert_eq!(listed.len(), 2);
+        for remote in listed {
+            let url = |args: &[&str]| git(p, args).unwrap().trim().to_owned();
+            assert_eq!(
+                remote.fetch_url,
+                url(&["remote", "get-url", "--", &remote.name])
+            );
+            assert_eq!(
+                remote.push_url,
+                url(&["remote", "get-url", "--push", "--", &remote.name])
+            );
+        }
+    }
+
+    #[test]
+    fn graph_view_matches_separate_queries() {
+        let d = repository();
+        let p = d.path();
+        commit(p, "first", "first\n");
+        std::fs::write(p.join("renamed.txt"), "to be renamed\n").unwrap();
+        git(p, &["add", "--all"]).unwrap();
+        git(p, &["commit", "-qm", "second"]).unwrap();
+        git(p, &["mv", "renamed.txt", "moved.txt"]).unwrap();
+        std::fs::write(p.join("file.txt"), "edited\n").unwrap();
+        std::fs::create_dir(p.join("dir")).unwrap();
+        std::fs::write(p.join("dir/new.txt"), "new\n").unwrap();
+        // Names that `status --porcelain` quotes: a space, non-ASCII, and on Unix also control
+        // characters, a quote and a newline (not valid in Windows file names).
+        std::fs::write(p.join("with space.txt"), "x\n").unwrap();
+        std::fs::write(p.join("é.txt"), "x\n").unwrap();
+        #[cfg(unix)]
+        for name in [
+            "tab\there.txt",
+            "quote\"d.txt",
+            "line\nbreak.txt",
+            "back\\slash",
+        ] {
+            std::fs::write(p.join(name), "x\n").unwrap();
+        }
+
+        let view = graph_view(p, false, false, 200, None).unwrap();
+        let expected = git(
+            p,
+            &[
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+                "--ignore-submodules=all",
+            ],
+        )
+        .unwrap();
+        assert!(expected.contains("R  renamed.txt -> moved.txt"));
+        assert_eq!(view.graph.changes, expected);
+        let separate = super::super::gitgraph::query_history(p, false, false, 200, None).unwrap();
+        assert_eq!(view.graph.history, separate.history);
+        assert_eq!(view.graph.branches, separate.branches);
+        assert_eq!(view.graph.head, separate.head);
+        assert_eq!(view.repository.token, snapshot(p).unwrap().token);
+        assert_eq!(view.repository.head, view.graph.head);
+
+        // The user's `core.quotePath` is honoured: non-ASCII names stay readable when it is off.
+        git(p, &["config", "core.quotePath", "false"]).unwrap();
+        let readable = graph_view(p, false, false, 200, None)
+            .unwrap()
+            .graph
+            .changes;
+        let expected = git(
+            p,
+            &[
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+                "--ignore-submodules=all",
+            ],
+        )
+        .unwrap();
+        // Compare with Git's own text, not a literal: macOS may normalize the name (NFD/NFC).
+        assert!(!readable.contains("\\303"), "{readable}");
+        assert_eq!(readable, expected);
+        git(p, &["config", "--unset", "core.quotePath"]).unwrap();
+
+        // A comparison view shows no local changes, as before.
+        assert!(graph_view(p, true, false, 200, None)
+            .unwrap()
+            .graph
+            .changes
+            .is_empty());
+    }
+
+    #[test]
+    fn token_follows_every_kind_of_change() {
+        let d = repository();
+        let p = d.path();
+        commit(p, "first", "first\n");
+        let clean = token(p).unwrap();
+        assert_eq!(
+            token(p).unwrap(),
+            clean,
+            "an unchanged repository keeps its token"
+        );
+
+        // A tracked file edited once, then edited again: status reads " M" both times.
+        std::fs::write(p.join("file.txt"), "edit one\n").unwrap();
+        let first_edit = token(p).unwrap();
+        assert_ne!(first_edit, clean);
+        std::fs::write(p.join("file.txt"), "a second, longer edit\n").unwrap();
+        let second_edit = token(p).unwrap();
+        assert_ne!(second_edit, first_edit);
+
+        // Same size and a restored modification time: size and mtime cannot tell the edits
+        // apart, the content (and on Unix the change time) does.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let set_old = |file: &Path| {
+            let handle = std::fs::OpenOptions::new().write(true).open(file).unwrap();
+            handle.set_modified(old).unwrap();
+        };
+        set_old(&p.join("file.txt"));
+        let aged = token(p).unwrap();
+        std::fs::write(p.join("file.txt"), "A SECOND, LONGER EDIT\n").unwrap();
+        set_old(&p.join("file.txt"));
+        assert_ne!(
+            token(p).unwrap(),
+            aged,
+            "same-size edit with a restored mtime"
+        );
+        let second_edit = token(p).unwrap();
+        // The token must not depend on the clock: a file edited moments ago keeps its token as
+        // time passes, or a reviewed state would be rejected as changed a few seconds later.
+        let moments_ago = std::time::SystemTime::now() - std::time::Duration::from_millis(2800);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(p.join("file.txt"))
+            .unwrap()
+            .set_modified(moments_ago)
+            .unwrap();
+        let fresh = token(p).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert_eq!(
+            token(p).unwrap(),
+            fresh,
+            "token changed only because time passed"
+        );
+        assert_ne!(fresh, second_edit);
+
+        // Untracked files, including one that appears in a folder.
+        std::fs::create_dir(p.join("dir")).unwrap();
+        std::fs::write(p.join("dir/new.txt"), "new\n").unwrap();
+        let untracked = token(p).unwrap();
+        assert_ne!(untracked, second_edit);
+
+        // A staged rename lists two records in `status -z`; both must parse without panicking.
+        git(p, &["add", "--all"]).unwrap();
+        git(p, &["mv", "dir/new.txt", "dir/moved.txt"]).unwrap();
+        assert_ne!(token(p).unwrap(), untracked);
+
+        // The light token reacts to a new reference and ignores work-tree edits.
+        let light = light_token(p).unwrap();
+        std::fs::write(p.join("file.txt"), "unrelated work tree edit\n").unwrap();
+        assert_eq!(light_token(p).unwrap(), light);
+        git(p, &["branch", "other"]).unwrap();
+        assert_ne!(light_token(p).unwrap(), light);
+    }
+
+    /// A large tracked file edited to the same size with its modification time restored still
+    /// changes the token, so a reviewed token cannot be reused for content nobody reviewed.
+    #[test]
+    fn token_sees_a_same_size_edit_of_a_large_file() {
+        let d = repository();
+        let p = d.path();
+        let big = "a".repeat(400 * 1024);
+        commit(p, "big", &big);
+        let file = p.join("file.txt");
+        std::fs::write(&file, big.replacen('a', "b", 1)).unwrap();
+        let modified = std::fs::metadata(&file).unwrap().modified().unwrap();
+        let first = token(p).unwrap();
+        std::fs::write(&file, big.replacen('a', "c", 1)).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert_ne!(token(p).unwrap(), first);
     }
 
     #[test]

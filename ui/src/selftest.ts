@@ -1189,7 +1189,9 @@ export async function runSelfTest() {
       mi.dispatchEvent(new MouseEvent("mouseover", { bubbles: true, relatedTarget: document.body }));
       const sub = await until(() => $$(".menu").find((m) => m.textContent?.includes("Teal")));
       const ir = mi.getBoundingClientRect(), sr = sub?.getBoundingClientRect();
-      log(!!sr && Math.abs(sr.left - ir.right) < 12 && Math.abs(sr.top - ir.top) < 20, "submenu opens next to its item", sr ? `item ${Math.round(ir.right)},${Math.round(ir.top)} sub ${Math.round(sr.left)},${Math.round(sr.top)}` : "no submenu");
+      // The submenu may be shifted up to stay inside the window, so only require it to sit beside the item vertically.
+      const beside = !!sr && sr.top <= ir.bottom && sr.bottom >= ir.top && sr.bottom <= window.innerHeight + 1;
+      log(!!sr && Math.abs(sr.left - ir.right) < 12 && beside, "submenu opens next to its item", sr ? `item ${Math.round(ir.right)},${Math.round(ir.top)} sub ${Math.round(sr.left)},${Math.round(sr.top)}` : "no submenu");
       await shot("23-folder-colour-menu");
       const teal = sub && $$(".mi", sub).find((x) => x.textContent?.includes("Teal"));
       if (teal) click(teal);
@@ -2755,7 +2757,71 @@ async function runKeyboardSelfTest() {
     key("Escape");
     await until(() => !getState().overlay);
 
+    // Folder marks: m{x} sets, '{x} / `{x} jump, '' returns, dm{x} deletes; c is the colour tag.
+    const marks = () => getState().marks.marks;
+    await A.navigate(0, docs);
+    await until(() => rowNames(0).includes("file2.txt"));
+    await selectRow(0, "file2.txt");
+    key("m");
+    const setList = await until(() => $(".wk-marks"), 1500);
+    log(!!setList && !!setList.textContent?.includes("No marks yet"), "m shows the (empty) mark list", setList?.textContent?.slice(0, 80) ?? "");
+    await shot("keyboard-vim-marks-set-empty");
+    key("a");
+    log(!!(await until(() => marks().a?.path === docs && !!marks().a?.item?.endsWith("file2.txt"))), "m a marks the folder and its focused item", JSON.stringify(marks().a ?? null));
+    log(!$(".wk"), "the mark list closes after the letter");
+    await A.navigate(0, root);
+    await until(() => activePath(0) === root && rowNames(0).includes("Documents"));
+    await focusPane(0);
+    key("m");
+    await sleep(60);
+    key("B", { shiftKey: true });
+    log(!!(await until(() => marks().B?.path === root)), "m B (upper case) is a separate mark");
+    const stored = await api.marksGet();
+    log(stored.marks.a?.path === docs && stored.marks.B?.path === root, "marks are saved in the backend store", JSON.stringify(stored));
+    key("'");
+    const jumpList = await until(() => $(".wk-marks .wk-grid"), 1500);
+    log(!!jumpList && jumpList.textContent!.includes("Documents") && $$(".wk-marks .wk-item").length === 2, "' lists the marks with their folders", jumpList?.textContent ?? "");
+    await shot("keyboard-vim-marks-jump-list");
+    key("a");
+    log(!!(await until(() => activePath(0) === docs)), "' a opens the marked folder", activePath(0));
+    log(!!(await until(() => marks()["'"]?.path === root)), "the folder left behind becomes mark '");
+    await until(() => rowNames(0).includes("file2.txt"));
+    await focusPane(0);
+    key("'"); await sleep(60); key("'");
+    log(!!(await until(() => activePath(0) === root)), "'' returns to the folder before the jump", activePath(0));
+    await until(() => rowNames(0).includes("Documents"));
+    await selectRow(0, "Documents");
+    key("`"); await sleep(60); key("a");
+    log(!!(await until(() => activePath(0) === docs && controller(0)?.focused()?.name === "file2.txt", 3000)), "` a opens the folder and selects the marked item", controller(0)?.focused()?.name ?? "none");
+    // US International: ' is a dead key and Shift+b after it arrives composed.
+    await focusPane(0);
+    key("Dead", { code: "Quote" }); await sleep(60); key("Á", { code: "KeyB", shiftKey: true });
+    log(!!(await until(() => activePath(0) === root)), "dead ' then a composed letter still jumps (mark B)", activePath(0));
+    await until(() => rowNames(0).includes("Documents"));
+    await focusPane(0);
+    key("'"); await sleep(60); key("'");
+    await until(() => activePath(0) === docs && rowNames(0).includes("file2.txt"));
+    await focusPane(0);
+    key("'"); await sleep(60); key("x");
+    log(!!(await until(() => getState().notifications.some((n) => n.text.includes("Mark x is not set")))), "' x warns about an unset mark");
+    log(activePath(0) === docs, "an unset mark does not navigate");
+    const clipBefore = JSON.stringify(getState().clipboard);
+    for (const k of ["d", "m", "a"]) { key(k); await sleep(60); }
+    log(!!(await until(() => !marks().a)), "d m a deletes the mark");
+    log(JSON.stringify(getState().clipboard) === clipBefore, "d m does not cut the selection");
+    await selectRow(0, "file1.txt");
+    key("c");
+    log(!!(await until(() => getState().overlay?.type === "tag")), "c opens the colour tag popup");
+    key("Escape");
+    await until(() => !getState().overlay);
+
     await updateSettings({ vimKeys: false });
+    await focusPane(0);
+    key("m");
+    await sleep(300);
+    log(!$(".wk-marks") && !getState().keySeq.length && !!$(".quick-filter", browserEl(0)!)?.textContent?.includes("m"), "without vim keys m types into the filter, not a mark", $(".quick-filter", browserEl(0)!)?.textContent ?? "no filter");
+    key("Escape");
+    await until(() => rowNames(0).length > 1);
     await A.sessionCmd({ op: "newTab", b: 0, path: root });
     await until(() => br().tabs.length === 2 && tabs().length === 2);
     const activeId = br().tabs[br().active].id;

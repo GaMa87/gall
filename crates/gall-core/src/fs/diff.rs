@@ -774,7 +774,7 @@ pub fn unified_patch(a: &DiffSource, b: &DiffSource) -> Result<String> {
 fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
     // core.fsmonitor=false: never start a background fsmonitor daemon in the user's
     // repositories (users with core.fsmonitor=true would otherwise collect one per repo).
-    let mut cmd = std::process::Command::new("git");
+    let mut cmd = std::process::Command::new(super::gitstatus::program());
     cmd.args(["-c", "core.fsmonitor=false", "-C"])
         .arg(dir)
         .args(args);

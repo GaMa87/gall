@@ -21,10 +21,10 @@ it("marks branch tips so no line is drawn above a commit without a child", () =>
   expect(rows.map((r) => r.tip)).toEqual([true, true, false]);
 });
 it("draws lane changes as one horizontal run with rounded corners and no diagonals", () => {
-  expect(edgePath({ from: 1, to: 1 }, 0)).toBe("M 36 0 V 36");
-  expect(edgePath({ from: 0, to: 0 }, 0)).toBe("M 18 18 V 36");
-  expect(edgePath({ from: 0, to: 2 }, 0)).toBe("M 18 18 H 38 Q 54 18 54 34 V 36");
-  expect(edgePath({ from: 2, to: 0 }, 0)).toBe("M 54 0 V 2 Q 54 18 38 18 H 18");
+  expect(edgePath({ from: 1, to: 1 }, 0)).toBe("M 36 0 V 28");
+  expect(edgePath({ from: 0, to: 0 }, 0)).toBe("M 18 14 V 28");
+  expect(edgePath({ from: 0, to: 2 }, 0)).toBe("M 18 14 H 42 Q 54 14 54 26 V 28");
+  expect(edgePath({ from: 2, to: 0 }, 0)).toBe("M 54 0 V 2 Q 54 14 42 14 H 18");
 });
 it("changes lanes only at a commit: leaving it or joining it", () => {
   const line = (id: string, parents = "") => [id, parents, "", id, "User", "2026-01-01"].join("\0");

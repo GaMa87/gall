@@ -7,7 +7,9 @@
 #   ./scripts/selftest.sh --key-help [binary] help notation and layout only
 #   ./scripts/selftest.sh --key-profiles [binary] keyboard profiles and function keys
 #   ./scripts/selftest.sh --quick-open [binary] deleted Quick Open results only
-# Requires: KDE Spectacle (screenshots), ImageMagick, zip. Close Gall first.
+# Requires: KDE Spectacle (screenshots), kwin_wayland, ImageMagick, zip. Close Gall first.
+# Runs in a private headless KWin, so your mouse, keyboard and screen stay free;
+# GALL_SELFTEST_REAL=1 uses the real desktop instead.
 set -u
 MODE=1
 if [ "${1:-}" = "--updates" ]; then MODE=updates; shift; fi
@@ -71,6 +73,13 @@ if [ "$MODE" = "git-workspace" ]; then
   git -C "$T/submodule-host" -c protocol.file.allow=always submodule add -q "$T/remote.git" module
   git -C "$T/submodule-host" commit -qm 'add submodule'
   git -C "$T/submodule-host" submodule deinit -q module
+  # More than one page of history, so the "Load more commits" button is shown.
+  git init -q -b main "$T/many-commits"
+  git -C "$T/many-commits" config core.autocrlf false
+  for i in $(seq 1 230); do
+    printf 'commit refs/heads/main\ncommitter Test <test@example.com> %d +0000\ndata 15\ncommit no. %03d\n\n' "$((1700000000 + i * 60))" "$i"
+  done | git -C "$T/many-commits" fast-import --quiet
+  git -C "$T/many-commits" reset -q --hard
   sed -i '2s/.*/second changed/;25s/.*/twenty-five changed/' file.txt
   printf 'untracked\n' > new.txt
 elif [ "$MODE" = "git-compare" ]; then
@@ -152,11 +161,28 @@ if [ "$MODE" = "bug-report" ]; then
   mkdir -p "$T/data/gall"
   printf '%s' '{"unclean":true,"events":["command: 0ms list_dir failed"]}' > "$T/data/gall/diagnostics.json"
 fi
-export GALL_SELFTEST_DBUS="${DBUS_SESSION_BUS_ADDRESS:-}"
+# By default the app runs in a private headless KWin (own Wayland socket and D-Bus), so real
+# mouse, keyboard, focus and screen are not involved and the computer stays usable meanwhile.
+# GALL_SELFTEST_REAL=1 runs on the real desktop instead (needs Spectacle on the session bus).
+NESTED=0
+if [ -z "${GALL_SELFTEST_REAL:-}" ] && command -v kwin_wayland >/dev/null && command -v spectacle >/dev/null; then NESTED=1; fi
+[ "$NESTED" = 0 ] && export GALL_SELFTEST_DBUS="${DBUS_SESSION_BUS_ADDRESS:-}"
 export XDG_CONFIG_HOME="$T/config" XDG_DATA_HOME="$T/data" GALL_SELFTEST="$MODE" GALL_SELFTEST_DIR="$T/out"
 # Services activated on the private bus (portals, ksecretd, ...) outlive dbus-run-session;
 # remember the bus address and stop everything that still uses it afterwards.
-timeout 240 dbus-run-session -- sh -c 'echo "$DBUS_SESSION_BUS_ADDRESS" > "$0/bus"; exec "$1" -p "$0/td" -p2 "$0/td/Projects"' "$T" "$APP" > "$T/app.log" 2>&1
+if [ "$NESTED" = 1 ]; then
+  echo "Self-test mode: private headless KWin (GALL_SELFTEST_REAL=1 uses the real desktop)"
+  unset DISPLAY WAYLAND_DISPLAY GALL_SELFTEST_DBUS
+  # KWin takes one program path, so start the app through a wrapper with explicit arguments
+  # (this also keeps paths with spaces intact).
+  printf '#!/bin/sh\nexec "$1" -p "$2/td" -p2 "$2/td/Projects"\n' > "$T/run-app.sh"
+  printf '#!/bin/sh\nexec "%s/run-app.sh" "%s" "%s"\n' "$T" "$APP" "$T" > "$T/start.sh"
+  chmod +x "$T/run-app.sh" "$T/start.sh"
+  timeout 240 dbus-run-session -- sh -c 'echo "$DBUS_SESSION_BUS_ADDRESS" > "$0/bus"; exec kwin_wayland --virtual --no-lockscreen --no-global-shortcuts --socket "gall-selftest-$$" --width 1920 --height 1200 --exit-with-session "$0/start.sh"' "$T" > "$T/app.log" 2>&1
+else
+  echo "Self-test mode: real desktop"
+  timeout 240 dbus-run-session -- sh -c 'echo "$DBUS_SESSION_BUS_ADDRESS" > "$0/bus"; exec "$1" -p "$0/td" -p2 "$0/td/Projects"' "$T" "$APP" > "$T/app.log" 2>&1
+fi
 BUS="$(cat "$T/bus" 2>/dev/null)"
 if [ -n "$BUS" ]; then
   for p in /proc/[0-9]*; do

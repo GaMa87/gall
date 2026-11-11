@@ -1194,7 +1194,7 @@ export function FolderPane({ b, path, active, compact }: Props) {
             <div className="fp-title" title={`${path}\nClick to edit (Ctrl+L)`} onClick={() => A.openOverlay({ type: "pathEdit", b })}>{basename(path) || path}</div>
             <button className={`pin-btn ${pinned ? "on" : ""}`} title={`${pinned ? "Unpin from sidebar" : "Pin to sidebar"}${pinKeys ? ` (${pinKeys})` : ""}`} onClick={() => A.togglePin(path)}><Icon name="star" size={14} /></button>
             {visual && (
-              <span className="fp-visual" title="Visual mode: j/k, gg/G extend the selection; y y, d d, D, m, C, M … act on it; Esc or v cancels">
+              <span className="fp-visual" title="Visual mode: j/k, gg/G extend the selection; y y, d d, D, c, C, M … act on it; Esc or v cancels">
                 -- VISUAL -- {sel.size}
               </span>
             )}

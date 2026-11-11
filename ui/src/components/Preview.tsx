@@ -1,11 +1,13 @@
 // File previews (P-02…P-08). Used by the details pane and the preview window.
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
-import { api, fileSrc } from "../api/ipc";
+import { api, fileSrc, mediaSrc } from "../api/ipc";
 import type { FileEntry, PreviewInfo, SyntaxHighlight, VideoProbe } from "../api/types";
 import { imageRefresh, loadImageSnapshot } from "../core/imageRefresh";
 import { onFolderChanged } from "../state/controllers";
 import { segments } from "../core/diffRows";
 import { isBrowsableArchive } from "../core/archive";
+import { parseStl, type StlMesh } from "../core/stl";
+import { createStlViewer, type StlViewer } from "../core/stlView";
 import { formatSize } from "../core/format";
 import { basename, parent } from "../core/path";
 import * as A from "../state/actions";
@@ -72,6 +74,8 @@ export function Preview({ entry, info, big }: { entry: FileEntry; info: PreviewI
       return <MediaPreview key={entry.path} path={src} kind={kind} big={big} />;
     case "pdf":
       return <PdfPreview key={entry.path} path={src} />;
+    case "model":
+      return <ModelPreview key={entry.path} path={src} />;
     case "note":
       return <div className="pv-note">{info.text}</div>;
     case "text":
@@ -102,6 +106,82 @@ export function Preview({ entry, info, big }: { entry: FileEntry; info: PreviewI
         </div>
       );
   }
+}
+
+/** Models above this are not loaded just to be previewed. */
+const MODEL_MAX_BYTES = 256 << 20;
+
+/** STL model: drag to rotate, wheel to zoom, double-click to reset. */
+function ModelPreview({ path }: { path: string }) {
+  const canvas = useRef<HTMLCanvasElement>(null);
+  const [mesh, setMesh] = useState<StlMesh | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    const ctl = new AbortController();
+    fetch(fileSrc(path), { signal: ctl.signal })
+      .then((r) => {
+        if (!r.ok) throw new Error(r.statusText || "cannot read the file");
+        if (Number(r.headers.get("content-length") ?? 0) > MODEL_MAX_BYTES) throw new Error("The model is too large to preview");
+        return r.arrayBuffer();
+      })
+      .then((b) => {
+        if (b.byteLength > MODEL_MAX_BYTES) throw new Error("The model is too large to preview");
+        setMesh(parseStl(b));
+      })
+      .catch((e) => !ctl.signal.aborted && setErr(e instanceof Error ? e.message : String(e)));
+    return () => ctl.abort();
+  }, [path]);
+
+  useEffect(() => {
+    const el = canvas.current;
+    if (!mesh || !el) return;
+    let viewer: StlViewer;
+    try {
+      viewer = createStlViewer(el, mesh);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+      return;
+    }
+    const ro = new ResizeObserver(() => viewer.resize());
+    ro.observe(el);
+    let drag: { x: number; y: number } | null = null;
+    const down = (e: PointerEvent) => { drag = { x: e.clientX, y: e.clientY }; el.setPointerCapture(e.pointerId); };
+    const move = (e: PointerEvent) => {
+      if (!drag) return;
+      viewer.rotate(e.clientX - drag.x, e.clientY - drag.y);
+      drag = { x: e.clientX, y: e.clientY };
+    };
+    const up = () => { drag = null; };
+    const wheel = (e: WheelEvent) => { e.preventDefault(); viewer.zoom(e.deltaY); };
+    const dbl = () => viewer.reset();
+    el.addEventListener("pointerdown", down);
+    el.addEventListener("pointermove", move);
+    el.addEventListener("pointerup", up);
+    el.addEventListener("pointercancel", up);
+    el.addEventListener("wheel", wheel, { passive: false });
+    el.addEventListener("dblclick", dbl);
+    return () => {
+      ro.disconnect();
+      el.removeEventListener("pointerdown", down);
+      el.removeEventListener("pointermove", move);
+      el.removeEventListener("pointerup", up);
+      el.removeEventListener("pointercancel", up);
+      el.removeEventListener("wheel", wheel);
+      el.removeEventListener("dblclick", dbl);
+      viewer.dispose();
+    };
+  }, [mesh]);
+
+  if (err) return <div className="pv-pdf-error">Can't show this model: {err}</div>;
+  if (!mesh) return <div className="pv-icon"><Icon name="model" size={48} /><span>Loading model…</span></div>;
+  const size = [0, 1, 2].map((i) => +(mesh.max[i] - mesh.min[i]).toPrecision(4)).join(" × ");
+  return (
+    <div className="pv-model">
+      <canvas ref={canvas} title="Drag to rotate · wheel to zoom · double-click to reset" />
+      <span className="pv-model-info">{mesh.triangles.toLocaleString()} triangles · {size}</span>
+    </div>
+  );
 }
 
 const MD_EXTS = new Set(["md", "markdown", "mdown", "mkd"]);
@@ -311,14 +391,17 @@ function MediaPreview({ path, kind, big }: { path: string; kind: "video" | "audi
     e.preventDefault();
     e.stopPropagation();
   };
+  // React's autoFocus only works on form controls, so the player is focused by hand: in the
+  // preview window k, ←/→ and [ ] then work at once, as the hint bar says.
+  useEffect(() => {
+    if (big && !err) ref.current?.focus();
+  }, [big, err, path]);
   if (err) return <MediaFallback path={path} kind={kind} err={err} />;
   const common = {
     ref,
-    src: fileSrc(path),
+    src: mediaSrc(path),
     controls: true,
     autoPlay: big && settings.autoplayMedia,
-    // In the preview window the player takes focus, so ←/→, [ ] and k work right away.
-    autoFocus: big,
     onKeyDown: onKey,
     tabIndex: 0,
     onError: () => {

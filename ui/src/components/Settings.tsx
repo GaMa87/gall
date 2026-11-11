@@ -44,8 +44,8 @@ const SECTIONS: Section[] = [
         { key: "fontStyle", label: "Font style", type: "select", options: [["regular", "Regular"], ["bold", "Bold"], ["italic", "Italic"], ["boldItalic", "Bold italic"]] },
         { key: "fontSize", label: "Font size", type: "number", min: 9, max: 24, step: 0.5 },
         { key: "rowPadding", label: "Row padding (px)", type: "number", min: 0, max: 12 },
-        { key: "showNavColumns", label: "Miller columns above the list", hint: "Default for both browsers in the Standard layout; off shows a breadcrumb bar instead (Columns starts with columns, Single with breadcrumbs). ` or the button in a tab bar switches one browser in any layout, and that choice is remembered per layout.", type: "bool" },
-        { key: "showDetailsPane", label: "Show preview & details pane", hint: "Default for both browsers. Alt+P or the pane button in a tab bar shows or hides it in that browser only; Ctrl+U swaps the folders and keeps the panes. Space opens the preview window either way.", type: "bool" },
+        { key: "showNavColumns", label: "Miller columns above the list", hint: "Default for both browsers in the Standard layout; off shows a breadcrumb bar instead (Columns starts with columns, Single with breadcrumbs). The button in a tab bar (or Toggle columns / breadcrumbs in the key sheet) switches one browser in any layout, and that choice is remembered per layout.", type: "bool" },
+        { key: "showDetailsPane", label: "Show preview & details pane", hint: "Default for both browsers. Alt+P or the pane button in a tab bar shows or hides it in that browser only; swapping the folders (⇄ in the title bar) keeps the panes. The preview window opens either way.", type: "bool" },
         { key: "marchingAnts", label: "Dotted outline around the keyboard-focused item", type: "bool" },
         { key: "folderSizesAuto", label: "Calculate folder sizes automatically", hint: "Counts every folder in the open folder in the background and shows the total in the Size column (sorting by size then sorts folders too). Off: Ctrl+Alt+S or the context menu calculates on request. Mounted drives inside are not counted.", type: "bool" },
         { key: "showGitStatus", label: "Git status", hint: "In a Git repository: M modified, S staged, U new, ! conflict next to names (folders show what is inside), ignored items dimmed, and the branch in the status bar. Updates when the folder changes and when you come back to the window.", type: "bool" },
@@ -150,10 +150,10 @@ const SECTIONS: Section[] = [
         { key: "terminal", label: "Terminal command (F10)", hint: "Easier: Ctrl+F10 (Terminal here with…), pick one, Ctrl+Enter. Empty = auto-detect. {dir} = the folder; quote a program path with spaces.", type: "text", placeholder: "auto" },
       ] },
       { title: "Editor", opts: [
-        { key: "editor", label: "Editor command (Edit, F4 / e)", hint: "Easier: Shift+F4 (Edit with…), pick one, Ctrl+Enter. Empty = ask the first time. {path} = the file.", type: "text", placeholder: "ask" },
+        { key: "editor", label: "Editor command (Edit in editor)", hint: "Easier: Shift+F4 (Edit with…), pick one, Ctrl+Enter. Empty = ask the first time. {path} = the file.", type: "text", placeholder: "ask" },
       ] },
       { title: "Programs for files", opts: [
-        { key: "openRules", label: "Remembered programs", hint: "Made with Ctrl+Enter in Open with… (O). The most specific rule wins: one file, then the deepest folder, then everywhere. {path} = the file.", type: "openRules" },
+        { key: "openRules", label: "Remembered programs", hint: "Made with Ctrl+Enter in Open with…. The most specific rule wins: one file, then the deepest folder, then everywhere. {path} = the file.", type: "openRules" },
       ] },
     ],
   },

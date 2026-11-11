@@ -34,8 +34,38 @@ pub(super) fn has_content_filters(path: &Path) -> bool {
     .is_ok_and(|lines| filters_block(&lines))
 }
 
+/// Queries that only read the repository. They are the ones a view repeats many times, so
+/// they start the real Git program directly (see `gitstatus::program`); everything that
+/// changes the repository keeps going through `git` on `PATH`, exactly as in a terminal.
+fn reads_only(args: &[&str]) -> bool {
+    match args {
+        ["stash", "list", ..] | ["remote", "-v"] => true,
+        ["config", rest @ ..] => rest
+            .iter()
+            .any(|a| matches!(*a, "--get" | "--get-regexp" | "--list")),
+        // With a second name `symbolic-ref` writes the reference.
+        ["symbolic-ref", rest @ ..] => rest.iter().filter(|a| !a.starts_with('-')).count() == 1,
+        [command, ..] => matches!(
+            *command,
+            "rev-parse"
+                | "for-each-ref"
+                | "log"
+                | "rev-list"
+                | "status"
+                | "ls-files"
+                | "ls-tree"
+                | "cat-file"
+        ),
+        [] => false,
+    }
+}
+
 pub(super) fn git(root: &Path, args: &[&str]) -> Result<String> {
-    let mut cmd = Command::new("git");
+    let mut cmd = if reads_only(args) {
+        Command::new(super::gitstatus::program())
+    } else {
+        Command::new("git")
+    };
     cmd.args([
         "-c",
         "core.fsmonitor=false",
@@ -76,6 +106,105 @@ pub(super) fn git(root: &Path, args: &[&str]) -> Result<String> {
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
+/// Waits for a scoped worker thread. A panic in the worker becomes an error.
+pub(super) fn joined<T>(handle: std::thread::ScopedJoinHandle<'_, T>) -> Result<T> {
+    handle
+        .join()
+        .map_err(|_| CoreError::Other("A Git worker thread stopped unexpectedly".into()))
+}
+
+/// Work tree status with untracked files, in the machine-readable `-z` form.
+pub(super) fn status_z(root: &Path) -> Result<String> {
+    git(
+        root,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=all",
+        ],
+    )
+}
+
+/// One record of `status --porcelain=v1 -z`.
+pub(super) struct StatusEntry<'a> {
+    pub code: &'a str,
+    pub name: &'a str,
+    /// The original path of a rename or copy.
+    pub original: Option<&'a str>,
+}
+
+pub(super) fn status_entries(z: &str) -> Vec<StatusEntry<'_>> {
+    let mut entries = Vec::new();
+    let mut records = z.split('\0');
+    while let Some(record) = records.next() {
+        let Some((code, name)) = record.split_at_checked(3) else {
+            continue;
+        };
+        let renamed = matches!(code.as_bytes()[..2], [b'R' | b'C', _] | [_, b'R' | b'C']);
+        let original = if renamed { records.next() } else { None };
+        entries.push(StatusEntry {
+            code,
+            name,
+            original,
+        });
+    }
+    entries
+}
+
+/// Whether Git escapes non-ASCII bytes in printed paths (`core.quotePath`, on by default).
+pub(super) fn quote_non_ascii(root: &Path) -> bool {
+    git(root, &["config", "--type=bool", "--get", "core.quotePath"])
+        .map_or(true, |v| v.trim() != "false")
+}
+
+/// A path as `git status --porcelain` prints it: wrapped in double quotes, with C escapes and
+/// octal bytes, when it has a space, a control character, a quote, a backslash or non-ASCII
+/// bytes (Git's default `core.quotePath`); otherwise as is.
+fn quote_path(name: &str, escape_non_ascii: bool) -> String {
+    let plain = name.bytes().all(|b| {
+        b > b' ' && b != 0x7f && b != b'"' && b != b'\\' && (b < 0x80 || !escape_non_ascii)
+    });
+    if plain {
+        return name.to_owned();
+    }
+    let mut out = String::from("\"");
+    for b in name.bytes() {
+        match b {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            0x07 => out.push_str("\\a"),
+            0x08 => out.push_str("\\b"),
+            b'\t' => out.push_str("\\t"),
+            b'\n' => out.push_str("\\n"),
+            0x0b => out.push_str("\\v"),
+            0x0c => out.push_str("\\f"),
+            b'\r' => out.push_str("\\r"),
+            b' '..=b'~' => out.push(char::from(b)),
+            _ => out.push_str(&format!("\\{b:03o}")),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// The classic `status --porcelain` text (`XY path`, `XY old -> new`) built from a `-z` status,
+/// one line per entry, with names quoted the way Git quotes them.
+pub(super) fn changes_text(z: &str, escape_non_ascii: bool) -> String {
+    let mut text = String::new();
+    for entry in status_entries(z) {
+        text.push_str(entry.code);
+        if let Some(original) = entry.original {
+            text.push_str(&quote_path(original, escape_non_ascii));
+            text.push_str(" -> ");
+        }
+        text.push_str(&quote_path(entry.name, escape_non_ascii));
+        text.push('\n');
+    }
+    text
+}
+
 pub(super) fn root(path: &Path) -> Result<std::path::PathBuf> {
     super::diff::git_root(path)
         .ok_or_else(|| CoreError::Other("not inside a Git repository".into()))
@@ -113,13 +242,56 @@ pub fn query_history(
     limit: usize,
     reference: Option<&str>,
 ) -> Result<Graph> {
-    let root = root(path)?;
-    let has_filters = has_content_filters(&root);
-    let head = git(&root, &["rev-parse", "--verify", "HEAD"])
-        .map(|s| s.trim().to_owned())
-        .unwrap_or_default();
-    if let Some(reference) = reference.filter(|s| !s.is_empty()) {
-        let known = git(&root, &["for-each-ref", "--format=%(refname)"])?;
+    let root = &root(path)?;
+    std::thread::scope(|scope| {
+        // These do not depend on the history query: run them while it works. Only the status
+        // has to wait for the filter check, because it must not run when there are filters.
+        let branches = scope.spawn(|| branches(root));
+        let side = scope.spawn(|| -> Result<(bool, String)> {
+            let filters = has_content_filters(root);
+            let changes = if comparison || filters {
+                String::new()
+            } else {
+                changes_text(&status_z(root)?, quote_non_ascii(root))
+            };
+            Ok((filters, changes))
+        });
+        let mut graph = history_part(root, reflog, limit, reference, None)?;
+        graph.branches = joined(branches)??;
+        let (filters, changes) = joined(side)??;
+        graph.read_only_reason = read_only_reason(filters);
+        graph.changes = changes;
+        Ok(graph)
+    })
+}
+
+/// Why working-tree operations are refused in a repository with content filters.
+pub(super) fn read_only_reason(filters: bool) -> Option<String> {
+    filters.then(|| "History is read-only: content filters require the terminal for working-tree operations.".into())
+}
+
+/// Names of the local branches, as Git shortens them.
+pub(super) fn branches(root: &Path) -> Result<Vec<String>> {
+    let names = git(
+        root,
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+    )?;
+    Ok(names.lines().map(str::to_owned).collect())
+}
+
+/// The history itself (`log`, HEAD): everything except the branch list, the changes and the
+/// read-only reason. `head` is the HEAD commit when the caller has just read it (empty when
+/// there is none); otherwise it is read here.
+pub(super) fn history_part(
+    root: &Path,
+    reflog: bool,
+    limit: usize,
+    reference: Option<&str>,
+    head: Option<&str>,
+) -> Result<Graph> {
+    let reference = reference.filter(|s| !s.is_empty());
+    if let Some(reference) = reference {
+        let known = git(root, &["for-each-ref", "--format=%(refname)"])?;
         if !known.lines().any(|s| s == reference) {
             return Err(CoreError::Other(
                 "The selected reference no longer exists".into(),
@@ -136,32 +308,47 @@ pub fn query_history(
         &count,
         "--format=%H%x00%P%x00%D%x00%s%x00%an%x00%aI",
     ];
-    if let Some(reference) = reference.filter(|s| !s.is_empty()) {
+    if let Some(reference) = reference {
         args.push(reference);
+    } else if reflog {
+        args.extend(["--all", "--reflog"]);
     } else {
-        if reflog {
-            args.push("--all");
-            args.push("--reflog");
-        } else {
-            // Saved pre-rewrite commits stay hidden unless Reflog is enabled.
-            args.extend(["--exclude=refs/gall/recovery/*", "--all"]);
-            args.push("--decorate-refs-exclude=refs/gall/recovery/*");
-        }
+        // Saved pre-rewrite commits stay hidden unless Reflog is enabled.
+        args.extend(["--exclude=refs/gall/recovery/*", "--all"]);
+        args.push("--decorate-refs-exclude=refs/gall/recovery/*");
     }
+    let (log, head) = std::thread::scope(|scope| {
+        // HEAD is only needed once the log is there: read it while the log runs.
+        let read = head.is_none().then(|| {
+            scope.spawn(|| {
+                git(root, &["rev-parse", "--verify", "HEAD"])
+                    .map(|s| s.trim().to_owned())
+                    .unwrap_or_default()
+            })
+        });
+        let log = git(root, &args);
+        let head = match read {
+            Some(read) => joined(read),
+            None => Ok(head.unwrap_or_default().to_owned()),
+        };
+        (log, head)
+    });
+    let head = head?;
+    // A repository without commits and references has no history; there `log` may fail.
     let mut history =
-        if head.is_empty() && git(&root, &["for-each-ref", "--format=%(refname)"])?.is_empty() {
+        if head.is_empty() && git(root, &["for-each-ref", "--format=%(refname)"])?.is_empty() {
             String::new()
         } else {
-            git(&root, &args)?
+            log?
         };
     if !head.is_empty()
-        && reference.filter(|s| !s.is_empty()).is_none()
+        && reference.is_none()
         && !history
             .lines()
             .any(|line| line.split('\0').next() == Some(head.as_str()))
     {
         history.push_str(&git(
-            &root,
+            root,
             &[
                 "log",
                 "--no-walk",
@@ -173,29 +360,11 @@ pub fn query_history(
         )?);
     }
     Ok(Graph {
-        read_only_reason: has_filters.then(|| "History is read-only: content filters require the terminal for working-tree operations.".into()),
+        read_only_reason: None,
         history,
-        branches: git(
-            &root,
-            &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
-        )?
-        .lines()
-        .map(str::to_owned)
-        .collect(),
+        branches: Vec::new(),
         head,
-        changes: if comparison || has_filters {
-            String::new()
-        } else {
-            git(
-                &root,
-                &[
-                    "status",
-                    "--porcelain",
-                    "--untracked-files=all",
-                    "--ignore-submodules=all",
-                ],
-            )?
-        },
+        changes: String::new(),
     })
 }
 /// Retain a detached commit even after its HEAD reflog expires.

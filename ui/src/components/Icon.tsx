@@ -9,6 +9,7 @@ const P: Record<string, string> = {
   file: "M6 3h8l4 4v14H6z M14 3v4h4",
   image: "M4 5h16v14H4z M4 16l5-5 4 4 3-3 4 4 M15 9.5a1.5 1.5 0 1 0 0-.01",
   video: "M4 6h12v12H4z M16 10l5-3v10l-5-3",
+  model: "M12 3l8 4.5v9L12 21l-8-4.5v-9z M12 12l8-4.5 M12 12v9 M12 12L4 7.5",
   audio: "M9 18V6l10-2v12 M9 18a2.5 2.5 0 1 1-5 0 2.5 2.5 0 0 1 5 0 M19 16a2.5 2.5 0 1 1-5 0 2.5 2.5 0 0 1 5 0",
   pdf: "M6 3h8l4 4v14H6z M14 3v4h4 M8.5 15h7 M8.5 12h7 M8.5 18h4",
   text: "M6 3h8l4 4v14H6z M14 3v4h4 M9 11h6 M9 14h6 M9 17h4",

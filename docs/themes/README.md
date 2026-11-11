@@ -107,7 +107,7 @@ Two details matter:
 | `--accent` | Selection, focus, active pane, links, progress (needs `!important`) |
 | `--brand-b` | Second colour of the gradient in the active folder header and the disk usage bars |
 | `--accent-2` | Second colour of the gradient border around the focused pane |
-| `--sel`, `--sel-inactive` | Selected rows in the active and inactive pane. These are computed from `--accent`, so you rarely need to set them. |
+| `--sel`, `--sel-inactive` | Selected text and selected rows of the folder compare. Selected items in the file list, sidebar and other lists use `--sel-gradient` and `--sel-bar` (see *Size and shape*). All are computed from `--accent`, so you rarely need to set them. |
 
 ### Status and highlights
 
@@ -139,8 +139,25 @@ Set these on the root, as in block 2 above (themes that set them on `.diffv` col
 ### Size and shape
 
 These work in a theme too, but most people change them in *Settings › Appearance* instead:
-`--radius` and `--radius-lg` (corner rounding), `--gap` (space between panes), `--frame`
-(focused pane border width), `--font` and `--mono` (fonts).
+`--gap` (space between panes), `--frame` (focused pane border width), `--font` and `--mono`
+(fonts), and the corner rounding:
+
+| Variable | Rounds | Default |
+|---|---|---|
+| `--radius-sm` | Small marks inside a row, file rows, tiny icon buttons | `6px` |
+| `--radius` | Buttons, inputs, tabs, sidebar and list items | `9px` |
+| `--radius-lg` | Cards, panes, menus | `12px` |
+| `--radius-xl` | Dialogs and windows (Settings, Quick Open, compare, Git) | `16px` |
+| `--radius-pill` | Badges and chips | `999px` |
+
+For a square look set all five to a small value, for example `2px`.
+
+Buttons, selections and bars are drawn from shared variables as well, so a theme can restyle
+them everywhere at once: `--btn-bg` and `--btn-bg-hover` (button fills), `--btn-shadow`,
+`--primary-gradient` (main action), `--accent-text` (accent used for text and icons, mixed
+with the foreground so it stays readable), `--sel-gradient` and `--sel-bar` (selected item),
+`--row-hover`, `--bar-bg` (window headers and toolbars), `--foot-bg` (footers), `--well-bg`
+(track of segmented controls) and `--panel-bg` (dialogs).
 
 ## Limits
 

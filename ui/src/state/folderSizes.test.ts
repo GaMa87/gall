@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(), convertFileSrc: (p: string) => p }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(() => Promise.resolve(() => {})) }));
 import { api } from "../api/ipc";
-import { applyFolderSizeProgress, calcFolderSizes, cancelFolderSizes, invalidateFolderSizes } from "./actions";
+import { applyFolderSizeProgress, calcFolderSizes, cancelFolderSizes, invalidateAllFolderSizes, invalidateFolderSizes } from "./actions";
 import { registerController, type BrowserController } from "./controllers";
 import type { Settings } from "../api/types";
 import { getState, setState } from "./store";
@@ -156,6 +156,13 @@ describe("folder size calculations", () => {
     vi.spyOn(api, "folderSize").mockResolvedValue(total(0));
     await calcFolderSizes("test", ["/a"], 120_000);
     expect(getState().folderSizes["/a"].bytes).toBe(0);
+  });
+
+  it("a finished task makes every cached total stale, also folders the watcher does not see", () => {
+    setState({ folderSizes: Object.fromEntries(["/a", "/b/sub"].map((p) => [p, { ...total(100), done: true, at: Date.now() }])) });
+    invalidateAllFolderSizes();
+    expect(getState().folderSizes["/a"].at).toBe(0);
+    expect(getState().folderSizes["/b/sub"].at).toBe(0);
   });
 
   it("changes during a count keep the result stale for a follow-up count", async () => {

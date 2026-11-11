@@ -63,7 +63,7 @@ fn error(message: impl Into<String>) -> CoreError {
 /// Limit output before allocating a large preview. No subprocess runs an external
 /// diff, text converter, pager or editor, and no optional index refresh is needed.
 fn read_git(root: &Path, args: &[&str], limit: usize) -> Result<(Vec<u8>, bool)> {
-    let mut command = Command::new("git");
+    let mut command = Command::new(super::gitstatus::program());
     command
         .args([
             "--no-pager",

@@ -1353,9 +1353,16 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn eject_of_a_missing_or_bad_drive_fails_cleanly() {
+        // `Path::exists` is not enough: a letter can fail it and still open as
+        // `\\.\X:`. Only a letter missing from the logical-drive bitmask is free.
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetLogicalDrives() -> u32;
+        }
+        let used = unsafe { GetLogicalDrives() };
         let free = (b'D'..=b'Z')
+            .find(|c| used & (1 << (c - b'A')) == 0)
             .map(|c| format!("{}:\\", c as char))
-            .find(|m| !std::path::Path::new(m).exists())
             .unwrap();
         let e = eject(&free).unwrap_err().to_string();
         assert!(e.contains("cannot be opened"), "{e}");
