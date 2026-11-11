@@ -42,7 +42,7 @@ csv = "1.4.0"
 tar = "0.4.46"
 flate2 = "1.1.10"
 lzma-rust2 = "0.23"
-sevenz-rust2 = { version = "0.24.2", default-features = false, features = ["aes256", "compress", "util", "deflate", "ppmd"] }
+sevenz-rust2 = { version = "0.25.0", default-features = false, features = ["aes256", "compress", "util", "deflate", "ppmd"] }
 ruzstd = "0.9.1"
 bzip2-rs = "0.1.2"
 fontdb = "0.24.0"
