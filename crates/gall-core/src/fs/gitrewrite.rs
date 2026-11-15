@@ -9,9 +9,11 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 const MAX_PLAN: u64 = 8 * 1024 * 1024;
 static SERIAL: AtomicU64 = AtomicU64::new(0);
+static STREAMED_REPLAY_SUPPORTED: OnceLock<bool> = OnceLock::new();
 
 fn fail(message: impl Into<String>) -> CoreError {
     CoreError::Other(message.into())
@@ -227,8 +229,13 @@ fn merge_trees(
     let text = String::from_utf8_lossy(&out.stdout);
     let mut parts = text.split('\0');
     let tree = parts.next().unwrap_or_default().trim().to_owned();
-    if tree.is_empty() {
-        return Err(fail("Git returned no tree for the conflict check"));
+    if tree.len() != theirs.len() || !tree.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        let message = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+        return Err(fail(if message.is_empty() {
+            "Git returned an invalid tree for the conflict check".to_owned()
+        } else {
+            message
+        }));
     }
     let files = parts
         .take_while(|name| !name.is_empty())
@@ -236,6 +243,23 @@ fn merge_trees(
         .collect();
     Ok((tree, conflicted.then_some(files)))
 }
+fn git_supports_streamed_replay(version: &str) -> bool {
+    let Some(version) = version.trim().strip_prefix("git version ") else {
+        return false;
+    };
+    let Some(version) = version.split_whitespace().next() else {
+        return false;
+    };
+    let mut parts = version.split('.');
+    let mut number = || parts.next().and_then(|part| part.parse::<u32>().ok());
+    let (Some(major), Some(minor), Some(_patch)) = (number(), number(), number()) else {
+        return false;
+    };
+    // Git 2.49 both accepts tree inputs and flushes each --stdin reply. Older versions
+    // can wait for EOF while Gall waits for the reply: fall back before opening pipes.
+    major > 2 || (major == 2 && minor >= 49)
+}
+
 /// [`merge_trees`] for every commit of `ids` in turn, starting from `start`, in one
 /// `merge-tree --stdin` process: Git answers each input line (`<base> -- <ours> <theirs>`)
 /// before it reads the next, so each merge can start from the tree of the one before. A
@@ -250,6 +274,19 @@ fn replay_streamed(root: &Path, start: &str, ids: &[String]) -> Option<Vec<Confl
     if super::gitexec::place(root).is_some() {
         return None;
     }
+    if !*STREAMED_REPLAY_SUPPORTED.get_or_init(|| {
+        super::gitexec::command(root, super::gitstatus::program())
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .is_some_and(|version| git_supports_streamed_replay(&version))
+    }) {
+        return None;
+    }
     let mut cmd = super::gitexec::command(root, super::gitstatus::program());
     cmd.args(["-c", "core.fsmonitor=false", "-C"])
         .arg(super::gitexec::dir_arg(root))
@@ -257,6 +294,7 @@ fn replay_streamed(root: &Path, start: &str, ids: &[String]) -> Option<Vec<Confl
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .env("GIT_FLUSH", "1")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0");
     let mut child = cmd.spawn().ok()?;
@@ -312,9 +350,177 @@ fn replay_streamed(root: &Path, start: &str, ids: &[String]) -> Option<Vec<Confl
     found.filter(|_| finished.success())
 }
 
+fn preview_object_directory(root: &Path) -> Result<PathBuf> {
+    // Git resolves linked worktrees, submodules, object-directory overrides and WSL.
+    // Ask once per fallback replay, never once per intermediate commit.
+    let path = git(
+        root,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "objects",
+        ],
+    )?;
+    let path = path.strip_suffix('\n').unwrap_or(&path);
+    let directory = super::gitexec::host_path(root, path);
+    if !directory.is_absolute() {
+        return Err(fail("Git returned a relative object directory"));
+    }
+    Ok(directory)
+}
+
+fn existing_preview_commit(target: &Path, object: &[u8]) -> Result<bool> {
+    let metadata = match target.symlink_metadata() {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(fail(format!("Cannot read a Git preview object: {error}"))),
+    };
+    let mut existing = Vec::new();
+    if !metadata.is_file()
+        || File::open(target)
+            .and_then(|file| {
+                flate2::read::ZlibDecoder::new(file)
+                    .take(object.len() as u64 + 1)
+                    .read_to_end(&mut existing)
+            })
+            .is_err()
+        || existing != object
+    {
+        return Err(fail(
+            "An existing Git preview object has different contents",
+        ));
+    }
+    Ok(true)
+}
+
+/// Older Git accepts commits rather than raw trees as the sides of merge-tree. Wrap
+/// the intermediate tree in an unreferenced commit; no ref, index or working file changes.
+/// Writing its canonical loose object avoids a commit-tree process for every replay step.
+fn preview_commit(directory: &Path, tree: &str, hash_len: usize) -> Result<String> {
+    use sha1::Digest;
+    if !matches!(hash_len, 40 | 64)
+        || tree.len() != hash_len
+        || !tree.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(fail("Git returned an invalid tree for the conflict check"));
+    }
+    let payload = format!(
+        "tree {}\nauthor Gall <preview@gall.invalid> 0 +0000\ncommitter Gall <preview@gall.invalid> 0 +0000\n\nConflict preview\n",
+        tree.to_ascii_lowercase()
+    );
+    let mut object = format!("commit {}\0", payload.len()).into_bytes();
+    object.extend_from_slice(payload.as_bytes());
+    let id = if hash_len == 40 {
+        sha1::Sha1::digest(&object)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    } else {
+        sha2::Sha256::digest(&object)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    let fanout = directory.join(&id[..2]);
+    let target = fanout.join(&id[2..]);
+    if existing_preview_commit(&target, &object)? {
+        return Ok(id);
+    }
+    #[cfg(unix)]
+    let object_permissions = {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let mode = directory
+            .metadata()
+            .map_err(io_context("Cannot read Git object permissions"))?
+            .permissions()
+            .mode();
+        // Shared Git object stores use setgid directories. Inherit that mode even when
+        // the process umask is more restrictive, but never relax an existing directory.
+        match std::fs::DirBuilder::new()
+            .mode(mode & 0o2777)
+            .create(&fanout)
+        {
+            Ok(()) => {
+                std::fs::set_permissions(&fanout, std::fs::Permissions::from_mode(mode & 0o2777))
+                    .map_err(io_context("Cannot set Git object directory permissions"))?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(fail(format!("Cannot create Git preview objects: {error}"))),
+        }
+        // A user who can traverse the object store must be able to read its objects.
+        // Loose objects remain read-only; Windows keeps the inherited directory ACL.
+        std::fs::Permissions::from_mode((mode & 0o111) << 2)
+    };
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(&fanout).map_err(io_context("Cannot create Git preview objects"))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(&fanout)
+        .map_err(io_context("Cannot create a Git preview object"))?;
+    {
+        let mut compressed = flate2::write::ZlibEncoder::new(
+            temporary.as_file_mut(),
+            flate2::Compression::default(),
+        );
+        compressed
+            .write_all(&object)
+            .map_err(io_context("Cannot write a Git preview object"))?;
+        compressed
+            .finish()
+            .map_err(io_context("Cannot finish a Git preview object"))?;
+    }
+    #[cfg(unix)]
+    temporary
+        .as_file()
+        .set_permissions(object_permissions)
+        .map_err(io_context("Cannot set Git preview object permissions"))?;
+    // No user reference reaches these disposable objects. Atomic publication is enough;
+    // forcing every intermediate tree to disk would add round trips over a WSL share.
+    match temporary.persist_noclobber(&target) {
+        Ok(_) => {}
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Another preview may have written the same immutable object. Reuse only an
+            // identical regular object; never replace corrupt or conflicting data.
+            if !existing_preview_commit(&target, &object)? {
+                return Err(fail("The Git preview object disappeared while being saved"));
+            }
+        }
+        Err(error) => {
+            return Err(fail(format!(
+                "Cannot save a Git preview object: {}",
+                error.error
+            )))
+        }
+    }
+    Ok(id)
+}
+
+fn replay_serial(root: &Path, base: &str, ids: &[String]) -> Result<Vec<ConflictPrediction>> {
+    let mut current = base.to_owned();
+    let mut found = Vec::new();
+    let mut objects = None;
+    for (index, id) in ids.iter().enumerate() {
+        let (tree, conflict) = merge_trees(root, &format!("{id}^1"), &current, id)?;
+        if let Some(files) = conflict {
+            found.push(ConflictPrediction {
+                id: id.clone(),
+                files,
+            });
+        }
+        if index + 1 < ids.len() {
+            if objects.is_none() {
+                objects = Some(preview_object_directory(root)?);
+            }
+            if let Some(directory) = &objects {
+                current = preview_commit(directory, &tree, base.len())?;
+            }
+        }
+    }
+    Ok(found)
+}
+
 /// Replays the entries in memory, in order, and reports every commit that would stop the rebase
-/// with a conflict. Nothing in the working tree, index or any reference changes; Git only writes
-/// unreferenced tree objects. Pick, reword, edit, squash and fixup all apply their changes to the
+/// with a conflict. Nothing in the working tree, index or any reference changes; only
+/// unreferenced tree and preview commit objects are written. Pick, reword, edit, squash and fixup all apply their changes to the
 /// result so far, so they are checked alike; a dropped commit is skipped. After a conflict the
 /// replay continues from the conflicted tree, so later reports assume the conflict gets resolved
 /// without changing the commit's own side. Needs Git 2.40 or newer (`merge-tree --write-tree --merge-base`).
@@ -347,19 +553,7 @@ pub fn predict_conflicts(
     if let Some(found) = streamed {
         return Ok(found);
     }
-    let mut current = base;
-    let mut found = Vec::new();
-    for id in &ids {
-        let (tree, conflict) = merge_trees(&root, &format!("{id}^1"), &current, id)?;
-        if let Some(files) = conflict {
-            found.push(ConflictPrediction {
-                id: id.clone(),
-                files,
-            });
-        }
-        current = tree;
-    }
-    Ok(found)
+    replay_serial(&root, &base, &ids)
 }
 fn validate_entries(plan: &RewritePlan, entries: &[RewriteEntry]) -> Result<()> {
     let expected: BTreeSet<_> = plan.commits.iter().map(|c| c.id.as_str()).collect();
@@ -1259,6 +1453,32 @@ pub fn is_edit_stop(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn streamed_replay_requires_a_version_with_tree_inputs_and_incremental_replies() {
+        for version in [
+            "git version 2.49.0",
+            "git version 2.49.1.windows.1\n",
+            "git version 2.56.1",
+            "git version 2.50.0 (Apple Git-200)",
+            "git version 3.0.0",
+        ] {
+            assert!(git_supports_streamed_replay(version), "{version}");
+        }
+        for version in [
+            "git version 2.40.0",
+            "git version 2.43.0",
+            "git version 2.48.9",
+            "git version 2.49",
+            "git version 2.49.bad",
+            "git version 2.49.0-rc0",
+            "git version unknown",
+            "2.56.1",
+            "",
+        ] {
+            assert!(!git_supports_streamed_replay(version), "{version}");
+        }
+    }
+
     fn repository() -> tempfile::TempDir {
         let temp = tempfile::Builder::new()
             .prefix("gall-rewrite ' $ test-")
@@ -1268,6 +1488,7 @@ mod tests {
         git(path, &["init", "-q"]).unwrap();
         git(path, &["config", "user.name", "Test"]).unwrap();
         git(path, &["config", "user.email", "test@example.com"]).unwrap();
+        git(path, &["config", "core.autocrlf", "false"]).unwrap();
         commit(path, "base", "base.txt");
         temp
     }
@@ -1356,6 +1577,164 @@ mod tests {
         assert!(!path.join(".git/rebase-merge").exists());
     }
     #[test]
+    #[cfg(unix)]
+    fn preview_objects_preserve_shared_store_access_and_existing_directory_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        for (mode, readable) in [(0o700, 0o400), (0o2770, 0o440), (0o2775, 0o444)] {
+            let temp = tempfile::tempdir().unwrap();
+            let objects = temp.path().join("objects");
+            std::fs::create_dir(&objects).unwrap();
+            std::fs::set_permissions(&objects, std::fs::Permissions::from_mode(mode)).unwrap();
+            let tree = "1".repeat(40);
+            let id = preview_commit(&objects, &tree, 40).unwrap();
+            let fanout = objects.join(&id[..2]);
+            let object = fanout.join(&id[2..]);
+            assert_eq!(
+                fanout.metadata().unwrap().permissions().mode() & 0o2777,
+                mode
+            );
+            assert_eq!(
+                object.metadata().unwrap().permissions().mode() & 0o777,
+                readable
+            );
+            // Existing fanout restrictions belong to the repository: writing another
+            // preview must not relax them, even in a more permissive shared store.
+            std::fs::remove_file(&object).unwrap();
+            std::fs::set_permissions(&fanout, std::fs::Permissions::from_mode(0o2700)).unwrap();
+            assert_eq!(preview_commit(&objects, &tree, 40).unwrap(), id);
+            assert_eq!(
+                fanout.metadata().unwrap().permissions().mode() & 0o2777,
+                0o2700
+            );
+            assert_eq!(
+                objects.metadata().unwrap().permissions().mode() & 0o2777,
+                mode
+            );
+        }
+    }
+
+    #[test]
+    fn preview_commits_are_valid_sha1_and_sha256_objects_and_never_overwrite_existing_data() {
+        for format in ["sha1", "sha256"] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path();
+            if let Err(error) = git(path, &["init", "-q", &format!("--object-format={format}")]) {
+                if format == "sha256"
+                    && (error.to_string().contains("unknown option")
+                        || error.to_string().contains("not supported"))
+                {
+                    eprintln!("Git does not support SHA-256 repositories: skipped");
+                    continue;
+                }
+                panic!("Cannot initialize {format} repository: {error}");
+            }
+            git(path, &["config", "user.name", "Test"]).unwrap();
+            git(path, &["config", "user.email", "test@example.com"]).unwrap();
+            git(path, &["config", "core.autocrlf", "false"]).unwrap();
+            let head = commit(path, "base", "base.txt");
+            let tree = git(path, &["rev-parse", "HEAD^{tree}"])
+                .unwrap()
+                .trim()
+                .to_owned();
+            let directory = preview_object_directory(path).unwrap();
+            let wrapped = preview_commit(&directory, &tree, head.len()).unwrap();
+            assert_eq!(
+                git(path, &["cat-file", "-t", &wrapped]).unwrap().trim(),
+                "commit"
+            );
+            assert_eq!(
+                git(path, &["rev-parse", &format!("{wrapped}^{{tree}}")])
+                    .unwrap()
+                    .trim(),
+                tree
+            );
+            // Exercise successive compatibility merges with both object formats, not
+            // just acceptance of the standalone wrapper by cat-file.
+            let a = commit(path, "a", "shared.txt");
+            let b = commit(path, "b", "shared.txt");
+            let refs = git(path, &["show-ref"]).unwrap();
+            let index_path = git_dir(path).unwrap().join("index");
+            let index = std::fs::read(&index_path).unwrap();
+            assert!(replay_serial(path, &head, &[a.clone(), b.clone()])
+                .unwrap()
+                .is_empty());
+            let conflicts = replay_serial(path, &head, &[b.clone(), a.clone()]).unwrap();
+            assert_eq!(
+                conflicts.iter().map(|entry| &entry.id).collect::<Vec<_>>(),
+                [&b, &a]
+            );
+            assert_eq!(git(path, &["show-ref"]).unwrap(), refs);
+            assert_eq!(std::fs::read(index_path).unwrap(), index);
+            assert_eq!(std::fs::read(path.join("shared.txt")).unwrap(), b"b\n");
+            let object = directory.join(&wrapped[..2]).join(&wrapped[2..]);
+            let original = std::fs::read(&object).unwrap();
+            let written = object.metadata().unwrap().modified().unwrap();
+            assert_eq!(
+                preview_commit(&directory, &tree, head.len()).unwrap(),
+                wrapped
+            );
+            assert_eq!(std::fs::read(&object).unwrap(), original);
+            assert_eq!(object.metadata().unwrap().modified().unwrap(), written);
+            // A hash-shaped pathname alone is not proof that an existing object is valid.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&object, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            std::fs::write(&object, b"preserve conflicting data").unwrap();
+            assert!(preview_commit(&directory, &tree, head.len()).is_err());
+            assert_eq!(
+                std::fs::read(&object).unwrap(),
+                b"preserve conflicting data"
+            );
+            assert!(preview_commit(&directory, "not a tree", head.len()).is_err());
+            assert!(preview_commit(&directory, &tree, 12).is_err());
+        }
+    }
+
+    #[test]
+    fn compatible_replay_preserves_refs_index_and_working_files_for_clean_and_conflicting_plans() {
+        let temp = repository();
+        let path = temp.path();
+        let base = git(path, &["rev-parse", "HEAD"]).unwrap().trim().to_owned();
+        let a = commit(path, "a", "shared.txt");
+        let b = commit(path, "b", "shared.txt");
+        let c = commit(path, "c", "independent.txt");
+        std::fs::write(path.join("shared.txt"), "unsaved working content\n").unwrap();
+        std::fs::write(path.join("untracked.txt"), "untracked content\n").unwrap();
+        let refs = git(path, &["show-ref"]).unwrap();
+        let head = git(path, &["rev-parse", "HEAD"]).unwrap();
+        let index_path = git_dir(path).unwrap().join("index");
+        let index = std::fs::read(&index_path).unwrap();
+        let status = git(path, &["status", "--porcelain"]).unwrap();
+        assert!(
+            replay_serial(path, &base, &[a.clone(), b.clone(), c.clone()])
+                .unwrap()
+                .is_empty()
+        );
+        let conflicts = replay_serial(path, &base, &[b.clone(), a.clone(), c.clone()]).unwrap();
+        assert_eq!(
+            conflicts.iter().map(|entry| &entry.id).collect::<Vec<_>>(),
+            [&b, &a]
+        );
+        assert_eq!(conflicts[0].files, ["shared.txt"]);
+        assert!(replay_serial(path, &base, &[c, a, b]).unwrap().is_empty());
+        assert_eq!(git(path, &["show-ref"]).unwrap(), refs);
+        assert_eq!(git(path, &["rev-parse", "HEAD"]).unwrap(), head);
+        assert_eq!(git(path, &["status", "--porcelain"]).unwrap(), status);
+        assert_eq!(std::fs::read(index_path).unwrap(), index);
+        assert_eq!(
+            std::fs::read(path.join("shared.txt")).unwrap(),
+            b"unsaved working content\n"
+        );
+        assert_eq!(
+            std::fs::read(path.join("untracked.txt")).unwrap(),
+            b"untracked content\n"
+        );
+        assert!(!path.join(".git/rebase-merge").exists());
+    }
+
+    #[test]
     fn the_replay_in_one_process_matches_one_merge_per_commit() {
         let temp = repository();
         let path = temp.path();
@@ -1365,18 +1744,15 @@ mod tests {
         let b = commit(path, "b", "shared.txt");
         let c = commit(path, "c", "other file.txt");
         let d = commit(path, "d", "shared.txt");
-        // The replay as `predict_conflicts` did it before: one `merge-tree` per commit.
+        // The compatibility path uses one merge-tree per commit and unreferenced commit
+        // wrappers, so it also works with Git versions that reject raw tree inputs.
         let serial = |ids: &[&String]| {
-            let mut current = base.clone();
-            let mut found = Vec::new();
-            for id in ids {
-                let (tree, conflict) = merge_trees(path, &format!("{id}^1"), &current, id).unwrap();
-                if let Some(files) = conflict {
-                    found.push((id.to_string(), files));
-                }
-                current = tree;
-            }
-            found
+            let ids = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+            replay_serial(path, &base, &ids)
+                .unwrap()
+                .into_iter()
+                .map(|entry| (entry.id, entry.files))
+                .collect::<Vec<_>>()
         };
         for order in [
             vec![&a, &b, &c, &d],
@@ -1385,12 +1761,25 @@ mod tests {
             vec![&c],
         ] {
             let ids: Vec<String> = order.iter().map(|id| id.to_string()).collect();
-            let streamed = replay_streamed(path, &base, &ids)
-                .expect("the replay runs in one process")
-                .into_iter()
-                .map(|found| (found.id, found.files))
-                .collect::<Vec<_>>();
-            assert_eq!(streamed, serial(&order), "{order:?}");
+            let compatible = serial(&order);
+            if let Some(streamed) = replay_streamed(path, &base, &ids) {
+                let streamed = streamed
+                    .into_iter()
+                    .map(|entry| (entry.id, entry.files))
+                    .collect::<Vec<_>>();
+                assert_eq!(streamed, compatible, "{order:?}");
+            } else {
+                let entries = ids
+                    .iter()
+                    .map(|id| entry(id, RewriteAction::Pick, ""))
+                    .collect::<Vec<_>>();
+                let predicted = predict_conflicts(path, &base, &entries)
+                    .unwrap()
+                    .into_iter()
+                    .map(|entry| (entry.id, entry.files))
+                    .collect::<Vec<_>>();
+                assert_eq!(predicted, compatible, "{order:?}");
+            }
         }
         assert!(
             !serial(&[&b, &a]).is_empty(),

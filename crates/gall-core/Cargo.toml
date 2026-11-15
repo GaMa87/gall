@@ -42,6 +42,11 @@ calamine = "0.38.0"
 csv = "1.4.0"
 tar = "0.4.46"
 flate2 = "1.1.10"
+# Already transitive dependencies; conflict previews write atomic, unreferenced Git
+# commit objects for Git versions that cannot merge intermediate trees directly.
+sha1 = "0.11.0"
+sha2 = "0.11.1"
+tempfile = "3"
 lzma-rust2 = "0.23"
 sevenz-rust2 = { version = "0.24.2", default-features = false, features = ["aes256", "compress", "util", "deflate", "ppmd"] }
 ruzstd = "0.9.1"
@@ -61,6 +66,3 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = ["s
 winreg = "0.56"
 dunce = "1.0.5"
 windows = { version = "0.62.2", features = ["Win32_System_Com", "Win32_UI_Shell", "Win32_Storage_FileSystem"] }
-
-[dev-dependencies]
-tempfile = "3"

@@ -1659,6 +1659,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sevenz-rust2",
+ "sha1",
+ "sha2 0.11.1",
  "similar",
  "syntect",
  "sysinfo",

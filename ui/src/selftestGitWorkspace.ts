@@ -183,6 +183,9 @@ export async function runGitWorkspaceSelfTest(h: typeof import("./selftest").git
     log(reworded.message.includes("\n\nMessage body preserved."), "direct reword preserves multiline commit body");
     click(history("add beta")!); await selectedKey("i");
     log(!!await until(() => $$(".grw-entry").length === 3), "interactive planner includes selected commit through HEAD");
+    log(!!await until(() => $(".grw-summary .grw-chip.clean"), 8000), "actual rebase planner finishes conflict prediction for multiple commits");
+    log((await repo()).head === renamedHead && !(await repo()).operation, "conflict preview leaves HEAD and operation state unchanged");
+    await shot("workspace-rebase-prediction-clean");
     const oldest = () => $$(".grw-entry").at(-1);
     log($$(".grw-entry")[0]?.textContent?.includes("add beta") === false && !!oldest()?.textContent?.includes("add beta"), "interactive planner lists newest commit first, like the graph");
     click($<HTMLButtonElement>("button[aria-label='Move add beta up']", oldest())!);
@@ -198,6 +201,7 @@ export async function runGitWorkspaceSelfTest(h: typeof import("./selftest").git
     const beta = $$(".grw-entry").find((r) => r.textContent?.includes("add beta"))!;
     const betaAction = $("select", beta) as HTMLSelectElement; betaAction.value = "reword"; betaAction.dispatchEvent(new Event("change", { bubbles: true }));
     await sleep(80); typeInto($("textarea", beta) as HTMLTextAreaElement, "combine beta and gamma"); await sleep(80);
+    log(!!await until(() => $(".grw-summary .grw-chip.clean"), 8000), "conflict prediction finishes after reordering and changing commit actions");
     await shot("workspace-interactive-rebase");
     await press("Start rebase…", $(".git-rebase")!); await dialog("Start interactive rebase");
     log(!!await until(() => history("combine beta and gamma"), 12000), "interactive reword and fixup execute through actual native helper");

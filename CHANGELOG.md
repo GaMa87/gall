@@ -4,6 +4,8 @@
 
 ## 0.2.2 — 2026-11-15
 
+- Fixed: interactive rebase conflict prediction works with Git 2.40–2.48, including Ubuntu 24.04 in WSL. Intermediate results are stored as unreferenced commit objects without changing branches, the index or working files.
+
 - Fixed: move preflight correctly classifies missing sources and non-directory destinations on Windows.
 
 - Fixed: Worktrees shows a submodule’s actual working folder instead of its Git metadata directory, including when viewed from a linked worktree. Repositories with a separate Git directory also show the correct folder when opened directly.

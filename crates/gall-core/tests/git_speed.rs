@@ -484,6 +484,21 @@ type View<'a> = (&'static str, u64, Box<dyn Fn() -> Sample + 'a>);
 /// that commit changed and `base` the tenth ancestor of the linked worktree's branch.
 fn views<'a>(place: &'a Place, head: &'a str, in_head: &'a str, base: &'a str) -> Vec<View<'a>> {
     let root: &'a Path = &place.dir;
+    // Older native Git cannot merge an intermediate tree directly and uses the same
+    // commit-wrapper fallback as WSL. This setup query is outside measured calls.
+    let legacy_tree_inputs = if place.wsl.is_none() {
+        let version = place.git("", &["version"], &[], b"");
+        let mut parts = version.split_whitespace().nth(2).unwrap_or("").split('.');
+        match (
+            parts.next().and_then(|v| v.parse::<u32>().ok()),
+            parts.next().and_then(|v| v.parse::<u32>().ok()),
+        ) {
+            (Some(major), Some(minor)) => (major, minor) < (2, 49),
+            _ => false,
+        }
+    } else {
+        false
+    };
     let plain = "src/mod001/sub1/file000001.rs";
     let edited = "src/mod102/sub4/file000102.rs";
     let all = listing::ListOptions {
@@ -739,12 +754,18 @@ fn views<'a>(place: &'a Place, head: &'a str, in_head: &'a str, base: &'a str) -
         ),
         (
             "interactive rebase: conflict check of 10 commits",
-            // One `merge-tree --stdin` for the plan; in WSL one per commit.
-            n(2, 11, 0),
+            // Modern native Git streams the plan. The fallback uses one merge per
+            // commit plus one object-directory query for safe unreferenced wrappers.
+            // Legacy native Git bypasses buffered streaming and uses the same fallback.
+            if legacy_tree_inputs { 12 } else { n(2, 12, 0) },
             Box::new(move || {
                 let wt = root.join("../wt-feature");
-                let Ok(plan) = gitrewrite::plan(&wt, base) else {
-                    return FAILED;
+                let plan = match gitrewrite::plan(&wt, base) {
+                    Ok(plan) => plan,
+                    Err(error) => {
+                        eprintln!("Conflict-check plan failed at {}: {error}", wt.display());
+                        return FAILED;
+                    }
                 };
                 let entries: Vec<gitrewrite::RewriteEntry> = plan
                     .commits
@@ -755,7 +776,15 @@ fn views<'a>(place: &'a Place, head: &'a str, in_head: &'a str, base: &'a str) -
                         message: String::new(),
                     })
                     .collect();
-                timed(|| gitrewrite::predict_conflicts(&wt, base, &entries).is_ok())
+                timed(
+                    || match gitrewrite::predict_conflicts(&wt, base, &entries) {
+                        Ok(_) => true,
+                        Err(error) => {
+                            eprintln!("Conflict prediction failed at {}: {error}", wt.display());
+                            false
+                        }
+                    },
+                )
             }),
         ),
         // Operations that change the repository. Each one is undone afterwards, outside
