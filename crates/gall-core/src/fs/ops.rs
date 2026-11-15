@@ -1782,14 +1782,21 @@ fn moves_by_rename(sources: &[PathBuf], dest: &Path) -> bool {
     #[cfg(unix)]
     let same_drive = {
         use std::os::unix::fs::MetadataExt;
-        let Ok(drive) = fs::metadata(dest).map(|m| m.dev()) else {
+        let Ok(destination) = fs::metadata(dest) else {
             return false;
         };
+        if !destination.is_dir() {
+            return false;
+        }
+        let drive = destination.dev();
         move |src: &Path| fs::symlink_metadata(src).is_ok_and(|m| m.dev() == drive)
     };
     // The drive letter or the share: what the path begins with.
     #[cfg(not(unix))]
     let same_drive = {
+        if !dest.is_dir() {
+            return false;
+        }
         let root = |p: &Path| match p.components().next() {
             Some(std::path::Component::Prefix(prefix)) => {
                 Some(prefix.as_os_str().to_string_lossy().to_lowercase())
@@ -1797,7 +1804,7 @@ fn moves_by_rename(sources: &[PathBuf], dest: &Path) -> bool {
             _ => None,
         };
         let drive = root(dest);
-        move |src: &Path| drive.is_some() && root(src) == drive
+        move |src: &Path| drive.is_some() && root(src) == drive && fs::symlink_metadata(src).is_ok()
     };
     sources.iter().all(|src| {
         same_drive(src)
@@ -3397,6 +3404,7 @@ mod tests {
         let both = [src.join("tree"), src.join("file.txt")];
         assert!(moves_by_rename(&both, &dst));
         assert!(!moves_by_rename(&both, &t.path().join("missing")));
+        assert!(!moves_by_rename(&both, &src.join("file.txt")));
         assert!(!moves_by_rename(&[src.join("gone.txt")], &dst));
         std::fs::write(dst.join("file.txt"), "there").unwrap();
         assert!(moves_by_rename(&both[..1], &dst));

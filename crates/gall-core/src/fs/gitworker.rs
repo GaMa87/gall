@@ -256,14 +256,23 @@ mod tests {
             writeln!(stdin, "{}", base64(line.as_bytes())).unwrap();
         }
         drop(stdin);
-        let mut text = String::new();
-        child
-            .stdout
-            .take()
-            .unwrap()
-            .read_to_string(&mut text)
-            .unwrap();
-        assert_eq!(text, "3 4 3\nout\nerr0 3 0\na b");
-        let _ = child.wait();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        for (code, stdout, stderr) in [(3, "out\n", "err"), (0, "a b", "")] {
+            let mut header = String::new();
+            output.read_line(&mut header).unwrap();
+            // BSD wc pads its counts; the protocol uses numeric fields, then exact bytes.
+            let fields: Vec<usize> = header
+                .split_whitespace()
+                .map(|field| field.parse().unwrap())
+                .collect();
+            assert_eq!(fields, [code, stdout.len(), stderr.len()]);
+            let mut body = vec![0; stdout.len() + stderr.len()];
+            output.read_exact(&mut body).unwrap();
+            assert_eq!(body, format!("{stdout}{stderr}").as_bytes());
+        }
+        let mut trailing = Vec::new();
+        output.read_to_end(&mut trailing).unwrap();
+        assert!(trailing.is_empty());
+        assert!(child.wait().unwrap().success());
     }
 }

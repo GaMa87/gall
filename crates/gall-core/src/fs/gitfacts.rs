@@ -836,13 +836,15 @@ mod tests {
             return;
         }
         // Not accepted yet (Git may be refusing it and hiding its filters): asked, not kept.
-        assert!(filters(&root).is_empty());
+        // Git for Windows and developer machines may already configure LFS or other
+        // filters globally. Keep that baseline: the cache must preserve it too.
+        let inherited = filters(&root);
         assert!(
             !kept(&root),
             "an answer about an unaccepted repository was kept"
         );
         super::super::gitstatus::accept(&root);
-        assert!(filters(&root).is_empty());
+        assert_eq!(*filters(&root), *inherited);
         assert!(kept(&root));
         // A filter added to the configuration is seen at once, not after the time limit.
         let set = std::process::Command::new("git")
@@ -853,10 +855,9 @@ mod tests {
             .unwrap();
         assert!(set.success());
         let found = filters(&root);
-        assert_eq!(
-            *found,
-            vec![("filter.evil.clean".to_owned(), "touch ran".to_owned())]
-        );
+        let mut expected = (*inherited).clone();
+        expected.push(("filter.evil.clean".to_owned(), "touch ran".to_owned()));
+        assert_eq!(*found, expected);
     }
 
     /// Runs Git in `dir` with a fixed author; the output, or None when it failed.

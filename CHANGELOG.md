@@ -4,6 +4,8 @@
 
 ## 0.2.2 — 2026-11-15
 
+- Fixed: move preflight correctly classifies missing sources and non-directory destinations on Windows.
+
 - Fixed: Worktrees shows a submodule’s actual working folder instead of its Git metadata directory, including when viewed from a linked worktree. Repositories with a separate Git directory also show the correct folder when opened directly.
 
 - Fixed: errors from applying a clipboard patch remain visible after the Git workspace refreshes.
