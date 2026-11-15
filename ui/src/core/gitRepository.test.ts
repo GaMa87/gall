@@ -1,5 +1,5 @@
 import { expect, it } from "vitest";
-import { contextHints, gitActionEnabled, gitCommandForKey, gitCommands, gitContextHint, gitMenuGroup, gitNavigationHint, gitPanelOf, type GitContext } from "./gitRepository";
+import { contextHints, gitActionEnabled, gitCommandForKey, gitCommands, gitContextHint, gitMenuGroup, gitNavigationHint, gitPanelOf, rewritesHistory, stashAtCommit, stashEntryActions, type GitContext } from "./gitRepository";
 it("uses lazygit actions for each focused panel without a prefix", () => {
   expect(gitCommandForKey("files", " ")?.action).toBe("file: ");
   expect(gitCommandForKey("files", "s")?.action).toBe("stashSave");
@@ -20,6 +20,7 @@ it("keeps commit-panel keys identical to lazygit and leaves rebase/merge keys to
   for (const key of ["M", "I"]) expect(gitCommandForKey("history", key)).toBeUndefined();
   // `y` opens the copy-attribute menu on a commit; the Gall-only tools opener is `x` everywhere.
   expect(gitCommandForKey("history", "y")?.action).toBe("copyMenu");
+  expect(gitCommandForKey("history", "a")?.action).toBe("applyPatch");
   expect(gitCommandForKey("branches", "y")?.action).toBe("copyRef");
   for (const context of ["history", "branches", "tags", "stashes", "remotes"] as GitContext[]) expect(gitCommandForKey(context, "x")?.action).toBe("tools");
   expect(gitCommandForKey("branches", "r")?.action).toBe("rebase");
@@ -30,13 +31,23 @@ it("only offers operations applicable to the selected reference and operation", 
   const state = { commit: false, head: true, stash: false, remote: false, conflict: false, branch: true, remotes: 1, operation: null, conflicts: 0 };
   expect(gitActionEnabled("reword", state)).toBe(false);
   expect(gitActionEnabled("renameBranch", { ...state, referenceKind: "tag" })).toBe(false);
-  expect(gitActionEnabled("deleteBranch", { ...state, referenceKind: "remote" })).toBe(false);
+  expect(gitActionEnabled("deleteBranch", { ...state, referenceKind: "remote" })).toBe(true);
+  expect(gitActionEnabled("deleteBranch", { ...state, referenceKind: "tag" })).toBe(false);
   expect(gitActionEnabled("deleteTag", { ...state, referenceKind: "tag" })).toBe(true);
   expect(gitActionEnabled("renameBranch", { ...state, referenceKind: "branch" })).toBe(true);
   expect(gitActionEnabled("stashApply", state)).toBe(false);
   expect(gitActionEnabled("skip", { ...state, operation: "merge" })).toBe(false);
   expect(gitActionEnabled("continue", { ...state, operation: "rebase", conflicts: 1 })).toBe(false);
   expect(gitActionEnabled("continue", { ...state, operation: "rebase", conflicts: 0 })).toBe(true);
+});
+it("finds the stash that a graph row belongs to", () => {
+  const stashes = [{ id: "aaa", selector: "stash@{0}", message: "On Dev: one" }, { id: "bbb", selector: "stash@{1}", message: "On Dev: two" }];
+  expect(stashAtCommit(stashes, "bbb")?.selector).toBe("stash@{1}");
+  expect(stashAtCommit(stashes, "ccc")).toBeUndefined();
+  expect(stashAtCommit(stashes, null)).toBeUndefined();
+  for (const action of ["quick:squash", "quick:fixup", "quick:drop", "quick:moveEarlier", "reword", "revert", "cherryPick", "reset", "rebase", "merge", "interactiveRebase"]) expect(rewritesHistory(action)).toBe(true);
+  for (const action of ["stashDrop", "stashPop", "stashApply", "copyMenu", "createBranch", "createTag", "refresh"]) expect(rewritesHistory(action)).toBe(false);
+  expect(stashEntryActions).toEqual(["stashApply", "stashPop", "stashDrop"]);
 });
 it("shows unambiguous contextual menus and reserves lower-case typing for inputs", () => {
   for (const context of ["history", "files", "branches", "stashes", "remotes", "conflicts", "details"] as GitContext[]) {
@@ -52,7 +63,7 @@ it("footer key hints only advertise keys that really exist in that panel", () =>
   for (const context of Object.keys(contextHints) as GitContext[]) {
     expect(contextHints[context].length).toBeGreaterThan(0);
     // Details keys j/d/v are handled locally by the details panel and are not Git commands.
-    if (context === "details" || context === "tools") continue;
+    if (context === "details" || context === "tools" || context === "worktrees") continue;
     for (const [key] of contextHints[context]) expect(gitCommandForKey(context, key), `${context} ${key}`).toBeDefined();
   }
   expect(gitContextHint("history")).toContain("r reword");
@@ -70,7 +81,7 @@ it("maps every key context to exactly one visible panel", () => {
   expect(gitPanelOf("files")).toBe("changes");
   expect(gitPanelOf("details")).toBe("details");
   expect(gitPanelOf("tools")).toBe("tools");
-  for (const context of ["branches", "tags", "stashes", "remotes", "conflicts"] as GitContext[]) expect(gitPanelOf(context)).toBe("sidebar");
+  for (const context of ["branches", "tags", "stashes", "remotes", "worktrees", "conflicts"] as GitContext[]) expect(gitPanelOf(context)).toBe("sidebar");
 });
 
 it("groups rarely used Git actions into context menu submenus", () => {

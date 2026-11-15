@@ -1,5 +1,6 @@
 // Current Folder Pane (F-01…F-13, V-01, V-02): virtualised list with sorting,
 // quick filter, selection (incl. rubber band), drag & drop and context menus.
+import { maxOf } from "../core/maxOf";
 import { archiveBaseName, archiveInfo, archiveOf, CREATE_FORMATS } from "../core/archive";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { api, fileSrc } from "../api/ipc";
@@ -9,13 +10,13 @@ import { hasNerdFont } from "../core/nerdFont";
 import { quickFilterMatches } from "../core/filter";
 import { focusAfterRemoval } from "../core/focus";
 import { formatDate, formatSize, formatTime, unixMode, windowsMode } from "../core/format";
-import { buildKeymap, primaryMod, typedChar, type Action } from "../core/keymap";
+import { buildKeymap, IS_MAC, primaryMod, typedChar, type Action } from "../core/keymap";
 import { basename, parent, splitExt } from "../core/path";
 import { sortEntries, type SortSpec } from "../core/sort";
 import * as A from "../state/actions";
 import { controller, registerController } from "../state/controllers";
 import { draggedPaths, draggedSingle, dropInto, hintNoop, isFileDrag, onDragOverCompare, onDragOverTarget, startDrag } from "../state/dnd";
-import { bumpNonce, useDirList, useGitStatus, useNonce, usePrefs, useSearchHidden, useSize, useTags } from "../state/hooks";
+import { bumpNonce, useDirList, useGitStatus, useGitUntrusted, useNonce, usePrefs, useSearchHidden, useSize, useTags } from "../state/hooks";
 import { getState, setState, useStore, type MenuItem } from "../state/store";
 import { useKeyLabels } from "../state/keyLabels";
 import { FileIcon, Icon, TAG_COLORS } from "./Icon";
@@ -92,6 +93,7 @@ export function FolderPane({ b, path, active, compact }: Props) {
   const isShortcut = (chord: string) => keymap.has(chord);
   // Git status badges and the branch (Settings › Files › Git status).
   const git = useGitStatus(path, settings.showGitStatus);
+  const gitRefused = useGitUntrusted(path, settings.showGitStatus, !!git);
   // Items a .gallignore hides from search are dimmed (Hide from search / Show in search again).
   const searchHidden = useSearchHidden(path);
   // Git work tree of this folder (enables "Compare with Git HEAD").
@@ -233,6 +235,20 @@ export function FolderPane({ b, path, active, compact }: Props) {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [indexOf]);
+
+  // A freshly entered folder starts with its first item selected, so the cursor is
+  // visible and Enter / arrows work at once (once per folder: later clicks on empty
+  // space may still clear the selection).
+  const autoSelected = useRef<string | null>(null);
+  useEffect(() => {
+    if (autoSelected.current !== path) autoSelected.current = null;
+    if (autoSelected.current || dir.loading || !visible.length || pendingSelect.current) return;
+    autoSelected.current = path;
+    setFocus(visible[0].path);
+    setSel(new Set([visible[0].path]));
+    setAnchor(visible[0].path);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [path, dir.loading, visible]);
 
   // Drop selection entries that vanished.
   useEffect(() => {
@@ -959,7 +975,7 @@ export function FolderPane({ b, path, active, compact }: Props) {
     meta: !longNames && chars > 76,
   };
   // Owner column (Linux / macOS "Mode" view): as wide as the longest owner here, 4–12 characters.
-  const ownerW = useMemo(() => `${Math.min(12, Math.max(4, ...dir.entries.map((e) => e.owner?.length ?? 0))) + 1.2}ch`, [dir.entries]);
+  const ownerW = useMemo(() => `${Math.min(12, maxOf(dir.entries, (e) => e.owner?.length ?? 0, 4)) + 1.2}ch`, [dir.entries]);
     const scrollbarW = listRef.current ? listRef.current.offsetWidth - listRef.current.clientWidth : 0;
 
   const background = useMemo(() => {
@@ -976,7 +992,7 @@ export function FolderPane({ b, path, active, compact }: Props) {
     const selected = sel.has(entry.path);
     const focused = focus === entry.path;
     const tag = tags.get(entry.path);
-    const gs = git ? git.all ?? git.entries[entry.name] : undefined;
+    const gs = git ? git.all ?? git.entries[IS_MAC ? entry.name.normalize("NFC") : entry.name] : undefined;
     const cls = [
       isGrid ? "grid-cell" : "row",
       selected && "selected",
@@ -1313,6 +1329,11 @@ export function FolderPane({ b, path, active, compact }: Props) {
         {git && (
           <button className="mod git" onClick={() => A.openOverlay({ type: "gitGraph", path: git.root })} title={`Git: ${git.branch ? `branch ${git.branch}` : "detached HEAD"}${git.ahead ? `, ${git.ahead} to push` : ""}${git.behind ? `, ${git.behind} to pull` : ""}${git.containingBranches?.length ? `, contained in ${git.containingBranches.join(", ")}` : ""}${git.subject ? ` · ${git.subject}` : ""} · ${git.root}`}>
             <Glyph nf={"\u{E0A0}"} icon="code" />{git.branch ?? (git.containingBranches?.length ? git.containingBranches.join(", ") : "detached")}{git.subject ? ` · ${git.subject}` : ""}{git.ahead ? ` ↑${git.ahead}` : ""}{git.behind ? ` ↓${git.behind}` : ""}
+          </button>
+        )}
+        {!git && gitRefused && (
+          <button className="mod git refused" onClick={() => void A.trustGitFolder(path)} title={`Git refuses this repository (owned by another user): ${gitRefused}. Click to trust it${settings.vimKeys ? ", or press gr" : ""}.`}>
+            <Glyph nf={"\u{E0A0}"} icon="code" />Git blocked
           </button>
         )}
         {sel.size > 0 && <span className="mod accent"><Glyph nf={"\u{F14A}"} icon="check" />{sel.size}{selBytes ? ` · ${formatSize(selBytes)}` : ""}</span>}

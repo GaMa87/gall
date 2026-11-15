@@ -7,6 +7,7 @@ import { join } from "../core/path";
 import { issueLink, reportBodyPreview, reproduction } from "../core/bugReport";
 import { flattenScreenshot, validateMedia, type ReportMedia } from "../core/reportMedia";
 import { beginReportDraft, completeReportDraft, getReportDraft, subscribeReportDraft, updateReportDraft } from "../core/reportDraft";
+import { takeUpdatedVersion } from "../state/updates";
 import { Icon } from "./Icon";
 import { ReportImageEditor, useBlobUrl } from "./ReportImageEditor";
 import { startReportCapture } from "./ReportCapture";
@@ -132,7 +133,7 @@ export function BugReport({ previous = false, resume = false }: { previous?: boo
         <div className="report-brand"><Icon name="activity" size={22} /></div>
         <div><span className="report-eyebrow">MAKE GALL BETTER</span><h2 id="bug-report-title" tabIndex={-1} ref={heading}>{exporting ? exporting === "report" ? "Save your report" : "Save attachment" : editing ? "A picture makes it clear" : review ? "Ready when you are" : "Something not quite right?"}</h2>
           <p id="bug-report-subtitle">{review ? "One last look. You're in control of what you share." : "A few words or a quick capture can make a big difference."}</p></div>
-        <button className="report-close" aria-label="Close bug report" disabled={busy} onClick={close}><Icon name="close" size={20} /></button>
+        <button className="report-close" aria-label="Close bug report" title="Close" disabled={busy} onClick={close}><Icon name="close" size={20} /></button>
       </header>
       <div className="report-scroll">
         {previous && <div className="report-notice"><Icon name="history" /><p>Diagnostics from the previous improperly closed session are included. This does not necessarily mean Gall crashed.</p></div>}
@@ -226,6 +227,6 @@ export function BugReport({ previous = false, resume = false }: { previous?: boo
 }
 
 export function PreviousBugReport() {
-  useEffect(() => { let active = true; api.bugReportStatus().then((available) => { if (active && available) { void api.bugReportDismiss().catch(() => {}); A.notify("Gall's previous session did not close normally.", "warn", { label: "Report a bug", run: () => A.openOverlay({ type: "bugReport", previous: true }) }); } }).catch(() => {}); return () => { active = false; }; }, []);
+  useEffect(() => { let active = true; const updated = takeUpdatedVersion(); api.bugReportStatus().then((available) => { if (updated !== null) { void api.bugReportDismiss().catch(() => {}); A.notify(updated ? `Update successful: Gall ${updated} is now installed.` : "Update successful.", "info"); } else if (active && available) { void api.bugReportDismiss().catch(() => {}); A.notify("Gall's previous session did not close normally.", "warn", { label: "Report a bug", run: () => A.openOverlay({ type: "bugReport", previous: true }) }); } }).catch(() => {}); return () => { active = false; }; }, []);
   return null;
 }

@@ -5,13 +5,33 @@ use std::sync::{Mutex, OnceLock};
 use tauri::Manager;
 static DIAGNOSTICS: OnceLock<Mutex<Diagnostics>> = OnceLock::new();
 
-fn installation(dirs: &gall_core::util::appdirs::AppDirs) -> &'static str {
+/// How Gall was installed, as far as it is known without asking anything: None when a
+/// package manager has to be asked (`packaged`).
+fn installation(dirs: &gall_core::util::appdirs::AppDirs) -> Option<&'static str> {
     if dirs.portable {
-        return "portable";
+        return Some("portable");
     }
     if std::env::var_os("APPIMAGE").is_some() {
-        return "AppImage";
+        return Some("AppImage");
     }
+    if cfg!(target_os = "linux") {
+        return None;
+    }
+    Some(unpackaged())
+}
+
+fn unpackaged() -> &'static str {
+    if cfg!(debug_assertions) {
+        "local (debug)"
+    } else {
+        "installed/local"
+    }
+}
+
+/// Asks the package managers which of them owns the program. Each is a process that
+/// reads its database (tens of milliseconds, seconds on a cold disk), so this runs
+/// beside the start, not in it.
+fn packaged() -> &'static str {
     #[cfg(target_os = "linux")]
     if let Ok(exe) = std::env::current_exe() {
         for (command, query, kind) in [("dpkg-query", "-S", "deb"), ("rpm", "-qf", "rpm")] {
@@ -27,11 +47,7 @@ fn installation(dirs: &gall_core::util::appdirs::AppDirs) -> &'static str {
             }
         }
     }
-    if cfg!(debug_assertions) {
-        "local (debug)"
-    } else {
-        "installed/local"
-    }
+    unpackaged()
 }
 
 fn identity(
@@ -47,7 +63,10 @@ fn identity(
         ),
         ("os", std::env::consts::OS.into()),
         ("arch", std::env::consts::ARCH.into()),
-        ("installation", installation(dirs).into()),
+        (
+            "installation",
+            installation(dirs).unwrap_or("not known yet").into(),
+        ),
         (
             "desktop",
             sanitize(&format!(
@@ -78,6 +97,32 @@ pub fn init(dirs: &gall_core::util::appdirs::AppDirs) {
         ),
         identity(dirs),
     )));
+    if installation(dirs).is_none() {
+        std::thread::spawn(|| {
+            let kind = packaged();
+            if let Some(d) = DIAGNOSTICS.get() {
+                d.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .set_identity("installation", kind);
+            }
+        });
+    }
+    // Ordinary events (one per UI command) stay in memory; this thread writes them out.
+    // A crash loses at most the last two seconds of them: errors and panics are written
+    // at once and a normal exit writes everything (`clean`). The file is written after the
+    // lock is released, so recording never waits for the disk.
+    let _ = std::thread::Builder::new()
+        .name("diagnostics-flush".into())
+        .spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let pending = DIAGNOSTICS
+                .get()
+                .map(|d| d.lock().unwrap_or_else(|e| e.into_inner()))
+                .and_then(|mut d| d.pending());
+            if let Some(pending) = pending {
+                pending.write();
+            }
+        });
     let old = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let location = info
@@ -94,7 +139,16 @@ pub fn init(dirs: &gall_core::util::appdirs::AppDirs) {
 }
 pub fn record(kind: &str, message: &str) {
     if let Some(lock) = DIAGNOSTICS.get() {
-        if let Ok(mut d) = lock.try_lock() {
+        // A panic may come from a thread that holds the lock: never wait there. Everything
+        // else waits (the lock is held for microseconds), so no event is dropped because the
+        // flush thread happened to be reading the session.
+        let guard = if kind == "panic" {
+            lock.try_lock().ok()
+        } else {
+            // A panic elsewhere must not silence the record for good.
+            Some(lock.lock().unwrap_or_else(|e| e.into_inner()))
+        };
+        if let Some(mut d) = guard {
             // Keep successful actions categorical; only the latest error needs a short message.
             let safe = if kind == "command" || kind == "action" {
                 message
@@ -171,6 +225,14 @@ pub fn clean() {
         }
     }
 }
+/// Undoes [`clean`] when the process was not actually left (a failed update install).
+pub fn reopen() {
+    if let Some(d) = DIAGNOSTICS.get() {
+        if let Ok(mut d) = d.lock() {
+            d.reopen();
+        }
+    }
+}
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
@@ -197,6 +259,14 @@ pub struct Report {
 #[tauri::command]
 pub fn bug_report_record(kind: String, message: String) {
     record(&kind, &message);
+}
+/// Several `(kind, message)` records in one call: the UI notes every command it runs,
+/// and one message per note doubled the traffic between the UI and the backend.
+#[tauri::command]
+pub fn bug_report_record_many(entries: Vec<(String, String)>) {
+    for (kind, message) in &entries {
+        record(kind, message);
+    }
 }
 #[tauri::command]
 pub fn bug_report_status() -> bool {

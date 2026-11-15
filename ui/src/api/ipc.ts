@@ -5,16 +5,39 @@ import { invoke as rawInvoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type * as T from "./types";
 
+// Notes for a bug report are collected and sent together: one message per note doubled
+// the traffic with the backend (a navigation runs about ten commands). They go out
+// shortly after the last one, at once after a failure, and when the window is hidden.
+const NOTE_DELAY_MS = 400;
+let notes: [string, string][] = [];
+let noteTimer: ReturnType<typeof setTimeout> | undefined;
+function flushNotes() {
+  if (noteTimer !== undefined) clearTimeout(noteTimer);
+  noteTimer = undefined;
+  if (!notes.length) return;
+  const entries = notes;
+  notes = [];
+  void rawInvoke("bug_report_record_many", { entries }).catch(() => {});
+}
+function note(kind: string, message: string, now = false) {
+  notes.push([kind, message]);
+  if (now || notes.length >= 100) flushNotes();
+  else if (noteTimer === undefined) noteTimer = setTimeout(flushNotes, NOTE_DELAY_MS);
+}
+if (typeof window !== "undefined") window.addEventListener("pagehide", flushNotes);
+
 // Never record arguments or successful results; error messages are sanitized by the backend.
 function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   const start = performance.now();
   const record = !command.startsWith("bug_report_") && !command.startsWith("selftest_") && command !== "ui_log";
+  // A report is built from what the backend has: everything noted so far goes first.
+  if (command.startsWith("bug_report_")) flushNotes();
   return rawInvoke<T>(command, args).then((value) => {
-    if (record) void rawInvoke("bug_report_record", { kind: "command", message: `${command} ok ${Math.round(performance.now() - start)}ms` }).catch(() => {});
+    if (record) note("command", `${command} ok ${Math.round(performance.now() - start)}ms`);
     return value;
   }, (error) => {
-    if (record) void rawInvoke("bug_report_record", { kind: "command", message: `${command} failed ${Math.round(performance.now() - start)}ms` }).catch(() => {});
-    if (record) void rawInvoke("bug_report_record", { kind: "error", message: `${command} failed: ${String(error).slice(0, 1000)}` }).catch(() => {});
+    if (record) note("command", `${command} failed ${Math.round(performance.now() - start)}ms`);
+    if (record) note("error", `${command} failed: ${String(error).slice(0, 1000)}`, true);
     throw error;
   });
 }
@@ -41,6 +64,8 @@ export const api = {
   systemStats: () => invoke<T.SysStats>("system_stats"),
   diffCompare: (a: T.DiffSource, b: T.DiffSource, opts: T.DiffOptions) => invoke<T.DiffResult>("diff_compare", { a, b, opts }),
   diffHighlight: (name: string, lines: string[]) => invoke<T.SyntaxHighlight | null>("diff_highlight", { name, lines }),
+  /** Per line of a unified patch: null (no change or changed as a whole), [] (layout only) or the changed ranges. */
+  diffPatchMarks: (name: string, patch: string) => invoke<([number, number][] | null)[]>("diff_patch_marks", { name, patch }),
   diffPatch: (a: T.DiffSource, b: T.DiffSource) => invoke<string>("diff_patch", { a, b }),
   diffSavePatch: (a: T.DiffSource, b: T.DiffSource, dest: string) => invoke<void>("diff_save_patch", { a, b, dest }),
   gitRoot: (path: string) => invoke<string | null>("git_root", { path }),
@@ -86,6 +111,10 @@ export const api = {
   folderSize: (path: string, ticket: number) => invoke<T.DirSize | null>("folder_size", { path, ticket }),
   folderSizesCancel: (ticket: number) => invoke<void>("folder_sizes_cancel", { ticket }),
   gitStatus: (dir: string) => invoke<T.GitStatus | null>("git_status", { dir }),
+  /** The repository path when Git refuses it as owned by another user ("dubious ownership"), else null. */
+  gitUntrusted: (dir: string) => invoke<string | null>("git_untrusted", { dir }),
+  /** Adds the refused repository to Git's global safe.directory; returns the trusted path. */
+  gitTrust: (dir: string) => invoke<string>("git_trust", { dir }),
   gitCommits: (path: string) => invoke<{ id: string; subject: string }[]>("git_commits", { path }),
   /** Renames all items as one undo step (swaps allowed); resolves to the new paths. */
   batchRename: (items: [string, string][]) => invoke<string[]>("batch_rename", { items }),

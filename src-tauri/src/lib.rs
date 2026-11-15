@@ -109,6 +109,8 @@ pub fn startup_ms() -> u64 {
 
 pub fn run() {
     startup_ms();
+    #[cfg(target_os = "macos")]
+    gall_core::util::macpath::fix_path();
     let args = cli::parse(std::env::args());
     let exe_dir = std::env::current_exe()
         .ok()
@@ -254,6 +256,14 @@ pub fn run() {
                 });
             }
             log::info!("startup: state loaded at {} ms", startup_ms());
+            #[cfg(target_os = "macos")]
+            gall_core::fs::mactrash::set_index_file(
+                handle
+                    .state::<state::AppState>()
+                    .dirs
+                    .data
+                    .join("macos-trash.json"),
+            );
             // Build the Quick Open index shortly after start, then keep it fresh.
             let h4 = handle.clone();
             std::thread::spawn(move || {
@@ -305,6 +315,7 @@ pub fn run() {
             commands::git_commit_details,
             commands::git_commit_diff,
             commands::git_commit_patch,
+            commands::git_commit_patch_text,
             commands::git_file_history,
             commands::git_blame,
             commands::git_commit_content,
@@ -316,13 +327,16 @@ pub fn run() {
             commands::git_network,
             commands::git_network_cancel,
             commands::git_advanced,
+            commands::git_submodule_tree,
             commands::git_advanced_action,
             commands::git_advanced_cancel,
             commands::git_rebase_plan,
+            commands::git_rebase_conflicts,
             commands::git_rebase_execute,
             commands::git_reword,
             commands::git_commit_edit,
             commands::diff_patch,
+            commands::diff_patch_marks,
             commands::diff_highlight,
             commands::diff_save_patch,
             commands::git_root,
@@ -360,6 +374,8 @@ pub fn run() {
             commands::conflict_info,
             commands::batch_rename,
             commands::git_status,
+            commands::git_untrusted,
+            commands::git_trust,
             commands::folder_size,
             commands::folder_sizes_cancel,
             commands::rename,
@@ -427,6 +443,7 @@ pub fn run() {
             commands::read_bytes,
             bug_report::bug_report_prepare,
             bug_report::bug_report_record,
+            bug_report::bug_report_record_many,
             bug_report::bug_report_status,
             bug_report::bug_report_dismiss,
             bug_report::bug_report_export,
@@ -439,9 +456,43 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building Gall")
-        .run(|_, event| {
-            if matches!(event, tauri::RunEvent::Exit) {
-                bug_report::clean();
+        .run(|app, event| {
+            #[cfg(not(target_os = "macos"))]
+            let _ = app;
+            match event {
+                tauri::RunEvent::Exit => {
+                    // The session is written in the background; make sure the last
+                    // state is on disk.
+                    use tauri::Manager;
+                    if let Some(state) = app.try_state::<state::AppState>() {
+                        state.flush_session();
+                    }
+                    bug_report::clean()
+                }
+                // macOS delivers "Open With Gall", a folder dropped on the Dock icon and
+                // `open -a Gall <path>` as an event, not as command-line arguments.
+                #[cfg(target_os = "macos")]
+                tauri::RunEvent::Opened { urls } => {
+                    let path = urls
+                        .iter()
+                        .filter_map(|u| u.to_file_path().ok())
+                        .map(|p| {
+                            if p.is_dir() {
+                                p
+                            } else {
+                                p.parent().map(|d| d.to_path_buf()).unwrap_or(p)
+                            }
+                        })
+                        .next();
+                    if let Some(path) = path {
+                        let args = cli::CliArgs {
+                            path1: Some(path.to_string_lossy().into_owned()),
+                            ..Default::default()
+                        };
+                        let _ = app.emit("second-instance", args);
+                    }
+                }
+                _ => {}
             }
         });
 }

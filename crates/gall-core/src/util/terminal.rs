@@ -164,6 +164,50 @@ pub fn open_terminal(dir: &Path, configured: &str) -> Result<()> {
     open_terminal_with(dir, &first.command)
 }
 
+/// Runs `script` in a terminal (Linux), so its output is visible: the terminal's
+/// command-line form of "run this program" differs per terminal. `configured` is the
+/// terminal template from the settings, else the first installed terminal. `None`
+/// when there is no terminal.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn run_script(script: &Path, configured: &str) -> Option<Result<()>> {
+    let dir = script.parent().filter(|d| d.is_dir())?;
+    let template = if configured.trim().is_empty() {
+        terminal_apps().into_iter().next()?.command
+    } else {
+        configured.to_string()
+    };
+    Some(
+        build(&template, dir, dir, false)
+            .map(|argv| script_argv(argv, script))
+            .and_then(|argv| spawn(&argv, Some(dir))),
+    )
+}
+
+/// `terminal` (a started terminal command) extended to run `script` in it and wait for
+/// Enter afterwards, so a short script's output does not vanish with the window.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn script_argv(mut terminal: Vec<String>, script: &Path) -> Vec<String> {
+    let program = terminal
+        .first()
+        .and_then(|p| Path::new(p).file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    match program.as_str() {
+        "gnome-terminal" | "ptyxis" | "wezterm" => terminal.push("--".into()),
+        "xfce4-terminal" | "terminator" => terminal.push("-x".into()),
+        // These take the program directly after the options.
+        "kitty" | "foot" => {}
+        _ => terminal.push("-e".into()),
+    }
+    terminal.extend([
+        "sh".into(),
+        "-c".into(),
+        r#""$0"; s=$?; printf '\n[exit status %s] Press Enter to close ' "$s"; read _"#.into(),
+        script.to_string_lossy().into_owned(),
+    ]);
+    terminal
+}
+
 // ───────────────────────────── editors ─────────────────────────────
 
 /// Known text editors: (display name, program on the PATH or absolute path, template).
@@ -271,4 +315,29 @@ pub fn editor_apps() -> Vec<AppChoice> {
         }
     }
     out
+}
+
+#[cfg(all(test, unix, not(target_os = "macos")))]
+mod tests {
+    use super::*;
+
+    fn argv(template: &[&str]) -> Vec<String> {
+        script_argv(
+            template.iter().map(|s| s.to_string()).collect(),
+            Path::new("/tmp/a b/run.sh"),
+        )
+    }
+
+    #[test]
+    fn script_runs_after_the_terminals_execute_flag() {
+        let konsole = argv(&["konsole", "--workdir", "/tmp/a b"]);
+        assert_eq!(&konsole[..4], ["konsole", "--workdir", "/tmp/a b", "-e"]);
+        assert_eq!(konsole[4], "sh");
+        // The script path is a separate argument, never part of the shell text.
+        assert_eq!(konsole.last().unwrap(), "/tmp/a b/run.sh");
+        assert!(konsole[6].contains("read"));
+        assert_eq!(argv(&["gnome-terminal"])[1], "--");
+        assert_eq!(argv(&["/usr/bin/xfce4-terminal"])[1], "-x");
+        assert_eq!(argv(&["kitty", "--directory", "/x"])[3], "sh");
+    }
 }

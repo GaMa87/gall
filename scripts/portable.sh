@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds the portable Windows release on Linux (cross-compiled with cargo-xwin):
-# a zip with gall.exe and a `portable` marker, so settings, data, logs and the
-# webview's data stay in .\UserData next to the exe. Linux twin of portable.ps1.
+# a zip with gall.exe. Settings stay in the user profile so a new version finds them;
+# an empty `portable` file next to the exe switches to .\UserData. Linux twin of portable.ps1.
 #   ./scripts/portable.sh            build, then pack
 #   ./scripts/portable.sh --no-build pack an existing cross-built gall.exe
 # Requires: clang, lld, llvm (lld-link, llvm-lib), zip, the Rust target
@@ -31,18 +31,18 @@ STAGE="dist/$NAME"
 rm -rf "$STAGE" "dist/$NAME.zip"
 mkdir -p "$STAGE"
 cp "$EXE" "$STAGE/gall.exe"
-: > "$STAGE/portable"
 cp LICENSE THIRD-PARTY-NOTICES.md "$STAGE/"
 # Same README.txt as portable.ps1, with Windows line endings.
 sed 's/$/\r/' > "$STAGE/README.txt" <<EOF
 Gall $VERSION, portable
 
-Run gall.exe. Nothing is installed and nothing is written to your user profile:
-settings, data, logs and the browser engine's cache live in the UserData folder
-next to gall.exe, so the whole folder can be moved or kept on a USB drive.
+Run gall.exe. Nothing is installed. Settings and data are kept in your user
+profile (%APPDATA%\\gall and %LOCALAPPDATA%\\gall), so a newer version you unzip
+elsewhere finds them and you do not have to set everything up again.
 
-Delete the file named "portable" to use the normal per-user locations instead
-(%APPDATA%\\gall and %LOCALAPPDATA%).
+To keep everything next to gall.exe instead (for example on a USB drive), create
+an empty file named "portable" beside it; settings, data, logs and the browser
+engine's cache then live in the UserData folder.
 
 Requires the Microsoft Edge WebView2 Runtime, which Windows 10 and 11 include.
 If gall.exe does not start, install it from

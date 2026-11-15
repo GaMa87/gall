@@ -1,10 +1,10 @@
-export type GitReference = { name: string; fullName: string; kind: "branch" | "remote" | "tag"; id: string; upstream: string | null; ahead: number; behind: number };
+export type GitReference = { name: string; fullName: string; kind: "branch" | "remote" | "tag"; id: string; upstream: string | null; ahead: number; behind: number; upstreamGone: boolean };
 export type GitStash = { id: string; selector: string; message: string };
 export type GitSubmodule = { name: string; path: string; url: string; id: string; state: string };
 export type GitRemote = { name: string; fetchUrl: string; pushUrl: string };
 export type Repository = { root: string; head: string; branch: string | null; refs: GitReference[]; stashes: GitStash[]; remotes: GitRemote[]; operation: string | null; operationCommit: { id: string; subject: string; step: [number, number] | null } | null; editStop: boolean; bisectActive: boolean; conflicts: string[]; token: string };
 export type GitRequest = { action: string; [key: string]: string };
-export type GitContext = "history" | "files" | "branches" | "tags" | "stashes" | "remotes" | "conflicts" | "details" | "tools";
+export type GitContext = "history" | "files" | "branches" | "tags" | "stashes" | "remotes" | "worktrees" | "conflicts" | "details" | "tools";
 export type GitCommand = { key: string; label: string; action: string; danger?: boolean };
 const common: GitCommand[] = [
   { key: "f", label: "Fetch remote", action: "fetch" },
@@ -31,7 +31,8 @@ const commands: Record<GitContext, GitCommand[]> = {
     { key: "t", label: "Revert commit…", action: "revert" },
     { key: "g", label: "Reset to commit…", action: "reset" },
     { key: "W", label: "Mark comparison base / compare", action: "compareBase" },
-    { key: "y", label: "Copy commit attribute…", action: "copyMenu" },
+    { key: "y", label: "Copy commit attribute (hash, message, patch…)…", action: "copyMenu" },
+    { key: "a", label: "Apply patch from clipboard…", action: "applyPatch" },
     { key: "b", label: "Bisect options…", action: "tools:bisect" },
     { key: "w", label: "Worktree options…", action: "tools:worktrees" },
     { key: "/", label: "Search loaded history", action: "search" },
@@ -52,7 +53,7 @@ const commands: Record<GitContext, GitCommand[]> = {
     { key: "n", label: "Create branch here…", action: "createBranch" },
     { key: "c", label: "Checkout remote branch as local…", action: "checkoutRemote" },
     { key: "R", label: "Rename branch…", action: "renameBranch" },
-    { key: "d", label: "Delete merged local branch…", action: "deleteBranch", danger: true },
+    { key: "d", label: "Delete branch…", action: "deleteBranch", danger: true },
     { key: "r", label: "Rebase current branch onto selection…", action: "rebase" },
     { key: "M", label: "Merge selection into current branch…", action: "merge" },
     { key: "u", label: "Set upstream…", action: "setUpstream" },
@@ -87,6 +88,8 @@ const commands: Record<GitContext, GitCommand[]> = {
     { key: "t", label: "Use incoming Git side (theirs)…", action: "resolveTheirs" },
     { key: " ", label: "Mark file resolved…", action: "resolveMark" },
   ],
+  // The Worktrees tab handles Space/Enter (open), d (remove) and n (new) itself; only the shared keys exist here.
+  worktrees: [],
   // The Tools panel handles its own tab keys (w s b p n r); only the shared keys exist here.
   tools: [],
   details: [
@@ -96,14 +99,15 @@ const commands: Record<GitContext, GitCommand[]> = {
     { key: "f", label: "File history", action: "detail:f" },
   ],
 };
-/** Short key hints for the footer bar, like lazygit's options bar. Every key must exist in `commands[context]`, except in `details` and `tools`, whose panels handle their own keys (a test enforces the rest). */
+/** Short key hints for the footer bar, like lazygit's options bar. Every key must exist in `commands[context]`, except in `details`, `worktrees` and `tools`, whose panels handle their own keys (a test enforces the rest). */
 export const contextHints: Record<GitContext, [key: string, label: string][]> = {
-  history: [["r", "reword"], ["f", "fixup"], ["s", "squash"], ["d", "drop"], ["i", "interactive"], ["y", "copy"], ["x", "tools"], [" ", "checkout"]],
+  history: [["r", "reword"], ["f", "fixup"], ["s", "squash"], ["d", "drop"], ["i", "interactive"], ["y", "copy"], ["a", "apply patch"], ["x", "tools"], [" ", "checkout"]],
   files: [[" ", "stage"], ["a", "stage all"], ["c", "commit"], ["d", "discard"], ["e", "edit"], ["s", "stash"]],
   branches: [[" ", "checkout"], ["r", "rebase"], ["M", "merge"], ["n", "new"], ["R", "rename"], ["d", "delete"]],
   tags: [[" ", "checkout"], ["n", "new"], ["d", "delete"], ["g", "reset"]],
   stashes: [[" ", "apply"], ["g", "pop"], ["d", "drop"], ["s", "save"]],
   remotes: [["n", "add"], ["e", "edit"], ["r", "rename"], ["d", "remove"]],
+  worktrees: [[" ", "open"], ["n", "new"], ["d", "remove"]],
   conflicts: [["e", "edit"], ["o", "ours"], ["t", "theirs"], [" ", "mark resolved"]],
   details: [["j", "next file"], ["d", "diff"], ["v", "file"], ["f", "history"], ["b", "blame"], ["y", "copy path"]],
   tools: [["w", "worktrees"], ["s", "submodules"], ["b", "bisect"], ["p", "patches"], ["n", "notes"], ["r", "repository"]],
@@ -137,16 +141,28 @@ export function gitCommandForKey(context: GitContext, key: string): GitCommand |
   return gitCommands(context).find((item) => item.key === key);
 }
 
+/** Actions that work on a saved stash entry (saving a new stash is not one of them). */
+export const stashEntryActions = ["stashApply", "stashPop", "stashDrop"];
+/** History-rewriting or integrating actions; they make no sense on a stash commit. */
+export function rewritesHistory(action: string): boolean {
+  return action.startsWith("quick:") || ["reword", "interactiveRebase", "interactiveRebaseOnto", "rebase", "merge", "revert", "cherryPick", "reset"].includes(action);
+}
+/** The stash whose commit is the given graph row, so the row can offer the stash actions. */
+export function stashAtCommit(stashes: GitStash[], id: string | null | undefined): GitStash | undefined {
+  return id ? stashes.find((stash) => stash.id === id) : undefined;
+}
+
 export type GitActionState = { commit: boolean; head: boolean; referenceKind?: string; stash: boolean; remote: boolean; conflict: boolean; branch: boolean; remotes: number; operation: string | null; conflicts: number };
 export function gitActionEnabled(action: string, state: GitActionState): boolean {
   if (action.startsWith("quick:") || ["checkout", "reword", "interactiveRebase", "interactiveRebaseOnto", "merge", "rebase", "revert", "reset", "copyCommit", "copyMenu", "compareBase", "createTag"].includes(action)) return state.commit;
   if (action === "createBranch" || action === "copyHash") return state.commit || state.head;
-  if (["renameBranch", "deleteBranch"].includes(action)) return state.referenceKind === "branch";
+  if (action === "renameBranch") return state.referenceKind === "branch";
+  if (action === "deleteBranch") return state.referenceKind === "branch" || state.referenceKind === "remote";
   if (action === "checkoutRemote") return state.referenceKind === "remote";
   if (action === "deleteTag") return state.referenceKind === "tag";
   if (action === "copyRef" || action === "showHistory") return !!state.referenceKind;
   if (action === "setUpstream") return (state.referenceKind === "branch" || state.branch) && state.remotes > 0;
-  if (["stashApply", "stashPop", "stashDrop"].includes(action)) return state.stash;
+  if (stashEntryActions.includes(action)) return state.stash;
   if (action === "stashSave") return state.head && !state.operation;
   if (["renameRemote", "setRemoteUrl", "removeRemote"].includes(action)) return state.remote;
   if (action === "fetch") return state.remotes > 0;

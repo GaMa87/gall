@@ -78,6 +78,18 @@ node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1]));
 ! prepare "" "$sec" /w || fail "an empty public key was accepted"
 echo "ok"
 
+step "Git speed (time and process budget of every Git view)"
+# Runs on this machine, so it covers Linux; CI runs the same test on macOS, on Windows
+# and there once more for a repository inside WSL (job "Git speed").
+( cd "$root" && cargo test -q -p gall-core --release --test git_speed -- --ignored --nocapture ) ||
+  fail "a Git view is over its time or process budget (see the table above)"
+echo "ok"
+
+step "App speed (listing, search, Quick Open, diff)"
+( cd "$root" && cargo test -q -p gall-core --release --test app_speed -- --ignored --nocapture ) ||
+  fail "an operation is over its time limit (see the table above)"
+echo "ok"
+
 if (( quick )); then echo; echo "Quick checks passed (no build was run)."; exit 0; fi
 
 step "Linux build in ubuntu:22.04 ($engine)"

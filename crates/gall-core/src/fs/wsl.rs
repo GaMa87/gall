@@ -965,7 +965,7 @@ fn linux_command(distro: &str, via_root: Option<&Path>, argv: &[String]) -> std:
     }
 }
 
-fn wsl_exe() -> PathBuf {
+pub(super) fn wsl_exe() -> PathBuf {
     let sys = std::env::var_os("SystemRoot")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));

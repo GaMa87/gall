@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import * as A from "../state/actions";
 import { api } from "../api/ipc";
-import type { GitReference, GitRemote, GitRequest, GitStash, Repository } from "../core/gitRepository";
+import { stashEntryActions, type GitReference, type GitRemote, type GitRequest, type GitStash, type Repository } from "../core/gitRepository";
 
 export type GitTarget =
   | { kind: "commit"; id: string }
@@ -38,6 +38,7 @@ export function useGitRepositoryActions(path: string, repository: Repository | n
     if (action === "copyHash" || action === "copyRef") { await invoke("clip_set_text", { text: action === "copyRef" ? name : commit ?? repository.head }).catch((e) => setError(String(e))); return; }
     if (action === "copyCommit") { if (commit) { setCopied(commit); A.notify(`Copied ${commit.slice(0, 8)} for cherry-pick. Use V to apply.`); } return; }
     if (action === "terminal") { await api.openTerminal(repository.root).catch((e) => setError(String(e))); return; }
+    let retryForced = false;
     active.current = true; setBusy(true); setError("");
     try {
       let request: GitRequest | null = null;
@@ -107,7 +108,7 @@ export function useGitRepositoryActions(path: string, repository: Repository | n
       } else if (action === "stashSave") {
         const message = await A.promptText("Stash tracked and untracked changes", "", "Save stash");
         if (message !== null) request = { action, message };
-      } else if (["stashApply", "stashPop", "stashDrop"].includes(action) && stash) {
+      } else if (stashEntryActions.includes(action) && stash) {
         const verb = action === "stashApply" ? "Apply" : action === "stashPop" ? "Pop" : "Drop";
         if (await A.confirm(`${verb} stash?`, `${stash.selector} · ${stash.message}\n${stash.id}\n\n${action === "stashDrop" ? "Remove this stash from the list. A recovery reference is retained." : "Restore this stash into the working tree. A conflicting pop keeps the stash."}`, verb, action === "stashDrop")) request = { action, id: stash.id };
       } else if (["merge", "rebase", "cherryPick", "revert"].includes(action)) {
@@ -116,7 +117,7 @@ export function useGitRepositoryActions(path: string, repository: Repository | n
         const verb = action === "cherryPick" ? "Cherry-pick" : action[0].toUpperCase() + action.slice(1);
         if (await A.confirm(`${verb} commit?`, `${verb} ${id.slice(0, 12)} ${action === "rebase" ? "as the new base of" : "into"} ${repository.branch ?? "detached HEAD"}.\n\nCommit or stash local changes first. Conflicts remain available in the Conflicts panel. Recovery references preserve rewritten commits. Commits are unsigned and hooks are disabled.`, verb, action === "rebase")) request = { action, target: id };
       } else if (action === "reset" && commit) {
-        const result = await A.dialog({ title: `Reset ${repository.branch ?? "HEAD"} to ${targetLabel}`, message: "Soft keeps the index and working files. Mixed also unstages changes. Hard replaces tracked working files after saving recovery data; untracked collisions are refused.", buttons: [{ id: "cancel", label: "Cancel" }, { id: "soft", label: "Soft" }, { id: "mixed", label: "Mixed" }, { id: "hard", label: "Hard…", danger: true }] });
+        const result = await A.dialog({ title: `Reset ${repository.branch ?? "HEAD"} to ${targetLabel}`, message: "s  Soft: keeps the index and working files.\nm  Mixed: also unstages changes.\nh  Hard: replaces tracked working files after saving recovery data; untracked files that the target would overwrite are refused.\nEsc  Cancel", buttons: [{ id: "cancel", label: "Cancel" }, { id: "soft", label: "Soft", key: "s" }, { id: "mixed", label: "Mixed", key: "m" }, { id: "hard", label: "Hard…", danger: true, key: "h" }] });
         if (result && result.button !== "cancel") {
           if (result.button !== "hard" || await A.confirm("Replace tracked working files?", `Hard reset to ${targetLabel} will remove tracked local edits from the working folder. Gall saves the old HEAD and tracked changes for recovery.`, "Hard reset", true)) request = { action, target: commit, mode: result.button };
         }
@@ -137,30 +138,53 @@ export function useGitRepositoryActions(path: string, repository: Repository | n
         if (name?.trim()) request = { action, name: remote.name, newName: name.trim() };
       } else if (action === "removeRemote" && remote) {
         if (await A.confirm("Remove remote?", `Remove ${remote.name} and its tracking references? The remote repository itself is unchanged.`, "Remove remote", true)) request = { action, name: remote.name };
-      } else if (["fetch", "pull", "push", "forcePush"].includes(action)) {
-        if (!remote) throw new Error("Add a remote first.");
+      } else if (["fetch", "pull", "push", "forcePush"].includes(action) || (action === "deleteBranch" && reference?.kind === "remote")) {
+        // A remote branch is deleted on its own remote (`<remote>/<branch>`), not on the remote of the current branch.
+        const owner = action === "deleteBranch" ? repository.remotes.find((r) => name.startsWith(r.name + "/")) : remote;
+        if (!owner) throw new Error(action === "deleteBranch" ? "The remote of this branch is not configured." : "Add a remote first.");
+        const branchName = action === "deleteBranch" ? name.slice(owner.name.length + 1) : null;
+        if (action === "deleteBranch" && (branchName === "HEAD" || /^tags\//.test(branchName ?? ""))) throw new Error("Select a remote branch to delete.");
+        if (action === "deleteBranch" && !await A.confirm("Delete remote branch?", `Delete branch ${branchName} on ${owner.name}?\n${owner.pushUrl}\n\nThis removes the branch from the remote repository for everyone. Local branches are unchanged. Hooks are disabled.`, "Delete remote branch", true)) return;
         let lease: string | null = null;
         if (action === "forcePush") {
-          const upstream = repository.refs.find((r) => r.name === repository.branch && r.kind === "branch")?.upstream ?? `${remote.name}/${repository.branch}`;
+          const upstream = repository.refs.find((r) => r.name === repository.branch && r.kind === "branch")?.upstream ?? `${owner.name}/${repository.branch}`;
           lease = repository.refs.find((r) => r.kind === "remote" && r.name === upstream)?.id ?? null;
           if (!lease) throw new Error("Fetch the upstream before force-with-lease.");
         }
-        if (action !== "fetch" && !await A.confirm(`${action === "pull" ? "Pull" : "Push"} ${repository.branch ?? "detached HEAD"}?`, `${action === "pull" ? "Fast-forward from" : "Publish to"} ${remote.name}\n${action === "pull" ? remote.fetchUrl : remote.pushUrl}\n\n${action === "forcePush" ? `Force-with-lease expects ${lease}. This can replace remote history.` : action === "pull" ? "Diverged history is refused. Use merge or rebase after fetching." : "This changes the remote branch. Hooks are disabled."}`, action === "pull" ? "Pull" : action === "forcePush" ? "Force-with-lease" : "Push", action === "forcePush")) return;
+        if (action === "forcePush") {
+          if (!await A.confirm("Force push with lease", `Your branch has diverged from the remote branch. Press Esc to cancel, or Enter to force push with lease.\n\n${owner.name} · ${owner.pushUrl}\nThe lease expects the remote branch at ${lease}; the push fails if someone else has pushed since.`, "Force push with lease", true)) return;
+        } else if (action !== "fetch" && action !== "deleteBranch" && !await A.confirm(`${action === "pull" ? "Pull" : "Push"} ${repository.branch ?? "detached HEAD"}?`, `${action === "pull" ? "Fast-forward from" : "Publish to"} ${owner.name}\n${action === "pull" ? owner.fetchUrl : owner.pushUrl}\n\n${action === "pull" ? "Diverged history is refused. Use merge or rebase after fetching." : "This changes the remote branch. Hooks are disabled."}`, action === "pull" ? "Pull" : "Push")) return;
         const id = crypto.randomUUID(); activeJob.current = id; setJob(id); setOutput("");
         const unlisten = await listen<{ id: string; text: string }>("git-network-progress", (event) => { if (event.payload.id === id && mounted.current) setOutput((text) => (text + event.payload.text).slice(-12000)); });
-        try { const text = await invoke<string>("git_network", { path, id, remote: remote.name, action, expected: repository.token, lease }); if (mounted.current) setOutput(text); }
+        try { const text = await invoke<string>("git_network", { path, id, remote: owner.name, action, expected: repository.token, lease, branchName }); if (mounted.current) setOutput(text); }
         finally { unlisten(); activeJob.current = null; if (mounted.current) setJob(null); }
         await reload(); return;
       }
       if (request) { const result = await invoke<string>("git_repository_action", { path, request, expected: repository.token }); if (mounted.current) setOutput(result); if (["merge", "rebase", "cherryPick", "revert", "reset", "continue", "abort", "skip"].includes(request.action)) await refreshHistory(); else await reload(); }
     } catch (e) {
       const text = String(e);
+      if (action === "deleteBranch" && reference?.kind === "branch" && /not fully merged/i.test(text)) {
+        // Like lazygit: offer `git branch -D`, naming the tip so the branch can be recreated.
+        try {
+          if (await A.confirm("Branch is not fully merged", `${name} has commits that no other branch contains. Deleting it leaves them reachable only through the reflog.\n\nTip: ${reference.id}\nRecreate it with: git branch ${name} ${reference.id.slice(0, 12)}`, "Force delete", true)) {
+            const result = await invoke<string>("git_repository_action", { path, request: { action, name, force: true }, expected: repository.token });
+            if (mounted.current) setOutput(result);
+          }
+        } catch (forced) { if (mounted.current) setError(String(forced)); }
+        await reload().catch(() => {});
+        return;
+      }
       const rejected = action === "push" && /rejected|non-fast-forward|fetch first|failed to push/i.test(text);
       const missing = /No such file or directory \(os error 2\)/.test(text) ? `A file or folder Git needed no longer exists, so the operation stopped. Reload the workspace (the working tree or rebase state may have changed outside Gall) and try again.\n\n${text}` : text;
-      if (mounted.current) setError(rejected ? `Push rejected: the remote branch has commits your branch does not contain (it diverged, for example after a rebase or reset).\nUse Actions → Force push with explicit lease… to overwrite it safely, or Pull to integrate the remote commits first.\n\n${text}` : missing);
+      if (rejected) {
+        // Like lazygit: the force-with-lease confirmation explains why; Enter accepts it.
+        retryForced = true;
+        if (mounted.current) setOutput(text);
+      } else if (mounted.current) setError(missing);
       await reload().catch(() => {});
     }
     finally { active.current = false; if (mounted.current) setBusy(false); }
+    if (retryForced && mounted.current) await perform("forcePush", target);
   };
   return { perform, busy, error, setError, output, setOutput, job, cancel: () => job && void invoke("git_network_cancel", { id: job }) };
 }

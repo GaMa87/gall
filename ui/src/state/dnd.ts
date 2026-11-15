@@ -355,6 +355,8 @@ export function dropInto(e: React.DragEvent, dest: string) {
       return;
     }
     api.uiLog("warn", `drop on ${dest}: no paths (types: ${Array.from(e.dataTransfer.types ?? []).join(",")})`).catch(() => {});
+    // Some sources (an archive manager's virtual files) offer no file paths at all.
+    notify("Cannot drop these items: the source gave no file paths. Extract them to a folder first, then drag them from there.", "warn");
     return;
   }
   performDrop(paths, dest, ev, at);
@@ -374,8 +376,16 @@ if (typeof window !== "undefined" && (window as { __TAURI_INTERNALS__?: unknown 
   }).catch(() => {});
 }
 
+/** 7-Zip's drag-out folder (`7zE<hex>` in the temp folder). */
+const archiveTempDir = (p: string) => /^7z[EO][0-9A-F]{4,}$/i.test(baseName(p));
 /** Moves, copies or links `paths` into `dest`, by the keys held at the drop (`ev`). */
 function performDrop(paths: string[], dest: string, ev: EvMods, at: { x: number; y: number }) {
+  if (paths.some(archiveTempDir)) {
+    // 7-Zip extracts into this temp folder and deletes it again while the drop is still in
+    // progress; only a target that copies inside the drop itself (Explorer) gets the files.
+    notify("7-Zip removes its files as soon as the drop ends, so Gall cannot take them. Use Extract in 7-Zip, or drop into Explorer.", "warn");
+    return;
+  }
   if (paths.some((p) => isInside(dest, p))) {
     notify("Cannot move or copy a folder into itself", "warn");
     return;

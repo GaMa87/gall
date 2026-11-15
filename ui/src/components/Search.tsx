@@ -1,6 +1,7 @@
+import { ThemedSelect } from "./ThemedSelect";
 // Search window (Q-01, Q-02): recursive wildcard search streamed from the core,
 // plus a Tags tab listing items by colour.
-import { useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { api, events } from "../api/ipc";
 import type { FileEntry, Tagged } from "../api/types";
 import { formatSize } from "../core/format";
@@ -11,6 +12,31 @@ import { FileIcon, Icon, TAG_COLORS } from "./Icon";
 import { primaryMod } from "../core/keymap";
 
 let searchSeq = 1;
+
+/** Shows the folder of `p` in the active browser, with `p` selected. */
+function locate(p: string) {
+  const b = A.activeBrowser();
+  const dir = parent(p);
+  A.openOverlay(null);
+  if (dir) A.navigate(b, dir);
+  setTimeout(() => controller(b)?.select([p], p), 200);
+}
+
+/** One found file. Memoized: results arrive in batches of a few hundred, and without it
+ *  every batch rendered all rows so far again (thousands, each with its icon). */
+const ResultRow = memo(function ResultRow({ entry: r, index, on, pick }: { entry: FileEntry; index: number; on: boolean; pick: (index: number, add: boolean) => void }) {
+  return (
+    <div className={`r ${on ? "on" : ""}`}
+      onClick={(e) => pick(index, primaryMod(e))}
+      onDoubleClick={() => A.openEntries(A.activeBrowser(), [r])}>
+      <button className="icon-btn" title="Locate in browser" onClick={(e) => { e.stopPropagation(); locate(r.path); }}><Icon name="locate" size={14} /></button>
+      <FileIcon entry={r} />
+      <span className="n">{r.name}</span>
+      <span className="p" title={r.path}><bdi>{parent(r.path)}</bdi></span>
+      <span style={{ textAlign: "right", color: "var(--fg-dim)" }}>{r.isDir ? "" : formatSize(r.size)}</span>
+    </div>
+  );
+});
 
 export function SearchWindow({ root, initialPattern, initialEverything }: { root: string; initialPattern?: string; initialEverything?: boolean }) {
   const [tab, setTab] = useState<"files" | "tags">("files");
@@ -65,13 +91,14 @@ export function SearchWindow({ root, initialPattern, initialEverything }: { root
     start();
   });
 
-  const locate = (p: string) => {
-    const b = A.activeBrowser();
-    const dir = parent(p);
-    A.openOverlay(null);
-    if (dir) A.navigate(b, dir);
-    setTimeout(() => controller(b)?.select([p], p), 200);
-  };
+  const pick = useCallback((i: number, add: boolean) => {
+    setSel((s) => {
+      const n = new Set(add ? s : []);
+      if (add && n.has(i)) n.delete(i);
+      else n.add(i);
+      return n;
+    });
+  }, []);
 
   const openSelected = () => {
     const list = sel.size ? [...sel].map((i) => results[i]) : results.slice(0, 1);
@@ -94,36 +121,26 @@ export function SearchWindow({ root, initialPattern, initialEverything }: { root
               <input ref={inputRef} type="text" placeholder="Name or wildcard: *.pdf, report?.txt" value={pattern}
                 onChange={(e) => setPattern(e.target.value)}
                 onKeyDown={(e) => { if (e.key === "Enter") { if (results.length && !running && primaryMod(e)) openSelected(); else start(); } }} />
-              <select value={scope} onChange={(e) => setScope(e.target.value)} title="Search in">
+              <ThemedSelect value={scope} onChange={(e) => setScope(e.target.value)} title="Search in">
                 <option value={root}>This folder: {basename(root)}</option>
                 {top !== root && <option value={top}>Whole drive: {top}</option>}
-              </select>
+              </ThemedSelect>
               <label style={{ display: "flex", gap: 4, alignItems: "center" }}><input type="checkbox" checked={hidden} onChange={(e) => setHidden(e.target.checked)} /> hidden</label>
               <label style={{ display: "flex", gap: 4, alignItems: "center" }} title="Also search what is normally skipped: Settings › Search › Never index or search, .gitignore, .gallignore and cache folders (Alt+I)"><input type="checkbox" checked={everything} onChange={(e) => setEverything(e.target.checked)} /> ignored</label>
               {running ? <button className="btn" onClick={() => api.searchCancel()}>Stop</button> : <button className="btn primary" onClick={start}>Search</button>}
             </>
           ) : (
             <div className="tags" style={{ gap: 4 }}>
-              <button style={{ background: "var(--bg-3)", color: "var(--fg)", width: 40, height: 26, fontSize: 11 }} onClick={() => setTagColor(null)}>All</button>
+              <button style={{ background: "var(--bg-3)", color: "var(--fg)", width: 40, height: 26, fontSize: 11 }} title="Any colour tag" onClick={() => setTagColor(null)}>All</button>
               {TAG_COLORS.slice(1).map((c, i) => (
-                <button key={i} style={{ background: c, width: 30, height: 26, borderColor: tagColor === i + 1 ? "var(--fg)" : "transparent" }} onClick={() => setTagColor(i + 1)}>{i + 1}</button>
+                <button key={i} style={{ background: c, width: 30, height: 26, borderColor: tagColor === i + 1 ? "var(--fg)" : "transparent" }} title={`Colour tag ${i + 1}`} onClick={() => setTagColor(i + 1)}>{i + 1}</button>
               ))}
             </div>
           )}
         </div>
         <div className="results">
           {tab === "files"
-            ? results.map((r, i) => (
-                <div key={r.path} className={`r ${sel.has(i) ? "on" : ""}`}
-                  onClick={(e) => setSel((s) => { const n = new Set(primaryMod(e) ? s : []); n.has(i) && primaryMod(e) ? n.delete(i) : n.add(i); return n; })}
-                  onDoubleClick={() => A.openEntries(A.activeBrowser(), [r])}>
-                  <button className="icon-btn" title="Locate in browser" onClick={(e) => { e.stopPropagation(); locate(r.path); }}><Icon name="locate" size={14} /></button>
-                  <FileIcon entry={r} />
-                  <span className="n">{r.name}</span>
-                  <span className="p" title={r.path}><bdi>{parent(r.path)}</bdi></span>
-                  <span style={{ textAlign: "right", color: "var(--fg-dim)" }}>{r.isDir ? "" : formatSize(r.size)}</span>
-                </div>
-              ))
+            ? results.map((r, i) => <ResultRow key={r.path} entry={r} index={i} on={sel.has(i)} pick={pick} />)
             : tagged.map((t) => (
                 <div key={t.path} className="r" onDoubleClick={() => locate(t.path)}>
                   <button className="icon-btn" title="Locate" onClick={() => locate(t.path)}><Icon name="locate" size={14} /></button>

@@ -2,6 +2,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { ACTION_LABELS, buildKeymap, keyboardProfile, KEYBOARD_PROFILES, type Action } from "../core/keymap";
 import type { Mark } from "../api/types";
+import { balanceColumns } from "../core/balance";
 import { tildify } from "../core/path";
 import { LEADER_KEYS, NORMAL_KEYS, PREVIOUS_MARK, resolve, shadowed, splitKeys, type KeyNode, type MarkOp } from "../core/vim";
 import * as A from "../state/actions";
@@ -110,6 +111,29 @@ function specRows(specs: typeof NORMAL_KEYS, prefix: string[] = []): HelpRow[] {
   return [...rows.values()];
 }
 
+/**
+ * Columns of the key sheet: up to three, each at least 290 px wide. The sections are split
+ * here instead of by CSS `columns`, whose balancing lays the whole sheet out several times
+ * (it made opening the sheet about three times slower). The width follows `.kh` and
+ * `.kh-cols` in app.css: min(1100px, 94vw), less the border, padding and scrollbar.
+ */
+function sheetColumns(): number {
+  // No window width (a test without a layout): the widest sheet.
+  const width = typeof window !== "undefined" && window.innerWidth > 0 ? window.innerWidth : 1280;
+  const inner = Math.min(1100, width * 0.94) - 2 - 36 - 12;
+  return Math.max(1, Math.min(3, Math.floor((inner + 18) / (290 + 18))));
+}
+
+function useSheetColumns(): number {
+  const [n, setN] = useState(sheetColumns);
+  useEffect(() => {
+    const update = () => setN(sheetColumns());
+    window.addEventListener("resize", update);
+    return () => window.removeEventListener("resize", update);
+  }, []);
+  return n;
+}
+
 /** Full keyboard reference with explicit chords, sequences and alternatives. */
 export function KeyHelp() {
   const settings = useStore((s) => s.settings)!;
@@ -123,10 +147,12 @@ export function KeyHelp() {
     return [...by.entries()].map(([a, bindings]) => ({ bindings, label: ACTION_LABELS[a] }));
   }, [settings.shortcuts, settings.vimKeys, profile, leader]);
 
+  const columnCount = useSheetColumns();
   const section = (title: string, rows: HelpRow[]) => {
     const vis = rows.filter((r) => !q || [r.label, r.text, ...(r.bindings?.map((steps) => steps.join(" ")) ?? [])].join(" ").toLowerCase().includes(q.toLowerCase()));
     if (!vis.length) return null;
-    return (
+    // Height in rows, for the column split: the heading and margin count as one and a half.
+    return { weight: vis.length + 1.5, el: (
       <section key={title}>
         <h4>{title}</h4>
         {vis.map((r) => (
@@ -136,7 +162,7 @@ export function KeyHelp() {
           </div>
         ))}
       </section>
-    );
+    ) };
   };
   const hasLeader = !!leader;
   const vimRows = specRows(NORMAL_KEYS);
@@ -230,6 +256,7 @@ export function KeyHelp() {
       { bindings: either("Alt+ArrowRight", "Alt+ArrowLeft"), label: "text: copy the change to the right / left" },
       { bindings: either("Ctrl+S", "Ctrl+Z"), label: "text: save edits / undo an edit" },
       { bindings: [["w"], ["i"], ["e"], ["m"]], label: "text: ignore whitespace / case / line ends · minimal diff" },
+      { bindings: [["t"]], label: "text: structural diff (reformatting is not a change) on / off" },
       { bindings: [["z"], ["l"]], label: "text: fold unchanged · wrap lines" },
       { bindings: [["s"], ["r"], ["y"]], label: "text: swap sides · reload · copy patch" },
       { bindings: either("c"), label: "spreadsheet: only changes" },
@@ -284,7 +311,8 @@ export function KeyHelp() {
       { bindings: either("Ctrl+Shift+Enter"), label: "stop recording" },
       { bindings: either("Ctrl+Shift+Backspace"), label: "cancel recording" },
     ]),
-  ].filter(Boolean);
+  ].filter((s): s is { weight: number; el: React.JSX.Element } => !!s);
+  const columns = balanceColumns(sections.map((s) => s.weight), columnCount);
 
   return (
     <div className="backdrop glass center" onMouseDown={() => A.openOverlay(null)}>
@@ -302,7 +330,7 @@ export function KeyHelp() {
           <div><span className="kh-legend-label">Letter shortcuts</span><small>Caps Lock is ignored; hold Shift for the shifted-letter shortcut.</small></div>
         </div>
         <div className="kh-scroll">
-          {sections.length ? <div className="kh-cols">{sections}</div>
+          {sections.length ? <div className="kh-cols">{columns.map((group) => <div className="kh-col" key={group[0]}>{group.map((i) => sections[i].el)}</div>)}</div>
             : <div className="kh-empty" role="status"><b>No shortcuts match “{q}”</b><span>Try an action name or a key such as Ctrl+C.</span></div>}
         </div>
       </div>

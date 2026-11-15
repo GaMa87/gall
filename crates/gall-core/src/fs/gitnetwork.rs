@@ -4,7 +4,9 @@ use crate::{CoreError, Result};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
+#[cfg(windows)]
+use std::process::Command;
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -16,6 +18,8 @@ pub enum NetworkAction {
     Pull,
     Push,
     ForcePush,
+    /// Deletes a branch on the remote (`git push <remote> --delete`).
+    DeleteBranch,
 }
 
 #[derive(Clone, Serialize)]
@@ -30,17 +34,22 @@ fn failure(message: impl Into<String>) -> CoreError {
 }
 
 /// `lease` is the reviewed remote branch SHA, never an implicit moving tracking ref.
+/// `branch_name` is the short name of the remote branch that `DeleteBranch` removes.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     path: &Path,
     remote: &str,
     action: NetworkAction,
     expected: &str,
     lease: Option<&str>,
+    branch_name: Option<&str>,
     cancel: &AtomicBool,
     progress: impl Fn(String),
 ) -> Result<String> {
+    let _busy = super::gitfacts::mutating();
     let root = root(path)?;
-    let state = super::gitrepository::snapshot(&root)?;
+    // A fetch looks only at the remotes; the others also at references.
+    let state = super::gitrepository::checked(&root, !matches!(action, NetworkAction::Fetch))?;
     if state.token != expected {
         return Err(failure(
             "Repository changed. Refresh and review the remote operation again.",
@@ -97,6 +106,27 @@ pub fn run(
                 remote.into(),
             ];
         }
+        NetworkAction::DeleteBranch => {
+            let name = branch_name
+                .filter(|n| !n.is_empty() && !n.starts_with('-') && *n != "HEAD")
+                .ok_or_else(|| failure("Select a remote branch to delete."))?;
+            if !state.refs.iter().any(|r| {
+                r.kind == "remote" && r.full_name == format!("refs/remotes/{remote}/{name}")
+            }) {
+                return Err(failure(
+                    "The remote branch is no longer known. Fetch and review again.",
+                ));
+            }
+            args = vec![
+                "push".into(),
+                "--progress".into(),
+                "--no-recurse-submodules".into(),
+                "--delete".into(),
+                "--".into(),
+                remote.into(),
+                format!("refs/heads/{name}"),
+            ];
+        }
         NetworkAction::Push | NetworkAction::ForcePush => {
             let branch =
                 branch.ok_or_else(|| failure("Attach HEAD to a branch before pushing."))?;
@@ -144,29 +174,31 @@ pub fn run(
             ]);
         }
     }
-    let mut command = Command::new("git");
+    // For a repository in WSL this runs the Git (and the credentials and SSH keys) of the
+    // distribution, as in a terminal there.
+    let mut command = super::gitexec::command(&root, super::gitstatus::program());
     command
-        .args([
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            if cfg!(windows) {
-                "core.hooksPath=NUL"
-            } else {
-                "core.hooksPath=/dev/null"
-            },
-            "-c",
-            "protocol.ext.allow=never",
-            "-C",
-        ])
-        .arg(&root)
+        .args(["-c", "core.fsmonitor=false", "-c"])
+        .arg(format!(
+            "core.hooksPath={}",
+            super::gitexec::null_device(&root)
+        ))
+        .args(["-c", "protocol.ext.allow=never", "-C"])
+        .arg(super::gitexec::dir_arg(&root))
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GCM_INTERACTIVE", "never")
-        .env("GIT_ASKPASS", if cfg!(windows) { "" } else { "/bin/false" });
+        .env(
+            "GIT_ASKPASS",
+            if cfg!(windows) && super::gitexec::place(&root).is_none() {
+                ""
+            } else {
+                "/bin/false"
+            },
+        );
     if std::env::var_os("GIT_SSH_COMMAND").is_none() {
         command.env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes -oConnectTimeout=15");
     }
@@ -183,6 +215,7 @@ pub fn run(
     if cancel.load(Ordering::Relaxed) {
         return Err(failure("Remote operation cancelled before starting."));
     }
+    super::gitexec::forward_env(&mut command);
     let mut child = command.spawn().map_err(|e| failure(e.to_string()))?;
     let (tx, rx) = mpsc::channel();
     for mut pipe in [
@@ -207,6 +240,7 @@ pub fn run(
     // Inactivity deadline: progress output proves the transfer is advancing.
     let mut last_activity = Instant::now();
     let mut output = String::new();
+    let mut closed = false;
     loop {
         for _ in 0..128 {
             let Ok(chunk) = rx.try_recv() else {
@@ -214,15 +248,7 @@ pub fn run(
             };
             last_activity = Instant::now();
             progress(chunk.clone());
-            output.push_str(&chunk);
-            if output.len() > 128 * 1024 {
-                let cut = output
-                    .char_indices()
-                    .find(|(i, _)| *i >= output.len() - 64 * 1024)
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-                output.drain(..cut);
-            }
+            keep_output(&mut output, &chunk);
         }
         if cancel.load(Ordering::Relaxed) || last_activity.elapsed() > Duration::from_secs(300) {
             #[cfg(unix)]
@@ -295,7 +321,35 @@ pub fn run(
                 Err(failure(output.trim().to_owned()))
             };
         }
-        std::thread::sleep(Duration::from_millis(40));
+        // Once both pipes are closed Git is ending: look for its exit often, still minding
+        // cancel. Until then wake for output right away, otherwise to look at cancel.
+        if closed {
+            std::thread::sleep(Duration::from_millis(2));
+            continue;
+        }
+        match rx.recv_timeout(Duration::from_millis(40)) {
+            Ok(chunk) => {
+                last_activity = Instant::now();
+                progress(chunk.clone());
+                keep_output(&mut output, &chunk);
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => closed = true,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+/// Appends `chunk` to the collected output, keeping only its last 64 KiB once it exceeds
+/// 128 KiB.
+fn keep_output(output: &mut String, chunk: &str) {
+    output.push_str(chunk);
+    if output.len() > 128 * 1024 {
+        let cut = output
+            .char_indices()
+            .find(|(i, _)| *i >= output.len() - 64 * 1024)
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        output.drain(..cut);
     }
 }
 
@@ -327,6 +381,7 @@ mod tests {
             NetworkAction::Push,
             &s.token,
             None,
+            None,
             &cancel,
             |_| {},
         )
@@ -337,6 +392,7 @@ mod tests {
             "origin",
             NetworkAction::Fetch,
             &s.token,
+            None,
             None,
             &cancel,
             |_| {},
@@ -349,6 +405,7 @@ mod tests {
             NetworkAction::Pull,
             &s.token,
             None,
+            None,
             &cancel,
             |_| {},
         )
@@ -358,6 +415,7 @@ mod tests {
             "origin",
             NetworkAction::Push,
             "stale",
+            None,
             None,
             &cancel,
             |_| {}
@@ -369,6 +427,7 @@ mod tests {
             NetworkAction::ForcePush,
             &s.token,
             Some(&"0".repeat(40)),
+            None,
             &cancel,
             |_| {}
         )
@@ -380,10 +439,66 @@ mod tests {
             NetworkAction::Fetch,
             &s.token,
             None,
+            None,
             &cancel,
             |_| {}
         )
         .is_err());
         assert_eq!(std::fs::read_to_string(p.join("file")).unwrap(), "first");
+    }
+
+    #[test]
+    fn deletes_a_remote_branch() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path();
+        git(p, &["init", "-q", "-b", "main"]).unwrap();
+        git(p, &["config", "user.name", "Test"]).unwrap();
+        git(p, &["config", "user.email", "test@example.com"]).unwrap();
+        git(p, &["config", "core.autocrlf", "false"]).unwrap();
+        std::fs::write(p.join("file"), "first").unwrap();
+        git(p, &["add", "."]).unwrap();
+        git(p, &["commit", "-qm", "first"]).unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        git(bare.path(), &["init", "--bare", "-q"]).unwrap();
+        git(
+            p,
+            &["remote", "add", "origin", bare.path().to_str().unwrap()],
+        )
+        .unwrap();
+        git(p, &["push", "-q", "origin", "main:main", "main:topic/one"]).unwrap();
+        git(p, &["fetch", "-q", "origin"]).unwrap();
+        let cancel = AtomicBool::new(false);
+        let s = super::super::gitrepository::snapshot(p).unwrap();
+        for bad in [None, Some("HEAD"), Some("--all"), Some("missing")] {
+            assert!(run(
+                p,
+                "origin",
+                NetworkAction::DeleteBranch,
+                &s.token,
+                None,
+                bad,
+                &cancel,
+                |_| {}
+            )
+            .is_err());
+        }
+        run(
+            p,
+            "origin",
+            NetworkAction::DeleteBranch,
+            &s.token,
+            None,
+            Some("topic/one"),
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+        let remote = git(bare.path(), &["--git-dir=.", "branch", "--list"]).unwrap();
+        assert!(remote.contains("main") && !remote.contains("topic/one"));
+        let s = super::super::gitrepository::snapshot(p).unwrap();
+        assert!(s
+            .refs
+            .iter()
+            .all(|r| r.full_name != "refs/remotes/origin/topic/one"));
     }
 }

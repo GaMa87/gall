@@ -1,3 +1,4 @@
+import { ThemedSelect } from "./ThemedSelect";
 // Welcome setup on the first start (no settings file yet): look, layout, keys and file
 // defaults in four short steps. Every choice applies at once, so the window behind shows
 // it; "Skip" keeps the defaults. Settings › About › "Welcome setup" opens it again.
@@ -66,7 +67,7 @@ function Toggle({ label, hint, checked, set }: { label: string; hint?: string; c
   return (
     <label className="wc-row">
       <span className="wc-row-text"><span>{label}</span>{hint && <small>{hint}</small>}</span>
-      <input type="checkbox" className="switch" role="switch" checked={checked} onChange={(e) => set(e.target.checked)} />
+      <input type="checkbox" className="switch" role="switch" title={label} checked={checked} onChange={(e) => set(e.target.checked)} />
     </label>
   );
 }
@@ -174,16 +175,16 @@ export function Welcome() {
             <div className="wc-rows">
               <div className="wc-row">
                 <span className="wc-row-text"><span>View</span><small>How items are listed</small></span>
-                <select value={s.defaultView} onChange={(e) => set({ defaultView: e.target.value })}>
+                <ThemedSelect value={s.defaultView} onChange={(e) => set({ defaultView: e.target.value })}>
                   {VIEWS.map((v) => <option key={v.id} value={v.id}>{v.label}</option>)}
-                </select>
+                </ThemedSelect>
               </div>
               <div className="wc-row">
                 <span className="wc-row-text"><span>Sort by</span></span>
                 <span className="wc-sort">
-                  <select value={s.defaultSort} onChange={(e) => set({ defaultSort: e.target.value as Settings["defaultSort"] })}>
+                  <ThemedSelect value={s.defaultSort} onChange={(e) => set({ defaultSort: e.target.value as Settings["defaultSort"] })}>
                     {[["name", "Name"], ["ext", "Type"], ["modified", "Date modified"], ["created", "Date created"], ["size", "Size"]].map(([k, l]) => <option key={k} value={k}>{l}</option>)}
-                  </select>
+                  </ThemedSelect>
                   <button className="btn" title="Direction" onClick={() => set({ defaultDescending: !s.defaultDescending })}>
                     {s.defaultDescending ? "Descending ↓" : "Ascending ↑"}
                   </button>

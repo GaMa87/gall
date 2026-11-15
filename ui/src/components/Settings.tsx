@@ -1,3 +1,4 @@
+import { ThemedSelect } from "./ThemedSelect";
 // Settings window (C-01, C-04): searchable, applies changes immediately.
 import { cloneElement, isValidElement, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api/ipc";
@@ -210,11 +211,11 @@ function DraftInput({ saved, commit, live, ...rest }: {
 
 function OptRow({ o, s }: { o: Opt; s: Settings }) {
   const v = o.key === "keyboardProfile" ? keyboardProfile(s) : s[o.key] as unknown;
-  const set = (val: unknown) => A.updateSettings({ [o.key]: val } as Partial<Settings>);
+  const set = (val: unknown) => A.updateSettings({ [o.key]: val } as Partial<Settings>, o.type === "text" || o.type === "color");
   const keys = useKeyLabels();
   let ctl: React.ReactNode;
   switch (o.type) {
-    case "bool": ctl = <input type="checkbox" className="switch" role="switch" checked={!!v} onChange={(e) => set(e.target.checked)} />; break;
+    case "bool": ctl = <input type="checkbox" className="switch" role="switch" title={o.label} checked={!!v} onChange={(e) => set(e.target.checked)} />; break;
     case "number": ctl = (
       <DraftInput type="number" saved={String(v)} min={o.min} max={o.max} step={o.step ?? 1}
         live={(t) => String(Number(t)) === t.trim() && Number(t) >= (o.min ?? -Infinity) && Number(t) <= (o.max ?? Infinity)}
@@ -226,7 +227,7 @@ function OptRow({ o, s }: { o: Opt; s: Settings }) {
         }} />
     ); break;
     case "text": ctl = <input type="text" value={v as string} placeholder={o.placeholder} onChange={(e) => set(e.target.value)} spellCheck={false} />; break;
-    case "select": ctl = <select value={v as string} onChange={(e) => set(e.target.value)}>{o.options.map(([k, l]) => <option key={k} value={k}>{l}</option>)}</select>; break;
+    case "select": ctl = <ThemedSelect value={v as string} onChange={(e) => set(e.target.value)}>{o.options.map(([k, l]) => <option key={k} value={k}>{l}</option>)}</ThemedSelect>; break;
     case "theme": ctl = <ThemePicker value={v as string} set={set} />; break;
     case "font": ctl = <FontPicker value={v as string} set={set} />; break;
     case "openRules": return <OpenRulesList rules={v as OpenRule[]} set={set} label={o.label} hint={o.hint} />;
@@ -255,7 +256,7 @@ function OptRow({ o, s }: { o: Opt; s: Settings }) {
 
 /** Gives the row's control the id its label points at (clicking the label focuses / toggles it). */
 function withId(ctl: React.ReactNode, id: string): React.ReactNode {
-  return isValidElement(ctl) && (ctl.type === "input" || ctl.type === "select") ? cloneElement(ctl as React.ReactElement<{ id?: string }>, { id }) : ctl;
+  return isValidElement(ctl) && (ctl.type === "input" || ctl.type === ThemedSelect) ? cloneElement(ctl as React.ReactElement<{ id?: string }>, { id }) : ctl;
 }
 
 /** Theme files (<config>/themes/*.css) as a dropdown; the list is re-read when the menu is opened. */
@@ -270,13 +271,13 @@ function FontPicker({ value, set }: { value: string; set: (v: string) => void })
   const cur = fonts?.find((f) => f.name === value);
   return (
     <span className="font-pick">
-      <select value={value} onFocus={load} onChange={(e) => set(e.target.value)} style={value ? { fontFamily: `"${value}"` } : undefined}>
+      <ThemedSelect value={value} onFocus={load} onChange={(e) => set(e.target.value)} style={value ? { fontFamily: `"${value}"` } : undefined}>
         <option value="">Default (JetBrains Mono)</option>
         {!known && <option value={value}>{value} {fonts ? "(not installed)" : ""}</option>}
         {fonts == null && <option disabled>Loading fonts…</option>}
         {mono.length > 0 && <optgroup label="Fixed width">{mono.map((f) => <option key={f.name} value={f.name}>{f.name}</option>)}</optgroup>}
         {prop.length > 0 && <optgroup label="Proportional">{prop.map((f) => <option key={f.name} value={f.name}>{f.name}</option>)}</optgroup>}
-      </select>
+      </ThemedSelect>
       {cur && (!cur.bold || !cur.italic) && <small className="font-note">no {[!cur.bold && "bold", !cur.italic && "italic"].filter(Boolean).join(" or ")} face: imitated</small>}
     </span>
   );
@@ -300,14 +301,14 @@ function ThemePicker({ value, set }: { value: string; set: (v: string) => void }
   const missing = value && !names.includes(value) && !BUILTIN_THEMES[value];
   return (
     <span className="theme-pick">
-      <select value={value} onFocus={refresh} onMouseDown={refresh} onChange={(e) => set(e.target.value)}>
+      <ThemedSelect value={value} onFocus={refresh} onMouseDown={refresh} onChange={(e) => set(e.target.value)}>
         <option value="">None (built-in colours)</option>
         <optgroup label="Included">
           {builtins.map(([k, t]) => <option key={k} value={k}>{t.label}{names.includes(k) ? " (your file)" : ""}</option>)}
         </optgroup>
         {files.length > 0 && <optgroup label="Themes folder">{files.map((n) => <option key={n} value={n}>{n}</option>)}</optgroup>}
         {missing && <option value={value}>{value} (file not found)</option>}
-      </select>
+      </ThemedSelect>
       <FolderLink path={dir} before={ensureDir} />
     </span>
   );

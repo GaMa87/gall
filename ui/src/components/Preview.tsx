@@ -585,7 +585,7 @@ function PdfPreview({ path }: { path: string }) {
           <button title="Zoom out (−, Ctrl+wheel)" onClick={() => zoomBy(1 / 1.25)}>−</button>
           <button className="pct" title="Back to fit (0)" onClick={() => setZoom(1)}>{Math.round(zoom * 100)}%</button>
           <button title="Zoom in (+, Ctrl+wheel)" onClick={() => zoomBy(1.25)}>+</button>
-          <button onClick={() => { setFitWidth((f) => !f); setZoom(1); }}>{fitWidth ? "Fit page" : "Fit width"}</button>
+          <button title={fitWidth ? "Fit the whole page in the window" : "Fit the page width to the window"} onClick={() => { setFitWidth((f) => !f); setZoom(1); }}>{fitWidth ? "Fit page" : "Fit width"}</button>
         </div>
       )}
     </div>

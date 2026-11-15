@@ -121,7 +121,7 @@ export function SystemMonitor() {
         <Meter label="Memory" value={memPct} color="var(--sm-mem)" topRow={topRow} sub={s ? memText(s.memUsed, s.memTotal) : null}
           hint="Main memory (RAM) in use / in total" />
       </div>
-      <button className="sm-toggle" onClick={() => { setOpen(!open); localStorage.setItem("sysmon:details", open ? "0" : "1"); }}>
+      <button className="sm-toggle" title="Show or hide details" onClick={() => { setOpen(!open); localStorage.setItem("sysmon:details", open ? "0" : "1"); }}>
         <Icon name={open ? "chevronDown" : "chevronRight"} size={12} /> Network and disk
       </button>
       {open && s && (

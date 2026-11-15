@@ -1,5 +1,5 @@
-# Builds the portable Windows release: a zip with gall.exe and a `portable` marker,
-# so settings, data, logs and the webview's data stay in .\UserData next to the exe.
+# Builds the portable Windows release: a zip with gall.exe. Settings stay in the user
+# profile so a new version finds them; an empty `portable` file next to the exe switches to .\UserData.
 #   ./scripts/portable.ps1            build, then pack
 #   ./scripts/portable.ps1 -NoBuild   pack an existing target\release\gall.exe
 # Output: dist\Gall-<version>-windows-x64-portable.zip
@@ -22,17 +22,17 @@ try {
   if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
   New-Item -ItemType Directory -Force $stage | Out-Null
   Copy-Item $exe (Join-Path $stage "gall.exe")
-  New-Item -ItemType File (Join-Path $stage "portable") | Out-Null
   Copy-Item LICENSE, THIRD-PARTY-NOTICES.md $stage
   @"
 Gall $version, portable
 
-Run gall.exe. Nothing is installed and nothing is written to your user profile:
-settings, data, logs and the browser engine's cache live in the UserData folder
-next to gall.exe, so the whole folder can be moved or kept on a USB drive.
+Run gall.exe. Nothing is installed. Settings and data are kept in your user
+profile (%APPDATA%\gall and %LOCALAPPDATA%\gall), so a newer version you unzip
+elsewhere finds them and you do not have to set everything up again.
 
-Delete the file named "portable" to use the normal per-user locations instead
-(%APPDATA%\gall and %LOCALAPPDATA%).
+To keep everything next to gall.exe instead (for example on a USB drive), create
+an empty file named "portable" beside it; settings, data, logs and the browser
+engine's cache then live in the UserData folder.
 
 Requires the Microsoft Edge WebView2 Runtime, which Windows 10 and 11 include.
 If gall.exe does not start, install it from

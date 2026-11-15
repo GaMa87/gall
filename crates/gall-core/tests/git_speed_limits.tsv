@@ -1,0 +1,57 @@
+# Time limits of the Git speed test (crates/gall-core/tests/git_speed.rs), as multiples
+# of the reference time (a plain `git status` of the test repository, measured before each
+# view): 150 % of the slowest recorded run. Written by GALL_SPEED_RECORD=1; delete a line
+# to record that view again from scratch.
+linux	blame	0.63
+linux	checkout another branch	4.78
+linux	cherry-pick a commit	3.11
+linux	commit as a patch	0.09
+linux	commit details	0.01
+linux	commit diff	0.11
+linux	commit the staged files	2.35
+linux	commits for the diff picker	0.10
+linux	content of a file in a commit	0.12
+linux	create a branch	2.15
+linux	delete a branch	2.27
+linux	fetch (nothing new, local remote)	2.77
+linux	git root of a folder	0.01
+linux	graph view with the reflog	1.86
+linux	graph view, 200 commits	1.92
+linux	graph view, 2000 commits	2.65
+linux	history of a file	0.59
+linux	history query	1.25
+linux	interactive rebase: conflict check of 10 commits	0.68
+linux	interactive rebase: plan of 10 commits	1.46
+linux	linked worktree: graph view	1.52
+linux	linked worktree: status badges	1.60
+linux	linked worktree: working changes	1.18
+linux	list .cache/pkg001/lib1	0.01
+linux	list node_modules (500 folders)	0.03
+linux	list the root	0.01
+linux	merge a branch	7.95
+linux	nested submodule: working changes	0.22
+linux	patch of a changed file	1.37
+linux	patch of one file of a commit	0.07
+linux	push one commit (local remote)	2.92
+linux	rebase 3 commits onto a branch	4.35
+linux	repository snapshot	3.15
+linux	selectable patch of a changed file	1.87
+linux	stage a file	2.13
+linux	stash a staged file	5.63
+linux	status badges: .cache (hidden, ignored)	0.47
+linux	status badges: node_modules (ignored)	0.39
+linux	status badges: node_modules/pkg001	0.59
+linux	status badges: root	1.97
+linux	status badges: src/mod001	0.38
+linux	status badges: untracked/d1	0.39
+linux	status badges: vendor (folder of submodules)	0.62
+linux	status badges: vendor/big (a submodule)	0.69
+linux	status badges: vendor/big/src/mod001	0.18
+linux	submodule tree (3 submodules, one nested)	0.57
+linux	submodule: graph view	0.81
+linux	submodule: working changes	0.67
+linux	the same with the notes of a commit	3.08
+linux	unstage a file	2.62
+linux	untrusted repository check	0.01
+linux	working changes	2.37
+linux	worktrees, submodules, bisect	2.62

@@ -6,9 +6,11 @@
 
 use serde::{Deserialize, Serialize};
 use similar::{Algorithm, DiffTag, TextDiff};
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use super::structural::{self, Mark, Syntax};
 use crate::error::IoContext;
 use crate::{CoreError, Result};
 
@@ -47,6 +49,9 @@ pub struct DiffOptions {
     /// Minimal diff (Myers): the fewest changed lines. Off: histogram diff,
     /// which reads better.
     pub minimal: bool,
+    /// Compare changed lines by their tokens: a change of layout alone (line breaks,
+    /// indentation, alignment) is told apart from a change of content.
+    pub structural: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -68,6 +73,8 @@ pub struct Op {
     pub a_len: usize,
     pub b: usize,
     pub b_len: usize,
+    /// The two sides hold the same tokens: only the layout differs (structural diff).
+    pub cosmetic: bool,
 }
 
 /// Half-open UTF-16 ranges.
@@ -97,6 +104,11 @@ pub struct TextDiffResult {
     pub ratio: f32,
     /// Removed lines that reappear unchanged (indentation aside) among the added lines.
     pub moves: Vec<Move>,
+    /// Structural diff: lines of changed blocks by what changed on them. An empty list:
+    /// nothing, only the layout differs; else the changed ranges. A line not listed
+    /// changed as a whole (or was compared by words, see `pairs`).
+    pub left_marks: BTreeMap<usize, Spans>,
+    pub right_marks: BTreeMap<usize, Spans>,
 }
 
 /// `len` lines removed at left `a` and added at right `b`: moved, not changed.
@@ -239,7 +251,9 @@ pub fn compare(a: &DiffSource, b: &DiffSource, opts: DiffOptions) -> Result<Diff
             lb.side.crlf = tb.contains("\r\n");
             la.side.final_newline = ta.is_empty() || ta.ends_with('\n');
             lb.side.final_newline = tb.is_empty() || tb.ends_with('\n');
-            let text = diff_text(ta, tb, opts);
+            // The language of the newer side, else of the older one.
+            let syntax = Syntax::for_names(&[&lb.side.label, &la.side.label]);
+            let text = diff_text_as(ta, tb, opts, syntax);
             Ok(DiffResult {
                 left: la.side,
                 right: lb.side,
@@ -340,6 +354,11 @@ fn normalize(line: &str, raw: &str, opts: DiffOptions) -> String {
 }
 
 pub fn diff_text(a: &str, b: &str, opts: DiffOptions) -> TextDiffResult {
+    diff_text_as(a, b, opts, Syntax::for_names(&[]))
+}
+
+/// `diff_text` with the token rules of the files' language, for `opts.structural`.
+pub fn diff_text_as(a: &str, b: &str, opts: DiffOptions, syntax: Syntax) -> TextDiffResult {
     let left = split_lines(a);
     let right = split_lines(b);
     // Raw lines keep "\r" so CRLF vs LF counts as a change unless ignore_eol.
@@ -370,6 +389,42 @@ pub fn diff_text(a: &str, b: &str, opts: DiffOptions) -> TextDiffResult {
         moved_b[m.b..m.b + m.len].fill(true);
     }
 
+    let mut blocks = if opts.structural {
+        structural::compare_hunks(
+            &left,
+            &right,
+            &hunks,
+            syntax,
+            opts.ignore_whitespace,
+            opts.ignore_case,
+        )
+    } else {
+        Vec::new()
+    };
+    if !opts.ignore_eol {
+        for (block, &(a0, a1, b0, b1)) in blocks.iter_mut().zip(&hunks) {
+            // Tokenization uses display lines without CR. Keep a literal block when
+            // the user explicitly requests comparing its CRLF line endings.
+            if ra[a0..a1]
+                .iter()
+                .chain(&rb[b0..b1])
+                .any(|line| line.ends_with('\r'))
+            {
+                *block = None;
+            }
+        }
+    }
+    let (mut left_marks, mut right_marks) = (BTreeMap::new(), BTreeMap::new());
+    let note = |marks: &mut BTreeMap<usize, Spans>, first: usize, of: Vec<Mark>| {
+        for (k, mark) in of.into_iter().enumerate() {
+            match mark {
+                Mark::Whole => {}
+                Mark::Same => drop(marks.insert(first + k, Vec::new())),
+                Mark::Part(spans) => drop(marks.insert(first + k, spans)),
+            }
+        }
+    };
+
     let mut ops = Vec::new();
     let mut pairs = Vec::new();
     let (mut added, mut removed) = (0, 0);
@@ -382,14 +437,25 @@ pub fn diff_text(a: &str, b: &str, opts: DiffOptions) -> TextDiffResult {
                 a_len: len,
                 b,
                 b_len: len,
+                cosmetic: false,
             });
         }
     };
-    for (a0, a1, b0, b1) in hunks {
+    for (n, (a0, a1, b0, b1)) in hunks.into_iter().enumerate() {
         equal(&mut ops, pa, pb, a0 - pa);
         let (al, bl) = (a1 - a0, b1 - b0);
-        removed += al;
-        added += bl;
+        // Compared by tokens: the marks say what changed on each line.
+        let block = blocks.get_mut(n).and_then(Option::take);
+        let by_tokens = block.is_some();
+        let cosmetic = block.as_ref().is_some_and(|b| !b.changed);
+        if let Some(block) = block {
+            note(&mut left_marks, a0, block.a);
+            note(&mut right_marks, b0, block.b);
+        }
+        if !cosmetic {
+            removed += al;
+            added += bl;
+        }
         let tag = match (al, bl) {
             (_, 0) => "delete",
             (0, _) => "insert",
@@ -403,7 +469,14 @@ pub fn diff_text(a: &str, b: &str, opts: DiffOptions) -> TextDiffResult {
             let lb: Vec<String> = ib.iter().map(|&j| right[j].clone()).collect();
             for (i, j) in pair_lines(&la, &lb) {
                 let (a, b) = (ia[i], ib[j]);
-                let (sa, sb) = word_spans(&left[a], &right[b]);
+                let (sa, sb) = if by_tokens {
+                    let of = |marks: &BTreeMap<usize, Spans>, line| {
+                        marks.get(&line).cloned().unwrap_or_default()
+                    };
+                    (of(&left_marks, a), of(&right_marks, b))
+                } else {
+                    word_spans(&left[a], &right[b])
+                };
                 pairs.push(LinePair {
                     a,
                     b,
@@ -418,6 +491,7 @@ pub fn diff_text(a: &str, b: &str, opts: DiffOptions) -> TextDiffResult {
             a_len: al,
             b: b0,
             b_len: bl,
+            cosmetic,
         });
         pa = a1;
         pb = b1;
@@ -439,6 +513,8 @@ pub fn diff_text(a: &str, b: &str, opts: DiffOptions) -> TextDiffResult {
         removed,
         ratio,
         moves,
+        left_marks,
+        right_marks,
     }
 }
 
@@ -719,7 +795,7 @@ fn common_affixes(x: &str, y: &str) -> (usize, usize) {
     (w(&cx[..p]), w(&cx[cx.len() - s..]))
 }
 
-fn push_span(v: &mut Spans, s: usize, e: usize) {
+pub(super) fn push_span(v: &mut Spans, s: usize, e: usize) {
     if s >= e {
         return;
     }
@@ -730,7 +806,7 @@ fn push_span(v: &mut Spans, s: usize, e: usize) {
 }
 
 /// Joins spans separated by whitespace only or by a single character.
-fn join_gaps(spans: Spans, line: &str) -> Spans {
+pub(super) fn join_gaps(spans: Spans, line: &str) -> Spans {
     let units: Vec<u16> = line.encode_utf16().collect();
     let mut out: Spans = Vec::new();
     for (s, e) in spans {
@@ -774,21 +850,18 @@ pub fn unified_patch(a: &DiffSource, b: &DiffSource) -> Result<String> {
 fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
     // core.fsmonitor=false: never start a background fsmonitor daemon in the user's
     // repositories (users with core.fsmonitor=true would otherwise collect one per repo).
-    let mut cmd = std::process::Command::new(super::gitstatus::program());
+    // `command` also keeps a console window from flashing on Windows (FolderPane calls
+    // git_root on every navigation) and runs Git inside WSL for repositories there.
+    let mut cmd = super::gitexec::command(dir, super::gitstatus::program());
     cmd.args(["-c", "core.fsmonitor=false", "-C"])
-        .arg(dir)
+        .arg(super::gitexec::dir_arg(dir))
         .args(args);
-    // A GUI process spawning a console program gets a fresh console window on Windows,
-    // which flashes on screen (FolderPane calls git_root on every navigation).
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
+    super::gitexec::forward_env(&mut cmd);
+    let out = match super::gitexec::run(&cmd, std::time::Duration::from_secs(120)) {
+        Some(out) => out,
+        None => cmd.output(),
     }
-    let out = cmd
-        .output()
-        .map_err(|e| CoreError::Other(format!("git not available: {e}")))?;
+    .map_err(|e| CoreError::Other(format!("git not available: {e}")))?;
     if !out.status.success() {
         return Err(CoreError::Other(
             String::from_utf8_lossy(&out.stderr).trim().to_string(),
@@ -801,10 +874,12 @@ fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
 pub fn git_root(path: &Path) -> Option<PathBuf> {
     let dir = if path.is_dir() { path } else { path.parent()? };
     // Outside a repository no git is started (this runs on every navigation).
-    super::gitstatus::work_tree(dir)?;
-    let out = git(dir, &["rev-parse", "--show-toplevel"]).ok()?;
-    let s = String::from_utf8_lossy(&out).trim().to_string();
-    (!s.is_empty()).then(|| PathBuf::from(s))
+    // Git is asked once per folder (see `gitfacts::root`).
+    super::gitfacts::root(dir, || {
+        let out = git(dir, &["rev-parse", "--show-toplevel"]).ok()?;
+        let s = String::from_utf8_lossy(&out).trim().to_string();
+        (!s.is_empty()).then(|| super::gitexec::host_path(dir, &s))
+    })
 }
 
 fn git_revision_bytes(path: &Path, revision: &str) -> Result<Vec<u8>> {
@@ -974,12 +1049,58 @@ mod tests {
     }
 
     #[test]
+    fn structural_diff_tells_layout_from_content() {
+        let o = DiffOptions {
+            structural: true,
+            ..DiffOptions::default()
+        };
+        let a = "fn a() {\n    call(one, two);\n}\n\nfn b() { old(); }\n";
+        let b = "fn a() {\n    call(\n        one,\n        two,\n    );\n}\n\nfn b() { new(); }\n";
+        let r = diff_text_as(a, b, o, Syntax::for_names(&["a.rs"]));
+        let changed: Vec<&Op> = r.ops.iter().filter(|op| op.tag != "equal").collect();
+        assert_eq!(changed.len(), 2);
+        // The reflowed call differs only by a trailing comma: one token marked.
+        assert!(!changed[0].cosmetic);
+        assert_eq!(r.left_marks.get(&1), Some(&vec![]));
+        assert_eq!(r.right_marks.get(&3), Some(&vec![(11, 12)]));
+        assert_eq!(r.left_marks.get(&4), Some(&vec![(9, 12)]));
+        assert_eq!(r.right_marks.get(&7), Some(&vec![(9, 12)]));
+        // Layout alone is a block of its own kind and is not counted.
+        let r = diff_text_as(
+            "a(b);\nc();\n",
+            "a( b );\nc();\n",
+            o,
+            Syntax::for_names(&["a.rs"]),
+        );
+        assert!(r.ops[0].cosmetic && r.ops[0].tag == "replace");
+        assert_eq!((r.added, r.removed, r.ratio), (0, 0, 1.0));
+        // Without the option, and for a file of no known language, spaces are content.
+        assert!(!diff_text("a(b);\n", "a( b );\n", DiffOptions::default()).ops[0].cosmetic);
+        assert!(!diff_text("a(b);\n", "a( b );\n", o).ops[0].cosmetic);
+    }
+
+    #[test]
+    fn structural_diff_respects_explicit_line_ending_comparison() {
+        let options = DiffOptions {
+            structural: true,
+            ignore_eol: false,
+            ..DiffOptions::default()
+        };
+        let result = diff_text_as("a();\r\n", "a();\n", options, Syntax::for_names(&["a.rs"]));
+        assert!(result
+            .ops
+            .iter()
+            .any(|op| op.tag != "equal" && !op.cosmetic));
+        assert_eq!((result.added, result.removed), (1, 1));
+    }
+
+    #[test]
     fn ignore_options() {
         let o = DiffOptions {
             ignore_whitespace: true,
             ignore_case: true,
             ignore_eol: true,
-            minimal: false,
+            ..DiffOptions::default()
         };
         let r = diff_text("Hello   World\r\nx\n", "hello world\nx\n", o);
         assert!(r.ops.iter().all(|op| op.tag == "equal"));

@@ -10,8 +10,8 @@ nothing to install.
 
 | Theme | Dark mode | Light mode |
 |---|---|---|
-| Catppuccin | Mocha | Latte |
 | Gruvbox | Dark (hard) | Light (soft) |
+| Night Owl | Night Owl | Light Owl |
 
 Gall uses the version that matches *Theme: Dark*, *Light* or *System*. Their source is in
 [`ui/src/themes`](../../ui/src/themes), and it's a good reference for a theme of your own.
@@ -30,7 +30,7 @@ This folder has one example to install: [`dracula.css`](dracula.css), the
    | Linux | `~/.config/gall/themes/` |
    | Windows | `%APPDATA%\gall\themes\` |
    | macOS | `~/Library/Application Support/gall/themes/` |
-   | Portable | `UserData\themes\` next to `gall.exe` |
+   | Portable (with a `portable` marker file) | `UserData\themes\` next to `gall.exe` |
 
 2. In *Settings › Appearance › Custom theme*, pick the theme from the dropdown. Files from the
    folder are listed under *Themes folder*. The folder is read again each time you open the
@@ -38,7 +38,7 @@ This folder has one example to install: [`dracula.css`](dracula.css), the
 
 To go back to the built-in colours, pick *None (built-in colours)*.
 
-A file named like an included theme (for example `catppuccin.css`) takes its place. That's the
+A file named like an included theme (for example `gruvbox.css`) takes its place. That's the
 way to adjust an included theme: copy it from `ui/src/themes` into the folder and edit it.
 
 ## Write your own

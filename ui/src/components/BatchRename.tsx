@@ -165,7 +165,7 @@ export function BatchRename({ b, entries }: { b: number; entries: FileEntry[] })
         </div>
         <div className="foot brn-foot">
           <span className="brn-hint">{problems ? `${A.items(problems)} to fix` : "Enter renames · one Ctrl+Z undoes all"}</span>
-          <button className="btn" onClick={close}>Cancel</button>
+          <button className="btn" title="Esc" onClick={close}>Cancel</button>
           <button className="btn primary" disabled={!canApply} onClick={apply}>Rename{changed ? ` ${A.items(changed)}` : ""}</button>
         </div>
       </div>

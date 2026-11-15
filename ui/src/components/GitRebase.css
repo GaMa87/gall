@@ -18,6 +18,9 @@
 .grw-chip b { font-weight: 600; color: var(--fg); }
 .grw-chip.changed, .grw-chip.moved { color: var(--accent-text); border-color: color-mix(in srgb, var(--accent) 25%, var(--border)); background: color-mix(in srgb, var(--accent) 7%, var(--bg-2)); }
 .grw-chip.changed b, .grw-chip.moved b { color: inherit; }
+.grw-chip.conflict { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 35%, var(--border)); background: color-mix(in srgb, var(--danger) 8%, var(--bg-2)); }
+.grw-chip.conflict b { color: inherit; }
+.grw-chip.clean { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 30%, var(--border)); background: color-mix(in srgb, var(--ok) 7%, var(--bg-2)); }
 .grw-direction { display: inline-flex; align-items: center; gap: 5px; margin-left: 5px; font-size: 10px; color: var(--fg-dim); white-space: nowrap; }
 .grw-direction svg { width: 12px; height: 12px; stroke: currentColor; stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; }
 .grw-range-options { min-width: 0; margin-left: auto; font-size: 10px; color: var(--fg-dim); }
@@ -73,6 +76,9 @@
 .grw-commit-meta code { color: var(--fg-dim); font: 10px var(--mono); }
 .grw-head-badge, .grw-moved-badge { font-size: 8px; border-radius: var(--radius-pill); padding: 1px 7px; background: var(--accent-soft); color: var(--accent-text); line-height: 1.5; }
 .grw-moved-badge { color: var(--fg-dim); background: var(--bg-3); }
+.grw-conflict-badge { font-size: 8px; border-radius: var(--radius-pill); padding: 1px 7px; line-height: 1.5; color: var(--danger); background: color-mix(in srgb, var(--danger) 12%, var(--bg-2)); }
+.grw-entry.conflict .grw-card { border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); }
+.grw-conflict-note { display: flex; gap: 7px; align-items: center; margin: 0 12px 12px 34px; font-size: 10px; line-height: 1.6; color: var(--danger); overflow-wrap: anywhere; }
 .grw-action-picker { position: relative; display: inline-flex; flex-shrink: 0; min-width: 91px; color: var(--grw-tone); }
 .grw-action-picker select { appearance: none; -webkit-appearance: none; color: inherit; background: color-mix(in srgb, var(--grw-tone) 9%, var(--bg-2)); border: 1px solid color-mix(in srgb, var(--grw-tone) 28%, var(--border)); border-radius: var(--radius-pill); width: 100%; min-height: 30px; padding: 5px 25px 5px 12px; font-size: 10px; font-weight: 500; cursor: pointer; }
 .grw-action-picker select option { color: var(--fg); background: var(--bg-2); }
@@ -123,7 +129,7 @@
   .grw-entries { padding: 12px 12px 15px; }.grw-entry { gap: 8px; }.grw-entry-line { flex-wrap: wrap; gap: 9px; padding: 10px; }
   .grw-step { width: 20px; height: 20px; margin-top: 17px; }.grw-entry::before { left: 9px; }
   .grw-commit-copy { flex: 1 1 calc(100% - 28px); }.grw-action-picker { margin-left: 19px; }.grw-move-controls { margin-left: auto; }
-  .grw-message-editor, .grw-combine-note, .grw-action-note { margin-left: 10px; margin-right: 10px; }
+  .grw-message-editor, .grw-combine-note, .grw-action-note, .grw-conflict-note { margin-left: 10px; margin-right: 10px; }
   .grw-footer { padding: 10px 14px; }.grw-outcome small { display: none; }.grw-direction { margin-left: 0; }
 }
 @media (prefers-reduced-motion: reduce) { .git-rebase * { animation: none !important; transition: none !important; } }

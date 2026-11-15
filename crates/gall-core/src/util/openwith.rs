@@ -178,6 +178,120 @@ pub fn open_default(path: &Path) -> Option<Result<()>> {
     }
 }
 
+/// What a file manager starts instead of handing the file to the MIME handler.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum Launcher {
+    /// A native program or an AppImage: run directly.
+    Program,
+    /// A script with a `#!` line: run in a terminal, so its output is visible.
+    Script,
+    /// A `.desktop` launcher.
+    Desktop,
+}
+
+/// How `path` is started when it is opened, if it is something to run: a regular file
+/// with the execute bit that is an AppImage or ELF program (not a shared library), a
+/// `#!` script or a `.desktop` file. Anything else is opened by its MIME handler.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn launcher(path: &Path) -> Option<Launcher> {
+    use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
+        return None;
+    }
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("appimage") => return Some(Launcher::Program),
+        Some("desktop") => return Some(Launcher::Desktop),
+        _ => {}
+    }
+    let mut head = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(18)
+        .read_to_end(&mut head)
+        .ok()?;
+    if head.starts_with(b"#!") {
+        return Some(Launcher::Script);
+    }
+    if head.len() < 18 || !head.starts_with(b"\x7fELF") {
+        return None;
+    }
+    // AppImage: `AI` and a type byte at offset 8 of the ELF header.
+    if &head[8..10] == b"AI" && matches!(head[10], 1 | 2) {
+        return Some(Launcher::Program);
+    }
+    // e_type: executable (2) or position independent executable / library (3).
+    let e_type = if head[5] == 2 {
+        u16::from_be_bytes([head[16], head[17]])
+    } else {
+        u16::from_le_bytes([head[16], head[17]])
+    };
+    let name = path.file_name()?.to_string_lossy();
+    let library = name.ends_with(".so") || name.contains(".so.");
+    (matches!(e_type, 2 | 3) && !library).then_some(Launcher::Program)
+}
+
+/// Opens `path` the way a file manager does when it is something to run (see
+/// [`launcher`]); `None` for any other file, which goes through the platform opener.
+/// `xdg-open` only looks at the MIME type, so it starts none of these. `terminal` is
+/// the configured terminal template, used for scripts. Windows and macOS start
+/// programs and scripts themselves, so they return `None`.
+pub fn open_executable(path: &Path, terminal: &str) -> Option<Result<()>> {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let kind = launcher(path)?;
+        let dir = path.parent().filter(|d| d.is_dir());
+        match kind {
+            Launcher::Program => Some(spawn_program(std::process::Command::new(path), path, dir)),
+            Launcher::Desktop => {
+                if !crate::util::cmdline::which("gio") {
+                    return None;
+                }
+                let mut cmd = std::process::Command::new("gio");
+                cmd.arg("launch").arg(path);
+                Some(spawn_program(cmd, path, dir))
+            }
+            Launcher::Script => {
+                match crate::util::terminal::run_script(path, terminal) {
+                    Some(r) => Some(r),
+                    // No terminal installed: run it without one.
+                    None => Some(spawn_program(std::process::Command::new(path), path, dir)),
+                }
+            }
+        }
+    }
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    {
+        let _ = (path, terminal);
+        None
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn spawn_program(mut cmd: std::process::Command, path: &Path, dir: Option<&Path>) -> Result<()> {
+    if let Some(dir) = dir {
+        cmd.current_dir(dir);
+    }
+    // When Gall itself runs from an AppImage these describe Gall's image; a started
+    // AppImage would take them for its own.
+    for var in ["APPIMAGE", "APPDIR", "ARGV0", "OWD"] {
+        cmd.env_remove(var);
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| CoreError::Other(format!("cannot start '{}': {e}", path.display())))?;
+    // Reap it when it exits so no zombie is left behind.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
 /// Shows the system's "Open with" dialog. Returns false where there is none.
 pub fn system_dialog(path: &Path) -> Result<bool> {
     #[cfg(windows)]
@@ -769,6 +883,47 @@ pub(crate) mod win_names {
 mod tests {
     use super::*;
 
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn launcher_picks_what_a_file_manager_runs() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let make = |name: &str, bytes: &[u8], mode: u32| {
+            let p = t.path().join(name);
+            std::fs::write(&p, bytes).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+            p
+        };
+        // ELF header: class, data, version, ABI, 4 pad bytes, then e_type at offset 16.
+        let elf = |kind: u8| {
+            let mut h = b"\x7fELF\x02\x01\x01\x00\0\0\0\0\0\0\0\0".to_vec();
+            h.extend([kind, 0, 0x3e, 0]);
+            h
+        };
+        let mut app_image = elf(2);
+        app_image[8..11].copy_from_slice(b"AI\x02");
+        let run = Some(Launcher::Program);
+        assert_eq!(launcher(&make("a.AppImage", b"x", 0o755)), run);
+        assert_eq!(launcher(&make("noext", &app_image, 0o755)), run);
+        assert_eq!(launcher(&make("pie", &elf(3), 0o755)), run);
+        assert_eq!(launcher(&make("old", &elf(2), 0o755)), run);
+        assert_eq!(launcher(&make("libx.so", &elf(3), 0o755)), None);
+        assert_eq!(launcher(&make("libx.so.6", &elf(3), 0o755)), None);
+        assert_eq!(launcher(&make("obj.o", &elf(1), 0o755)), None);
+        assert_eq!(
+            launcher(&make("run.sh", b"#!/bin/sh\necho hi\n", 0o755)),
+            Some(Launcher::Script)
+        );
+        assert_eq!(
+            launcher(&make("app.desktop", b"[Desktop Entry]\n", 0o755)),
+            Some(Launcher::Desktop)
+        );
+        // No execute bit, no marker, not a regular file: opened by its MIME handler.
+        assert_eq!(launcher(&make("b.AppImage", b"x", 0o644)), None);
+        assert_eq!(launcher(&make("p.sh", b"#!/bin/sh\n", 0o644)), None);
+        assert_eq!(launcher(&make("notes.txt", b"hello", 0o755)), None);
+        assert_eq!(launcher(t.path()), None);
+    }
     #[test]
     fn windows_registry_helpers() {
         std::env::set_var("GALL_TEST_ROOT", r"C:\Windows");

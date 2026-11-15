@@ -1,11 +1,12 @@
 //! Commit preparation with stale-state checks and recoverable file discard.
+use super::gitexec::{last_changed, remember_changed};
 use super::gitgraph::{git, has_content_filters, root};
 use crate::{CoreError, Result};
 use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -47,6 +48,7 @@ fn checked_root(path: &Path) -> Result<PathBuf> {
             "Index operations with content filters are not supported yet".into(),
         ));
     }
+    let listed = super::gitfacts::markers(&p);
     for marker in [
         "MERGE_HEAD",
         "CHERRY_PICK_HEAD",
@@ -55,8 +57,15 @@ fn checked_root(path: &Path) -> Result<PathBuf> {
         "rebase-apply",
         "BISECT_START",
     ] {
-        let value = git(&p, &["rev-parse", "--git-path", marker])?;
-        if p.join(value.trim()).exists() {
+        // One listing of the Git directory answers for all markers (see `gitfacts::Markers`).
+        let present = match &listed {
+            Some(listed) => listed.exists(marker),
+            None => {
+                let value = git(&p, &["rev-parse", "--git-path", marker])?;
+                p.join(super::gitexec::host_path(&p, value.trim())).exists()
+            }
+        };
+        if present {
             if marker == "rebase-merge" && super::gitrewrite::is_edit_stop(&p) {
                 continue;
             }
@@ -68,76 +77,183 @@ fn checked_root(path: &Path) -> Result<PathBuf> {
     Ok(p)
 }
 fn head(path: &Path) -> String {
+    if let Some(id) = super::gitfacts::head_id(path) {
+        return id;
+    }
     git(path, &["rev-parse", "--verify", "HEAD"])
         .unwrap_or_default()
         .trim()
         .to_owned()
 }
+/// HEAD, the index and the list of changes, read at the same time: three Git processes
+/// side by side instead of one after another.
+struct Seen {
+    head: String,
+    index: String,
+    changes: Vec<Change>,
+    /// Size and modification time of the index file before it was read.
+    index_file: Stamp,
+    /// Content digests of the paths changed at the last look, read while the changes were
+    /// listed; `None` for a path that could not be read.
+    early: Option<(Vec<String>, Vec<Option<u64>>)>,
+    /// In WSL: the `stat` fingerprint of the paths changed at the last look, read alike.
+    early_stat: Option<(Vec<String>, Vec<u8>)>,
+}
+type Stamp = Option<(u64, std::time::SystemTime)>;
+fn stamp(file: &Path) -> Stamp {
+    let meta = file.symlink_metadata().ok()?;
+    Some((meta.len(), meta.modified().ok()?))
+}
+fn index_stamp(path: &Path) -> Stamp {
+    stamp(&super::gitfacts::git_dir(path)?.join("index"))
+}
+fn see(path: &Path) -> Result<Seen> {
+    let index_file = index_stamp(path);
+    // The files changed at the last look are probably the ones changed now: their content
+    // is read while Git lists the changes, instead of after it (see `token_of`).
+    // In WSL their sizes and times, from one `stat` in the distribution.
+    let hint = last_changed(path);
+    let wsl = super::gitexec::place(path).is_some();
+    std::thread::scope(|scope| {
+        let head = scope.spawn(|| head(path));
+        let index = scope.spawn(|| git(path, &["ls-files", "--stage", "-z"]));
+        let early_stat = hint.clone().filter(|_| wsl).map(|names| {
+            scope.spawn(move || super::gitexec::fingerprint(path, &names).map(|stat| (names, stat)))
+        });
+        let early = hint.filter(|_| !wsl).map(|names| {
+            scope.spawn(move || {
+                let digests = super::gitrepository::parallel_map(&names, |name| {
+                    content_digest(&path.join(name)).ok()
+                });
+                (names, digests)
+            })
+        });
+        let changes = changes(path);
+        Ok(Seen {
+            head: super::gitgraph::joined(head)?,
+            index: super::gitgraph::joined(index)??,
+            changes: changes?,
+            index_file,
+            early: early.and_then(|early| early.join().ok()),
+            early_stat: early_stat.and_then(|early| early.join().ok().flatten()),
+        })
+    })
+}
+
 fn token(path: &Path) -> Result<String> {
+    token_of(path, &see(path)?)
+}
+/// The state `seen` and the content of every changed file as one value: equal tokens mean
+/// that nothing a commit, stage or discard depends on changed in between.
+fn token_of(path: &Path, seen: &Seen) -> Result<String> {
     let mut hash = std::collections::hash_map::DefaultHasher::new();
-    head(path).hash(&mut hash);
-    git(path, &["ls-files", "--stage", "-z"])?.hash(&mut hash);
-    for change in changes(path)? {
+    seen.head.hash(&mut hash);
+    seen.index.hash(&mut hash);
+    let list = &seen.changes;
+    for change in list {
         change.path.hash(&mut hash);
         change.index.hash(&mut hash);
         change.worktree.hash(&mut hash);
-        let file = path.join(&change.path);
-        match file.symlink_metadata() {
-            Ok(metadata) if metadata.is_symlink() => {
-                std::fs::read_link(&file)
-                    .map_err(|e| CoreError::Other(e.to_string()))?
-                    .hash(&mut hash);
-            }
-            Ok(metadata) if metadata.is_file() => {
-                let mut input =
-                    super::open_regular(&file).map_err(|e| CoreError::Other(e.to_string()))?;
-                let mut buffer = [0u8; 65536];
-                loop {
-                    let n = input
-                        .read(&mut buffer)
-                        .map_err(|e| CoreError::Other(e.to_string()))?;
-                    if n == 0 {
-                        break;
-                    }
-                    hash.write(&buffer[..n]);
-                }
-                metadata.len().hash(&mut hash);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    metadata.permissions().mode().hash(&mut hash);
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => "missing".hash(&mut hash),
-            Ok(_) => {
-                return Err(CoreError::Other(
-                    "A changed path is not a regular file or symlink".into(),
-                ))
-            }
-            Err(e) => return Err(CoreError::Other(e.to_string())),
-        }
+    }
+    // In WSL one `stat` in the distribution covers every path. Reading each one over 9P
+    // is slow, and symlinks there are reparse points that Windows cannot classify.
+    // The one read while Git listed the changes counts when the list is the same.
+    let names: Vec<String> = list.iter().map(|c| c.path.clone()).collect();
+    let early_stat = seen
+        .early_stat
+        .as_ref()
+        .filter(|(early, _)| *early == names)
+        .map(|(_, stat)| stat.clone());
+    if let Some(stat) = early_stat.or_else(|| super::gitexec::fingerprint(path, &names)) {
+        stat.hash(&mut hash);
+        remember_changed(path, names);
+        return Ok(format!("{:016x}", hash.finish()));
+    }
+    // Thousands of changed files are read on several threads; the digests go in in order.
+    // Read while Git listed the changes when the list is the one of the last look: the
+    // content is as current as the list. A path that could not be read then is read again,
+    // so its error is the one reported.
+    let early = seen
+        .early
+        .as_ref()
+        .filter(|(early, _)| *early == names)
+        .map(|(_, digests)| digests);
+    let digests = match early {
+        Some(early) => early
+            .iter()
+            .zip(list)
+            .map(|(digest, change)| match digest {
+                Some(digest) => Ok(*digest),
+                None => content_digest(&path.join(&change.path)),
+            })
+            .collect(),
+        None => super::gitrepository::parallel_map(list, |change| {
+            content_digest(&path.join(&change.path))
+        }),
+    };
+    remember_changed(path, names);
+    for digest in digests {
+        digest?.hash(&mut hash);
     }
     Ok(format!("{:016x}", hash.finish()))
 }
+/// The content of one changed path for [`token_of`].
+fn content_digest(file: &Path) -> Result<u64> {
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    match file.symlink_metadata() {
+        Ok(metadata) if metadata.is_symlink() => {
+            std::fs::read_link(file)
+                .map_err(|e| CoreError::Other(e.to_string()))?
+                .hash(&mut hash);
+        }
+        Ok(metadata) if metadata.is_file() => {
+            let mut input =
+                super::open_regular(file).map_err(|e| CoreError::Other(e.to_string()))?;
+            let mut buffer = [0u8; 65536];
+            loop {
+                let n = input
+                    .read(&mut buffer)
+                    .map_err(|e| CoreError::Other(e.to_string()))?;
+                if n == 0 {
+                    break;
+                }
+                hash.write(&buffer[..n]);
+            }
+            metadata.len().hash(&mut hash);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                metadata.permissions().mode().hash(&mut hash);
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => "missing".hash(&mut hash),
+        // An untracked nested repository is listed as a folder (`dir/`).
+        Ok(metadata) if metadata.is_dir() => "dir".hash(&mut hash),
+        Ok(_) => {
+            return Err(CoreError::Other(
+                "A changed path is not a regular file or symlink".into(),
+            ))
+        }
+        Err(e) => return Err(CoreError::Other(e.to_string())),
+    }
+    Ok(hash.finish())
+}
 fn verify_token(path: &Path, expected: &str) -> Result<()> {
-    if token(path)? != expected {
+    verified(path, expected).map(|_| ())
+}
+/// Checks the token and returns the state it was computed from, so the action that
+/// follows does not ask Git for HEAD and the changes a second time.
+fn verified(path: &Path, expected: &str) -> Result<Seen> {
+    let seen = see(path)?;
+    if token_of(path, &seen)? != expected {
         return Err(CoreError::Other(
             "The index, HEAD or working files changed. Refresh and review the changes again".into(),
         ));
     }
-    Ok(())
+    Ok(seen)
 }
 fn changes(path: &Path) -> Result<Vec<Change>> {
-    let raw = git(
-        path,
-        &[
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=all",
-            "--ignore-submodules=all",
-        ],
-    )?;
+    let raw = super::gitgraph::status_z(path)?;
     if raw.contains('\u{fffd}') {
         return Err(CoreError::Other(
             "Git paths with invalid UTF-8 are not supported".into(),
@@ -167,20 +283,23 @@ fn changes(path: &Path) -> Result<Vec<Change>> {
 }
 pub fn workspace(path: &Path) -> Result<Workspace> {
     let root = checked_root(path)?;
-    Ok(Workspace {
-        root: root.to_string_lossy().into_owned(),
-        edit_stop: super::gitrewrite::is_edit_stop(&root),
-        changes: changes(&root)?,
-        token: token(&root)?,
-        head: head(&root),
-        subject: git(&root, &["log", "-1", "--format=%s"])
-            .unwrap_or_default()
-            .trim_end()
-            .to_owned(),
-        message: git(&root, &["log", "-1", "--format=%B"])
-            .unwrap_or_default()
-            .trim_end()
-            .to_owned(),
+    super::gitfacts::keep_commit_graph(&root);
+    std::thread::scope(|scope| {
+        // Subject and full message in one query, next to the state.
+        let last = scope.spawn(|| git(&root, &["log", "-1", "--format=%s%x00%B"]));
+        let seen = see(&root);
+        let last = super::gitgraph::joined(last)?.unwrap_or_default();
+        let seen = seen?;
+        let (subject, message) = last.split_once('\0').unwrap_or((&last, ""));
+        Ok(Workspace {
+            root: root.to_string_lossy().into_owned(),
+            edit_stop: super::gitrewrite::is_edit_stop(&root),
+            token: token_of(&root, &seen)?,
+            head: seen.head,
+            changes: seen.changes,
+            subject: subject.trim_end().to_owned(),
+            message: message.trim_end().to_owned(),
+        })
     })
 }
 pub fn index_action(
@@ -190,8 +309,9 @@ pub fn index_action(
     message: &str,
     expected: &str,
 ) -> Result<()> {
+    let _busy = super::gitfacts::mutating();
     let root = checked_root(path)?;
-    verify_token(&root, expected)?;
+    let seen = verified(&root, expected)?;
     if matches!(action, IndexAction::Commit) && super::gitrewrite::is_edit_stop(&root) {
         return Err(CoreError::Other(
             "Use Amend at this interactive edit stop, then Continue the rebase".into(),
@@ -202,8 +322,13 @@ pub fn index_action(
             if message.trim().is_empty() {
                 return Err(CoreError::Other("A commit message is required".into()));
             }
+            // Staged: the index column of the status says so (what
+            // `diff --cached --name-only` lists).
             if matches!(action, IndexAction::Commit)
-                && git(&root, &["diff", "--cached", "--name-only", "--no-ext-diff"])?.is_empty()
+                && !seen
+                    .changes
+                    .iter()
+                    .any(|change| !matches!(change.index, ' ' | '?' | '!'))
             {
                 return Err(CoreError::Other("Stage changes before committing".into()));
             }
@@ -222,6 +347,7 @@ pub fn index_action(
                     ],
                 )?;
                 git(&root, &["commit", "--amend", "-m", message])?;
+                super::gitgraph::drop_recovery(&root, &previous);
             } else {
                 git(&root, &["commit", "-m", message])?;
             }
@@ -273,8 +399,8 @@ pub fn index_action(
             }
         }
         IndexAction::Stage | IndexAction::Unstage => {
-            let list = changes(&root)?;
-            let entry = list
+            let entry = seen
+                .changes
                 .iter()
                 .find(|e| Some(e.path.as_str()) == file)
                 .ok_or_else(|| {
@@ -288,7 +414,7 @@ pub fn index_action(
                 })
                 .map(|p| format!(":(literal){p}"))
                 .collect();
-            let unborn = head(&root).is_empty();
+            let unborn = seen.head.is_empty();
             let mut args = match action {
                 IndexAction::Stage => vec!["add", "--all", "--"],
                 _ if unborn => vec!["rm", "--cached", "--"],
@@ -303,18 +429,7 @@ pub fn index_action(
 fn discard(path: &Path, entry: &Change, expected: &str) -> Result<()> {
     let spec = format!(":(literal){}", entry.path);
     if entry.index == '?' {
-        git(
-            path,
-            &[
-                "stash",
-                "push",
-                "--include-untracked",
-                "-m",
-                "Gall recovery before file discard",
-                "--",
-                &spec,
-            ],
-        )?;
+        super::gitgraph::push_recovery(path, &["--", &spec], "Gall recovery before file discard")?;
         return Ok(());
     }
     if entry.worktree == ' ' {
@@ -331,16 +446,7 @@ fn discard(path: &Path, entry: &Change, expected: &str) -> Result<()> {
             "Could not preserve the file before discarding".into(),
         ));
     }
-    git(
-        path,
-        &[
-            "stash",
-            "store",
-            "-m",
-            "Gall recovery before file discard",
-            saved.trim(),
-        ],
-    )?;
+    super::gitgraph::retain_recovery(path, saved.trim(), "Gall recovery before file discard")?;
     verify_token(path, expected)?;
     git(path, &["restore", "--worktree", "--", &spec])?;
     Ok(())
@@ -361,7 +467,7 @@ fn ignore(path: &Path, file: &str, local: bool) -> Result<()> {
     let target = if local {
         let common = git(path, &["rev-parse", "--git-common-dir"])?;
         let common = path
-            .join(common.trim())
+            .join(super::gitexec::host_path(path, common.trim()))
             .canonicalize()
             .map_err(|e| CoreError::Other(e.to_string()))?;
         let info = common.join("info");
@@ -414,7 +520,10 @@ fn ignore(path: &Path, file: &str, local: bool) -> Result<()> {
 }
 pub fn patch(path: &Path, file: &str, staged: bool) -> Result<String> {
     let root = checked_root(path)?;
-    let list = changes(&root)?;
+    patch_of(&root, &changes(&root)?, file, staged)
+}
+/// The patch of `file`, one entry of the change `list` of the work tree `root`.
+fn patch_of(root: &Path, list: &[Change], file: &str, staged: bool) -> Result<String> {
     let entry = list
         .iter()
         .find(|e| e.path == file)
@@ -464,7 +573,7 @@ pub fn patch(path: &Path, file: &str, staged: bool) -> Result<String> {
             args.push(original);
         }
     }
-    git(&root, &args)
+    git(root, &args)
 }
 
 #[derive(Serialize)]
@@ -485,22 +594,53 @@ pub struct SelectionPatch {
     pub lines: Vec<PatchLine>,
 }
 fn patch_token(path: &Path, file: &str, staged: bool, text: &str) -> Result<String> {
+    Ok(patch_token_of(&token(path)?, file, staged, text))
+}
+fn patch_token_of(token: &str, file: &str, staged: bool, text: &str) -> String {
     let mut hash = std::collections::hash_map::DefaultHasher::new();
-    token(path)?.hash(&mut hash);
+    token.hash(&mut hash);
     file.hash(&mut hash);
     staged.hash(&mut hash);
     text.hash(&mut hash);
-    Ok(format!("{:016x}", hash.finish()))
+    format!("{:016x}", hash.finish())
 }
 pub fn selection_patch(path: &Path, file: &str, staged: bool) -> Result<SelectionPatch> {
+    // The index may be rewritten once in the background while this reads (see
+    // `gitfacts::refresh_index`); that is no change of content, so one more try.
+    match selection_patch_once(path, file, staged) {
+        Err(CoreError::Other(message)) if message.starts_with("The index, HEAD or working") => {
+            selection_patch_once(path, file, staged)
+        }
+        result => result,
+    }
+}
+fn selection_patch_once(path: &Path, file: &str, staged: bool) -> Result<SelectionPatch> {
     let root = checked_root(path)?;
-    let before = token(&root)?;
-    let text = patch(&root, file, staged)?;
-    let entry = changes(&root)?
+    // The patch must describe one state: the state is read, then the patch, then the
+    // state again, and the two have to agree. Each state is read once (it used to be read
+    // three times, and the list of changes five times).
+    let seen = see(&root)?;
+    let before = token_of(&root, &seen)?;
+    let on_disk = stamp(&root.join(file));
+    let text = patch_of(&root, &seen.changes, file, staged)?;
+    // What this patch is made of must not have moved while it was read: HEAD, the index
+    // and the file itself. Anything else that changed meanwhile makes the token stale,
+    // and applying a selection checks the whole state again before it touches the index.
+    // (A full second look cost another status of the whole work tree per file clicked.)
+    if head(&root) != seen.head
+        || seen.index_file.is_none()
+        || index_stamp(&root) != seen.index_file
+        || stamp(&root.join(file)) != on_disk
+    {
+        return Err(CoreError::Other(
+            "The index, HEAD or working files changed. Refresh and review the changes again".into(),
+        ));
+    }
+    let entry = seen
+        .changes
         .into_iter()
         .find(|e| e.path == file)
         .ok_or_else(|| CoreError::Other("The selected file changed. Refresh the changes".into()))?;
-    verify_token(&root, &before)?;
     let unsupported = entry.index == '?'
         || entry.original.is_some()
         || text.len() > 2_000_000
@@ -539,7 +679,7 @@ pub fn selection_patch(path: &Path, file: &str, staged: bool) -> Result<Selectio
             }
         })
         .collect();
-    Ok(SelectionPatch { token: patch_token(&root, file, staged, &text)?, text, selectable: !unsupported,
+    Ok(SelectionPatch { token: patch_token_of(&before, file, staged, &text), text, selectable: !unsupported,
         reason: unsupported.then(|| "Select the whole file for additions, deletions, renames, binary/mode changes, very large files or files without a final newline.".into()), lines })
 }
 fn hunk_start(header: &str, index: usize) -> Result<i64> {
@@ -640,22 +780,22 @@ fn selected_patch(patch: &SelectionPatch, selected: &[usize], reverse: bool) -> 
     Ok(result)
 }
 fn apply_cached(path: &Path, text: &str, reverse: bool) -> Result<()> {
-    let mut command = Command::new("git");
-    command.arg("-C").arg(path).args([
-        "-c",
-        "core.fsmonitor=false",
-        "-c",
-        if cfg!(windows) {
-            "core.hooksPath=NUL"
-        } else {
-            "core.hooksPath=/dev/null"
-        },
-        "apply",
-        "--cached",
-        "--unidiff-zero",
-        "--whitespace=nowarn",
-        "--recount",
-    ]);
+    let mut command = super::gitexec::command(path, super::gitstatus::program());
+    command
+        .arg("-C")
+        .arg(super::gitexec::dir_arg(path))
+        .args(["-c", "core.fsmonitor=false", "-c"])
+        .arg(format!(
+            "core.hooksPath={}",
+            super::gitexec::null_device(path)
+        ))
+        .args([
+            "apply",
+            "--cached",
+            "--unidiff-zero",
+            "--whitespace=nowarn",
+            "--recount",
+        ]);
     if reverse {
         command.arg("--reverse");
     }
@@ -671,6 +811,7 @@ fn apply_cached(path: &Path, text: &str, reverse: bool) -> Result<()> {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
     }
+    super::gitexec::forward_env(&mut command);
     let mut child = command
         .spawn()
         .map_err(|e| CoreError::Other(e.to_string()))?;
@@ -692,6 +833,7 @@ pub fn apply_selection(
     selected: &[usize],
     expected: &str,
 ) -> Result<()> {
+    let _busy = super::gitfacts::mutating();
     let root = checked_root(path)?;
     let patch = selection_patch(&root, file, staged)?;
     if patch.token != expected {
@@ -712,6 +854,111 @@ pub fn apply_selection(
 mod tests {
     use super::*;
     #[test]
+    fn changes_load_when_an_untracked_nested_repository_is_listed() {
+        let temp = fixture();
+        let root = temp.path();
+        let nested = root.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        git(&nested, &["init", "-q"]).unwrap();
+        std::fs::write(nested.join("a.txt"), "x").unwrap();
+        std::fs::write(root.join("new.txt"), "y").unwrap();
+        let state = workspace(root).unwrap();
+        assert!(state.changes.iter().any(|c| c.path == "nested/"));
+        assert_eq!(workspace(root).unwrap().token, state.token);
+    }
+    #[test]
+    fn staged_nested_repository_is_visible_and_can_be_unstaged_without_touching_it() {
+        let temp = fixture();
+        let root = temp.path();
+        let nested = root.join(".worktrees");
+        std::fs::create_dir(&nested).unwrap();
+        git(&nested, &["init", "-q"]).unwrap();
+        for (key, value) in [
+            ("user.name", "Test"),
+            ("user.email", "test@example.com"),
+            ("core.autocrlf", "false"),
+        ] {
+            git(&nested, &["config", key, value]).unwrap();
+        }
+        std::fs::write(nested.join("keep.txt"), "original\n").unwrap();
+        git(&nested, &["add", "keep.txt"]).unwrap();
+        git(&nested, &["commit", "-qm", "nested first"]).unwrap();
+        let first = head(&nested);
+        git(root, &["add", ".worktrees"]).unwrap();
+        // The previous ignore-all status incorrectly called this real staged change clean.
+        assert!(git(
+            root,
+            &["status", "--porcelain=v1", "--ignore-submodules=all"]
+        )
+        .unwrap()
+        .is_empty());
+        let state = workspace(root).unwrap();
+        assert_eq!(state.changes.len(), 1);
+        assert_eq!(state.changes[0].path, ".worktrees");
+        assert_eq!(state.changes[0].index, 'A');
+        assert_eq!(state.changes[0].worktree, ' ');
+        index_action(
+            root,
+            IndexAction::Unstage,
+            Some(".worktrees"),
+            "",
+            &state.token,
+        )
+        .unwrap();
+        assert_eq!(head(&nested), first);
+        assert_eq!(
+            std::fs::read_to_string(nested.join("keep.txt")).unwrap(),
+            "original\n"
+        );
+        assert_eq!(workspace(root).unwrap().changes[0].path, ".worktrees/");
+
+        git(root, &["add", ".worktrees"]).unwrap();
+        git(root, &["commit", "-qm", "record nested repository"]).unwrap();
+        std::fs::write(nested.join("keep.txt"), "next\n").unwrap();
+        git(&nested, &["commit", "-qam", "nested second"]).unwrap();
+        let second = head(&nested);
+        std::fs::write(nested.join("keep.txt"), "local edit\n").unwrap();
+        std::fs::write(nested.join("untracked.txt"), "untracked\n").unwrap();
+        // A different module checkout and local files stay outside the parent's changes.
+        assert!(workspace(root).unwrap().changes.is_empty());
+        git(root, &["add", ".worktrees"]).unwrap();
+        let state = workspace(root).unwrap();
+        assert_eq!(state.changes.len(), 1);
+        assert_eq!(state.changes[0].index, 'M');
+        assert_eq!(state.changes[0].worktree, ' ');
+        // Last-gitlink deletion must remain visible even without .gitmodules.
+        git(root, &["update-index", "--force-remove", ".worktrees"]).unwrap();
+        let state = workspace(root).unwrap();
+        assert_eq!(state.changes.len(), 2);
+        assert!(state
+            .changes
+            .iter()
+            .any(|change| change.path == ".worktrees" && change.index == 'D'));
+        assert!(state
+            .changes
+            .iter()
+            .any(|change| change.path == ".worktrees/" && change.index == '?'));
+        index_action(
+            root,
+            IndexAction::Unstage,
+            Some(".worktrees"),
+            "",
+            &state.token,
+        )
+        .unwrap();
+        assert!(workspace(root).unwrap().changes.is_empty());
+        assert_eq!(head(&nested), second);
+        assert_eq!(
+            std::fs::read_to_string(nested.join("keep.txt")).unwrap(),
+            "local edit\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(nested.join("untracked.txt")).unwrap(),
+            "untracked\n"
+        );
+    }
+
+    #[test]
     fn commits_in_a_repository_with_a_submodule_without_staging_its_pointer() {
         let temp = fixture();
         let root = temp.path();
@@ -720,6 +967,7 @@ mod tests {
         git(s, &["init", "-q"]).unwrap();
         git(s, &["config", "user.email", "t@t"]).unwrap();
         git(s, &["config", "user.name", "t"]).unwrap();
+        git(s, &["config", "core.autocrlf", "false"]).unwrap();
         std::fs::write(s.join("f"), "1").unwrap();
         git(s, &["add", "f"]).unwrap();
         git(s, &["commit", "-q", "-m", "init"]).unwrap();
@@ -736,6 +984,7 @@ mod tests {
             ],
         )
         .unwrap();
+        git(&root.join("vendor"), &["config", "core.autocrlf", "false"]).unwrap();
         git(root, &["commit", "-q", "-m", "add submodule"]).unwrap();
         std::fs::write(s.join("f"), "2").unwrap();
         git(s, &["commit", "-q", "-am", "next"]).unwrap();
@@ -747,6 +996,16 @@ mod tests {
         assert_eq!(staged.trim(), "new.txt");
         let state = workspace(root).unwrap();
         index_action(root, IndexAction::Commit, None, "with sub", &state.token).unwrap();
+        // A staged submodule pointer is visible and can be committed on its own.
+        git(root, &["add", "vendor"]).unwrap();
+        let state = workspace(root).unwrap();
+        assert_eq!(state.changes.len(), 1);
+        assert_eq!(state.changes[0].path, "vendor");
+        assert_eq!(state.changes[0].index, 'M');
+        assert_eq!(state.changes[0].worktree, ' ');
+        index_action(root, IndexAction::Commit, None, "bump sub", &state.token).unwrap();
+        let last = git(root, &["log", "-1", "--format=%s"]).unwrap();
+        assert_eq!(last.trim(), "bump sub");
     }
     #[cfg(unix)]
     #[test]
@@ -1003,16 +1262,35 @@ mod tests {
         let state = workspace(root).unwrap();
         index_action(root, IndexAction::Amend, None, "amended", &state.token).unwrap();
         assert_eq!(git(root, &["show", "HEAD:a.txt"]).unwrap(), "changed\n");
-        assert_eq!(
-            git(
-                root,
-                &["rev-parse", &format!("refs/gall/recovery/{original}")]
-            )
-            .unwrap()
-            .trim(),
-            original
-        );
+        // A finished amend leaves no recovery reference behind (it would clutter other graphs).
+        assert!(git(
+            root,
+            &[
+                "show-ref",
+                "--verify",
+                &format!("refs/gall/recovery/{original}")
+            ]
+        )
+        .is_err());
         assert!(root.join("[new].txt").exists());
+    }
+    fn recovery_ids(root: &Path) -> std::collections::BTreeSet<String> {
+        git(
+            root,
+            &[
+                "for-each-ref",
+                "--format=%(objectname)",
+                "refs/gall/recovery",
+            ],
+        )
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+    }
+    fn only(ids: &std::collections::BTreeSet<String>) -> String {
+        assert_eq!(ids.len(), 1, "{ids:?}");
+        ids.iter().next().unwrap().clone()
     }
     #[test]
     fn targeted_discard_keeps_staged_content_and_unrelated_changes_recoverable() {
@@ -1034,9 +1312,15 @@ mod tests {
             "unrelated\n"
         );
         assert_eq!(
-            git(root, &["show", "stash@{0}:a.txt"]).unwrap(),
+            git(
+                root,
+                &["show", &format!("{}:a.txt", only(&recovery_ids(root)))]
+            )
+            .unwrap(),
             "unstaged\n"
         );
+        let first_ids = recovery_ids(root);
+        assert!(git(root, &["stash", "list"]).unwrap().is_empty());
         std::fs::write(root.join("[new].txt"), "recover me\n").unwrap();
         let state = workspace(root).unwrap();
         index_action(
@@ -1049,9 +1333,20 @@ mod tests {
         .unwrap();
         assert!(!root.join("[new].txt").exists());
         assert_eq!(
-            git(root, &["show", "stash@{0}^3:[new].txt"]).unwrap(),
+            git(
+                root,
+                &[
+                    "show",
+                    &format!(
+                        "{}^3:[new].txt",
+                        only(&recovery_ids(root).difference(&first_ids).cloned().collect())
+                    )
+                ]
+            )
+            .unwrap(),
             "recover me\n"
         );
+        assert!(git(root, &["stash", "list"]).unwrap().is_empty());
         assert_eq!(git(root, &["show", ":a.txt"]).unwrap(), "staged\n");
         assert_eq!(
             std::fs::read_to_string(root.join("other.txt")).unwrap(),

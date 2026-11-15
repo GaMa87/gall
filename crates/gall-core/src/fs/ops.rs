@@ -940,6 +940,7 @@ fn trash_timed(paths: &[PathBuf]) -> Result<(i64, i64)> {
 /// COM as single-threaded and *panics* if the calling thread already has COM in another
 /// mode (RPC_E_CHANGED_MODE), which happens on async worker threads that other libraries
 /// (sysinfo, the webview) used. A fresh thread has no COM state; a panic becomes an error.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn with_trash<T, E, F>(f: F) -> Result<T>
 where
     T: Send + 'static,
@@ -1022,18 +1023,46 @@ fn trash_paths(paths: &[PathBuf]) -> Result<()> {
         )));
     }
     let _released = release(paths.iter().map(PathBuf::as_path));
-    let owned = paths.to_vec();
-    with_trash(move || trash::delete_all(owned))
+    #[cfg(target_os = "macos")]
+    return super::mactrash::trash(paths);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let owned = paths.to_vec();
+        with_trash(move || trash::delete_all(owned))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn restore_from_system_trash(paths: &[PathBuf], at: i64, until: i64) -> Result<()> {
+    let wanted = pick_trashed(super::mactrash::items(), paths, at, until, |i| {
+        (
+            i.original.clone(),
+            i.time_ms.div_euclid(1000),
+            i.time_ms as u128 * 1_000_000,
+        )
+    });
+    if wanted.is_empty() {
+        return Err(CoreError::Trash("items are no longer in the trash".into()));
+    }
+    let missing = paths.len() - wanted.len();
+    super::mactrash::restore(wanted)?;
+    if missing > 0 {
+        return Err(CoreError::Trash(format!(
+            "{} no longer in the trash",
+            if missing == 1 {
+                "1 item is".to_string()
+            } else {
+                format!("{missing} items are")
+            }
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(not(any(
     target_os = "windows",
-    all(
-        unix,
-        not(target_os = "macos"),
-        not(target_os = "ios"),
-        not(target_os = "android")
-    )
+    target_os = "macos",
+    all(unix, not(target_os = "ios"), not(target_os = "android"))
 )))]
 fn restore_from_system_trash(_paths: &[PathBuf], _at: i64, _until: i64) -> Result<()> {
     Err(CoreError::Trash(
@@ -1179,7 +1208,7 @@ fn rename_many_with_ids(
 static RENAME_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Atomically renames without replacing an entry created concurrently at `to`.
-fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::ffi::OsStrExt;
@@ -1687,12 +1716,29 @@ pub fn find_conflicts(sources: &[PathBuf], dest: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Whether two paths name one item: equal, or, where the file system ignores case (macOS
+/// and Windows by default), equal apart from letter case. Purely textual, no disk access.
+fn same_path_ci(a: &Path, b: &Path) -> bool {
+    a == b
+        || (cfg!(any(windows, target_os = "macos"))
+            && a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase())
+}
+
+/// Whether `child` is `parent` or inside it, ignoring letter case on case-insensitive
+/// platforms (see [`same_path_ci`]).
+fn starts_with_ci(child: &Path, parent: &Path) -> bool {
+    child.starts_with(parent)
+        || (cfg!(any(windows, target_os = "macos"))
+            && PathBuf::from(child.to_string_lossy().to_lowercase())
+                .starts_with(PathBuf::from(parent.to_string_lossy().to_lowercase())))
+}
+
 fn ensure_not_into_itself(op: &'static str, src: &Path, dest_dir: &Path) -> Result<()> {
     let src_c = src.canonicalize().unwrap_or_else(|_| src.to_path_buf());
     let dst_c = dest_dir
         .canonicalize()
         .unwrap_or_else(|_| dest_dir.to_path_buf());
-    if dst_c.starts_with(&src_c)
+    if starts_with_ci(&dst_c, &src_c)
         && fs::symlink_metadata(src)
             .map(|m| m.is_dir())
             .unwrap_or(false)
@@ -1726,6 +1772,39 @@ fn measure(paths: &[PathBuf]) -> Totals {
         }
     }
     t
+}
+
+/// Every source can go to `dest` with one rename: all are on the drive of `dest` and
+/// none has a namesake there (a merge or a replace handles the items inside one by one).
+/// When this is wrong (a folder that is another drive in disguise), the move still works
+/// by copying, only without a total to show.
+fn moves_by_rename(sources: &[PathBuf], dest: &Path) -> bool {
+    #[cfg(unix)]
+    let same_drive = {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(drive) = fs::metadata(dest).map(|m| m.dev()) else {
+            return false;
+        };
+        move |src: &Path| fs::symlink_metadata(src).is_ok_and(|m| m.dev() == drive)
+    };
+    // The drive letter or the share: what the path begins with.
+    #[cfg(not(unix))]
+    let same_drive = {
+        let root = |p: &Path| match p.components().next() {
+            Some(std::path::Component::Prefix(prefix)) => {
+                Some(prefix.as_os_str().to_string_lossy().to_lowercase())
+            }
+            _ => None,
+        };
+        let drive = root(dest);
+        move |src: &Path| drive.is_some() && root(src) == drive
+    };
+    sources.iter().all(|src| {
+        same_drive(src)
+            && src
+                .file_name()
+                .is_some_and(|name| !exists_no_follow(&dest.join(name)))
+    })
 }
 
 /// Progress sink: number of bytes just processed (0 for directory/item events).
@@ -1775,7 +1854,7 @@ fn copy_file(
         }
     }
     w.flush().ctx("write", dst)?;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     xattrs::copy_fd(&r, &w);
     let _ = w.set_permissions(meta.permissions());
     if let Ok(m) = meta.modified() {
@@ -1884,6 +1963,108 @@ fn set_dir_modified(dir: &Path, t: SystemTime) {
     };
     if let Ok(f) = f {
         let _ = f.set_modified(t);
+    }
+}
+
+/// macOS: extended attributes (Finder tags and colours, comments, the resource fork) are
+/// copied with the file, like Finder does. Best effort: a volume without them (FAT, exFAT,
+/// some network shares) just does not get them.
+#[cfg(target_os = "macos")]
+mod xattrs {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    /// Set by the system itself and refused (or meaningless) on a copy.
+    const SKIPPED: [&[u8]; 2] = [b"com.apple.provenance", b"com.apple.rootless"];
+
+    fn wanted(name: &[u8]) -> bool {
+        !SKIPPED.contains(&name)
+    }
+
+    /// Calls `f(buf)` with a growing buffer until the value fits.
+    fn read(f: impl Fn(&mut [u8]) -> isize) -> Option<Vec<u8>> {
+        let n = f(&mut []);
+        if n < 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; n as usize + 64];
+        let n = f(&mut buf);
+        (n >= 0).then(|| {
+            buf.truncate(n as usize);
+            buf
+        })
+    }
+
+    pub fn copy_fd(src: &std::fs::File, dst: &std::fs::File) {
+        let (s, d) = (src.as_raw_fd(), dst.as_raw_fd());
+        // SAFETY: valid descriptors and buffers of the given lengths.
+        let Some(names) =
+            read(|b| unsafe { libc::flistxattr(s, b.as_mut_ptr().cast(), b.len(), 0) })
+        else {
+            return;
+        };
+        for name in names
+            .split(|&c| c == 0)
+            .filter(|n| !n.is_empty() && wanted(n))
+        {
+            let Ok(cname) = CString::new(name) else {
+                continue;
+            };
+            let value = read(|b| unsafe {
+                libc::fgetxattr(s, cname.as_ptr(), b.as_mut_ptr().cast(), b.len(), 0, 0)
+            });
+            if let Some(v) = value {
+                unsafe { libc::fsetxattr(d, cname.as_ptr(), v.as_ptr().cast(), v.len(), 0, 0) };
+            }
+        }
+    }
+
+    pub fn copy_path(src: &Path, dst: &Path) {
+        let (Ok(s), Ok(d)) = (
+            CString::new(src.as_os_str().as_bytes()),
+            CString::new(dst.as_os_str().as_bytes()),
+        ) else {
+            return;
+        };
+        let nofollow = libc::XATTR_NOFOLLOW;
+        // SAFETY: NUL-terminated paths and buffers of the given lengths.
+        let Some(names) = read(|b| unsafe {
+            libc::listxattr(s.as_ptr(), b.as_mut_ptr().cast(), b.len(), nofollow)
+        }) else {
+            return;
+        };
+        for name in names
+            .split(|&c| c == 0)
+            .filter(|n| !n.is_empty() && wanted(n))
+        {
+            let Ok(cname) = CString::new(name) else {
+                continue;
+            };
+            let value = read(|b| unsafe {
+                libc::getxattr(
+                    s.as_ptr(),
+                    cname.as_ptr(),
+                    b.as_mut_ptr().cast(),
+                    b.len(),
+                    0,
+                    nofollow,
+                )
+            });
+            if let Some(v) = value {
+                unsafe {
+                    libc::setxattr(
+                        d.as_ptr(),
+                        cname.as_ptr(),
+                        v.as_ptr().cast(),
+                        v.len(),
+                        0,
+                        nofollow,
+                    )
+                };
+            }
+        }
     }
 }
 
@@ -2035,7 +2216,7 @@ fn copy_tree_with(
         }
         // After the contents (adding them changes the time; a read-only folder would
         // refuse them): the source's permissions, attributes and modified time.
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         xattrs::copy_path(src, dst);
         #[cfg(unix)]
         let _ = fs::set_permissions(dst, meta.permissions());
@@ -2345,7 +2526,8 @@ impl Transfer<'_> {
             };
             // What this operation put there itself (two sources with one name, from search
             // results) is never replaced: the first item would go to the trash.
-            let ours = out.created.contains(&target) || out.moved.iter().any(|(_, t)| *t == target);
+            let ours = out.created.iter().any(|c| same_path_ci(c, &target))
+                || out.moved.iter().any(|(_, t)| same_path_ci(t, &target));
             let policy = match policy {
                 ConflictPolicy::Overwrite | ConflictPolicy::OverwritePermanently if ours => {
                     ConflictPolicy::KeepBoth
@@ -2695,6 +2877,24 @@ impl TaskManager {
                     .sum(),
                 items: req.sources.len() as u64,
             },
+            // Nothing is read or written per file: the progress counts the items
+            // themselves, and the tree is not walked first (in a large tree that walk
+            // took longer than the operation, could not be cancelled and showed nothing).
+            TaskKind::Delete => Totals {
+                bytes: 0,
+                items: req.sources.len() as u64,
+            },
+            TaskKind::Move
+                if req
+                    .dest
+                    .as_deref()
+                    .is_some_and(|dest| moves_by_rename(&req.sources, dest)) =>
+            {
+                Totals {
+                    bytes: 0,
+                    items: req.sources.len() as u64,
+                }
+            }
             _ => measure(&req.sources),
         };
         let mut progress = TaskProgress {
@@ -3083,10 +3283,6 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(leftovers.len(), 1, "no temporary file left: {leftovers:?}");
-        // macOS cannot restore from the trash (see `restore_from_trash`): the rest is untestable there.
-        if cfg!(target_os = "macos") {
-            return;
-        }
         j.undo().unwrap();
         assert_eq!(fs::read_to_string(&link).unwrap(), "old");
     }
@@ -3186,6 +3382,51 @@ mod tests {
         assert_eq!(trashed.describe(), "delete 2 items");
         assert_eq!(trashed.undone(), "Restored 2 items");
         assert_eq!(items(1), "1 item");
+    }
+
+    /// A move inside one drive is a rename per item and is not measured first; one that
+    /// meets a namesake (a merge or a replace works inside it) or leaves the drive is.
+    #[test]
+    fn a_move_inside_one_drive_is_not_measured_first() {
+        let t = test_dir();
+        let (src, dst) = (t.path().join("src"), t.path().join("dst"));
+        std::fs::create_dir_all(src.join("tree/deep")).unwrap();
+        std::fs::create_dir(&dst).unwrap();
+        std::fs::write(src.join("tree/deep/a.txt"), "a").unwrap();
+        std::fs::write(src.join("file.txt"), "f").unwrap();
+        let both = [src.join("tree"), src.join("file.txt")];
+        assert!(moves_by_rename(&both, &dst));
+        assert!(!moves_by_rename(&both, &t.path().join("missing")));
+        assert!(!moves_by_rename(&[src.join("gone.txt")], &dst));
+        std::fs::write(dst.join("file.txt"), "there").unwrap();
+        assert!(moves_by_rename(&both[..1], &dst));
+        assert!(!moves_by_rename(&both, &dst));
+        // The totals reported for it are the items themselves.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let m = TaskManager::new(Arc::new(UndoJournal::default()), {
+            let seen = seen.clone();
+            Arc::new(move |e| {
+                if let TaskEvent::Progress(p) = e {
+                    seen.lock().unwrap().push((p.total_items, p.total_bytes));
+                }
+            })
+        });
+        let handle = TaskHandle {
+            id: 1,
+            cancel: AtomicBool::new(false),
+        };
+        m.run(
+            &handle,
+            task(
+                TaskKind::Move,
+                &src.join("tree"),
+                &dst,
+                ConflictPolicy::KeepBoth,
+            ),
+        )
+        .unwrap();
+        assert!(dst.join("tree/deep/a.txt").is_file());
+        assert_eq!(*seen.lock().unwrap(), [(1, 0)]);
     }
 
     fn mgr() -> Arc<TaskManager> {
@@ -3420,10 +3661,6 @@ mod tests {
             j.peek_description().as_deref(),
             Some("copy “a.txt”, replacing the old one")
         );
-        // macOS cannot restore from the trash (see `restore_from_trash`): the rest is untestable there.
-        if cfg!(target_os = "macos") {
-            return;
-        }
         j.undo().unwrap();
         assert_eq!(fs::read_to_string(dst.join("a.txt")).unwrap(), "old");
         assert_eq!(fs::read_to_string(src.join("a.txt")).unwrap(), "new");
@@ -3705,10 +3942,6 @@ mod tests {
             j.peek_in(&dst).is_some(),
             "per-panel undo finds the merge from the parent folder"
         );
-        // macOS cannot restore from the trash (see `restore_from_trash`): the rest is untestable there.
-        if cfg!(target_os = "macos") {
-            return;
-        }
         j.undo().unwrap();
         assert_eq!(tree(&dst), before);
         assert_eq!(tree(&src).len(), 5, "source untouched");
@@ -4187,9 +4420,6 @@ mod tests {
 
     #[test]
     fn failed_replacement_keeps_copy_and_trash_in_undo_order() {
-        if cfg!(target_os = "macos") {
-            return; // restoring from the trash is not supported there
-        }
         let d = test_dir();
         let src_dir = d.path().join("src");
         let dest = d.path().join("dest");
@@ -4690,9 +4920,6 @@ mod tests {
     /// puts the old item back: the destination is never left with neither version.
     #[test]
     fn cancelled_replace_keeps_the_old_item() {
-        if cfg!(target_os = "macos") {
-            return; // restoring from the trash is not supported there
-        }
         let d = test_dir();
         let src = d.path().join("src");
         let dst = d.path().join("dst");
@@ -4910,9 +5137,6 @@ mod tests {
     /// item went to the trash and undo failed), it keeps both.
     #[test]
     fn replace_never_replaces_an_item_of_the_same_operation() {
-        if cfg!(target_os = "macos") {
-            return; // restoring from the trash is not supported there
-        }
         for kind in [TaskKind::Copy, TaskKind::Move] {
             let d = test_dir();
             let p = |s: &str| d.path().join(s);
@@ -4931,5 +5155,62 @@ mod tests {
             m.journal().undo().unwrap();
             assert_eq!(tree(d.path()), before, "{kind:?}");
         }
+    }
+
+    #[test]
+    fn case_insensitive_path_helpers() {
+        let ci = cfg!(any(windows, target_os = "macos"));
+        assert!(same_path_ci(Path::new("/a/B.txt"), Path::new("/a/B.txt")));
+        assert_eq!(
+            same_path_ci(Path::new("/a/B.txt"), Path::new("/a/b.txt")),
+            ci
+        );
+        assert_eq!(
+            starts_with_ci(Path::new("/x/photos/sub"), Path::new("/x/Photos")),
+            ci
+        );
+        assert!(starts_with_ci(
+            Path::new("/x/Photos/sub"),
+            Path::new("/x/Photos")
+        ));
+        assert!(!starts_with_ci(
+            Path::new("/x/Photos2"),
+            Path::new("/x/Photos")
+        ));
+    }
+
+    /// macOS: a copy keeps the Finder tag and comment stored as extended attributes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn copy_keeps_extended_attributes_on_macos() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let d = test_dir();
+        let src = d.path().join("tagged.txt");
+        fs::write(&src, "x").unwrap();
+        let (p, name) = (
+            CString::new(src.as_os_str().as_bytes()).unwrap(),
+            CString::new("com.apple.metadata:test_gall").unwrap(),
+        );
+        let v = b"value";
+        let rc =
+            unsafe { libc::setxattr(p.as_ptr(), name.as_ptr(), v.as_ptr().cast(), v.len(), 0, 0) };
+        assert_eq!(rc, 0, "set the attribute");
+        let dst = d.path().join("copy.txt");
+        let (cancel, mut tick) = (AtomicBool::new(false), |_: u64| {});
+        copy_file(&src, &dst, &cancel, &mut tick, false).unwrap();
+        let q = CString::new(dst.as_os_str().as_bytes()).unwrap();
+        let mut buf = [0u8; 16];
+        let n = unsafe {
+            libc::getxattr(
+                q.as_ptr(),
+                name.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                0,
+                0,
+            )
+        };
+        assert_eq!(&buf[..n.max(0) as usize], v);
     }
 }

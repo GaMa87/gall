@@ -29,3 +29,6 @@
 }
 
 .gc-edit-stop { padding: 7px 12px; font-size: 11px; color: var(--accent-text); background: var(--accent-soft); border-bottom: 1px solid var(--border-soft); }
+/* Structural diff: changed tokens stand out, lines that were only reformatted are dimmed. */
+.gc-diff-line mark.patch-token { color: inherit; border-radius: 2px; background: color-mix(in srgb, currentColor 26%, transparent); }
+.gc-diff-line.fmt:not(.chosen) { color: var(--fg-dim); background: color-mix(in srgb, var(--fg-dim) 7%, transparent); }

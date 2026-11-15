@@ -2,16 +2,21 @@
 # UI self-test: drives a debug build of Gall against disposable test data
 # (own D-Bus session, config and data dirs) and writes a report + screenshots.
 #   ./scripts/selftest.sh [binary]      default: target/debug/gall
+#   ./scripts/selftest.sh --themed-select [binary] themed dropdowns only
 #   ./scripts/selftest.sh --updates [binary]  updater scenarios only
 #   ./scripts/selftest.sh --keyboard [binary] keyboard and tab scenarios only
 #   ./scripts/selftest.sh --key-help [binary] help notation and layout only
 #   ./scripts/selftest.sh --key-profiles [binary] keyboard profiles and function keys
 #   ./scripts/selftest.sh --quick-open [binary] deleted Quick Open results only
+#   ./scripts/selftest.sh --git-rebase-submodules [binary] rebase with submodules only
+#   ./scripts/selftest.sh --structural-diff [binary] structural diff in the compare and Git views
+#   GALL_SELFTEST_REBASE_SOURCE=/path/to/ah800 clones its staged nested-repository case
 # Requires: KDE Spectacle (screenshots), kwin_wayland, ImageMagick, zip. Close Gall first.
 # Runs in a private headless KWin, so your mouse, keyboard and screen stay free;
 # GALL_SELFTEST_REAL=1 uses the real desktop instead.
 set -u
 MODE=1
+if [ "${1:-}" = "--themed-select" ]; then MODE=themed-select; shift; fi
 if [ "${1:-}" = "--updates" ]; then MODE=updates; shift; fi
 if [ "${1:-}" = "--quick-open" ]; then MODE=quick-open; shift; fi
 if [ "${1:-}" = "--bug-report" ]; then MODE=bug-report; shift; fi
@@ -21,8 +26,10 @@ if [ "${1:-}" = "--key-help" ]; then MODE=key-help; shift; fi
 if [ "${1:-}" = "--key-profiles" ]; then MODE=key-profiles; shift; fi
 if [ "${1:-}" = "--git-compare" ]; then MODE=git-compare; shift; fi
 if [ "${1:-}" = "--git-workspace" ]; then MODE=git-workspace; shift; fi
+if [ "${1:-}" = "--structural-diff" ]; then MODE=structural-diff; shift; fi
+if [ "${1:-}" = "--git-rebase-submodules" ]; then MODE=git-rebase-submodules; shift; fi
 APP="$(realpath "${1:-target/debug/gall}")"
-if [ "$MODE" = "quick-open" ] || [ "$MODE" = "bug-report" ] || [ "$MODE" = "bug-report-entry" ] || [ "$MODE" = "keyboard" ] || [ "$MODE" = "key-help" ] || [ "$MODE" = "key-profiles" ] || [ "$MODE" = "git-compare" ] || [ "$MODE" = "git-workspace" ]; then
+if [ "$MODE" = "themed-select" ] || [ "$MODE" = "quick-open" ] || [ "$MODE" = "bug-report" ] || [ "$MODE" = "bug-report-entry" ] || [ "$MODE" = "keyboard" ] || [ "$MODE" = "key-help" ] || [ "$MODE" = "key-profiles" ] || [ "$MODE" = "git-compare" ] || [ "$MODE" = "git-workspace" ] || [ "$MODE" = "git-rebase-submodules" ] || [ "$MODE" = "structural-diff" ]; then
   # This focused test has isolated config/data and must preserve an existing user session.
   export GALL_MULTI_INSTANCE=1
 elif pgrep -x gall >/dev/null; then echo "Gall is running; close it first."; exit 2; fi
@@ -32,7 +39,63 @@ mkdir -p "$T/config" "$T/data" "$T/out" "$T/td"
 # GALL_SELFTEST_NOFONTS=1 to test the fallbacks for missing fonts.
 [ -z "${GALL_SELFTEST_NOFONTS:-}" ] && [ -d "$HOME/.local/share/fonts" ] && ln -s "$HOME/.local/share/fonts" "$T/data/fonts"
 cd "$T/td"
-if [ "$MODE" = "git-workspace" ]; then
+if [ "$MODE" = "git-rebase-submodules" ]; then
+  if [ -n "${GALL_SELFTEST_REBASE_SOURCE:-}" ]; then
+    # Read the real repositories only; all index changes and checkouts use disposable clones.
+    rebase_source=$(realpath "$GALL_SELFTEST_REBASE_SOURCE")
+    staged_link=$(git -C "$rebase_source" ls-files --stage -- .worktrees)
+    if [ -z "$staged_link" ]; then echo "Source has no staged .worktrees entry"; exit 2; fi
+    git clone --shared --no-checkout -q "$rebase_source" . || exit 2
+    git config core.autocrlf false
+    git config user.name Test
+    git config user.email test@example.com
+    git config commit.gpgSign false
+    git config core.hooksPath /dev/null
+    GIT_LFS_SKIP_SMUDGE=1 git checkout --no-recurse-submodules -q MaybeSometime || exit 2
+    mkdir -p Projects
+    git branch Dev origin/Dev || exit 2
+    git clone --shared --no-checkout -q "$rebase_source/.worktrees" .worktrees || exit 2
+    git -C .worktrees config core.autocrlf false
+    link_id=$(printf '%s\n' "$staged_link" | awk '$1 == "160000" && $3 == "0" {print $2}')
+    if [ -z "$link_id" ]; then echo "Source .worktrees is not a staged gitlink"; exit 2; fi
+    GIT_LFS_SKIP_SMUDGE=1 git -C .worktrees -c core.hooksPath=/dev/null checkout --no-recurse-submodules -q --detach "$link_id" || exit 2
+    printf '%s\n' "$staged_link" | git update-index --index-info || exit 2
+  else
+    mkdir -p Projects
+    git init -q -b main "$T/module-source"
+    git -C "$T/module-source" config user.name Test
+    git -C "$T/module-source" config user.email test@example.com
+    git -C "$T/module-source" config core.autocrlf false
+    printf 'module content\n' > "$T/module-source/module.txt"
+    git -C "$T/module-source" add module.txt
+    git -C "$T/module-source" -c commit.gpgSign=false -c core.hooksPath=/dev/null commit -qm 'module base'
+    git init -q -b main
+    git config user.name Test
+    git config user.email test@example.com
+    git config core.autocrlf false
+    git config commit.gpgSign false
+    git config core.hooksPath /dev/null
+    git -c protocol.file.allow=always submodule add -q "$T/module-source" module
+    git -C module config core.autocrlf false
+    git commit -qm 'add initialized submodule'
+    git checkout -qb topic
+    printf 'topic content\n' > topic.txt
+    git add topic.txt
+    git commit -qm 'topic change'
+    git checkout -q main
+    printf 'upstream content\n' > upstream.txt
+    git add upstream.txt
+    git commit -qm 'upstream change'
+    git checkout -q topic
+    git config submodule.recurse true
+    printf 'module local edit\n' > module/module.txt
+    printf 'keep untracked content\n' > module/keep.txt
+    git clone -q "$T/module-source" .worktrees
+    git -C .worktrees config core.autocrlf false
+    git add .worktrees
+  fi
+  printf 'nested repository sentinel\n' > .worktrees/keep.txt
+elif [ "$MODE" = "git-workspace" ]; then
   mkdir -p Projects
   git init -q -b main
   git config user.name Test
@@ -82,6 +145,23 @@ if [ "$MODE" = "git-workspace" ]; then
   git -C "$T/many-commits" reset -q --hard
   sed -i '2s/.*/second changed/;25s/.*/twenty-five changed/' file.txt
   printf 'untracked\n' > new.txt
+elif [ "$MODE" = "structural-diff" ]; then
+  # One file, three versions: committed, committed again with a reflowed call and one changed
+  # argument, and a working copy with one line only reformatted and one changed number.
+  mkdir -p Projects
+  body() {
+    printf 'fn total(items: &[u32]) -> u32 {\n%s\n    %s\n    sum\n}\n\nfn main() {\n    println!("{}", total(&[1, %s]));\n}\n' "$1" "$2" "$3"
+  }
+  git -c user.name=Test -c user.email=test@example.com init -q
+  git config core.autocrlf false
+  body '    let sum = add(items[0], items[1]);' 'report(sum, "total  ok");' 2 > calc.rs
+  git add calc.rs
+  git -c user.name=Test -c user.email=test@example.com commit -qm first
+  reflowed="$(printf '    let sum = add(\n        items[0],\n        items[2],\n    );')"
+  body "$reflowed" 'report(sum, "total  ok");' 2 > calc.rs
+  git add calc.rs
+  git -c user.name=Test -c user.email=test@example.com commit -qm 'reflow the call'
+  body "$reflowed" 'report( sum, "total  ok" );' 3 > calc.rs
 elif [ "$MODE" = "git-compare" ]; then
   mkdir -p Projects
   printf 'first\n' > file.txt
@@ -99,7 +179,7 @@ elif [ "$MODE" = "git-compare" ]; then
   git -c core.hooksPath=/dev/null checkout -q "$initial_branch"
   printf 'working\n' > file.txt
   printf 'untracked\n' > new.txt
-elif [ "$MODE" = "quick-open" ] || [ "$MODE" = "keyboard" ] || [ "$MODE" = "key-help" ] || [ "$MODE" = "key-profiles" ]; then
+elif [ "$MODE" = "themed-select" ] || [ "$MODE" = "quick-open" ] || [ "$MODE" = "keyboard" ] || [ "$MODE" = "key-help" ] || [ "$MODE" = "key-profiles" ]; then
   mkdir -p Projects Documents
   for i in 1 2 10 20; do echo "line $i" > "Documents/file$i.txt"; done
 else

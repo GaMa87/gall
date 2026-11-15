@@ -4,7 +4,7 @@
     "homepage": "https://github.com/GaMa87/gall",
     "license": "MIT",
     "notes": [
-        "Settings and data are kept in $persist_dir\\UserData and survive updates.",
+        "Settings and data are kept in %APPDATA%\\gall and survive updates (create an empty file named portable next to gall.exe to use $persist_dir\\UserData instead).",
         "Gall needs the Microsoft Edge WebView2 Runtime (included in Windows 10 and 11)."
     ],
     "architecture": {

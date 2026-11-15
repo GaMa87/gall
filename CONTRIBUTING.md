@@ -33,6 +33,18 @@ to the temporary path printed by the runner. It never installs an update. Availa
 and signed-installation coverage depends on publishing a configured signed release; a
 missing manifest is tested as an actual endpoint error.
 
+Run `./scripts/selftest.sh --git-rebase-submodules [binary]` for the focused ordinary-rebase
+regression with an initialized submodule, recursive Git configuration, preserved submodule
+edits and Vim-key coverage. It also exercises a staged embedded `.worktrees` repository:
+visible changes, refusal before moving HEAD, unstage, local exclusion and successful rebase.
+It captures screenshots of the affected states.
+
+For the reported `MaybeSometime` → `Dev` case, prefix that focused command with
+`GALL_SELFTEST_REBASE_SOURCE=/path/to/repository`. The runner copies the branches and
+staged `.worktrees` gitlink into disposable shared clones, leaving the source untouched.
+A genuine conflict in that copy is inspected and aborted through the UI rather than
+automatically resolved.
+
 The self-test needs a build with the bundled UI (`npm --prefix ui run build`, then
 `cargo build -p gall --features tauri/custom-protocol` and pass that binary to the script):
 a debug build that loads the Vite dev server runs the test twice at once (React StrictMode).
@@ -98,6 +110,11 @@ see [packaging](packaging/README.md).
 Updater signatures are separate from Windows code signing and Apple signing or
 notarization. Cross-platform installation still needs testing on each target OS.
 
+Run `./scripts/selftest.sh --themed-select [binary]` after building the bundled debug
+application to check Settings dropdowns in built-in, Gruvbox, Night Owl and file themes,
+including light/dark modes, grouped choices, keyboard selection and a narrow window.
+The focused runner captures the open dropdowns for visual inspection.
+
 Run focused bug-report scenarios with `./scripts/selftest.sh --bug-report` after
 building the bundled debug application. The runner intercepts GitHub opening and
 checks compact report preparation, latest-error copying, optional saved-only
@@ -140,3 +157,13 @@ and pinning. Like `--keyboard`, it uses disposable data and requires Spectacle f
 screenshots. To verify a second process reloads the selection, launch the same isolated
 binary/configuration with `GALL_SELFTEST=key-profiles-reload` after this scenario;
 it expects the Commander profile and custom F9 pin shortcut left by the first process.
+
+Run `.\scripts\selftest-mapped-drives.ps1 -Drive X: -Binary .\target\debug\gall.exe`
+on Windows after building the bundled debug application to check an existing,
+accessible mapped network drive in the current logon session. This uses an isolated
+portable installation, checks discovery, sidebar navigation with Explorer and Vim
+profiles, and refresh without duplicate rows, and captures screenshots. It does not
+create or remove drive mappings or write to the share. A graphical desktop and
+WebView2 are required. Inspect the PNG files in the printed artifact directory.
+Also check an assigned mapping while its server is unavailable: drive refresh
+should still show the letter without waiting for capacity or volume information.

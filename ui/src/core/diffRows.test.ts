@@ -21,6 +21,30 @@ describe("diff rows", () => {
     expect(ins.kind === "line" && !ins.l && ins.r?.t).toBe("ins");
   });
 
+  it("structural marks: changed tokens, layout-only lines, and cosmetic blocks that are no change", () => {
+    // Block 1 (lines 10..12 → 10..11): line 10 partly changed, 11 layout only, 12 whole. Block 2 is cosmetic.
+    const sops: DiffOp[] = [eq(0, 0, 10), { tag: "replace", a: 10, aLen: 3, b: 10, bLen: 2 }, eq(13, 12, 5), { tag: "replace", a: 18, aLen: 1, b: 17, bLen: 2, cosmetic: true }];
+    const spairs = [{ a: 10, b: 10, aSpans: [[1, 2]] as [number, number][], bSpans: [[1, 3]] as [number, number][] }];
+    const marks = { a: { 10: [[4, 6]] as [number, number][], 11: [] }, b: { 10: [[4, 7]] as [number, number][], 11: [] } };
+    const { rows, blocks } = buildSplit(sops, spairs, { ...all, marks });
+    expect(blocks).toEqual([10]);
+    const at = (i: number) => rows[i] as Extract<(typeof rows)[number], { kind: "line" }>;
+    expect(at(10).l).toMatchObject({ t: "chg", spans: [[4, 6]] });
+    expect(at(10).r).toMatchObject({ t: "chg", spans: [[4, 7]] });
+    expect(at(11).l).toMatchObject({ n: 11, t: "del", fmt: true });
+    expect(at(11).r).toMatchObject({ n: 11, t: "ins", fmt: true });
+    expect(at(12).l).toMatchObject({ n: 12, t: "del" });
+    expect(at(12).l?.fmt).toBeUndefined();
+    const last = rows.filter((r) => r.kind === "line" && r.block === undefined && (r.l?.fmt || r.r?.fmt) && (r.l?.n === 18 || r.r?.n === 18));
+    expect(last.length).toBe(2);
+    const u = buildUnified(sops, spairs, { ...all, marks });
+    expect(u.blocks).toEqual([10]);
+    const fmt = u.rows.filter((r) => r.kind === "line" && r.fmt).map((r) => (r.kind === "line" ? [r.side, r.an ?? r.bn] : []));
+    expect(fmt).toEqual([["a", 11], ["b", 11], ["a", 18], ["b", 17], ["b", 18]]);
+    // Without marks a pair still carries its word spans.
+    expect((buildSplit(sops, spairs, all).rows[10] as ReturnType<typeof at>).l?.spans).toEqual([[1, 2]]);
+  });
+
   it("folds long unchanged runs, keeping context, and expands on request", () => {
     const o = { context: 3, expanded: new Set<string>() };
     const { rows } = buildSplit(ops, pairs, o);

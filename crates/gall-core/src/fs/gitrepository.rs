@@ -2,7 +2,7 @@
 //!
 //! The caller serializes mutations and supplies a freshly reviewed snapshot token.
 //! Git still checks its own locks; a token cannot lock out another Git application.
-use super::gitgraph::{git, has_content_filters, joined, retain_detached, root};
+use super::gitgraph::{has_content_filters, joined, retain_detached, root};
 use crate::{CoreError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
@@ -46,6 +46,8 @@ pub struct Reference {
     pub upstream: Option<String>,
     pub ahead: u32,
     pub behind: u32,
+    /// The configured upstream no longer exists (for example deleted on the remote).
+    pub upstream_gone: bool,
 }
 
 #[derive(Serialize)]
@@ -220,6 +222,9 @@ pub enum Request {
     },
     DeleteBranch {
         name: String,
+        /// `git branch -D`: also deletes a branch with commits that are not merged.
+        #[serde(default)]
+        force: bool,
     },
     CreateTag {
         name: String,
@@ -289,6 +294,133 @@ pub enum Request {
     },
 }
 
+/// What the token check of an action read about the repository: its guards (is the work
+/// tree clean, is something unmerged, are there submodules, where is HEAD) ask for the
+/// same things, and used to start the same Git processes again, one after another.
+struct Seen {
+    path: PathBuf,
+    head: String,
+    /// `ls-files --stage -z`.
+    index: String,
+    /// The work tree status; None in a repository with content filters.
+    status: Option<String>,
+    /// What the guards of this action will ask, read next to the token check.
+    prefetched: Prefetched,
+}
+
+/// Read-only answers the guards of an action need, asked side by side with the token check
+/// instead of one after another behind it. Each is what the guard would have asked Git a
+/// moment later; a missing answer (not asked, or Git failed) makes the guard ask itself.
+#[derive(Default)]
+struct Prefetched {
+    /// Commits `commit_id` would accept.
+    commits: Vec<String>,
+    /// `ls-files --others -z`.
+    others: Option<String>,
+    /// `ls-tree -r --name-only -z <target>` by target.
+    trees: Vec<(String, String)>,
+    /// `(target, log --raw … <target>..HEAD)` of a rebase.
+    replayed: Option<(String, String)>,
+}
+
+/// Starts what [`Prefetched`] holds for `request` in `path`.
+fn prefetch(path: &Path, request: &Request) -> Prefetched {
+    let (target, untracked, tree, replay) = match request {
+        Request::Merge { target } => (target, false, false, false),
+        Request::Rebase { target } => (target, true, true, true),
+        Request::CherryPick { target } => (target, true, true, false),
+        Request::Revert { target } => (target, true, false, false),
+        Request::Reset { target, .. }
+        | Request::CreateBranch { target, .. }
+        | Request::CreateTag { target, .. } => (target, false, false, false),
+        _ => return Prefetched::default(),
+    };
+    if !matches!(target.len(), 40 | 64) || !target.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return Prefetched::default();
+    }
+    let target = target.as_str();
+    let read = |args: &[&str]| super::gitgraph::git(path, args).ok();
+    std::thread::scope(|scope| {
+        // HEAD itself needs no question (see `commit_id`).
+        let commit = (super::gitfacts::head_id(path).as_deref() != Some(target)).then(|| {
+            scope.spawn(move || {
+                read(&["rev-parse", "--verify", &format!("{target}^{{commit}}")])
+                    .filter(|id| id.trim() == target)
+                    .map(|_| target.to_owned())
+            })
+        });
+        let tree = tree
+            .then(|| scope.spawn(move || read(&["ls-tree", "-r", "--name-only", "-z", target])));
+        let replayed = replay.then(|| {
+            scope.spawn(move || {
+                read(&[
+                    "log",
+                    "--format=",
+                    "--raw",
+                    "-z",
+                    "--no-renames",
+                    "--no-abbrev",
+                    &format!("{target}..HEAD"),
+                ])
+            })
+        });
+        let others = untracked
+            .then(|| read(&["ls-files", "--others", "-z"]))
+            .flatten();
+        let done = |handle: Option<std::thread::ScopedJoinHandle<'_, Option<String>>>| {
+            handle.and_then(|h| h.join().ok().flatten())
+        };
+        Prefetched {
+            commits: done(commit).into_iter().collect(),
+            others,
+            trees: done(tree)
+                .map(|listing| (target.to_owned(), listing))
+                .into_iter()
+                .collect(),
+            replayed: done(replayed).map(|log| (target.to_owned(), log)),
+        }
+    })
+}
+
+thread_local! {
+    /// The state read for the action running on this thread, until that action first
+    /// changes the repository (see [`git`]).
+    static SEEN: std::cell::RefCell<Option<Seen>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Keeps [`SEEN`] for as long as it lives.
+struct Armed;
+impl Armed {
+    fn new(seen: Seen) -> Self {
+        SEEN.with(|slot| *slot.borrow_mut() = Some(seen));
+        Armed
+    }
+}
+impl Drop for Armed {
+    fn drop(&mut self) {
+        SEEN.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+/// What was read for the running action about `path`, if it is still current.
+fn seen<T>(path: &Path, read: impl FnOnce(&Seen) -> Option<T>) -> Option<T> {
+    SEEN.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|seen| seen.path == path)
+            .and_then(read)
+    })
+}
+
+/// Runs Git. The first command that can change the repository ends the use of what the
+/// token check read: from then on every question is asked again.
+fn git(path: &Path, args: &[&str]) -> Result<String> {
+    if !super::gitgraph::reads_only(args) {
+        SEEN.with(|slot| *slot.borrow_mut() = None);
+    }
+    super::gitgraph::git(path, args)
+}
+
 fn fail(message: impl Into<String>) -> CoreError {
     CoreError::Other(message.into())
 }
@@ -305,42 +437,46 @@ fn checked_text(value: String) -> Result<String> {
     }
 }
 
-/// The per-worktree Git directory read from `.git` (a folder, or a `gitdir:` file for linked
-/// worktrees and submodules), without starting a process.
-fn worktree_git_dir(path: &Path) -> Option<PathBuf> {
-    let dot = path.join(".git");
-    if dot.is_dir() {
-        return Some(dot);
-    }
-    let text = std::fs::read_to_string(&dot).ok()?;
-    let target = Path::new(text.lines().next()?.strip_prefix("gitdir:")?.trim());
-    Some(path.join(target))
-}
-
 fn git_path(path: &Path, name: &str) -> Result<PathBuf> {
-    // These live in the per-worktree Git directory, so no `rev-parse` is needed. Each lookup used
-    // to be a process of its own, and a repository snapshot made dozens of them.
-    const PER_WORKTREE: [&str; 9] = [
-        "MERGE_HEAD",
-        "MERGE_MSG",
-        "CHERRY_PICK_HEAD",
-        "REVERT_HEAD",
-        "REBASE_HEAD",
-        "BISECT_START",
-        "rebase-merge",
-        "rebase-apply",
-        "sequencer",
-    ];
-    if PER_WORKTREE.contains(&name.split('/').next().unwrap_or(name)) {
-        if let Some(dir) = worktree_git_dir(path) {
-            return Ok(dir.join(name));
-        }
+    // The operation markers live in the per-worktree Git directory, so no `rev-parse` is
+    // needed. Each lookup used to be a process of its own.
+    if let Some(found) = super::gitfacts::marker(path, name) {
+        return Ok(found);
     }
     let value = git(path, &["rev-parse", "--git-path", name])?;
-    Ok(path.join(value.trim()))
+    Ok(path.join(super::gitexec::host_path(path, value.trim())))
+}
+
+/// Whether the operation marker `name` exists, from `listed` (one listing of the Git
+/// directory, see `gitfacts::Markers`) where there is one.
+fn marker_exists(
+    path: &Path,
+    listed: Option<&super::gitfacts::Markers>,
+    name: &str,
+) -> Result<bool> {
+    match listed {
+        Some(markers) => Ok(markers.exists(name)),
+        None => Ok(git_path(path, name)?.exists()),
+    }
+}
+
+/// The content of the operation marker `name`, if it exists (see [`marker_exists`]).
+fn marker_content(
+    path: &Path,
+    listed: Option<&super::gitfacts::Markers>,
+    name: &str,
+) -> Result<Option<Vec<u8>>> {
+    match listed {
+        Some(markers) => Ok(markers.read(name)),
+        None => Ok(std::fs::read(git_path(path, name)?).ok()),
+    }
 }
 
 fn operation(path: &Path) -> Result<Option<String>> {
+    operation_in(path, super::gitfacts::markers(path).as_ref())
+}
+
+fn operation_in(path: &Path, listed: Option<&super::gitfacts::Markers>) -> Result<Option<String>> {
     for (marker, name) in [
         ("rebase-merge", "rebase"),
         ("rebase-apply", "rebase"),
@@ -348,12 +484,12 @@ fn operation(path: &Path) -> Result<Option<String>> {
         ("CHERRY_PICK_HEAD", "cherry-pick"),
         ("REVERT_HEAD", "revert"),
     ] {
-        if git_path(path, marker)?.exists() {
+        if marker_exists(path, listed, marker)? {
             return Ok(Some(name.into()));
         }
     }
-    let todo = git_path(path, "sequencer/todo")?;
-    if let Ok(value) = std::fs::read_to_string(todo) {
+    let todo = marker_content(path, listed, "sequencer/todo")?;
+    if let Some(value) = todo.and_then(|bytes| String::from_utf8(bytes).ok()) {
         if value.lines().any(|l| l.starts_with("revert ")) {
             return Ok(Some("revert".into()));
         }
@@ -408,6 +544,12 @@ fn operation_commit(path: &Path) -> Option<OperationCommit> {
 }
 
 fn head(path: &Path) -> String {
+    if let Some(id) = seen(path, |seen| Some(seen.head.clone())) {
+        return id;
+    }
+    if let Some((id, ..)) = super::gitfacts::head(path) {
+        return id;
+    }
     git(path, &["rev-parse", "--verify", "HEAD"])
         .unwrap_or_default()
         .trim()
@@ -425,9 +567,17 @@ struct Head {
     branch: Option<String>,
 }
 
-/// Reads HEAD with one process. A load needs it in several places and reads it again for the
-/// final check, which used to be a `rev-parse` or `symbolic-ref` for every one of them.
+/// Reads HEAD from Git's files, or with one process where they cannot answer. A load needs it
+/// in several places and reads it again for the final check, which used to be a `rev-parse` or
+/// `symbolic-ref` for every one of them.
 fn read_head(path: &Path) -> Head {
+    if let Some((id, reference, branch)) = super::gitfacts::head(path) {
+        return Head {
+            id,
+            reference,
+            branch,
+        };
+    }
     let all = git(
         path,
         &[
@@ -458,11 +608,39 @@ fn read_head(path: &Path) -> Head {
 }
 
 fn status(path: &Path) -> Result<String> {
+    if let Some(status) = seen(path, |seen| seen.status.clone()) {
+        return Ok(status);
+    }
     checked_text(super::gitgraph::status_z(path)?)
 }
 
+/// The index as `ls-files --stage -z` lists it: `<mode> <object> <stage>\t<name>` records.
+fn index_listing(path: &Path) -> Result<String> {
+    if let Some(index) = seen(path, |seen| Some(seen.index.clone())) {
+        return Ok(index);
+    }
+    git(path, &["ls-files", "--stage", "-z"])
+}
+
 fn conflicts(path: &Path) -> Result<Vec<String>> {
-    let raw = checked_text(git(path, &["ls-files", "--unmerged", "-z"])?)?;
+    match seen(path, |seen| Some(seen.index.clone())) {
+        Some(index) => unmerged(&index),
+        None => unmerged(&git(path, &["ls-files", "--unmerged", "-z"])?),
+    }
+}
+
+/// The conflicted files of an index listing (`ls-files --stage -z` or `--unmerged -z`):
+/// those with an entry of a stage other than 0.
+fn unmerged(listing: &str) -> Result<Vec<String>> {
+    let raw: String = listing
+        .split_inclusive('\0')
+        .filter(|record| {
+            record
+                .split_once('\t')
+                .is_some_and(|(meta, _)| !meta.ends_with(" 0"))
+        })
+        .collect();
+    let raw = checked_text(raw)?;
     let mut names: Vec<_> = raw
         .split('\0')
         .filter_map(|record| record.split_once('\t').map(|(_, name)| name.to_owned()))
@@ -481,6 +659,8 @@ fn refs(path: &Path) -> Result<Vec<Reference>> {
         path,
         &[
             "for-each-ref",
+            // Newest first (tag date, otherwise commit date), so the latest tags lead the list.
+            "--sort=-creatordate",
             "--format=%(refname)%00%(objectname)%00%(*objectname)%00%(upstream:short)%00%(upstream:track,nobracket)",
             "refs/heads/",
             "refs/remotes/",
@@ -514,6 +694,7 @@ fn refs(path: &Path) -> Result<Vec<Reference>> {
                 upstream: (!parts[3].is_empty()).then(|| parts[3].into()),
                 ahead: track_count(parts[4], "ahead"),
                 behind: track_count(parts[4], "behind"),
+                upstream_gone: parts[4].trim() == "gone",
             })
         })
         .collect())
@@ -528,6 +709,16 @@ fn track_count(track: &str, word: &str) -> u32 {
 }
 
 fn stashes(path: &Path) -> Result<Vec<Stash>> {
+    if let Some(list) = super::gitfacts::stashes(path) {
+        return Ok(list
+            .into_iter()
+            .map(|(id, selector, message)| Stash {
+                id,
+                selector,
+                message,
+            })
+            .collect());
+    }
     let raw = git(path, &["stash", "list", "--format=%H%x00%gd%x00%gs"])?;
     Ok(raw
         .lines()
@@ -582,30 +773,22 @@ fn parse_remotes(listing: &str) -> Vec<Remote> {
 
 /// Hashes what describes the repository itself: HEAD, references, local configuration, stashes
 /// and the state of a running operation. Shared by the light and the full token.
-fn repository_hash(path: &Path) -> Result<u64> {
-    repository_parts(path).map(|(hash, _)| hash)
-}
-
-/// `repository_hash` together with the HEAD it read, for a caller that shows it.
 fn repository_parts(path: &Path) -> Result<(u64, Head)> {
-    // Every load computes this twice (before and after), so the Git queries run side by side;
-    // the results are hashed in a fixed order.
-    let (head, refs, config, stashes) = std::thread::scope(|scope| {
-        let head = scope.spawn(|| read_head(path));
-        let refs =
-            scope.spawn(|| git(path, &["for-each-ref", "--format=%(refname) %(objectname)"]));
-        let config = scope.spawn(|| git(path, &["config", "--local", "--list", "-z"]));
-        let stashes = git(path, &["stash", "list", "--format=%H%x00%gd"]);
-        (joined(head), joined(refs), joined(config), stashes)
-    });
-    let head = head?;
     let mut hasher = DefaultHasher::new();
     let h = &mut hasher;
-    head.hash(h);
-    refs??.hash(h);
-    config??.hash(h);
-    stashes?.hash(h);
-    operation(path)?.hash(h);
+    // References, configuration and stashes are only compared, so where Git's files can be
+    // read their content is hashed as it is, without a process.
+    let head = if let Some(files) = super::gitfacts::repository_files(path) {
+        let head = read_head(path);
+        head.hash(h);
+        files.hash(h);
+        head
+    } else {
+        repository_parts_from_git(path, h)?
+    };
+    let listed = super::gitfacts::markers(path);
+    let listed = listed.as_ref();
+    operation_in(path, listed)?.hash(h);
     for marker in [
         "MERGE_HEAD",
         "MERGE_MSG",
@@ -616,9 +799,29 @@ fn repository_parts(path: &Path) -> Result<(u64, Head)> {
         "rebase-apply/next",
         "BISECT_START",
     ] {
-        std::fs::read(git_path(path, marker)?).ok().hash(h);
+        marker_content(path, listed, marker)?.hash(h);
     }
     Ok((hasher.finish(), head))
+}
+
+/// The parts of [`repository_parts`] as Git prints them, for repositories whose files are not
+/// read directly. Every load computes this twice (before and after), so the queries run side
+/// by side; the results are hashed in a fixed order.
+fn repository_parts_from_git(path: &Path, h: &mut DefaultHasher) -> Result<Head> {
+    let (head, refs, config, stashes) = std::thread::scope(|scope| {
+        let head = scope.spawn(|| read_head(path));
+        let refs =
+            scope.spawn(|| git(path, &["for-each-ref", "--format=%(refname) %(objectname)"]));
+        let config = scope.spawn(|| git(path, &["config", "--local", "--list", "-z"]));
+        let stashes = git(path, &["stash", "list", "--format=%H%x00%gd"]);
+        (joined(head), joined(refs), joined(config), stashes)
+    });
+    let head = head?;
+    head.hash(h);
+    refs??.hash(h);
+    config??.hash(h);
+    stashes?.hash(h);
+    Ok(head)
 }
 
 /// Files up to this size are hashed by content, until `CONTENT_BUDGET` is used up.
@@ -631,7 +834,46 @@ const CONTENT_BUDGET: u64 = 16 * 1024 * 1024;
 /// when thousands of files changed. The result depends only on the file and the order of the
 /// calls, never on the current time: a token must stay the same until something changes.
 fn hash_metadata(file: &Path, h: &mut DefaultHasher, budget: &mut u64) {
-    let Ok(meta) = file.symlink_metadata() else {
+    let meta = file.symlink_metadata().ok();
+    let content = content_plan(meta.as_ref(), budget);
+    hash_file(file, meta.as_ref(), content, h);
+}
+
+/// How much of a changed file's content goes into its fingerprint.
+#[derive(Clone, Copy)]
+enum Content {
+    Nothing,
+    Whole,
+    /// A large file is not read whole, but its two ends are: an edit of the same size with a
+    /// restored modification time (Windows has no change time to expose it) that touches
+    /// either end still changes the token.
+    Ends,
+}
+
+/// Takes what reading the file costs from `budget`, in the order of the calls.
+fn content_plan(meta: Option<&std::fs::Metadata>, budget: &mut u64) -> Content {
+    let Some(meta) = meta.filter(|meta| meta.is_file()) else {
+        return Content::Nothing;
+    };
+    if meta.len() <= CONTENT_LIMIT {
+        if meta.len() <= *budget {
+            *budget -= meta.len();
+            return Content::Whole;
+        }
+    } else if 2 * SAMPLE <= *budget {
+        *budget -= 2 * SAMPLE;
+        return Content::Ends;
+    }
+    Content::Nothing
+}
+
+fn hash_file(
+    file: &Path,
+    meta: Option<&std::fs::Metadata>,
+    content: Content,
+    h: &mut DefaultHasher,
+) {
+    let Some(meta) = meta else {
         return;
     };
     meta.len().hash(h);
@@ -641,21 +883,60 @@ fn hash_metadata(file: &Path, h: &mut DefaultHasher, budget: &mut u64) {
         use std::os::unix::fs::MetadataExt;
         (meta.ctime(), meta.ctime_nsec()).hash(h);
     }
-    if !meta.is_file() {
-        return;
+    match content {
+        Content::Nothing => {}
+        Content::Whole => std::fs::read(file).ok().hash(h),
+        Content::Ends => sample_ends(file, meta.len()).ok().hash(h),
     }
-    if meta.len() <= CONTENT_LIMIT {
-        if meta.len() <= *budget {
-            *budget -= meta.len();
-            std::fs::read(file).ok().hash(h);
-        }
-    } else if 2 * SAMPLE <= *budget {
-        // A large file is not read whole, but its two ends are: an edit of the same size with a
-        // restored modification time (Windows has no change time to expose it) that touches
-        // either end still changes the token.
-        *budget -= 2 * SAMPLE;
-        sample_ends(file, meta.len()).ok().hash(h);
+}
+
+/// [`hash_metadata`] of every file of `names` in the work tree `path`, in that order. A status
+/// can list thousands of files, and one after the other each costs a few dozen microseconds
+/// on Windows, so they are looked at on several threads; the budget is still taken in order.
+fn hash_changed(path: &Path, names: &[String], h: &mut DefaultHasher) {
+    let files: Vec<PathBuf> = names.iter().map(|name| path.join(name)).collect();
+    let metas = parallel_map(&files, |file| file.symlink_metadata().ok());
+    let mut budget = CONTENT_BUDGET;
+    let jobs: Vec<_> = files
+        .iter()
+        .zip(&metas)
+        .map(|(file, meta)| (file, meta, content_plan(meta.as_ref(), &mut budget)))
+        .collect();
+    let prints = parallel_map(&jobs, |(file, meta, content)| {
+        let mut h = DefaultHasher::new();
+        hash_file(file, meta.as_ref(), *content, &mut h);
+        h.finish()
+    });
+    for (name, print) in names.iter().zip(prints) {
+        name.hash(h);
+        print.hash(h);
     }
+}
+
+/// `items.iter().map(f).collect()`, on up to eight threads for long lists.
+pub(super) fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    const PER_THREAD: usize = 64;
+    let threads = std::thread::available_parallelism()
+        .map_or(4, |n| n.get().min(8))
+        .min(items.len().div_ceil(PER_THREAD));
+    if threads <= 1 {
+        return items.iter().map(f).collect();
+    }
+    let f = &f;
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = items
+            .chunks(items.len().div_ceil(threads))
+            .map(|chunk| scope.spawn(move || chunk.iter().map(f).collect::<Vec<R>>()))
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| {
+                worker
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect()
+    })
 }
 
 /// How much of the start and of the end of a large file goes into the token.
@@ -676,7 +957,7 @@ fn sample_ends(file: &Path, len: u64) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
 /// Cheap token for the part of the state a snapshot reads (references, stashes, remotes,
 /// operation, conflicts). It does not look at working files, so it costs a few processes and no
 /// scan of the work tree. `snapshot` uses it to notice a change while it was loading.
-fn light_token(path: &Path) -> Result<String> {
+pub(super) fn light_token(path: &Path) -> Result<String> {
     light_parts(path).map(|light| light.token)
 }
 
@@ -693,7 +974,7 @@ fn light_parts(path: &Path) -> Result<Light> {
     let (repository, head) = repository_parts(path)?;
     let mut h = DefaultHasher::new();
     repository.hash(&mut h);
-    if let Some(dir) = worktree_git_dir(path) {
+    if let Some(dir) = super::gitfacts::git_dir(path) {
         hash_metadata(&dir.join("index"), &mut h, &mut 0);
     }
     Ok(Light {
@@ -704,35 +985,50 @@ fn light_parts(path: &Path) -> Result<Light> {
 }
 
 /// The part of the token that does not need the work tree status: the repository state and
-/// the index. It can be computed while `status` runs. `repository` is the `repository_hash`
-/// read at the start of a load; if the state moved since, the final check of the load fails.
-fn token_base(path: &Path, repository: u64) -> Result<u64> {
+/// the index (`ls-files --stage -z`). It can be computed while `status` runs. `repository` is
+/// the `repository_hash` read at the start of a load; if the state moved since, the final
+/// check of the load fails.
+fn token_base(repository: u64, index: &str) -> u64 {
     let mut h = DefaultHasher::new();
     repository.hash(&mut h);
-    git(path, &["ls-files", "--stage", "-z"])?.hash(&mut h);
-    Ok(h.finish())
+    index.hash(&mut h);
+    h.finish()
 }
 
 /// The work tree status for the token, or `None` when a repository with content filters must
 /// not run `status` (even status may execute a configured clean filter). Filter repositories
 /// are browsable, but working-tree mutations are refused by worktree_guard.
-fn current_status(path: &Path) -> Result<Option<String>> {
+fn current_status(path: &Path) -> Result<(Option<String>, Early)> {
     status_unless(path, has_filters(path))
 }
 
+/// In WSL: the fingerprint (`gitexec::fingerprint`) of the paths the last token of the work
+/// tree listed, read while the status for the next token runs. [`token_finish`] uses it when
+/// the status lists the same paths, so the token needs no round trip after the status (2 000
+/// changed files took 100 ms). It is handed along with its own status, never shared, so a
+/// token only uses what was read next to the status it hashes.
+type Early = Option<(Vec<String>, Vec<u8>)>;
+
 /// `current_status` for a caller that already knows whether the repository has filters.
-fn status_unless(path: &Path, filtered: bool) -> Result<Option<String>> {
+fn status_unless(path: &Path, filtered: bool) -> Result<(Option<String>, Early)> {
     if filtered {
-        Ok(None)
-    } else {
-        status(path).map(Some)
+        return Ok((None, None));
     }
+    let hint = super::gitexec::place(path).and(super::gitexec::last_changed(path));
+    std::thread::scope(|scope| {
+        let early = hint.map(|names| {
+            scope.spawn(move || super::gitexec::fingerprint(path, &names).map(|stat| (names, stat)))
+        });
+        let status = status(path);
+        let early = early.and_then(|early| early.join().ok().flatten());
+        Ok((Some(status?), early))
+    })
 }
 
 /// Completes a token from `token_base` and the status read at about the same time.
 /// A changed file is recognised by its size and modification time; its content is not read, so
 /// the cost does not grow with the size of the changes.
-fn token_finish(path: &Path, base: u64, status: Option<&str>) -> Result<String> {
+fn token_finish(path: &Path, base: u64, status: Option<&str>, early: Early) -> Result<String> {
     let mut h = DefaultHasher::new();
     base.hash(&mut h);
     let changed: Vec<String> = match status {
@@ -754,10 +1050,17 @@ fn token_finish(path: &Path, base: u64, status: Option<&str>) -> Result<String> 
         .map(str::to_owned)
         .collect(),
     };
-    let mut budget = CONTENT_BUDGET;
-    for name in &changed {
-        name.hash(&mut h);
-        hash_metadata(&path.join(name), &mut h, &mut budget);
+    // In WSL the times and sizes come from one `stat` in the distribution (see `gitexec`),
+    // read next to the status when it lists the same paths as last time (see `Early`).
+    let early = early
+        .filter(|(names, _)| *names == changed)
+        .map(|(_, stat)| stat);
+    if let Some(stat) = early.or_else(|| super::gitexec::fingerprint(path, &changed)) {
+        changed.hash(&mut h);
+        stat.hash(&mut h);
+        super::gitexec::remember_changed(path, changed);
+    } else {
+        hash_changed(path, &changed, &mut h);
     }
     Ok(format!("{:016x}", h.finish()))
 }
@@ -765,13 +1068,32 @@ fn token_finish(path: &Path, base: u64, status: Option<&str>) -> Result<String> 
 /// Token covers references, index, tracked changes and untracked file metadata.
 /// External Git clients must still be treated as concurrent writers after validation.
 fn token(path: &Path) -> Result<String> {
-    let repository = repository_hash(path)?;
-    let (base, status) = std::thread::scope(|scope| {
-        let base = scope.spawn(|| token_base(path, repository));
+    token_seen(path).map(|(token, _)| token)
+}
+
+/// The token together with what was read for it.
+fn token_seen(path: &Path) -> Result<(String, Seen)> {
+    let (repository, head) = repository_parts(path)?;
+    let (index, status) = std::thread::scope(|scope| {
+        let index = scope.spawn(|| git(path, &["ls-files", "--stage", "-z"]));
         let status = current_status(path);
-        (joined(base), status)
+        (joined(index), status)
     });
-    token_finish(path, base??, status?.as_deref())
+    let (index, (status, early)) = (index??, status?);
+    let token = token_finish(
+        path,
+        token_base(repository, &index),
+        status.as_deref(),
+        early,
+    )?;
+    let seen = Seen {
+        path: path.to_path_buf(),
+        head: head.id,
+        index,
+        status,
+        prefetched: Prefetched::default(),
+    };
+    Ok((token, seen))
 }
 
 /// Runs `read` with the light token taken before it (and what was read for it) and checks the
@@ -808,29 +1130,45 @@ fn load_consistently<P: Send, T>(
     ))
 }
 
-/// Reads the repository state without a token. The independent Git queries run concurrently.
-fn read_state(p: &Path, head: &Head) -> Result<Repository> {
+/// Reads the repository state without a token, and the index (`ls-files --stage -z`) the
+/// token needs; the conflicts come from that listing. The Git queries run concurrently.
+fn read_state(p: &Path, head: &Head) -> Result<(Repository, String)> {
+    let listed = super::gitfacts::markers(p);
+    let operation = operation_in(p, listed.as_ref())?;
     std::thread::scope(|scope| {
+        let index = scope.spawn(|| git(p, &["ls-files", "--stage", "-z"]));
         let refs = scope.spawn(|| refs(p));
         let stashes = scope.spawn(|| stashes(p));
         let remotes = scope.spawn(|| remotes(p));
-        let conflicts = scope.spawn(|| conflicts(p));
-        let operation_commit = scope.spawn(|| operation_commit(p));
-        Ok::<_, CoreError>(Repository {
+        // Only during an operation, which is rare.
+        let operation_commit = operation
+            .is_some()
+            .then(|| scope.spawn(|| operation_commit(p)));
+        let index = joined(index)??;
+        let repository = Repository {
             root: p.to_string_lossy().into_owned(),
             head: head.id.clone(),
             branch: head.branch.clone(),
             refs: joined(refs)??,
             stashes: joined(stashes)??,
             remotes: joined(remotes)??,
-            operation: operation(p)?,
-            operation_commit: joined(operation_commit)?,
+            operation,
+            operation_commit: operation_commit.map(joined).transpose()?.flatten(),
             edit_stop: super::gitrewrite::is_edit_stop(p),
-            bisect_active: git_path(p, "BISECT_START")?.exists(),
-            conflicts: joined(conflicts)??,
+            bisect_active: marker_exists(p, listed.as_ref(), "BISECT_START")?,
+            conflicts: unmerged(&index)?,
             token: String::new(),
-        })
+        };
+        Ok((repository, index))
     })
+}
+
+/// Brings the commit-graph and the index of the work tree up to date and waits for it. The
+/// Git views do this in the background when they open (see `gitfacts::keep_commit_graph`);
+/// this is for a caller that wants the result first, such as the speed test.
+pub fn prepare_history(path: &Path) -> Result<()> {
+    super::gitfacts::write_commit_graph(&root(path)?);
+    Ok(())
 }
 
 pub fn snapshot(path: &Path) -> Result<Repository> {
@@ -839,17 +1177,85 @@ pub fn snapshot(path: &Path) -> Result<Repository> {
         &p,
         || has_filters(&p),
         |light, &filtered| {
-            let (state, base, status) = std::thread::scope(|scope| {
-                let base = scope.spawn(|| token_base(&p, light.repository));
+            let (state, status) = std::thread::scope(|scope| {
                 let status = scope.spawn(|| status_unless(&p, filtered));
                 let state = read_state(&p, &light.head);
-                (state, joined(base), joined(status))
+                (state, joined(status))
             });
-            let mut state = state?;
-            state.token = token_finish(&p, base??, status??.as_deref())?;
+            let (mut state, index) = state?;
+            let base = token_base(light.repository, &index);
+            let (status, early) = status??;
+            state.token = token_finish(&p, base, status.as_deref(), early)?;
             Ok(state)
         },
     )
+}
+
+/// What a remote operation checks before it starts.
+pub(super) struct Checked {
+    /// The same value [`snapshot`] returns as its token.
+    pub token: String,
+    pub remotes: Vec<Remote>,
+    pub operation: Option<String>,
+    pub head: String,
+    pub branch: Option<String>,
+    /// Empty unless asked for.
+    pub refs: Vec<Reference>,
+}
+
+/// The parts of a [`snapshot`] a fetch or push looks at, with fewer processes: no stash
+/// list, operation commit or conflicts, and the references only when `with_refs` (their
+/// sorted listing with upstream counts is one of the slowest queries). Everything runs
+/// side by side.
+pub(super) fn checked(path: &Path, with_refs: bool) -> Result<Checked> {
+    let p = root(path)?;
+    // Another Git client rewriting the index or a reference meanwhile is common: one more
+    // try, as `load_consistently` does for a snapshot.
+    match checked_once(&p, with_refs) {
+        Err(CoreError::Other(message)) if message == CHANGED_WHILE_LOADING => {
+            checked_once(&p, with_refs)
+        }
+        result => result,
+    }
+}
+
+const CHANGED_WHILE_LOADING: &str =
+    "The repository changed while loading. Refresh to review its current state";
+
+fn checked_once(p: &Path, with_refs: bool) -> Result<Checked> {
+    let p = p.to_path_buf();
+    let light = light_parts(&p)?;
+    let (index, status, remotes, refs) = std::thread::scope(|scope| {
+        let remotes = scope.spawn(|| remotes(&p));
+        let refs = with_refs.then(|| scope.spawn(|| refs(&p)));
+        let index = scope.spawn(|| git(&p, &["ls-files", "--stage", "-z"]));
+        let status = current_status(&p);
+        (
+            joined(index),
+            status,
+            joined(remotes),
+            refs.map(joined).transpose(),
+        )
+    });
+    let (index, (status, early), remotes) = (index??, status?, remotes??);
+    let refs = refs?.transpose()?.unwrap_or_default();
+    // References read next to the token must belong to the state it describes.
+    if with_refs && light.token != light_token(&p)? {
+        return Err(fail(CHANGED_WHILE_LOADING));
+    }
+    Ok(Checked {
+        token: token_finish(
+            &p,
+            token_base(light.repository, &index),
+            status.as_deref(),
+            early,
+        )?,
+        remotes,
+        operation: operation(&p)?,
+        head: light.head.id,
+        branch: light.head.branch,
+        refs,
+    })
 }
 
 /// What the graph view shows: history and repository state, read in one pass. The work tree
@@ -868,52 +1274,62 @@ pub fn graph_view(
     reference: Option<&str>,
 ) -> Result<GraphView> {
     let p = root(path)?;
-    // The two configuration lookups run next to the first token instead of before it.
-    let prepare = || {
-        std::thread::scope(|scope| {
-            let escape = scope.spawn(|| super::gitgraph::quote_non_ascii(&p));
-            (has_filters(&p), joined(escape))
-        })
-    };
-    load_consistently(&p, prepare, |light, (filtered, escape)| {
-        let filtered = *filtered;
-        let (graph, branches, state, base, status) = std::thread::scope(|scope| {
-            let status = scope.spawn(|| status_unless(&p, filtered));
-            let base = scope.spawn(|| token_base(&p, light.repository));
-            let state = scope.spawn(|| read_state(&p, &light.head));
-            let branches = scope.spawn(|| super::gitgraph::branches(&p));
-            let graph =
-                super::gitgraph::history_part(&p, reflog, limit, reference, Some(&light.head.id));
-            (
-                graph,
-                joined(branches),
-                joined(state),
-                joined(base),
-                joined(status),
-            )
-        });
-        let (mut graph, mut state) = (graph?, state??);
-        graph.branches = branches??;
-        graph.read_only_reason = super::gitgraph::read_only_reason(filtered);
-        let status = status??;
-        state.token = token_finish(&p, base??, status.as_deref())?;
-        if !comparison {
-            if let Some(status) = &status {
+    // The filter lookup runs next to the first token instead of before it.
+    load_consistently(
+        &p,
+        || has_filters(&p),
+        |light, &filtered| {
+            let (graph, branches, state, status, escape) = std::thread::scope(|scope| {
+                let status = scope.spawn(|| status_unless(&p, filtered));
+                let state = scope.spawn(|| read_state(&p, &light.head));
+                let branches = scope.spawn(|| super::gitgraph::branches(&p));
+                // Only the list of changes needs it, and nothing waits for it.
+                let escape = (!comparison && !filtered)
+                    .then(|| scope.spawn(|| super::gitgraph::quote_non_ascii(&p)));
+                let graph = super::gitgraph::history_part(
+                    &p,
+                    reflog,
+                    limit,
+                    reference,
+                    Some(&light.head.id),
+                );
+                (
+                    graph,
+                    joined(branches),
+                    joined(state),
+                    joined(status),
+                    escape.map(joined),
+                )
+            });
+            let (mut graph, (mut state, index)) = (graph?, state??);
+            graph.branches = branches??;
+            graph.read_only_reason = super::gitgraph::read_only_reason(filtered);
+            let (status, early) = status??;
+            let base = token_base(light.repository, &index);
+            state.token = token_finish(&p, base, status.as_deref(), early)?;
+            if let (Some(status), Some(escape)) = (&status, escape) {
                 // Git escapes non-ASCII names unless told otherwise; a failed lookup means that.
-                let escape = *escape.as_ref().unwrap_or(&true);
-                graph.changes = super::gitgraph::changes_text(status, escape);
+                graph.changes = super::gitgraph::changes_text(status, escape.unwrap_or(true));
             }
-        }
-        Ok(GraphView {
-            graph,
-            repository: state,
-        })
-    })
+            Ok(GraphView {
+                graph,
+                repository: state,
+            })
+        },
+    )
 }
 
 fn commit_id(path: &Path, value: &str) -> Result<()> {
     if !matches!(value.len(), 40 | 64) || !value.bytes().all(|c| c.is_ascii_hexdigit()) {
         return Err(fail("Select a concrete commit before this operation"));
+    }
+    // The HEAD the token check read is a commit: creating a branch or tag there is the
+    // usual case, and needs no process.
+    let known = |seen: &Seen| {
+        (seen.head == value || seen.prefetched.commits.iter().any(|id| id == value)).then_some(())
+    };
+    if seen(path, known).is_some() {
+        return Ok(());
     }
     let resolved = git(
         path,
@@ -931,17 +1347,19 @@ fn validate_name(path: &Path, name: &str, kind: &str) -> Result<()> {
             "Invalid {kind} name “{name}”: {problem}. Example: feature/my-change"
         )));
     }
-    let checked = match kind {
-        // Validate the literal ref, rather than allowing --branch to expand @{-1}.
-        "branch" => git(path, &["check-ref-format", &format!("refs/heads/{name}")]),
-        "tag" => git(path, &["check-ref-format", &format!("refs/tags/{name}")]),
-        "remote" => git(
-            path,
-            &["check-ref-format", &format!("refs/remotes/{name}/check")],
-        ),
+    // Validate the literal ref, rather than allowing --branch to expand @{-1}.
+    let full = match kind {
+        "branch" => format!("refs/heads/{name}"),
+        "tag" => format!("refs/tags/{name}"),
+        "remote" => format!("refs/remotes/{name}/check"),
         _ => return Err(fail("Invalid reference kind")),
     };
-    checked
+    // The rules of git-check-ref-format(1) accept it: Git would too (a test compares the
+    // two). Anything else is left to Git, so its verdict stays the one that counts.
+    if super::gitfacts::plain_ref_name(&full) {
+        return Ok(());
+    }
+    git(path, &["check-ref-format", &full])
     .map_err(|_| {
         fail(format!(
             "Git rejected the {kind} name “{name}”. Use letters, digits, “-”, “_”, “.” and “/” only, without spaces or special characters. Example: feature/my-change"
@@ -976,12 +1394,20 @@ fn name_problem(name: &str) -> Option<String> {
     })
 }
 
-fn reference(path: &Path, kind: &str, name: &str) -> Result<Reference> {
+/// Checks that the `kind` (branch or tag) `name` still exists.
+fn reference(path: &Path, kind: &str, name: &str) -> Result<()> {
     validate_name(path, name, kind)?;
-    refs(path)?
-        .into_iter()
-        .find(|r| r.kind == kind && r.name == name)
-        .ok_or_else(|| fail(format!("The selected {kind} no longer exists")))
+    // Branches read from Git's files list what `for-each-ref refs/heads/` lists, by exact
+    // name; where the files cannot answer, Git is asked.
+    let files = (kind == "branch").then(|| super::gitfacts::branches(path));
+    let known = match files.flatten() {
+        Some(names) => names.iter().any(|branch| branch == name),
+        None => refs(path)?.iter().any(|r| r.kind == kind && r.name == name),
+    };
+    if !known {
+        return Err(fail(format!("The selected {kind} no longer exists")));
+    }
+    Ok(())
 }
 
 fn remote_exists(path: &Path, name: &str) -> Result<()> {
@@ -1005,16 +1431,28 @@ fn url(value: &str) -> Result<()> {
     Ok(())
 }
 
+/// For rebase and steps of an operation that is already running (continue, skip, abort,
+/// resolving a conflict). These support submodules; rebase commands explicitly disable
+/// recursion so that the submodule working folders stay untouched.
+fn control_guard(path: &Path) -> Result<()> {
+    worktree_guard_with(path, true)
+}
+
 fn worktree_guard(path: &Path) -> Result<()> {
+    worktree_guard_with(path, false)
+}
+
+fn worktree_guard_with(path: &Path, submodules_ok: bool) -> Result<()> {
     if has_filters(path) {
         return Err(fail(
             "Worktree operations with content filters require the terminal",
         ));
     }
-    if path.join(".gitmodules").exists()
-        || git(path, &["ls-files", "--stage"])?
-            .lines()
-            .any(|line| line.starts_with("160000 "))
+    if !submodules_ok
+        && (path.join(".gitmodules").exists()
+            || index_listing(path)?
+                .split('\0')
+                .any(|record| record.starts_with("160000 ")))
     {
         return Err(fail(
             "Worktree operations with submodules require the terminal",
@@ -1033,35 +1471,99 @@ fn clean(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Give the user the paths that block rebase; the graph and Working Changes read
+/// the same status, including staged gitlinks for embedded repositories.
+fn rebase_clean(path: &Path) -> Result<()> {
+    let changes = status(path)?;
+    if changes.is_empty() {
+        return Ok(());
+    }
+    let names: Vec<_> = super::gitgraph::status_entries(&changes)
+        .into_iter()
+        .take(5)
+        .map(|entry| format!("{:?}", entry.name))
+        .collect();
+    Err(fail(format!(
+        "Local changes block rebase: {}. Open Working Changes to review, commit, or unstage them. Unwanted untracked folders can be excluded locally without deleting them.",
+        names.join(", ")
+    )))
+}
+
 fn protect_untracked(path: &Path, targets: &[&str], replay: Option<&str>) -> Result<()> {
-    let other = checked_text(git(path, &["ls-files", "--others", "-z"])?)?;
+    // What the token check already read (`SEEN` belongs to this thread, so it is looked up
+    // before the workers start).
+    let known_trees: Vec<Option<String>> = targets
+        .iter()
+        .map(|target| {
+            seen(path, |seen| {
+                let found = seen.prefetched.trees.iter().find(|(t, _)| t == target);
+                found.map(|(_, listing)| listing.clone())
+            })
+        })
+        .collect();
+    let known_replay = replay.and_then(|target| {
+        seen(path, |seen| {
+            let found = seen.prefetched.replayed.as_ref();
+            found
+                .filter(|(t, _)| t == target)
+                .map(|(_, log)| log.clone())
+        })
+    });
+    let known_others = seen(path, |seen| seen.prefetched.others.clone());
+    // The three listings do not depend on each other: asked side by side.
+    let (other, trees, replayed) = std::thread::scope(|scope| {
+        let trees = scope.spawn(|| -> Result<Vec<String>> {
+            targets
+                .iter()
+                .zip(known_trees)
+                .map(|(target, known)| match known {
+                    Some(listing) => checked_text(listing),
+                    None => {
+                        checked_text(git(path, &["ls-tree", "-r", "--name-only", "-z", target])?)
+                    }
+                })
+                .collect()
+        });
+        let replayed = scope.spawn(|| -> Result<Option<String>> {
+            let Some(target) = replay else {
+                return Ok(None);
+            };
+            if let Some(log) = known_replay {
+                return checked_text(log).map(Some);
+            }
+            // Rebase can temporarily restore a path deleted again by a later commit.
+            // Include every replayed path, not only the final HEAD tree.
+            checked_text(git(
+                path,
+                &[
+                    "log",
+                    "--format=",
+                    "--raw",
+                    "-z",
+                    "--no-renames",
+                    "--no-abbrev",
+                    &format!("{target}..HEAD"),
+                ],
+            )?)
+            .map(Some)
+        });
+        let other = match known_others {
+            Some(listing) => checked_text(listing),
+            None => git(path, &["ls-files", "--others", "-z"]).and_then(checked_text),
+        };
+        (other, joined(trees), joined(replayed))
+    });
+    let other = other?;
     if other.is_empty() {
         return Ok(());
     }
     let mut touched = BTreeSet::new();
-    for target in targets {
-        for name in checked_text(git(path, &["ls-tree", "-r", "--name-only", "-z", target])?)?
-            .split('\0')
-            .filter(|name| !name.is_empty())
-        {
+    for tree in trees?? {
+        for name in tree.split('\0').filter(|name| !name.is_empty()) {
             touched.insert(name.to_owned());
         }
     }
-    if let Some(target) = replay {
-        // Rebase can temporarily restore a path deleted again by a later commit.
-        // Include every replayed path, not only the final HEAD tree.
-        let raw = checked_text(git(
-            path,
-            &[
-                "log",
-                "--format=",
-                "--raw",
-                "-z",
-                "--no-renames",
-                "--no-abbrev",
-                &format!("{target}..HEAD"),
-            ],
-        )?)?;
+    if let Some(raw) = replayed?? {
         let mut next_is_path = false;
         for record in raw.split('\0') {
             if next_is_path {
@@ -1119,24 +1621,13 @@ fn save_head(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn save_index_and_worktree(path: &Path) -> Result<()> {
+fn save_index_and_worktree(path: &Path, message: &str) -> Result<()> {
     // `stash create` stores index and tracked working content without cleaning
     // the working tree or changing the user's stash stack.
-    let id = git(
-        path,
-        &["stash", "create", "Gall recovery before mixed reset"],
-    )?;
+    let id = git(path, &["stash", "create", message])?;
     let id = id.trim();
     if !id.is_empty() {
-        git(
-            path,
-            &[
-                "update-ref",
-                "--no-deref",
-                &format!("refs/gall/recovery/{id}"),
-                id,
-            ],
-        )?;
+        super::gitgraph::retain_recovery(path, id, message)?;
     }
     Ok(())
 }
@@ -1165,6 +1656,9 @@ fn drop_stash(path: &Path, id: &str) -> Result<String> {
 }
 
 fn control(path: &Path, command: &str) -> Result<String> {
+    // Continue, skip and abort change the repository through other modules, which the
+    // local `git` does not see: from here on every question is asked again.
+    SEEN.with(|slot| *slot.borrow_mut() = None);
     let current = operation(path)?.ok_or_else(|| fail("There is no interrupted Git operation"))?;
     if command == "--continue" && !conflicts(path)?.is_empty() {
         return Err(fail("Resolve and stage all conflicts before continuing"));
@@ -1246,22 +1740,56 @@ fn control(path: &Path, command: &str) -> Result<String> {
             _ => Err(fail("A merge cannot be skipped; continue or abort it")),
         };
     }
-    git(path, &["-c", "core.editor=true", &current, command])
+    git(
+        path,
+        &[
+            "-c",
+            "core.editor=true",
+            "-c",
+            "submodule.recurse=false",
+            &current,
+            command,
+        ],
+    )
 }
 
 /// Execute one explicitly selected local action. Commits are unsigned, with hooks disabled.
 pub fn execute(path: &Path, request: Request, expected: &str) -> Result<String> {
+    let _busy = super::gitfacts::mutating();
     let p = root(path)?;
-    if git_path(&p, "BISECT_START")?.exists() {
+    if marker_exists(&p, super::gitfacts::markers(&p).as_ref(), "BISECT_START")? {
         return Err(fail(
             "Finish bisect in Tools before other repository operations.",
         ));
     }
-    if token(&p)? != expected {
+    let (checked, prefetched) = std::thread::scope(|scope| {
+        let prefetched = scope.spawn(|| prefetch(&p, &request));
+        (token_seen(&p), joined(prefetched))
+    });
+    let (token, mut seen) = checked?;
+    seen.prefetched = prefetched.unwrap_or_default();
+    if token != expected {
         return Err(fail(
             "The repository changed. Refresh and review the selected action again",
         ));
     }
+    // The guards of the action reuse what the token was computed from.
+    let _armed = Armed::new(seen);
+    // These neither move HEAD nor detach it, so a detached commit stays where it was: HEAD.
+    // Deleting a branch or tag still keeps it: that reference may have been the only one
+    // to the detached commit besides HEAD.
+    let keeps_head = matches!(
+        request,
+        Request::CreateBranch { .. }
+            | Request::RenameBranch { .. }
+            | Request::CreateTag { .. }
+            | Request::SetUpstream { .. }
+            | Request::AddRemote { .. }
+            | Request::RenameRemote { .. }
+            | Request::RemoveRemote { .. }
+            | Request::SetRemoteUrl { .. }
+            | Request::StashDrop { .. }
+    );
     let result = match request {
         Request::CreateBranch { name, target } => {
             validate_name(&p, &name, "branch")?;
@@ -1273,9 +1801,10 @@ pub fn execute(path: &Path, request: Request, expected: &str) -> Result<String> 
             validate_name(&p, &new_name, "branch")?;
             git(&p, &["branch", "--move", "--", &name, &new_name])
         }
-        Request::DeleteBranch { name } => {
+        Request::DeleteBranch { name, force } => {
             reference(&p, "branch", &name)?;
-            git(&p, &["branch", "--delete", "--", &name])
+            let flag = if force { "-D" } else { "--delete" };
+            git(&p, &["branch", flag, "--", &name])
         }
         Request::CreateTag {
             name,
@@ -1391,19 +1920,19 @@ pub fn execute(path: &Path, request: Request, expected: &str) -> Result<String> 
             Ok(output)
         }
         Request::Continue => {
-            worktree_guard(&p)?;
+            control_guard(&p)?;
             control(&p, "--continue")
         }
         Request::Skip => {
-            worktree_guard(&p)?;
+            control_guard(&p)?;
             control(&p, "--skip")
         }
         Request::Abort => {
-            worktree_guard(&p)?;
+            control_guard(&p)?;
             control(&p, "--abort")
         }
         Request::Resolve { file, side } => {
-            worktree_guard(&p)?;
+            control_guard(&p)?;
             if !conflicts(&p)?.contains(&file) {
                 return Err(fail("This file is no longer an unresolved conflict"));
             }
@@ -1422,7 +1951,7 @@ pub fn execute(path: &Path, request: Request, expected: &str) -> Result<String> 
             }
         }
         Request::ResolveContent { file, content } => {
-            worktree_guard(&p)?;
+            control_guard(&p)?;
             if !conflicts(&p)?.contains(&file) {
                 return Err(fail("This file is no longer an unresolved conflict"));
             }
@@ -1457,9 +1986,11 @@ pub fn execute(path: &Path, request: Request, expected: &str) -> Result<String> 
             )
         }
         Request::Rebase { target } => {
-            worktree_guard(&p)?;
+            // Rebase rewrites the superproject's gitlinks without checking out submodules.
+            // Reuse the token's status rather than recursively scanning their folders.
+            control_guard(&p)?;
             no_operation(&p)?;
-            clean(&p)?;
+            rebase_clean(&p)?;
             commit_id(&p, &target)?;
             protect_untracked(&p, &[&target], Some(&target))?;
             save_head(&p)?;
@@ -1470,6 +2001,8 @@ pub fn execute(path: &Path, request: Request, expected: &str) -> Result<String> 
                     "core.editor=true",
                     "-c",
                     "rebase.autoStash=false",
+                    "-c",
+                    "submodule.recurse=false",
                     "rebase",
                     &target,
                 ],
@@ -1503,36 +2036,21 @@ pub fn execute(path: &Path, request: Request, expected: &str) -> Result<String> 
             match mode {
                 ResetMode::Soft => git(&p, &["reset", "--soft", &target]),
                 ResetMode::Mixed => {
-                    save_index_and_worktree(&p)?;
+                    save_index_and_worktree(&p, "Gall recovery before mixed reset")?;
                     git(&p, &["reset", "--mixed", &target])
                 }
                 ResetMode::Hard => {
-                    // A hard reset can overwrite ignored/untracked collisions. Reject
-                    // those repositories instead of relying on Git's destructive default.
-                    if !git(&p, &["ls-files", "--others", "-z"])?.is_empty() {
-                        return Err(fail(
-                            "Move or stash untracked and ignored files before a hard reset",
-                        ));
-                    }
-                    if !status(&p)?.is_empty() {
-                        git(
-                            &p,
-                            &[
-                                "stash",
-                                "push",
-                                "--include-untracked",
-                                "-m",
-                                "Gall recovery before hard reset",
-                            ],
-                        )?;
-                    }
-                    clean(&p)?;
+                    // A hard reset overwrites untracked or ignored files that the target
+                    // commit tracks. Reject only those collisions: unrelated untracked and
+                    // ignored files (build output, dependencies) are left alone by Git.
+                    protect_untracked(&p, &[&target], None)?;
+                    save_index_and_worktree(&p, "Gall recovery before hard reset")?;
                     git(&p, &["reset", "--hard", &target])
                 }
             }
         }
     }?;
-    if !head(&p).is_empty() {
+    if !keeps_head && !head(&p).is_empty() {
         retain_detached(&p).map_err(|e| fail(format!("The operation completed, but its detached commit recovery reference could not be saved: {e}")))?;
     }
     Ok(result)
@@ -1561,6 +2079,163 @@ mod tests {
 
     fn act(path: &Path, request: Request) -> Result<String> {
         execute(path, request, &snapshot(path)?.token)
+    }
+
+    #[test]
+    fn the_check_before_a_remote_operation_agrees_with_the_snapshot() {
+        let d = repository();
+        let p = d.path();
+        commit(p, "one", "1");
+        git(
+            p,
+            &["remote", "add", "origin", "https://example.invalid/r.git"],
+        )
+        .unwrap();
+        git(p, &["branch", "side"]).unwrap();
+        git(p, &["branch", "--set-upstream-to=side", "main"]).unwrap();
+        std::fs::write(p.join("file.txt"), "changed").unwrap();
+        std::fs::write(p.join("new.txt"), "new").unwrap();
+        for with_refs in [false, true] {
+            let full = snapshot(p).unwrap();
+            let light = checked(p, with_refs).unwrap();
+            assert_eq!(light.token, full.token, "with_refs: {with_refs}");
+            assert_eq!(light.head, full.head);
+            assert_eq!(light.branch, full.branch);
+            assert_eq!(light.operation, full.operation);
+            let names = |remotes: &[Remote]| -> Vec<String> {
+                remotes.iter().map(|r| r.name.clone()).collect()
+            };
+            assert_eq!(names(&light.remotes), names(&full.remotes));
+            let upstreams = |refs: &[Reference]| -> Vec<(String, Option<String>)> {
+                refs.iter()
+                    .map(|r| (r.full_name.clone(), r.upstream.clone()))
+                    .collect()
+            };
+            if with_refs {
+                assert_eq!(upstreams(&light.refs), upstreams(&full.refs));
+            } else {
+                assert!(light.refs.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn branch_and_tag_actions_at_head_and_elsewhere_keep_their_checks() {
+        let d = repository();
+        let p = d.path();
+        let first = commit(p, "one", "1");
+        let second = commit(p, "two", "2");
+        assert!(act(
+            p,
+            Request::CreateBranch {
+                name: "at-head".into(),
+                target: second.clone()
+            }
+        )
+        .is_ok());
+        assert!(act(
+            p,
+            Request::CreateBranch {
+                name: "older".into(),
+                target: first.clone()
+            }
+        )
+        .is_ok());
+        assert_eq!(git(p, &["rev-parse", "older"]).unwrap().trim(), first);
+        // A tree is no commit, whichever way the check goes.
+        let tree = git(p, &["rev-parse", "HEAD^{tree}"])
+            .unwrap()
+            .trim()
+            .to_owned();
+        assert!(act(
+            p,
+            Request::CreateBranch {
+                name: "tree".into(),
+                target: tree
+            }
+        )
+        .is_err());
+        // Names Git refuses are refused, whether the rules here or Git say so.
+        for name in ["a.lock/b", "x..y", "-x", "a b"] {
+            assert!(
+                act(
+                    p,
+                    Request::CreateBranch {
+                        name: name.into(),
+                        target: second.clone()
+                    }
+                )
+                .is_err(),
+                "{name}"
+            );
+        }
+        assert!(act(
+            p,
+            Request::DeleteBranch {
+                name: "missing".into(),
+                force: true
+            }
+        )
+        .is_err());
+        assert!(act(
+            p,
+            Request::DeleteBranch {
+                name: "older".into(),
+                force: true
+            }
+        )
+        .is_ok());
+        assert!(act(
+            p,
+            Request::DeleteBranch {
+                name: "older".into(),
+                force: true
+            }
+        )
+        .is_err());
+        // In a detached HEAD, creating a branch leaves no recovery reference: HEAD still
+        // holds the commit, and every action that moves HEAD keeps it first.
+        git(p, &["switch", "-q", "--detach", &first]).unwrap();
+        assert!(act(
+            p,
+            Request::CreateBranch {
+                name: "from-detached".into(),
+                target: first.clone()
+            }
+        )
+        .is_ok());
+        assert_eq!(
+            git(
+                p,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "-q",
+                    &format!("refs/gall/recovery/{first}")
+                ]
+            )
+            .ok(),
+            None
+        );
+        // Deleting a branch there keeps it: that branch may have been its only other name.
+        let recovery = format!("refs/gall/recovery/{first}");
+        let deleted = Request::DeleteBranch {
+            name: "from-detached".into(),
+            force: true,
+        };
+        assert!(act(p, deleted).is_ok());
+        assert!(git(p, &["rev-parse", "--verify", "-q", &recovery]).is_ok());
+        // A symbolic branch makes the file reading give up; Git answers instead.
+        git(p, &["switch", "-q", "main"]).unwrap();
+        git(p, &["branch", "plain"]).unwrap();
+        git(p, &["symbolic-ref", "refs/heads/alias", "refs/heads/main"]).unwrap();
+        assert!(super::super::gitfacts::branches(p).is_none());
+        let delete = |name: &str| Request::DeleteBranch {
+            name: name.into(),
+            force: true,
+        };
+        assert!(act(p, delete("missing")).is_err());
+        assert!(act(p, delete("plain")).is_ok());
     }
 
     #[test]
@@ -1844,6 +2519,7 @@ mod tests {
             p,
             Request::DeleteBranch {
                 name: "feature/renamed".into(),
+                force: false,
             },
         )
         .unwrap();
@@ -1851,11 +2527,35 @@ mod tests {
         assert!(act(
             p,
             Request::DeleteBranch {
-                name: "main".into()
+                name: "main".into(),
+                force: true,
             }
         )
         .is_err());
         assert!(!snapshot(p).unwrap().refs.iter().any(|r| r.name == "v1"));
+    }
+
+    #[test]
+    fn deleting_an_unmerged_branch_needs_force() {
+        let d = repository();
+        let p = d.path();
+        commit(p, "first", "first\n");
+        git(p, &["switch", "-q", "-c", "side"]).unwrap();
+        commit(p, "second", "second\n");
+        git(p, &["switch", "-q", "-"]).unwrap();
+        let del = |force| {
+            act(
+                p,
+                Request::DeleteBranch {
+                    name: "side".into(),
+                    force,
+                },
+            )
+        };
+        let error = del(false).unwrap_err().to_string();
+        assert!(error.contains("not fully merged"), "{error}");
+        del(true).unwrap();
+        assert!(!snapshot(p).unwrap().refs.iter().any(|r| r.name == "side"));
     }
 
     #[test]
@@ -2029,6 +2729,54 @@ mod tests {
         )
         .unwrap();
         assert!(snapshot(p).unwrap().remotes.is_empty());
+    }
+
+    #[test]
+    fn a_branch_whose_upstream_was_deleted_is_reported_as_gone() {
+        let d = repository();
+        let p = d.path();
+        commit(p, "first", "first\n");
+        git(p, &["remote", "add", "origin", "."]).unwrap();
+        git(p, &["update-ref", "refs/remotes/origin/main", "HEAD"]).unwrap();
+        git(p, &["branch", "--set-upstream-to=origin/main", "main"]).unwrap();
+        let main = |p: &Path| {
+            refs(p)
+                .unwrap()
+                .into_iter()
+                .find(|r| r.full_name == "refs/heads/main")
+                .unwrap()
+        };
+        assert!(!main(p).upstream_gone);
+        git(p, &["update-ref", "-d", "refs/remotes/origin/main"]).unwrap();
+        assert!(main(p).upstream_gone);
+    }
+
+    #[test]
+    fn references_list_the_newest_tags_first() {
+        let d = repository();
+        let p = d.path();
+        commit(p, "first", "first\n");
+        // Created oldest-last in name order so that alphabetical order would be wrong.
+        for (name, date) in [
+            ("v1", "2024-01-01T10:00:00Z"),
+            ("v2", "2024-03-01T10:00:00Z"),
+            ("v0", "2024-02-01T10:00:00Z"),
+        ] {
+            let status = std::process::Command::new("git")
+                .current_dir(p)
+                .env("GIT_COMMITTER_DATE", date)
+                .args(["tag", "-a", "-m", name, name])
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let tags: Vec<_> = refs(p)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.kind == "tag")
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(tags, ["v2", "v0", "v1"]);
     }
 
     #[test]
@@ -2277,23 +3025,65 @@ mod tests {
             std::fs::read_to_string(p.join("file.txt")).unwrap(),
             "first\n"
         );
+        // The recovery copy is kept as a reference, not as a visible stash entry.
         let state = snapshot(p).unwrap();
-        assert_eq!(state.stashes.len(), 1);
+        assert!(state.stashes.is_empty());
+        let saved = git(
+            p,
+            &[
+                "for-each-ref",
+                "--format=%(objectname)",
+                "refs/gall/recovery",
+            ],
+        )
+        .unwrap();
+        assert!(saved.lines().any(|id| {
+            git(p, &["show", &format!("{id}:file.txt")]).is_ok_and(|text| text == "uncommitted\n")
+        }));
+        // Unrelated untracked and ignored files must not block a hard reset.
+        std::fs::write(p.join(".gitignore"), "build/\n").unwrap();
+        git(p, &["add", ".gitignore"]).unwrap();
+        git(p, &["commit", "-qm", "ignore"]).unwrap();
+        std::fs::create_dir(p.join("build")).unwrap();
+        std::fs::write(p.join("build").join("out.bin"), "ignored\n").unwrap();
+        std::fs::write(p.join("notes.txt"), "keep me\n").unwrap();
+        act(
+            p,
+            Request::Reset {
+                target: second.clone(),
+                mode: ResetMode::Hard,
+            },
+        )
+        .unwrap();
         assert_eq!(
-            git(p, &["show", &format!("{}:file.txt", state.stashes[0].id)]).unwrap(),
-            "uncommitted\n"
+            std::fs::read_to_string(p.join("notes.txt")).unwrap(),
+            "keep me\n"
         );
-        std::fs::write(p.join("untracked.txt"), "preserve me\n").unwrap();
-        assert!(act(
+        assert!(p.join("build").join("out.bin").exists());
+        // An untracked file that the target commit would overwrite still blocks it.
+        std::fs::write(p.join("extra.txt"), "tracked later\n").unwrap();
+        git(p, &["add", "extra.txt"]).unwrap();
+        git(p, &["commit", "-qm", "extra"]).unwrap();
+        let third = head(p);
+        act(
             p,
             Request::Reset {
                 target: second,
+                mode: ResetMode::Hard,
+            },
+        )
+        .unwrap();
+        std::fs::write(p.join("extra.txt"), "preserve me\n").unwrap();
+        assert!(act(
+            p,
+            Request::Reset {
+                target: third,
                 mode: ResetMode::Hard
             }
         )
         .is_err());
         assert_eq!(
-            std::fs::read_to_string(p.join("untracked.txt")).unwrap(),
+            std::fs::read_to_string(p.join("extra.txt")).unwrap(),
             "preserve me\n"
         );
     }
@@ -2329,6 +3119,323 @@ mod tests {
             std::fs::read_to_string(p.join("file.txt")).unwrap(),
             "first\n"
         );
+    }
+
+    fn add_submodule(p: &Path) -> tempfile::TempDir {
+        let module = repository();
+        commit(module.path(), "module one", "module one\n");
+        git(
+            p,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                &module.path().to_string_lossy().replace('\\', "/"),
+                "sub",
+            ],
+        )
+        .unwrap();
+        for (key, value) in [
+            ("core.autocrlf", "false"),
+            ("user.name", "Test"),
+            ("user.email", "test@example.com"),
+        ] {
+            git(&p.join("sub"), &["config", key, value]).unwrap();
+        }
+        git(p, &["commit", "-qm", "add submodule"]).unwrap();
+        module
+    }
+
+    #[test]
+    fn rebase_with_submodules_preserves_their_checkout_and_local_files() {
+        let d = repository();
+        let p = d.path();
+        let _module = add_submodule(p);
+        let sub = p.join("sub");
+        let module_head = head(&sub);
+        git(p, &["switch", "-qc", "topic"]).unwrap();
+        let topic = commit(p, "topic change", "topic\n");
+        git(p, &["switch", "-q", "main"]).unwrap();
+        // The target changes the recorded gitlink. Rebase must replay the parent history,
+        // but leave the module's checkout at its old commit even with recursion enabled.
+        commit(&sub, "module two", "module two\n");
+        let target_module = head(&sub);
+        git(p, &["add", "sub"]).unwrap();
+        git(p, &["commit", "-qm", "update module"]).unwrap();
+        let target = head(p);
+        git(&sub, &["checkout", "-q", &module_head]).unwrap();
+        git(p, &["switch", "-q", "topic"]).unwrap();
+        git(p, &["config", "submodule.recurse", "true"]).unwrap();
+        std::fs::write(sub.join("file.txt"), "local module edit\n").unwrap();
+        std::fs::write(sub.join("untracked.txt"), "keep\n").unwrap();
+
+        act(
+            p,
+            Request::Rebase {
+                target: target.clone(),
+            },
+        )
+        .unwrap();
+        assert_ne!(head(p), topic);
+        assert_eq!(git(p, &["rev-parse", "HEAD^"]).unwrap().trim(), target);
+        assert_eq!(
+            git(p, &["branch", "--show-current"]).unwrap().trim(),
+            "topic"
+        );
+        assert_eq!(
+            std::fs::read_to_string(p.join("file.txt")).unwrap(),
+            "topic\n"
+        );
+        assert_eq!(
+            git(p, &["rev-parse", "HEAD:sub"]).unwrap().trim(),
+            target_module
+        );
+        assert_eq!(head(&sub), module_head);
+        assert_eq!(
+            std::fs::read_to_string(sub.join("file.txt")).unwrap(),
+            "local module edit\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(sub.join("untracked.txt")).unwrap(),
+            "keep\n"
+        );
+        assert!(snapshot(p).unwrap().operation.is_none());
+    }
+
+    #[test]
+    fn rebase_with_submodules_preserves_an_unstaged_module_checkout() {
+        let d = repository();
+        let p = d.path();
+        let _module = add_submodule(p);
+        git(p, &["switch", "-qc", "topic"]).unwrap();
+        commit(p, "topic change", "topic\n");
+        git(p, &["switch", "-q", "main"]).unwrap();
+        std::fs::write(p.join("target.txt"), "target\n").unwrap();
+        git(p, &["add", "target.txt"]).unwrap();
+        git(p, &["commit", "-qm", "target change"]).unwrap();
+        let target = head(p);
+        git(p, &["switch", "-q", "topic"]).unwrap();
+        let moved = commit(&p.join("sub"), "local module commit", "local module\n");
+        git(p, &["config", "submodule.recurse", "true"]).unwrap();
+        act(p, Request::Rebase { target }).unwrap();
+        assert_eq!(head(&p.join("sub")), moved);
+        assert_eq!(
+            std::fs::read_to_string(p.join("sub/file.txt")).unwrap(),
+            "local module\n"
+        );
+        assert!(p.join("target.txt").exists());
+    }
+
+    #[test]
+    fn rebase_with_submodules_rejects_staged_gitlinks_and_parent_edits() {
+        let d = repository();
+        let p = d.path();
+        let _module = add_submodule(p);
+        let original = head(p);
+        let target = commit(p, "target change", "target\n");
+        git(p, &["reset", "-q", "--hard", &original]).unwrap();
+        let moved = commit(&p.join("sub"), "local module commit", "local module\n");
+        git(p, &["add", "sub"]).unwrap();
+        assert!(act(
+            p,
+            Request::Rebase {
+                target: target.clone()
+            }
+        )
+        .is_err());
+        assert_eq!(head(p), original);
+        assert_eq!(head(&p.join("sub")), moved);
+        assert!(snapshot(p).unwrap().operation.is_none());
+        // Removing the last gitlink leaves no submodule entry in the index. The
+        // remaining .gitmodules must still make us check before moving HEAD.
+        git(p, &["update-index", "--force-remove", "sub"]).unwrap();
+        assert!(act(
+            p,
+            Request::Rebase {
+                target: target.clone()
+            }
+        )
+        .is_err());
+        assert_eq!(head(p), original);
+        assert_eq!(head(&p.join("sub")), moved);
+        assert!(snapshot(p).unwrap().operation.is_none());
+        git(p, &["reset", "-q", "HEAD", "--", "sub"]).unwrap();
+        std::fs::write(p.join(".gitmodules"), "local parent edit\n").unwrap();
+        assert!(act(
+            p,
+            Request::Rebase {
+                target: target.clone()
+            }
+        )
+        .is_err());
+        assert_eq!(head(p), original);
+        assert_eq!(
+            std::fs::read_to_string(p.join(".gitmodules")).unwrap(),
+            "local parent edit\n"
+        );
+    }
+
+    #[test]
+    fn embedded_worktree_folder_is_visible_and_can_be_unstaged_and_excluded_before_rebase() {
+        let d = repository();
+        let p = d.path();
+        commit(p, "base", "base\n");
+        git(p, &["switch", "-qc", "topic"]).unwrap();
+        let original = commit(p, "topic", "topic\n");
+        git(p, &["switch", "-q", "main"]).unwrap();
+        std::fs::write(p.join("upstream.txt"), "upstream\n").unwrap();
+        git(p, &["add", "upstream.txt"]).unwrap();
+        git(p, &["commit", "-qm", "upstream"]).unwrap();
+        let target = head(p);
+        git(p, &["switch", "-q", "topic"]).unwrap();
+        let nested = p.join(".worktrees");
+        std::fs::create_dir(&nested).unwrap();
+        git(&nested, &["init", "-q", "-b", "main"]).unwrap();
+        for (key, value) in [
+            ("core.autocrlf", "false"),
+            ("user.name", "Test"),
+            ("user.email", "test@example.com"),
+        ] {
+            git(&nested, &["config", key, value]).unwrap();
+        }
+        let module_head = commit(&nested, "nested", "keep nested content\n");
+        std::fs::write(nested.join("untracked.txt"), "keep untracked\n").unwrap();
+        git(p, &["add", "--", ".worktrees"]).unwrap();
+        let before = graph_view(p, false, false, 200, None).unwrap();
+        assert!(before.graph.changes.contains("A  .worktrees"));
+        let error = act(
+            p,
+            Request::Rebase {
+                target: target.clone(),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains(".worktrees"), "{error}");
+        assert!(error.contains("Working Changes"), "{error}");
+        assert_eq!(head(p), original);
+        assert!(snapshot(p).unwrap().operation.is_none());
+        let workspace = super::super::gitworktree::workspace(p).unwrap();
+        assert!(workspace
+            .changes
+            .iter()
+            .any(|entry| entry.path == ".worktrees" && entry.index == 'A'));
+        super::super::gitworktree::index_action(
+            p,
+            super::super::gitworktree::IndexAction::Unstage,
+            Some(".worktrees"),
+            "",
+            &workspace.token,
+        )
+        .unwrap();
+        let workspace = super::super::gitworktree::workspace(p).unwrap();
+        let untracked = workspace
+            .changes
+            .iter()
+            .find(|entry| entry.path.trim_end_matches('/') == ".worktrees" && entry.index == '?')
+            .unwrap();
+        super::super::gitworktree::index_action(
+            p,
+            super::super::gitworktree::IndexAction::Exclude,
+            Some(&untracked.path),
+            "",
+            &workspace.token,
+        )
+        .unwrap();
+        act(
+            p,
+            Request::Rebase {
+                target: target.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(git(p, &["rev-parse", "HEAD^"]).unwrap().trim(), target);
+        assert_eq!(
+            git(p, &["branch", "--show-current"]).unwrap().trim(),
+            "topic"
+        );
+        assert_eq!(head(&nested), module_head);
+        assert_eq!(
+            std::fs::read_to_string(nested.join("file.txt")).unwrap(),
+            "keep nested content\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(nested.join("untracked.txt")).unwrap(),
+            "keep untracked\n"
+        );
+        assert!(snapshot(p).unwrap().operation.is_none());
+    }
+
+    #[test]
+    fn rebase_with_submodules_can_be_resolved_skipped_and_aborted() {
+        let d = repository();
+        let p = d.path();
+        let _module = add_submodule(p);
+        let sub = p.join("sub");
+        let module_head = head(&sub);
+        let (main, other) = conflict(p);
+        git(p, &["config", "submodule.recurse", "true"]).unwrap();
+        std::fs::write(sub.join("file.txt"), "module edit\n").unwrap();
+        std::fs::write(sub.join("untracked.txt"), "keep\n").unwrap();
+        for command in ["continue", "skip", "abort"] {
+            git(
+                p,
+                &[
+                    "-c",
+                    "submodule.recurse=false",
+                    "reset",
+                    "-q",
+                    "--hard",
+                    &main,
+                ],
+            )
+            .unwrap();
+            assert!(act(
+                p,
+                Request::Rebase {
+                    target: other.clone()
+                }
+            )
+            .is_err());
+            assert_eq!(snapshot(p).unwrap().operation.as_deref(), Some("rebase"));
+            match command {
+                "continue" => {
+                    act(
+                        p,
+                        Request::ResolveContent {
+                            file: "file.txt".into(),
+                            content: "resolved\n".into(),
+                        },
+                    )
+                    .unwrap();
+                    act(p, Request::Continue).unwrap();
+                    assert_eq!(
+                        std::fs::read_to_string(p.join("file.txt")).unwrap(),
+                        "resolved\n"
+                    );
+                }
+                "skip" => {
+                    act(p, Request::Skip).unwrap();
+                    assert_eq!(head(p), other);
+                }
+                _ => {
+                    act(p, Request::Abort).unwrap();
+                    assert_eq!(head(p), main);
+                }
+            }
+            assert!(snapshot(p).unwrap().operation.is_none());
+            assert_eq!(head(&sub), module_head);
+            assert_eq!(
+                std::fs::read_to_string(sub.join("file.txt")).unwrap(),
+                "module edit\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(sub.join("untracked.txt")).unwrap(),
+                "keep\n"
+            );
+        }
     }
 
     #[test]

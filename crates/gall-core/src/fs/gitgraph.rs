@@ -2,7 +2,7 @@
 use crate::{CoreError, Result};
 use serde::Serialize;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 /// Whether `config_lines` (`git config --get-regexp` output, `key value` per
 /// line) define a content filter that would run a program on checkout or
@@ -12,32 +12,29 @@ use std::process::{Command, Stdio};
 /// `git-lfs `), which is what `git lfs install` writes. It is not a security
 /// boundary: anyone who can write the user's Git configuration can already run
 /// programs, so this only avoids refusing ordinary LFS repositories.
+#[cfg(test)]
 fn filters_block(config_lines: &str) -> bool {
     config_lines.lines().any(|line| {
         let (key, value) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
-        let standard_lfs = key.starts_with("filter.lfs.") && value.trim().starts_with("git-lfs ");
-        !standard_lfs
+        filter_blocks(key, value)
     })
+}
+
+/// One filter setting: everything but the standard Git LFS filter blocks.
+fn filter_blocks(key: &str, value: &str) -> bool {
+    !(key.starts_with("filter.lfs.") && value.trim().starts_with("git-lfs "))
 }
 
 /// True when the repository's effective configuration (including global and
 /// system files) has a content filter other than standard Git LFS.
 pub(super) fn has_content_filters(path: &Path) -> bool {
-    git(
-        path,
-        &[
-            "config",
-            "--get-regexp",
-            "^filter\\..*\\.(clean|smudge|process)$",
-        ],
-    )
-    .is_ok_and(|lines| filters_block(&lines))
+    super::gitfacts::filters(path)
+        .iter()
+        .any(|(key, value)| filter_blocks(key, value))
 }
 
-/// Queries that only read the repository. They are the ones a view repeats many times, so
-/// they start the real Git program directly (see `gitstatus::program`); everything that
-/// changes the repository keeps going through `git` on `PATH`, exactly as in a terminal.
-fn reads_only(args: &[&str]) -> bool {
+/// Queries that only read the repository; any other command may change it.
+pub(super) fn reads_only(args: &[&str]) -> bool {
     match args {
         ["stash", "list", ..] | ["remote", "-v"] => true,
         ["config", rest @ ..] => rest
@@ -60,38 +57,47 @@ fn reads_only(args: &[&str]) -> bool {
     }
 }
 
+/// Parallel checkout for Git for Windows on a Windows folder: writing the files is most of
+/// a branch switch there, and Git writes them one after the other by default (a switch that
+/// changes 800 files of a 50 000-file work tree took 400 ms instead of 310 ms). Git uses
+/// the workers only for 100 files or more (`checkout.thresholdForParallelism`), and the
+/// files written are the same; commands that write no files ignore the setting. Not for
+/// other systems, where it was not measured.
+fn checkout_workers(root: &Path) -> Option<String> {
+    (cfg!(windows) && super::gitexec::place(root).is_none()).then(|| {
+        let workers = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
+        format!("checkout.workers={workers}")
+    })
+}
+
 pub(super) fn git(root: &Path, args: &[&str]) -> Result<String> {
-    let mut cmd = if reads_only(args) {
-        Command::new(super::gitstatus::program())
-    } else {
-        Command::new("git")
-    };
-    cmd.args([
-        "-c",
-        "core.fsmonitor=false",
-        "-c",
-        if cfg!(windows) {
-            "core.hooksPath=NUL"
-        } else {
-            "core.hooksPath=/dev/null"
-        },
-        "-c",
-        "commit.gpgSign=false",
-        "-c",
-        "log.showSignature=false",
-        "-C",
-    ])
-    .arg(root)
-    .args(args)
-    .stdin(Stdio::null())
-    .env("GIT_OPTIONAL_LOCKS", "0")
-    .env("GIT_TERMINAL_PROMPT", "0");
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000);
+    let mut cmd = super::gitexec::command(root, super::gitstatus::program());
+    cmd.args(["-c", "core.fsmonitor=false", "-c"])
+        .arg(format!(
+            "core.hooksPath={}",
+            super::gitexec::null_device(root)
+        ))
+        .args([
+            "-c",
+            "commit.gpgSign=false",
+            "-c",
+            "log.showSignature=false",
+        ]);
+    if let Some(workers) = checkout_workers(root) {
+        cmd.arg("-c").arg(workers);
     }
-    let out = cmd.output().map_err(|e| CoreError::Other(e.to_string()))?;
+    cmd.arg("-C")
+        .arg(super::gitexec::dir_arg(root))
+        .args(args)
+        .stdin(Stdio::null())
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    super::gitexec::forward_env(&mut cmd);
+    let out = match super::gitexec::run(&cmd, std::time::Duration::from_secs(120)) {
+        Some(out) => out,
+        None => cmd.output(),
+    }
+    .map_err(|e| CoreError::Other(e.to_string()))?;
     if !out.status.success() {
         let message = String::from_utf8_lossy(&out.stderr).trim().to_owned();
         return Err(CoreError::Other(if message.is_empty() {
@@ -113,18 +119,126 @@ pub(super) fn joined<T>(handle: std::thread::ScopedJoinHandle<'_, T>) -> Result<
         .map_err(|_| CoreError::Other("A Git worker thread stopped unexpectedly".into()))
 }
 
-/// Work tree status with untracked files, in the machine-readable `-z` form.
+/// Work tree status in porcelain-v1 `-z` form. Staged submodule pointers are shown,
+/// while submodule checkout drift, edits and untracked files are ignored.
+///
+/// Git does the two halves of a status one after the other: it compares every tracked
+/// file with the index, then walks the work tree for files it does not know. In a large
+/// repository each half takes about as long as the other, so here they are two processes
+/// side by side (`status` without untracked files and `ls-files --others`), joined in
+/// Git's order: tracked changes first, then the untracked files.
+///
+/// Not with Git for Windows on a Windows folder: there `status` reads folders through its
+/// file system cache (`core.fscache`) and `ls-files` does not, so one `status` that walks
+/// the work tree as well takes about a third of the time `ls-files --others` alone does.
 pub(super) fn status_z(root: &Path) -> Result<String> {
-    git(
-        root,
-        &[
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=all",
-            "--ignore-submodules=all",
-        ],
-    )
+    if cfg!(windows) && super::gitexec::place(root).is_none() {
+        return status_v1(&git(
+            root,
+            &[
+                "status",
+                "--porcelain=v2",
+                "-z",
+                "--untracked-files=all",
+                "--ignore-submodules=dirty",
+            ],
+        )?);
+    }
+    std::thread::scope(|scope| {
+        let untracked =
+            scope.spawn(|| git(root, &["ls-files", "--others", "--exclude-standard", "-z"]));
+        let tracked = git(
+            root,
+            &[
+                "status",
+                "--porcelain=v2",
+                "-z",
+                "--untracked-files=no",
+                "--ignore-submodules=dirty",
+            ],
+        );
+        let mut status = status_v1(&tracked?)?;
+        for name in joined(untracked)??.split_terminator('\0') {
+            status.push_str("?? ");
+            status.push_str(name);
+            status.push('\0');
+        }
+        Ok(status)
+    })
+}
+
+/// Porcelain v2 includes each path's modes, so a worktree-only gitlink change can
+/// be ignored without another Git query or a scan of the module's files. Unlike
+/// `--ignore-submodules=all`, this keeps staged additions, updates and removals.
+fn status_v1(raw: &str) -> Result<String> {
+    let invalid = || CoreError::Other("Invalid Git status record".into());
+    let mut out = String::with_capacity(raw.len());
+    let mut records = raw.split_terminator('\0');
+    while let Some(record) = records.next() {
+        let (code, name, original, gitlink) = match record.as_bytes().first() {
+            // Optional headers (for example status.showStash) do not describe paths.
+            // Ignore unknown headers too, as porcelain v2 permits future extensions.
+            Some(b'#') => continue,
+            Some(b'1' | b'2') => {
+                let renamed = record.starts_with('2');
+                let fields: Vec<_> = record.splitn(if renamed { 10 } else { 9 }, ' ').collect();
+                if fields.len() != if renamed { 10 } else { 9 } {
+                    return Err(invalid());
+                }
+                let original = if renamed {
+                    Some(records.next().ok_or_else(invalid)?)
+                } else {
+                    None
+                };
+                // After a staged type change from a module to a regular file, retain
+                // that file's worktree edits. A removed module has a zero index mode.
+                let gitlink =
+                    fields[4] == "160000" || (fields[3] == "160000" && fields[4] == "000000");
+                (fields[1], fields[fields.len() - 1], original, gitlink)
+            }
+            Some(b'u') => {
+                let fields: Vec<_> = record.splitn(11, ' ').collect();
+                if fields.len() != 11 {
+                    return Err(invalid());
+                }
+                (fields[1], fields[10], None, false)
+            }
+            Some(b'?' | b'!') if record.as_bytes().get(1) == Some(&b' ') && record.len() > 2 => {
+                out.push(record.as_bytes()[0] as char);
+                out.push(record.as_bytes()[0] as char);
+                out.push(' ');
+                out.push_str(&record[2..]);
+                out.push('\0');
+                continue;
+            }
+            _ => return Err(invalid()),
+        };
+        let code = code.as_bytes();
+        if code.len() != 2 || !code.is_ascii() || name.is_empty() {
+            return Err(invalid());
+        }
+        if gitlink && code[0] == b'.' {
+            continue;
+        }
+        out.push(if code[0] == b'.' {
+            ' '
+        } else {
+            code[0] as char
+        });
+        out.push(if gitlink || code[1] == b'.' {
+            ' '
+        } else {
+            code[1] as char
+        });
+        out.push(' ');
+        out.push_str(name);
+        out.push('\0');
+        if let Some(original) = original {
+            out.push_str(original);
+            out.push('\0');
+        }
+    }
+    Ok(out)
 }
 
 /// One record of `status --porcelain=v1 -z`.
@@ -272,6 +386,9 @@ pub(super) fn read_only_reason(filters: bool) -> Option<String> {
 
 /// Names of the local branches, as Git shortens them.
 pub(super) fn branches(root: &Path) -> Result<Vec<String>> {
+    if let Some(names) = super::gitfacts::branches(root) {
+        return Ok(names);
+    }
     let names = git(
         root,
         &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
@@ -289,6 +406,7 @@ pub(super) fn history_part(
     reference: Option<&str>,
     head: Option<&str>,
 ) -> Result<Graph> {
+    super::gitfacts::keep_commit_graph(root);
     let reference = reference.filter(|s| !s.is_empty());
     if let Some(reference) = reference {
         let known = git(root, &["for-each-ref", "--format=%(refname)"])?;
@@ -368,9 +486,14 @@ pub(super) fn history_part(
     })
 }
 /// Retain a detached commit even after its HEAD reflog expires.
+/// HEAD's file says whether it is detached; Git is asked where the file cannot answer.
 pub(super) fn retain_detached(root: &Path) -> Result<()> {
-    if git(root, &["symbolic-ref", "-q", "HEAD"]).is_err() {
-        let head = git(root, &["rev-parse", "--verify", "HEAD"])?;
+    let detached = match super::gitfacts::detached_head(root) {
+        Some(state) => state,
+        None if git(root, &["symbolic-ref", "-q", "HEAD"]).is_ok() => None,
+        None => Some(git(root, &["rev-parse", "--verify", "HEAD"])?),
+    };
+    if let Some(head) = detached {
         let head = head.trim();
         git(
             root,
@@ -385,16 +508,72 @@ pub(super) fn retain_detached(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Remove the recovery reference of a history rewrite that finished successfully, so it no
+/// longer clutters other tools' graphs. Best effort: a leftover reference is harmless.
+pub(super) fn drop_recovery(root: &Path, id: &str) {
+    let _ = git(
+        root,
+        &["update-ref", "-d", &format!("refs/gall/recovery/{id}")],
+    );
+}
+
+/// Keep a commit (such as one made by `git stash create`) reachable under
+/// `refs/gall/recovery/<id>` with a reflog entry that names the reason. Unlike the stash
+/// list, these references do not show up in other Git tools' stash or branch views.
+pub(super) fn retain_recovery(root: &Path, id: &str, message: &str) -> Result<()> {
+    git(
+        root,
+        &[
+            "update-ref",
+            "--no-deref",
+            "--create-reflog",
+            "-m",
+            message,
+            &format!("refs/gall/recovery/{id}"),
+            id,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Remove local changes with `git stash push` options but keep them only as a recovery
+/// reference, not as a visible stash entry. `extra` is appended (for example a pathspec).
+pub(super) fn push_recovery(root: &Path, extra: &[&str], message: &str) -> Result<()> {
+    let top = |root: &Path| {
+        git(root, &["rev-parse", "-q", "--verify", "refs/stash"])
+            .map(|id| id.trim().to_owned())
+            .unwrap_or_default()
+    };
+    let before = top(root);
+    let mut args = vec!["stash", "push", "--include-untracked", "-m", message];
+    args.extend_from_slice(extra);
+    git(root, &args)?;
+    let created = top(root);
+    if created.is_empty() || created == before {
+        return Ok(());
+    }
+    retain_recovery(root, &created, message)?;
+    git(root, &["stash", "drop", "-q", "stash@{0}"])?;
+    Ok(())
+}
+
 pub fn switch(path: &Path, target: &str, branch: bool, action: &str, message: &str) -> Result<()> {
+    let _busy = super::gitfacts::mutating();
     let root = root(path)?;
     if has_content_filters(&root) {
         return Err(CoreError::Other(
             "Switching repositories with content filters is not supported yet".into(),
         ));
     }
-    let state = graph(&root)?;
+    // Only the branch names and whether there are changes matter here; this used to load
+    // the whole history graph for them.
+    let (known, changes) = std::thread::scope(|scope| {
+        let known = scope.spawn(|| branches(&root));
+        (joined(known), status_z(&root))
+    });
+    let (known, changes) = (known??, changes?);
     if branch {
-        if !state.branches.iter().any(|b| b == target) {
+        if !known.iter().any(|b| b == target) {
             return Err(CoreError::Other("branch no longer exists".into()));
         }
     } else if !(target.len() == 40 || target.len() == 64)
@@ -402,7 +581,9 @@ pub fn switch(path: &Path, target: &str, branch: bool, action: &str, message: &s
     {
         return Err(CoreError::Other("invalid commit ID".into()));
     }
-    // Reject unfinished operations and submodules rather than risk partial data loss.
+    // Reject unfinished operations rather than risk partial data loss. Submodules are supported: the
+    // switch never recurses into their folders (they stay as they are, like in lazygit or GitLens).
+    let listed = super::gitfacts::markers(&root);
     for marker in [
         "MERGE_HEAD",
         "CHERRY_PICK_HEAD",
@@ -411,26 +592,24 @@ pub fn switch(path: &Path, target: &str, branch: bool, action: &str, message: &s
         "rebase-apply",
         "BISECT_START",
     ] {
-        let p = git(&root, &["rev-parse", "--git-path", marker])?;
-        let p = std::path::PathBuf::from(p.trim());
-        if (if p.is_absolute() { p } else { root.join(p) }).exists() {
+        // One listing of the Git directory answers for all markers (see `gitfacts::Markers`).
+        let present = match &listed {
+            Some(listed) => listed.exists(marker),
+            None => {
+                let p = git(&root, &["rev-parse", "--git-path", marker])?;
+                root.join(super::gitexec::host_path(&root, p.trim()))
+                    .exists()
+            }
+        };
+        if present {
             return Err(CoreError::Other(
                 "Finish or abort the current Git operation first".into(),
             ));
         }
     }
-    if root.join(".gitmodules").exists()
-        || git(&root, &["ls-files", "--stage"])?
-            .lines()
-            .any(|line| line.starts_with("160000 "))
-    {
-        return Err(CoreError::Other(
-            "Switching repositories with submodules is not supported yet".into(),
-        ));
-    }
-    if !state.changes.is_empty() {
+    if !changes.is_empty() {
         match action {
-            "stash" | "discard" => {
+            "stash" => {
                 git(
                     &root,
                     &[
@@ -438,14 +617,11 @@ pub fn switch(path: &Path, target: &str, branch: bool, action: &str, message: &s
                         "push",
                         "--include-untracked",
                         "-m",
-                        if action == "discard" {
-                            "Gall recovery before discard"
-                        } else {
-                            "Gall before revision switch"
-                        },
+                        "Gall before revision switch",
                     ],
                 )?;
             }
+            "discard" => push_recovery(&root, &[], "Gall recovery before discard")?,
             "commit" => {
                 if message.trim().is_empty() {
                     return Err(CoreError::Other("A commit message is required".into()));
@@ -460,16 +636,19 @@ pub fn switch(path: &Path, target: &str, branch: bool, action: &str, message: &s
             }
         }
     }
-    if !git(
-        &root,
-        &[
-            "status",
-            "--porcelain",
-            "--untracked-files=all",
-            "--ignore-submodules=all",
-        ],
-    )?
-    .is_empty()
+    // After a stash, commit or discard the work tree has to be clean now. Without one it
+    // was read as clean a moment ago, and Git itself refuses to overwrite a change.
+    if !changes.is_empty()
+        && !git(
+            &root,
+            &[
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+                "--ignore-submodules=all",
+            ],
+        )?
+        .is_empty()
     {
         return Err(CoreError::Other(
             "Files changed during preparation; switching cancelled".into(),
@@ -478,11 +657,28 @@ pub fn switch(path: &Path, target: &str, branch: bool, action: &str, message: &s
     retain_detached(&root)?;
     // Never force checkout: Git protects ignored/untracked collisions and concurrent edits.
     if branch {
-        git(&root, &["switch", "--no-overwrite-ignore", "--", target])?;
+        git(
+            &root,
+            &[
+                "-c",
+                "submodule.recurse=false",
+                "switch",
+                "--no-overwrite-ignore",
+                "--",
+                target,
+            ],
+        )?;
     } else {
         git(
             &root,
-            &["switch", "--detach", "--no-overwrite-ignore", target],
+            &[
+                "-c",
+                "submodule.recurse=false",
+                "switch",
+                "--detach",
+                "--no-overwrite-ignore",
+                target,
+            ],
         )?;
     }
     Ok(())
@@ -491,6 +687,109 @@ pub fn switch(path: &Path, target: &str, branch: bool, action: &str, message: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn porcelain_v2_keeps_staged_gitlinks_and_literal_paths() {
+        let oid = "0".repeat(40);
+        let raw = format!(
+            "1 A. S... 000000 160000 160000 {oid} {oid} .worktrees\0\
+             1 .M SC.. 160000 160000 160000 {oid} {oid} drift only\0\
+             1 MM SC.. 160000 160000 160000 {oid} {oid} staged module\0\
+             1 D. S... 160000 000000 000000 {oid} {oid} removed module\0\
+             1 TM N... 160000 100644 100644 {oid} {oid} regular now\0\
+             2 R. N... 100644 100644 100644 {oid} {oid} R100 new é\nname\0old name\0\
+             u UU N... 100644 100644 100644 100644 {oid} {oid} {oid} conflicted file\0\
+             ? untracked\nfile\0"
+        );
+        assert_eq!(
+            status_v1(&raw).unwrap(),
+            "A  .worktrees\0M  staged module\0D  removed module\0TM regular now\0\
+             R  new é\nname\0old name\0UU conflicted file\0?? untracked\nfile\0"
+        );
+    }
+
+    #[test]
+    fn porcelain_v2_ignores_optional_headers() {
+        let raw = "# stash 1\0# future.extension optional metadata\0? new file\0";
+        assert_eq!(status_v1(raw).unwrap(), "?? new file\0");
+        assert_eq!(status_v1("# stash 1\0").unwrap(), "");
+    }
+
+    #[test]
+    fn malformed_porcelain_v2_is_rejected_instead_of_hiding_changes() {
+        for raw in [
+            "1 M. truncated\0",
+            "2 R. N... 100644 100644 100644 a b R100 new\0",
+            "u UU truncated\0",
+            "unexpected\0",
+        ] {
+            assert!(status_v1(raw).is_err(), "{raw:?}");
+        }
+    }
+
+    /// The status put together from two processes is byte for byte what one
+    /// `git status` prints, for every kind of entry.
+    #[test]
+    fn the_joined_status_equals_gits_own() {
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path();
+        if git(r, &["init", "-q"]).is_err() {
+            eprintln!("git not installed: skipped");
+            return;
+        }
+        for (key, value) in [
+            ("user.email", "t@example.com"),
+            ("user.name", "t"),
+            ("core.autocrlf", "false"),
+        ] {
+            git(r, &["config", key, value]).unwrap();
+        }
+        let write = |name: &str, text: &str| {
+            let file = r.join(name);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, text).unwrap();
+        };
+        write(".gitignore", "build/\n*.o\n");
+        for name in [
+            "a.txt",
+            "dir/b.txt",
+            "dir/c.txt",
+            "gone.txt",
+            "old name.txt",
+        ] {
+            write(name, &format!("{name}\n").repeat(30));
+        }
+        git(r, &["add", "."]).unwrap();
+        git(r, &["commit", "-qm", "init"]).unwrap();
+        write("a.txt", "changed\n");
+        write("dir/b.txt", "staged\n");
+        git(r, &["add", "dir/b.txt"]).unwrap();
+        std::fs::remove_file(r.join("gone.txt")).unwrap();
+        git(r, &["mv", "old name.txt", "new name.txt"]).unwrap();
+        write("added.txt", "new and staged\n");
+        git(r, &["add", "added.txt"]).unwrap();
+        // Untracked: a file, files in folders, odd names, an ignored file and folder, and
+        // a nested repository (listed as a folder).
+        write("zz untracked.txt", "u");
+        write("dir/new/deep/u.txt", "u");
+        write("-dash.txt", "u");
+        write("build/out.bin", "ignored");
+        write("dir/x.o", "ignored");
+        write("nested/inner.txt", "u");
+        git(&r.join("nested"), &["init", "-q"]).unwrap();
+        let whole = git(
+            r,
+            &[
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+                "--ignore-submodules=all",
+            ],
+        )
+        .unwrap();
+        assert!(whole.contains("?? nested/\0") && whole.contains("R  new name.txt\0"));
+        assert_eq!(status_z(r).unwrap(), whole);
+    }
     #[test]
     fn standard_lfs_filters_do_not_block_but_other_filters_do() {
         let lfs = "filter.lfs.clean git-lfs clean -- %f\n\
@@ -652,6 +951,53 @@ mod tests {
     }
 
     #[test]
+    fn switch_works_with_submodules_and_leaves_their_folders_alone() {
+        let d = tempfile::tempdir().unwrap();
+        let module = tempfile::tempdir().unwrap();
+        let (p, m) = (d.path(), module.path());
+        for dir in [p, m] {
+            git(dir, &["init", "-q", "-b", "main"]).unwrap();
+            git(dir, &["config", "user.name", "Test"]).unwrap();
+            git(dir, &["config", "user.email", "test@example.com"]).unwrap();
+            git(dir, &["config", "core.autocrlf", "false"]).unwrap();
+        }
+        std::fs::write(m.join("m.txt"), "one").unwrap();
+        git(m, &["add", "."]).unwrap();
+        git(m, &["commit", "-qm", "module one"]).unwrap();
+        git(
+            p,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                &m.to_string_lossy().replace('\\', "/"),
+                "sub",
+            ],
+        )
+        .unwrap();
+        git(p, &["commit", "-qm", "add submodule"]).unwrap();
+        git(p, &["branch", "other"]).unwrap();
+        std::fs::write(p.join("f"), "main only").unwrap();
+        git(p, &["add", "."]).unwrap();
+        git(p, &["commit", "-qm", "on main"]).unwrap();
+        // Untracked and edited files inside the submodule must not block or be touched.
+        std::fs::write(p.join("sub").join("untracked"), "keep").unwrap();
+        std::fs::write(p.join("sub").join("m.txt"), "edited").unwrap();
+        switch(p, "other", true, "clean", "").unwrap();
+        assert!(!p.join("f").exists());
+        assert_eq!(
+            std::fs::read_to_string(p.join("sub").join("untracked")).unwrap(),
+            "keep"
+        );
+        assert_eq!(
+            std::fs::read_to_string(p.join("sub").join("m.txt")).unwrap(),
+            "edited"
+        );
+    }
+
+    #[test]
     fn switch_preserves_dirty_data_in_stash() {
         let d = tempfile::tempdir().unwrap();
         let p = d.path();
@@ -679,9 +1025,9 @@ mod tests {
             .contains("saved"));
         std::fs::write(p.join("f"), "discarded").unwrap();
         switch(p, "example", true, "discard", "").unwrap();
-        assert!(git(p, &["stash", "list"])
-            .unwrap()
-            .contains("Gall recovery before discard"));
+        assert!(git(p, &["stash", "list"]).unwrap().is_empty());
+        let reflog = git(p, &["reflog", "show", "--all", "--format=%gs"]).unwrap();
+        assert!(reflog.contains("Gall recovery before discard"));
         git(p, &["config", "filter.example.clean", "false"]).unwrap();
         assert!(graph(p).unwrap().read_only_reason.is_some());
         assert!(switch(p, &first, false, "clean", "").is_err());

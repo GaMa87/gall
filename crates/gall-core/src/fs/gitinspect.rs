@@ -5,12 +5,12 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 const METADATA_LIMIT: usize = 8 * 1024 * 1024;
 const PATCH_LIMIT: usize = 1024 * 1024;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChangedFile {
     pub path: String,
@@ -20,7 +20,7 @@ pub struct ChangedFile {
     pub deleted: Option<u64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Details {
     pub root: String,
@@ -63,7 +63,7 @@ fn error(message: impl Into<String>) -> CoreError {
 /// Limit output before allocating a large preview. No subprocess runs an external
 /// diff, text converter, pager or editor, and no optional index refresh is needed.
 fn read_git(root: &Path, args: &[&str], limit: usize) -> Result<(Vec<u8>, bool)> {
-    let mut command = Command::new(super::gitstatus::program());
+    let mut command = super::gitexec::command(root, super::gitstatus::program());
     command
         .args([
             "--no-pager",
@@ -75,7 +75,7 @@ fn read_git(root: &Path, args: &[&str], limit: usize) -> Result<(Vec<u8>, bool)>
             "color.ui=false",
             "-C",
         ])
-        .arg(root)
+        .arg(super::gitexec::dir_arg(root))
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -83,11 +83,7 @@ fn read_git(root: &Path, args: &[&str], limit: usize) -> Result<(Vec<u8>, bool)>
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_NO_LAZY_FETCH", "1");
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
-    }
+    super::gitexec::forward_env(&mut command);
     let mut child = command.spawn().map_err(|e| error(e.to_string()))?;
     let mut stderr = child
         .stderr
@@ -158,34 +154,29 @@ fn relative_file(file: &str) -> Result<()> {
 }
 
 fn changed_files(root: &Path, base: &str, commit: &str) -> Result<Vec<ChangedFile>> {
-    let names = text(
-        root,
-        &[
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--name-status",
-            "-z",
-            "-M",
-            base,
-            commit,
-            "--",
-        ],
-    )?;
-    let stats = text(
-        root,
-        &[
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--numstat",
-            "-z",
-            "-M",
-            base,
-            commit,
-            "--",
-        ],
-    )?;
+    let list = |kind: &str| {
+        text(
+            root,
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                kind,
+                "-z",
+                "-M",
+                base,
+                commit,
+                "--",
+            ],
+        )
+    };
+    // Names and line counts are two queries: asked at the same time.
+    let (names, stats) = std::thread::scope(|scope| {
+        let stats = scope.spawn(|| list("--numstat"));
+        (list("--name-status"), stats.join())
+    });
+    let names = names?;
+    let stats = stats.map_err(|_| error("A Git worker thread stopped unexpectedly"))??;
     let mut counts = HashMap::new();
     let mut records = stats.split('\0').filter(|s| !s.is_empty());
     while let Some(record) = records.next() {
@@ -240,7 +231,50 @@ fn changed_files(root: &Path, base: &str, commit: &str) -> Result<Vec<ChangedFil
 /// Root commits are compared to the empty tree without storing an object.
 pub fn details(path: &Path, commit: &str, base: Option<&str>) -> Result<Details> {
     let root = root(path)?;
-    let id = commit_id(&root, commit)?;
+    // A commit and its comparison with another commit never change, and the patch of
+    // every file clicked in the list starts from these details: they are kept.
+    let key = (
+        root.clone(),
+        commit.to_ascii_lowercase(),
+        base.map(str::to_ascii_lowercase),
+    );
+    if let Ok(known) = KNOWN_DETAILS.lock() {
+        if let Some((_, details)) = known.iter().find(|(k, _)| *k == key) {
+            return Ok(details.clone());
+        }
+    }
+    let details = read_details(&root, commit, base)?;
+    if let Ok(mut known) = KNOWN_DETAILS.lock() {
+        if known.len() >= 16 {
+            known.remove(0);
+        }
+        known.push((key, details.clone()));
+    }
+    Ok(details)
+}
+
+type DetailsKey = (std::path::PathBuf, String, Option<String>);
+static KNOWN_DETAILS: std::sync::Mutex<Vec<(DetailsKey, Details)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The tree without entries, which a root commit is compared to. Its ID is a constant of
+/// the object format (SHA-1 or SHA-256, told apart by the length of `like`).
+fn empty_tree(like: &str) -> &'static str {
+    if like.len() == 64 {
+        "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321"
+    } else {
+        "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+    }
+}
+
+fn read_details(root: &Path, commit: &str, base: Option<&str>) -> Result<Details> {
+    let root = root.to_path_buf();
+    if !matches!(commit.len(), 40 | 64) || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(error("A full Git commit ID is required"));
+    }
+    let id = commit.to_ascii_lowercase();
+    // One query both checks that the ID names a commit (not a tag or a tree, which
+    // `^{commit}` would peel or refuse) and reads it.
     let metadata = text(
         &root,
         &[
@@ -248,12 +282,14 @@ pub fn details(path: &Path, commit: &str, base: Option<&str>) -> Result<Details>
             "--no-show-signature",
             "-s",
             "--format=%H%x00%P%x00%an%x00%ae%x00%aI%x00%cn%x00%cI%x00%B",
-            &id,
+            &format!("{id}^{{commit}}"),
             "--",
         ],
     )?;
     let mut fields = metadata.splitn(8, '\0');
-    fields.next();
+    if fields.next() != Some(id.as_str()) {
+        return Err(error("The selected object is not a commit"));
+    }
     let parents: Vec<String> = fields
         .next()
         .unwrap_or_default()
@@ -270,14 +306,7 @@ pub fn details(path: &Path, commit: &str, base: Option<&str>) -> Result<Details>
         Some(value) => Some(commit_id(&root, value)?),
         None => parents.first().cloned(),
     };
-    let empty = if base.is_none() {
-        text(&root, &["hash-object", "-t", "tree", "--stdin"])?
-            .trim()
-            .to_owned()
-    } else {
-        String::new()
-    };
-    let files = changed_files(&root, base.as_deref().unwrap_or(&empty), &id)?;
+    let files = changed_files(&root, base.as_deref().unwrap_or(empty_tree(&id)), &id)?;
     Ok(Details {
         root: root.to_string_lossy().into_owned(),
         id,
@@ -298,20 +327,14 @@ pub fn details(path: &Path, commit: &str, base: Option<&str>) -> Result<Details>
 pub fn commit_diff(path: &Path, commit: &str) -> Result<String> {
     let details = details(path, commit, None)?;
     let root = Path::new(&details.root);
-    let empty = if details.base.is_none() {
-        text(root, &["hash-object", "-t", "tree", "--stdin"])?
-            .trim()
-            .to_owned()
-    } else {
-        String::new()
-    };
+    let empty = empty_tree(&details.id);
     let args = [
         "diff",
         "--no-ext-diff",
         "--no-textconv",
         "--no-color",
         "-M",
-        details.base.as_deref().unwrap_or(&empty),
+        details.base.as_deref().unwrap_or(empty),
         &details.id,
     ];
     let (bytes, truncated) = read_git(root, &args, PATCH_LIMIT)?;
@@ -320,6 +343,40 @@ pub fn commit_diff(path: &Path, commit: &str) -> Result<String> {
         output.push_str("\n[Diff truncated at 1 MiB]\n");
     }
     Ok(output)
+}
+
+/// The commit as an email-style patch (`git format-patch`), for copying to the clipboard so it can be
+/// pasted into "Apply patch from clipboard" or `git am`. Unlike `commit_diff` it is never truncated:
+/// a cut-off patch would not apply, so a commit above 16 MiB (or with non-UTF-8 content) is refused.
+pub fn commit_patch_text(path: &Path, commit: &str) -> Result<String> {
+    const LIMIT: usize = 16 * 1024 * 1024;
+    let details = details(path, commit, None)?;
+    if details.parents.len() > 1 {
+        return Err(error(
+            "A merge commit has no single-parent patch; select a non-merge commit",
+        ));
+    }
+    let root = Path::new(&details.root);
+    let mut args = vec!["format-patch", "-1", "--stdout", "--no-signature"];
+    if details.parents.is_empty() {
+        args.push("--root");
+    }
+    args.extend([
+        "--no-stat",
+        "--binary",
+        "--full-index",
+        "--no-ext-diff",
+        "--no-textconv",
+        details.id.as_str(),
+    ]);
+    let (bytes, truncated) = read_git(root, &args, LIMIT)?;
+    if truncated {
+        return Err(error(
+            "This commit's patch is larger than 16 MiB; export it to a file instead",
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| error("This commit's patch is not valid UTF-8; export it to a file instead"))
 }
 
 /// Preview only a path known to be in this comparison, preserving rename context.
@@ -332,13 +389,7 @@ pub fn patch(path: &Path, commit: &str, base: Option<&str>, file: &str) -> Resul
         .find(|entry| entry.path == file)
         .ok_or_else(|| error("File is not in the selected comparison"))?;
     let root = Path::new(&details.root);
-    let empty = if details.base.is_none() {
-        text(root, &["hash-object", "-t", "tree", "--stdin"])?
-            .trim()
-            .to_owned()
-    } else {
-        String::new()
-    };
+    let empty = empty_tree(&details.id);
     let spec = format!(":(literal){file}");
     let original = entry
         .original
@@ -350,7 +401,7 @@ pub fn patch(path: &Path, commit: &str, base: Option<&str>, file: &str) -> Resul
         "--no-textconv",
         "--no-color",
         "-M",
-        details.base.as_deref().unwrap_or(&empty),
+        details.base.as_deref().unwrap_or(empty),
         &details.id,
         "--",
         &spec,
@@ -366,6 +417,34 @@ pub fn patch(path: &Path, commit: &str, base: Option<&str>, file: &str) -> Resul
     Ok(output)
 }
 
+/// The file that `commit` renamed or copied to `file`, if it did (as `git log --follow`
+/// finds it). A merge is compared with no parent, so the history ends there.
+fn came_from(root: &Path, commit: &str, file: &str) -> Option<String> {
+    let found = text(
+        root,
+        &[
+            "diff-tree",
+            "--no-commit-id",
+            "-r",
+            "-M",
+            "-C",
+            "--diff-filter=RC",
+            "--name-status",
+            "-z",
+            commit,
+        ],
+    )
+    .ok()?;
+    // `R<score>` or `C<score>`, the old name, the new name.
+    let mut fields = found.split('\0');
+    while let (Some(_), Some(old), Some(new)) = (fields.next(), fields.next(), fields.next()) {
+        if new == file {
+            return Some(old.to_owned());
+        }
+    }
+    None
+}
+
 pub fn file_history(
     path: &Path,
     file: &str,
@@ -374,22 +453,82 @@ pub fn file_history(
 ) -> Result<Vec<HistoryEntry>> {
     relative_file(file)?;
     let root = root(path)?;
-    let limit = format!("-{}", limit.clamp(1, 1000));
-    let spec = format!(":(literal){file}");
+    super::gitfacts::keep_commit_graph(&root);
+    let limit = limit.clamp(1, 1000);
     let start = commit.map(|value| commit_id(&root, value)).transpose()?;
-    let output = text(
-        &root,
-        &[
-            "log",
-            "--no-show-signature",
-            "--follow",
-            &limit,
-            "--format=%H%x00%s%x00%an%x00%aI%x00",
-            start.as_deref().unwrap_or("HEAD"),
-            "--",
-            &spec,
-        ],
-    )?;
+    // The history is followed across renames here instead of with `git log --follow`,
+    // which compares the trees of every commit of the repository (0.6 s for 20 000
+    // commits). A plain `log -- path` uses the changed-path filters of the commit-graph
+    // and stops at the commit that brought the path in; if that commit renamed another
+    // file to it, the history goes on from its parent under the old name.
+    let mut output = String::new();
+    let mut from = start.unwrap_or_else(|| "HEAD".to_owned());
+    let mut name = file.to_owned();
+    let mut found = 0;
+    for _ in 0..32 {
+        let spec = format!(":(literal){name}");
+        let count = format!("-{}", limit - found);
+        // Next to the list: the newest commit that brought this name in. A name can have
+        // been used by another file before; the history of this one starts there.
+        let (part, added) = std::thread::scope(|scope| {
+            let added = scope.spawn(|| {
+                text(
+                    &root,
+                    &[
+                        "log",
+                        "--no-show-signature",
+                        "-1",
+                        "--diff-filter=A",
+                        "--format=%H",
+                        &from,
+                        "--",
+                        &spec,
+                    ],
+                )
+            });
+            let part = text(
+                &root,
+                &[
+                    "log",
+                    "--no-show-signature",
+                    &count,
+                    "--format=%H%x00%s%x00%an%x00%aI%x00",
+                    &from,
+                    "--",
+                    &spec,
+                ],
+            );
+            (part, added.join())
+        });
+        let part = part?;
+        let added = added
+            .ok()
+            .and_then(|added| added.ok())
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        let ids: Vec<&str> = part
+            .split('\0')
+            .step_by(4)
+            .map(|id| id.trim_start_matches('\n'))
+            .filter(|id| !id.is_empty())
+            .collect();
+        let start = ids.iter().position(|id| *id == added);
+        let kept = start.map_or(ids.len(), |at| at + 1);
+        output.extend(part.split_inclusive('\0').take(kept * 4));
+        found += kept;
+        // The start is not among the commits listed (the limit came first): done.
+        if start.is_none() || found >= limit {
+            break;
+        }
+        match came_from(&root, &added, &name) {
+            Some(old) => {
+                from = format!("{added}^");
+                name = old;
+            }
+            None => break,
+        }
+    }
     let mut fields = output.split('\0');
     let mut entries = Vec::new();
     while let Some(id) = fields.next() {
@@ -436,6 +575,7 @@ pub fn content(path: &Path, commit: &str, file: &str) -> Result<String> {
 pub fn blame(path: &Path, commit: &str, file: &str) -> Result<Vec<BlameLine>> {
     relative_file(file)?;
     let root = root(path)?;
+    super::gitfacts::keep_commit_graph(&root);
     let commit = commit_id(&root, commit)?;
     // Reject binary content and large blobs before asking Git to attribute lines.
     let spec = format!("{commit}:{file}");
@@ -505,6 +645,47 @@ pub fn blame(path: &Path, commit: &str, file: &str) -> Result<Vec<BlameLine>> {
 mod tests {
     use super::super::gitgraph::git;
     use super::*;
+    /// The history of a file starts where its name was last brought in: a rename or a
+    /// copy is followed, and an earlier file that had the same name is not part of it.
+    #[test]
+    fn file_history_follows_renames_and_copies_but_not_an_earlier_file_of_that_name() {
+        let directory = repository();
+        let root = directory.path();
+        let subjects = |file: &str| -> Vec<String> {
+            file_history(root, file, 100, None)
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.subject)
+                .collect()
+        };
+        let body = "one\ntwo\nthree\nfour\nfive\nsix\n";
+        fs::write(root.join("b.txt"), "an unrelated earlier file\n").unwrap();
+        commit(root, "add old b");
+        fs::remove_file(root.join("b.txt")).unwrap();
+        commit(root, "delete old b");
+        fs::write(root.join("a.txt"), body).unwrap();
+        commit(root, "add a");
+        fs::write(root.join("a.txt"), format!("{body}seven\n")).unwrap();
+        commit(root, "edit a");
+        fs::rename(root.join("a.txt"), root.join("b.txt")).unwrap();
+        commit(root, "rename a to b");
+        fs::write(root.join("b.txt"), format!("{body}seven\neight\n")).unwrap();
+        commit(root, "edit b");
+        assert_eq!(
+            subjects("b.txt"),
+            ["edit b", "rename a to b", "edit a", "add a"]
+        );
+        // A copy made in a commit that also changes the original.
+        fs::copy(root.join("b.txt"), root.join("c.txt")).unwrap();
+        fs::write(root.join("b.txt"), format!("{body}seven\neight\nnine\n")).unwrap();
+        commit(root, "copy b to c");
+        assert_eq!(
+            subjects("c.txt"),
+            ["copy b to c", "edit b", "rename a to b", "edit a", "add a"]
+        );
+        // The limit still counts across names.
+        assert_eq!(file_history(root, "c.txt", 3, None).unwrap().len(), 3);
+    }
     use std::fs;
 
     fn repository() -> tempfile::TempDir {

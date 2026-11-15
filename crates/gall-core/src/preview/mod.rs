@@ -231,12 +231,12 @@ pub fn read_text(path: &Path, max: usize) -> Result<(String, bool, bool)> {
 
 pub fn list_archive(path: &Path) -> Result<(Vec<ArchiveItem>, usize)> {
     let f = crate::fs::open_regular(path).ctx("open", path)?;
-    let mut z =
-        zip::ZipArchive::new(f).map_err(|e| crate::CoreError::Other(format!("archive: {e}")))?;
+    let z = zip::ZipArchive::new(crate::fs::archive_view::SeekBuffered::new(f))
+        .map_err(|e| crate::CoreError::Other(format!("archive: {e}")))?;
     let total = z.len();
     let mut items = Vec::new();
     for i in 0..total.min(ARCHIVE_LIMIT) {
-        if let Ok(e) = z.by_index_raw(i) {
+        if let Ok(e) = z.by_index_data(i) {
             items.push(ArchiveItem {
                 name: e.name().map(|n| n.to_string()).unwrap_or_default(),
                 size: e.size(),

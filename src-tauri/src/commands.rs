@@ -99,11 +99,24 @@ pub fn get_settings(state: State<'_, AppState>) -> Settings {
     state.settings.read().unwrap().clone()
 }
 
+/// One writer at a time per settings file (settings, favourites, marks). These commands
+/// run on worker threads, because a save is a sync to disk, a re-read and a backup copy;
+/// the gate keeps what is on disk the same as what is in memory when two of them overlap.
+static STORE_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn store_gate() -> std::sync::MutexGuard<'static, ()> {
+    STORE_GATE.lock().unwrap_or_else(|err| err.into_inner())
+}
+
 #[tauri::command]
-pub fn set_settings(state: State<'_, AppState>, settings: Settings) -> R<()> {
-    state.settings_store.save(&settings).map_err(e)?;
-    *state.settings.write().unwrap() = settings;
-    Ok(())
+pub async fn set_settings(app: AppHandle, settings: Settings) -> R<()> {
+    off_main(app, move |state| {
+        let _gate = store_gate();
+        state.settings_store.save(&settings).map_err(e)?;
+        *state.settings.write().unwrap() = settings;
+        Ok(())
+    })
+    .await
 }
 
 // ───────────────────────── listing / drives / prefs ─────────────────────────
@@ -165,6 +178,21 @@ pub async fn diff_highlight(
     tauri::async_runtime::spawn_blocking(move || gall_core::fs::syntax::highlight(&name, &lines))
         .await
         .map_err(e)
+}
+
+/// What changed on each line of a unified patch when its changed lines are compared by
+/// tokens: null (no change, or changed as a whole), an empty list (layout only) or the
+/// changed ranges. `name` is the file the patch belongs to, for its language.
+#[tauri::command]
+pub async fn diff_patch_marks(
+    name: String,
+    patch: String,
+) -> R<Vec<Option<gall_core::fs::diff::Spans>>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        gall_core::fs::structural::patch_marks(&name, &patch)
+    })
+    .await
+    .map_err(e)
 }
 
 #[tauri::command]
@@ -374,36 +402,44 @@ pub async fn drive_lock(mount: String) -> R<()> {
 /// Every setting back to its default and the folder views forgotten; favourites,
 /// colour tags, history and the open tabs stay. Returns the new settings.
 #[tauri::command]
-pub fn reset_settings(state: State<'_, AppState>) -> R<Settings> {
-    let settings = Settings::default();
-    state.settings_store.save(&settings).map_err(e)?;
-    *state.settings.write().unwrap() = settings.clone();
-    state.db.clear_prefs().map_err(e)?;
-    Ok(settings)
+pub async fn reset_settings(app: AppHandle) -> R<Settings> {
+    off_main(app, move |state| {
+        let _gate = store_gate();
+        let settings = Settings::default();
+        state.settings_store.save(&settings).map_err(e)?;
+        *state.settings.write().unwrap() = settings.clone();
+        state.db.clear_prefs().map_err(e)?;
+        Ok(settings)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn resolve_prefs(state: State<'_, AppState>, path: String) -> R<ResolvedPrefs> {
-    let s = state.settings.read().unwrap();
-    if !s.remember_folder_views {
-        return Ok(ResolvedPrefs {
-            sort_key: s.default_sort,
-            descending: s.default_descending,
-            folders_on_top: s.folders_on_top,
-            view: s.default_view.clone(),
-            view_source: None,
-        });
-    }
-    state
-        .db
-        .resolve_prefs(
-            Path::new(&path),
-            s.default_sort,
-            s.default_descending,
-            s.folders_on_top,
-            &s.default_view,
-        )
-        .map_err(e)
+pub async fn resolve_prefs(app: AppHandle, path: String) -> R<ResolvedPrefs> {
+    off_main(app, move |state| {
+        // A copy, so a slow database never holds the settings lock.
+        let s = state.settings.read().unwrap().clone();
+        if !s.remember_folder_views {
+            return Ok(ResolvedPrefs {
+                sort_key: s.default_sort,
+                descending: s.default_descending,
+                folders_on_top: s.folders_on_top,
+                view: s.default_view.clone(),
+                view_source: None,
+            });
+        }
+        state
+            .db
+            .resolve_prefs(
+                Path::new(&path),
+                s.default_sort,
+                s.default_descending,
+                s.folders_on_top,
+                &s.default_view,
+            )
+            .map_err(e)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -660,36 +696,40 @@ pub fn favorites_get(state: State<'_, AppState>) -> Favorites {
 }
 
 #[tauri::command]
-pub fn favorites_cmd(state: State<'_, AppState>, cmd: FavCmd) -> Favorites {
-    let snap = {
-        let mut f = state.favorites.lock().unwrap();
-        match cmd {
-            FavCmd::AddGroup { name } => {
-                f.add_group(&name);
+pub async fn favorites_cmd(app: AppHandle, cmd: FavCmd) -> R<Favorites> {
+    off_main(app, move |state| {
+        let _gate = store_gate();
+        let snap = {
+            let mut f = state.favorites.lock().unwrap();
+            match cmd {
+                FavCmd::AddGroup { name } => {
+                    f.add_group(&name);
+                }
+                FavCmd::RenameGroup { id, name } => f.rename_group(id, &name),
+                FavCmd::DeleteGroup { id } => f.delete_group(id),
+                FavCmd::MoveGroup { id, delta } => f.move_group(id, delta),
+                FavCmd::Collapse { id, collapsed } => f.set_collapsed(id, collapsed),
+                FavCmd::AddItem { id, path, index } => {
+                    f.add_item(id, &path, index);
+                }
+                FavCmd::RemoveItem { id, index } => f.remove_item(id, index),
+                FavCmd::Alias { id, index, alias } => f.set_alias(id, index, alias),
+                FavCmd::MoveItem {
+                    from_group,
+                    from_index,
+                    to_group,
+                    to_index,
+                } => f.move_item(from_group, from_index, to_group, to_index),
+                FavCmd::RestoreDefault => {
+                    f.restore_default_group();
+                }
             }
-            FavCmd::RenameGroup { id, name } => f.rename_group(id, &name),
-            FavCmd::DeleteGroup { id } => f.delete_group(id),
-            FavCmd::MoveGroup { id, delta } => f.move_group(id, delta),
-            FavCmd::Collapse { id, collapsed } => f.set_collapsed(id, collapsed),
-            FavCmd::AddItem { id, path, index } => {
-                f.add_item(id, &path, index);
-            }
-            FavCmd::RemoveItem { id, index } => f.remove_item(id, index),
-            FavCmd::Alias { id, index, alias } => f.set_alias(id, index, alias),
-            FavCmd::MoveItem {
-                from_group,
-                from_index,
-                to_group,
-                to_index,
-            } => f.move_item(from_group, from_index, to_group, to_index),
-            FavCmd::RestoreDefault => {
-                f.restore_default_group();
-            }
-        }
-        f.clone()
-    };
-    state.save_favorites();
-    snap
+            f.clone()
+        };
+        state.save_favorites();
+        Ok(snap)
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -712,22 +752,25 @@ pub fn marks_get(state: State<'_, AppState>) -> Marks {
 
 /// Changes the vim folder marks and saves them; on an error nothing changes.
 #[tauri::command]
-pub fn marks_cmd(state: State<'_, AppState>, cmd: MarkCmd) -> R<Marks> {
-    let mut marks = state.marks.lock().unwrap();
-    let mut next = marks.clone();
-    match cmd {
-        MarkCmd::Set { key, path, item } => {
-            if !next.set(&key, &path, item) {
-                return Err(format!("Not a mark key: {key}"));
+pub async fn marks_cmd(app: AppHandle, cmd: MarkCmd) -> R<Marks> {
+    off_main(app, move |state| {
+        let _gate = store_gate();
+        let mut next = state.marks.lock().unwrap().clone();
+        match cmd {
+            MarkCmd::Set { key, path, item } => {
+                if !next.set(&key, &path, item) {
+                    return Err(format!("Not a mark key: {key}"));
+                }
+            }
+            MarkCmd::Remove { key } => {
+                next.remove(&key);
             }
         }
-        MarkCmd::Remove { key } => {
-            next.remove(&key);
-        }
-    }
-    state.save_marks(&next).map_err(e)?;
-    *marks = next.clone();
-    Ok(next)
+        state.save_marks(&next).map_err(e)?;
+        *state.marks.lock().unwrap() = next.clone();
+        Ok(next)
+    })
+    .await
 }
 
 /// The history, newest first, without folders that were deleted or renamed since
@@ -974,6 +1017,25 @@ pub async fn git_status(
     off_main(app, move |_| Ok(gall_core::fs::gitstatus::status(&dir))).await
 }
 
+/// The repository path when Git refuses the repository around `dir` as owned by another
+/// user (null otherwise).
+#[tauri::command]
+pub async fn git_untrusted(app: AppHandle, dir: PathBuf) -> R<Option<String>> {
+    off_main(app, move |_| {
+        Ok(gall_core::fs::gitstatus::untrusted(&dir).map(lossy))
+    })
+    .await
+}
+
+/// Adds the repository Git refuses around `dir` to the global `safe.directory`.
+#[tauri::command]
+pub async fn git_trust(app: AppHandle, dir: PathBuf) -> R<String> {
+    off_main(app, move |_| {
+        gall_core::fs::gitstatus::trust(&dir).map(lossy)
+    })
+    .await
+}
+
 /// Batch rename: `(path, new name)` pairs as one undo step; returns the new paths.
 #[tauri::command]
 pub async fn batch_rename(app: AppHandle, items: Vec<(PathBuf, String)>) -> R<Vec<String>> {
@@ -1077,8 +1139,8 @@ pub async fn undo(app: AppHandle, permanent: Option<bool>) -> R<String> {
 }
 
 #[tauri::command]
-pub fn undo_peek(state: State<'_, AppState>) -> Option<String> {
-    state.journal().peek_description()
+pub async fn undo_peek(app: AppHandle) -> R<Option<String>> {
+    off_main(app, |state| Ok(state.journal().peek_description())).await
 }
 
 /// Per-panel undo: the most recent operation that touched `dir`.
@@ -1096,8 +1158,11 @@ pub async fn undo_in(app: AppHandle, dir: String, permanent: Option<bool>) -> R<
 }
 
 #[tauri::command]
-pub fn undo_peek_in(state: State<'_, AppState>, dir: String) -> Option<String> {
-    state.journal().peek_in(Path::new(&dir))
+pub async fn undo_peek_in(app: AppHandle, dir: String) -> R<Option<String>> {
+    off_main(app, move |state| {
+        Ok(state.journal().peek_in(Path::new(&dir)))
+    })
+    .await
 }
 
 /// The real file for a path inside an archive (extracted into the cache); other paths
@@ -1151,6 +1216,12 @@ pub async fn open_path(app: AppHandle, state: State<'_, AppState>, path: String)
     if let Some(rule) = rule {
         return gall_core::util::openwith::run_choice(Path::new(&path), &rule.command).map_err(e);
     }
+    // Linux: programs, AppImages, scripts and .desktop files with the execute bit run,
+    // as in a file manager; xdg-open would only look at their MIME type.
+    let terminal = state.settings.read().unwrap().terminal.clone();
+    if let Some(r) = gall_core::util::openwith::open_executable(Path::new(&path), &terminal) {
+        return r.map_err(e);
+    }
     // Windows: ShellExecute + permission to come to the front (else files open behind).
     if let Some(r) = gall_core::util::openwith::open_default(Path::new(&path)) {
         return r.map_err(e);
@@ -1170,23 +1241,32 @@ pub async fn open_with_apps(path: PathBuf) -> R<Vec<gall_core::util::openwith::A
 }
 
 #[tauri::command]
-pub fn open_with_app(path: PathBuf, id: String) -> R<()> {
-    gall_core::util::openwith::open_with_app(&real_path(&path)?, &id).map_err(e)
+pub async fn open_with_app(app: AppHandle, path: PathBuf, id: String) -> R<()> {
+    off_main(app, move |_| {
+        gall_core::util::openwith::open_with_app(&real_path(&path)?, &id).map_err(e)
+    })
+    .await
 }
 
 /// Shows the system "Open with" dialog; false where there is none.
 #[tauri::command]
-pub fn open_with_dialog(path: PathBuf) -> R<bool> {
-    gall_core::util::openwith::system_dialog(&real_path(&path)?).map_err(e)
+pub async fn open_with_dialog(app: AppHandle, path: PathBuf) -> R<bool> {
+    off_main(app, move |_| {
+        gall_core::util::openwith::system_dialog(&real_path(&path)?).map_err(e)
+    })
+    .await
 }
 
 /// Opens each path with a choice's command (see `AppChoice::command`).
 #[tauri::command]
-pub fn open_with_run(paths: Vec<PathBuf>, command: String) -> R<()> {
-    for p in archive_view::materialize(&paths).map_err(e)? {
-        gall_core::util::openwith::run_choice(&p, &command).map_err(e)?;
-    }
-    Ok(())
+pub async fn open_with_run(app: AppHandle, paths: Vec<PathBuf>, command: String) -> R<()> {
+    off_main(app, move |_| {
+        for p in archive_view::materialize(&paths).map_err(e)? {
+            gall_core::util::openwith::run_choice(&p, &command).map_err(e)?;
+        }
+        Ok(())
+    })
+    .await
 }
 
 /// Terminals installed on this computer, preferred first.
@@ -1207,22 +1287,31 @@ pub async fn editor_apps() -> R<Vec<gall_core::util::openwith::AppChoice>> {
 
 /// Opens a terminal in `dir` with a command template (Terminal here with…).
 #[tauri::command]
-pub fn open_terminal_with(dir: String, command: String) -> R<()> {
-    terminal::open_terminal_with(Path::new(&dir), &command).map_err(e)
+pub async fn open_terminal_with(app: AppHandle, dir: String, command: String) -> R<()> {
+    off_main(app, move |_| {
+        terminal::open_terminal_with(Path::new(&dir), &command).map_err(e)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn open_with_command(path: PathBuf, command: String) -> R<()> {
-    gall_core::util::openwith::open_with_command(&real_path(&path)?, &command).map_err(e)
+pub async fn open_with_command(app: AppHandle, path: PathBuf, command: String) -> R<()> {
+    off_main(app, move |_| {
+        gall_core::util::openwith::open_with_command(&real_path(&path)?, &command).map_err(e)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn reveal_path(app: AppHandle, path: String) -> R<()> {
+pub async fn reveal_path(app: AppHandle, path: String) -> R<()> {
     // Inside an archive: show the archive file itself.
     let path = archive_view::split(Path::new(&path))
         .map(|(ar, _)| ar.to_string_lossy().into_owned())
         .unwrap_or(path);
-    app.opener().reveal_item_in_dir(path).map_err(e)
+    // The file manager is asked over D-Bus on Linux, which can take seconds.
+    tauri::async_runtime::spawn_blocking(move || app.opener().reveal_item_in_dir(path).map_err(e))
+        .await
+        .map_err(e)?
 }
 
 /// What is in the trash (sidebar › Trash window), most recently deleted first.
@@ -1263,9 +1352,12 @@ pub async fn trash_purge(ids: Vec<String>) -> R<()> {
 }
 
 #[tauri::command]
-pub fn open_terminal(state: State<'_, AppState>, dir: String) -> R<()> {
-    let t = state.settings.read().unwrap().terminal.clone();
-    terminal::open_terminal(Path::new(&dir), &t).map_err(e)
+pub async fn open_terminal(app: AppHandle, dir: String) -> R<()> {
+    off_main(app, move |state| {
+        let t = state.settings.read().unwrap().terminal.clone();
+        terminal::open_terminal(Path::new(&dir), &t).map_err(e)
+    })
+    .await
 }
 
 // ───────────────────────── notes / templates ─────────────────────────
@@ -1638,22 +1730,25 @@ pub struct ScopeInfo {
 /// Whether the system index holds `path`. When it does not (WSL, a network share),
 /// the folder scan starts right away, so results are ready by the time one types.
 #[tauri::command]
-pub fn index_covers(app: AppHandle, state: State<'_, AppState>, path: String) -> ScopeInfo {
-    let roots = index_options(&state.settings.read().unwrap()).0;
-    let p = Path::new(&path);
-    if gall_core::fs::index::index_covers(&roots, p) {
-        return ScopeInfo {
-            covered: true,
-            scanning: false,
-            entries: 0,
-        };
-    }
-    let fi = folder_scan(&app, &state, p);
-    ScopeInfo {
-        covered: false,
-        scanning: fi.is_building() || fi.age().is_none(),
-        entries: fi.status().entries,
-    }
+pub async fn index_covers(app: AppHandle, path: String) -> R<ScopeInfo> {
+    off_main(app.clone(), move |state| {
+        let roots = index_options(&state.settings.read().unwrap()).0;
+        let p = Path::new(&path);
+        if gall_core::fs::index::index_covers(&roots, p) {
+            return Ok(ScopeInfo {
+                covered: true,
+                scanning: false,
+                entries: 0,
+            });
+        }
+        let fi = folder_scan(&app, state, p);
+        Ok(ScopeInfo {
+            covered: false,
+            scanning: fi.is_building() || fi.age().is_none(),
+            entries: fi.status().entries,
+        })
+    })
+    .await
 }
 
 /// Seconds a folder scan is reused before Quick Open scans the folder again.
@@ -1847,26 +1942,23 @@ pub async fn grep_context(
 // ───────────────────────── tags / destinations ─────────────────────────
 
 #[tauri::command]
-pub fn tags_in(state: State<'_, AppState>, dir: String) -> R<Vec<Tagged>> {
-    state.db.tags_in(&dir).map_err(e)
+pub async fn tags_in(app: AppHandle, dir: String) -> R<Vec<Tagged>> {
+    off_main(app, move |state| state.db.tags_in(&dir).map_err(e)).await
 }
 
 #[tauri::command]
 pub fn set_tag(state: State<'_, AppState>, paths: Vec<String>, color: u8) -> R<()> {
-    for p in paths {
-        state.db.set_tag(&p, color).map_err(e)?;
-    }
-    Ok(())
+    state.db.set_tags(&paths, color).map_err(e)
 }
 
 #[tauri::command]
-pub fn tagged(state: State<'_, AppState>, color: Option<u8>) -> R<Vec<Tagged>> {
-    state.db.tagged(color).map_err(e)
+pub async fn tagged(app: AppHandle, color: Option<u8>) -> R<Vec<Tagged>> {
+    off_main(app, move |state| state.db.tagged(color).map_err(e)).await
 }
 
 #[tauri::command]
-pub fn destinations(state: State<'_, AppState>) -> R<Vec<String>> {
-    state.db.destinations().map_err(e)
+pub async fn destinations(app: AppHandle) -> R<Vec<String>> {
+    off_main(app, |state| state.db.destinations().map_err(e)).await
 }
 
 #[tauri::command]
@@ -2558,6 +2650,16 @@ pub async fn git_commit_diff(path: PathBuf, commit: String) -> R<String> {
     .map_err(e)?
     .map_err(e)
 }
+/// The commit as an applicable email-style patch, for the clipboard.
+#[tauri::command]
+pub async fn git_commit_patch_text(path: PathBuf, commit: String) -> R<String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        gall_core::fs::gitinspect::commit_patch_text(&path, &commit)
+    })
+    .await
+    .map_err(e)?
+    .map_err(e)
+}
 #[tauri::command]
 pub async fn git_commit_patch(
     path: PathBuf,
@@ -2712,6 +2814,7 @@ impl Drop for JobGuard {
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn git_network(
     app: AppHandle,
     path: PathBuf,
@@ -2720,6 +2823,7 @@ pub async fn git_network(
     action: gall_core::fs::gitnetwork::NetworkAction,
     expected: String,
     lease: Option<String>,
+    branch_name: Option<String>,
 ) -> R<String> {
     let (_registration, cancel) = JobGuard::register(&id, "Remote operation ID is already active")?;
     let job = id.clone();
@@ -2731,6 +2835,7 @@ pub async fn git_network(
             action,
             &expected,
             lease.as_deref(),
+            branch_name.as_deref(),
             &cancel,
             |text| {
                 let _ = app.emit(
@@ -2771,6 +2876,13 @@ pub async fn git_advanced(
     .map_err(e)
 }
 #[tauri::command]
+pub async fn git_submodule_tree(path: PathBuf) -> R<gall_core::fs::gitadvanced::SubmoduleTree> {
+    tauri::async_runtime::spawn_blocking(move || gall_core::fs::gitadvanced::submodule_tree(&path))
+        .await
+        .map_err(e)?
+        .map_err(e)
+}
+#[tauri::command]
 pub async fn git_advanced_action(
     app: AppHandle,
     path: PathBuf,
@@ -2809,6 +2921,19 @@ pub async fn git_rebase_plan(
         .await
         .map_err(e)?
         .map_err(e)
+}
+#[tauri::command]
+pub async fn git_rebase_conflicts(
+    path: PathBuf,
+    entries: Vec<gall_core::fs::gitrewrite::RewriteEntry>,
+    base: String,
+) -> R<Vec<gall_core::fs::gitrewrite::ConflictPrediction>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        gall_core::fs::gitrewrite::predict_conflicts(&path, &base, &entries)
+    })
+    .await
+    .map_err(e)?
+    .map_err(e)
 }
 #[tauri::command]
 pub async fn git_rebase_execute(

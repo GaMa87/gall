@@ -111,13 +111,12 @@ jobs:
           scoop install .\packaging\scoop\gall.json
           $app = "$env:USERPROFILE\scoop\apps\gall\current"
           if (-not (Test-Path "$app\gall.exe")) { throw "gall.exe not installed" }
-          if (-not (Test-Path "$app\portable")) { throw "portable marker missing" }
           $lnk = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Scoop Apps\Gall.lnk"
           if (-not (Test-Path $lnk)) { throw "Start menu shortcut missing" }
           if (-not (Test-Path "$env:USERPROFILE\scoop\shims\gall.exe")) { throw "shim missing" }
           scoop info gall
 
-      - name: gall runs (via shim) and writes UserData into persist
+      - name: gall runs (via shim)
         shell: pwsh
         run: |
           Start-Process -FilePath "$env:USERPROFILE\scoop\shims\gall.exe"
@@ -127,8 +126,6 @@ jobs:
           $p | Format-Table Id, Path
           $p | Stop-Process -Force
           Get-Process -Name gall -ErrorAction SilentlyContinue | Stop-Process -Force
-          Get-ChildItem "$env:USERPROFILE\scoop\persist\gall\UserData" | Format-Table Name
-          if (-not (Get-ChildItem "$env:USERPROFILE\scoop\persist\gall\UserData")) { throw "UserData in persist is empty" }
 
       - name: checkver and autoupdate
         shell: pwsh

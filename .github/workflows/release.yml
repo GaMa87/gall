@@ -103,14 +103,14 @@ jobs:
           # Empty in a dry run: tauri-action then only builds and does not create a release.
           tagName: ${{ inputs.dry_run != true && github.ref_name || '' }}
           releaseName: ${{ inputs.dry_run != true && format('Gall {0}', github.ref_name) || '' }}
-          releaseBody: 'See CHANGELOG.md for details. Linux and Windows are fully supported; macOS builds are experimental.'
+          releaseBody: 'See CHANGELOG.md for details. Linux, Windows and macOS are supported.'
           releaseDraft: true
           prerelease: ${{ contains(github.ref_name, '-') }}
           uploadUpdaterJson: ${{ inputs.dry_run != true }}
           uploadUpdaterSignatures: ${{ inputs.dry_run != true }}
           updaterJsonPreferNsis: true
           args: ${{ matrix.args }} --config "${{ steps.updater.outputs.config }}"
-      # Portable Windows zip: the exe tauri-action just built, plus a `portable` marker.
+      # Portable Windows zip: the exe tauri-action just built, packed by portable.ps1 (no `portable` marker: settings stay in the user profile).
       - name: Portable zip (Windows)
         if: startsWith(matrix.platform, 'windows')
         shell: pwsh
@@ -123,7 +123,7 @@ jobs:
         run: gh release upload "${{ github.ref_name }}" (Get-Item dist/*.zip).FullName --clobber
       - name: Keep the packages of a dry run as build artifacts
         if: inputs.dry_run == true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dry-run-${{ matrix.platform }}-${{ strategy.job-index }}
           path: |
@@ -132,7 +132,7 @@ jobs:
           if-no-files-found: error
       - name: Keep portable zip as a build artifact
         if: startsWith(matrix.platform, 'windows')
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: gall-windows-portable
           path: dist/*.zip

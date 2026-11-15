@@ -89,6 +89,28 @@ export async function runGitWorkspaceSelfTest(h: typeof import("./selftest").git
     await press("Commit diff", $(".menu")!); await sleep(700);
     const diff = await invoke<{ kind: string; text?: string }>("clip_inspect");
     log(diff.kind === "text" && !!diff.text?.includes("diff --git a/gamma.txt b/gamma.txt") && !!diff.text?.includes("+gamma"), "copying the diff puts the whole commit diff on the clipboard");
+    // The copy menu opens beside the commit (not over it) and lists its Vim accelerators; pressing one copies.
+    const selectedRow = $(".git-graph-lines .gg-row.selected")!.getBoundingClientRect();
+    key("y", {}, document.activeElement); await sleep(600);
+    const copyMenu = $(".menu")!.getBoundingClientRect();
+    log(copyMenu.top <= selectedRow.top + 4 && copyMenu.left > selectedRow.left + 150, "the copy menu opens level with the commit row, right of its start", `${JSON.stringify(copyMenu)} vs ${JSON.stringify(selectedRow)}`);
+    const accels = Object.fromEntries($$(".menu .mi", document).map((item) => [item.querySelector(".lbl")?.textContent, item.querySelector(".sc")?.textContent]));
+    log(accels["Full commit message"] === "m" && accels["Commit patch"] === "p" && accels["Commit hash"] === "y", "the copy menu shows the key of every entry", JSON.stringify(accels));
+    await shot("workspace-copy-menu-keys");
+    key("m", {}, document.body); await sleep(600);
+    const fullMessage = await invoke<{ kind: string; text?: string }>("clip_inspect");
+    log(!$(".menu") && fullMessage.kind === "text" && fullMessage.text === "add gamma", "m in the copy menu copies the full commit message", JSON.stringify(fullMessage));
+    key("y", {}, document.activeElement); await sleep(600);
+    key("p", {}, document.body); await sleep(900);
+    const patch = await invoke<{ kind: string; text?: string }>("clip_inspect");
+    log(patch.kind === "text" && !!patch.text?.includes("Subject: [PATCH] add gamma") && !!patch.text?.includes("+gamma"), "p in the copy menu copies the commit as an applicable patch");
+    // a asks before applying the clipboard patch; this one is already in the history, so applying it is refused and nothing changes.
+    key("a", {}, document.activeElement); await until(() => $(".modal"), 4000);
+    log(!!$(".modal")?.textContent?.includes("Apply patch from clipboard?") && !!$(".modal")?.textContent?.includes("Subject: [PATCH] add gamma"), "a shows the patch from the clipboard and asks before applying it");
+    await shot("workspace-apply-patch-confirm");
+    await press("Apply", $(".modal")!); await until(() => $(".gg-error"), 6000);
+    log(!!$(".gg-error") && !$(".modal"), "a patch that is already applied is refused with an error", $(".gg-error")?.textContent ?? "");
+    await sleep(300);
     // Tools with lazygit keys: b bisect, w worktrees, x generic; Esc and h return to the commit list.
     const toolTab = () => $(".ga-tabs [aria-selected='true']")?.textContent ?? "";
     key("b", {}, document.activeElement); await sleep(600);
@@ -196,14 +218,27 @@ export async function runGitWorkspaceSelfTest(h: typeof import("./selftest").git
     await press("Remotes", $(".gg-side-tabs")!); await sleep(100);
     click($$(".gg-side-row").find((r) => r.textContent?.includes("origin"))!);
     await sleep(80); key("f", {}, $(".gg-sidebar")); await settle(); log(!!$(".gg-output") && !$(".gg-error") && !!(await repo()).refs.some((ref) => ref.fullName === "refs/remotes/origin/main"), "fetch completes through cancellable remote job");
-    await selectedKey("P"); await dialog("Push"); await settle();
-    log(!!$(".gg-error"), "normal push refuses rewritten remote history");
+    const remoteBeforePush = (await repo()).refs.find((ref) => ref.fullName === "refs/remotes/origin/main")?.id;
+    const rewrittenHead = (await repo()).head;
+    await selectedKey("P"); await dialog("Push");
+    log(!!await until(() => $(".modal")?.textContent?.includes("Your branch has diverged"), 12000), "rejected normal push offers force-with-lease confirmation");
+    log(!!$(".gg-output")?.textContent?.match(/rejected|non-fast-forward|failed to push/i), "rejected push keeps Git output visible behind confirmation");
+    await shot("workspace-push-lease-confirm");
+    key("Escape", {}, $(".modal")); await until(() => !$(".modal")); await settle();
+    await selectedKey("f"); await settle();
+    const cancelledPush = await repo();
+    log(!!remoteBeforePush && remoteBeforePush !== rewrittenHead && cancelledPush.head === rewrittenHead && cancelledPush.refs.find((ref) => ref.fullName === "refs/remotes/origin/main")?.id === remoteBeforePush, "cancelling force-with-lease preserves local and freshly fetched remote history");
     click($(".gg-actions")!); await sleep(80);
     const repositoryLabels = $$(".mi .lbl", $(".menu")!).map((label) => label.textContent?.trim());
     log(["Fetch remote", "Pull (fast-forward only)", "Push branch", "Force push with explicit lease…", "Stash working changes…", "Terminal here"].every((label) => repositoryLabels.includes(label)) && !repositoryLabels.includes("Rewrite history"), "Actions menu holds repository-wide actions only");
     await shot("workspace-actions-menu");
-    await press("Force push with explicit lease…", $$(".menu").at(-1)!); await dialog("Force-with-lease"); await settle();
-    log(!$(".gg-error"), "explicit force-with-lease publishes disposable rewritten branch");
+    key("Escape", {}, $(".menu")); await until(() => !$(".menu"));
+    await selectedKey("P"); await dialog("Push");
+    await until(() => $(".modal")?.textContent?.includes("Your branch has diverged"), 12000);
+    await dialog("Force push with lease"); await settle();
+    await selectedKey("f"); await settle();
+    const forcedPush = await repo();
+    log(!$(".gg-error") && forcedPush.refs.find((ref) => ref.fullName === "refs/remotes/origin/main")?.id === rewrittenHead, "confirmed force-with-lease publishes the rewritten disposable branch");
     await shot("workspace-refs-remotes");
     await press("Refs", $(".gg-side-tabs")!); await sleep(100);
     const left = $$(".gg-side-row").find((r) => r.textContent?.includes("conflict-left") && !r.textContent?.includes("origin/"))!;
@@ -251,6 +286,21 @@ export async function runGitWorkspaceSelfTest(h: typeof import("./selftest").git
     log(!!button("Unlock", treeRow) && !!(button("Remove…", treeRow) as HTMLButtonElement)?.disabled, "locked worktree cannot be removed");
     await shot("workspace-worktree-locked");
     await press("Unlock", treeRow); await dialog("Unlock worktree"); await settle();
+    await press("Tools"); await until(() => !$(".git-advanced"));
+    await press("Worktrees", $(".gg-side-tabs")!);
+    const linkedRow = () => $$<HTMLButtonElement>(".gg-worktree-main").find((row) => row.title === treePath);
+    log(!!await until(linkedRow), "worktree sidebar lists the created working folder");
+    await h.updateSettings({ keyboardProfile: "explorer" });
+    linkedRow()?.focus(); key("d", {}, linkedRow()); key("n", {}, linkedRow()); await sleep(250);
+    log(!$(".modal") && !$(".git-advanced") && (await h.api.pathResolve(treePath)).exists, "worktree d and n do nothing when Vim keys are disabled");
+    await shot("workspace-worktrees-vim-disabled");
+    await h.updateSettings({ keyboardProfile: "vim" });
+    linkedRow()?.focus(); key("d", {}, linkedRow());
+    log(!!await until(() => $(".modal")?.textContent?.includes(treePath)), "Vim d asks to remove the focused worktree");
+    await shot("workspace-worktree-remove-key-confirm");
+    key("Escape", {}, $(".modal")); await until(() => !$(".modal")); await settle();
+    linkedRow()?.focus(); key("n", {}, linkedRow());
+    log(!!await until(() => $(".git-advanced [aria-label='Worktree destination']")), "Vim n opens the actual worktree creation form");
     treeRow = $$(".ga-item").find((row) => row.textContent?.includes(treePath))!;
     await press("Remove…", treeRow); await dialog("Remove worktree"); await settle();
     log(!(await h.api.pathResolve(treePath)).exists, "worktree removal removes only clean test worktree");
@@ -289,6 +339,18 @@ export async function runGitWorkspaceSelfTest(h: typeof import("./selftest").git
     await press("Initialize…", $(".git-advanced")!); await dialog("Initialize submodule"); await settle();
     log((await h.api.pathResolve(moduleHost + "/module/file.txt")).exists && !$(".ga-error"), "submodule initialization checks out recorded commit through UI");
     await shot("workspace-submodule-initialized");
+    await press("Tools"); await until(() => !$(".git-advanced"));
+    await press("Worktrees", $(".gg-side-tabs")!);
+    log(!!await until(() => $<HTMLButtonElement>(".gg-worktree-main")?.title === moduleHost), "host worktree sidebar shows the host repository");
+    click($("button[aria-label='Repository']")!); await until(() => $(".rp-menu"));
+    click($$(".rp-item").find((item) => $(".rp-name", item)?.textContent === "module")!);
+    await dialog("Switch");
+    log(!!await until(() => $<HTMLButtonElement>(".gg-worktree-main")?.title === moduleHost + "/module"), "switching repositories replaces host worktree rows with submodule rows");
+    log(!$$<HTMLButtonElement>(".gg-worktree-main").some((row) => row.title === moduleHost), "submodule worktree list does not retain the previous host row");
+    await shot("workspace-worktrees-submodule");
+    click($("button[aria-label='Repository']")!); await until(() => $(".rp-menu")); click($$(".rp-item")[0]); await dialog("Switch");
+    log(!!await until(() => $<HTMLButtonElement>(".gg-worktree-main")?.title === moduleHost), "switching back restores only the host repository worktrees");
+    await shot("workspace-worktrees-host");
     const parent = path.slice(0, path.lastIndexOf("/"));
     const emptyPath = await h.api.createDir(parent, "new-repository");
     A.openOverlay(null); await sleep(100); A.openOverlay({ type: "gitGraph", path: emptyPath });
@@ -341,5 +403,93 @@ export async function runGitWorkspaceSelfTest(h: typeof import("./selftest").git
     const beforeDisabled = await invoke<Repository>("git_repository", { path: emptyPath }); key("P", {}, $(".git-graph")); await sleep(100);
     log(h.getState().overlay?.type !== "dialog" && (await invoke<Repository>("git_repository", { path: emptyPath })).head === beforeDisabled.head, "Vim-disabled letters do not trigger repository actions");
   } catch (e) { log(false, "Git workspace scenario", String(e)); await shot("workspace-failure"); }
+  await h.finish();
+}
+
+/** Focused regression: staged nested repositories remain visible and can be excluded before rebase. */
+export async function runGitRebaseSubmodulesSelfTest(h: typeof import("./selftest").gitSelftest) {
+  const { $, $$, key, click, until, sleep, shot, log } = h;
+  const path = h.activePath(0);
+  const repo = (root = path) => invoke<Repository>("git_repository", { path: root });
+  const button = (label: string, scope: ParentNode = document) => $$<HTMLButtonElement>("button", scope).find((element) => { const text = element.cloneNode(true) as HTMLElement; text.querySelectorAll("kbd,svg").forEach((node) => node.remove()); return text.textContent?.trim() === label; });
+  const press = async (label: string, scope: ParentNode = document) => { const element = await until(() => button(label, scope) ?? $$(".mi", scope).find((row) => $(".lbl", row)?.textContent?.trim() === label)); if (!element) throw new Error(`Missing action ${label}`); click(element); };
+  const settle = async () => { await sleep(160); await until(() => !($(".gg-actions") as HTMLButtonElement)?.disabled, 12000); };
+  const nestedFile = () => $$(".gc-file").find((row) => !!row.querySelector('[title=".worktrees"]') || !!row.querySelector('[title=".worktrees/"]'));
+  try {
+    await h.updateSettings({ keyboardProfile: "vim", theme: "dark", shortcuts: {} });
+    await getCurrentWindow().unmaximize(); await getCurrentWindow().setSize(new LogicalSize(1320, 900));
+    const before = await repo(), nestedBefore = await repo(path + "/.worktrees");
+    const actualCopy = before.branch === "MaybeSometime", destination = actualCopy ? "Dev" : "main";
+    const moduleBefore = actualCopy ? null : await repo(path + "/module");
+    const base = before.refs.find((ref) => ref.kind === "branch" && ref.name === destination);
+    const beforeDetails = await invoke<{ message: string }>("git_commit_details", { path, commit: before.head, base: null });
+    if (!base) throw new Error(`Missing ${destination} branch in rebase fixture`);
+    const baseRow = () => $$(".gg-sidebar .gg-side-row").find((row) => row.querySelector("span")?.firstChild?.textContent === destination);
+    const startRebase = async () => {
+      const row = await until(baseRow, 12000); if (!row) throw new Error("Missing destination branch in sidebar");
+      click(row); row.focus(); await sleep(120); key("r", {}, row);
+      log(!!await until(() => $(".modal")?.textContent?.includes("Rebase commit?")), "Vim r on destination asks to rebase the current branch");
+      log(!!$(".modal")?.textContent?.includes(base.id.slice(0, 12)) && !!$(".modal")?.textContent?.includes(`as the new base of ${before.branch}`), "confirmation identifies the selected destination and current branch");
+    };
+    log(before.head !== base.id && !!nestedBefore.head, "fixture has divergent branches and a staged nested repository");
+    A.openOverlay({ type: "gitGraph", path });
+    await until(() => $(".gg-working"), 12000);
+    const changesBadge = $(".gg-working .gg-badge");
+    log(!!changesBadge && /^\d+ changed$/.test(changesBadge.textContent?.trim() ?? ""), "Working Changes badge exposes the staged gitlink instead of showing Clean");
+    click($(".gg-working")!);
+    log(!!await until(() => nestedFile()?.querySelector(".staged")), "Working Changes lists the staged .worktrees gitlink");
+    await shot("rebase-submodules-staged-working-changes");
+    await press("Collapse", $(".gg-working-title")!);
+    await startRebase(); await shot("rebase-submodules-blocked-confirm"); await press("Rebase", $(".modal")!);
+    await until(() => !$(".modal")); await settle();
+    log(!!$(".gg-error")?.textContent?.includes(".worktrees"), "rebase names the staged gitlink that must be unstaged");
+    const blocked = await repo();
+    log(blocked.head === before.head && !blocked.operation, "blocked rebase leaves HEAD unchanged and starts no operation");
+    await shot("rebase-submodules-blocked");
+    click($(".gg-working")!);
+    const staged = await until(nestedFile); if (!staged) throw new Error("Missing staged nested repository");
+    click(staged); await press("Unstage file", $(".git-changes")!); await settle();
+    const unstaged = await until(() => { const row = nestedFile(); return row && !row.querySelector(".staged") ? row : null; });
+    if (!unstaged) throw new Error("Nested repository was not unstaged");
+    click(unstaged); await press("File actions…", $(".git-changes")!); await press("Exclude file locally", $(".menu")!); await settle();
+    log(!nestedFile() && !$(".gc-error"), "local exclusion removes the untracked nested repository from Working Changes");
+    await press("Collapse", $(".gg-working-title")!);
+    await startRebase(); await shot("rebase-submodules-confirm"); await press("Rebase", $(".modal")!);
+    await until(() => !$(".modal")); await settle();
+    let after = await repo();
+    if (actualCopy && after.operation === "rebase" && after.conflicts.length > 0) {
+      log(!$(".gg-error")?.textContent?.includes("Unstage") && !!$(".gg-operation"), "rebase starts on the disposable project copy and exposes its genuine content conflicts");
+      const conflict = await until(() => $$(".gg-sidebar .gg-side-row").find((row) => row.querySelector("span")?.firstChild?.textContent === after.conflicts[0]));
+      if (!conflict) throw new Error("Running rebase did not expose its first conflict");
+      click(conflict);
+      log(!!await until(() => $(".gg-conflict")?.textContent?.includes(after.conflicts[0])), "actual project conflict can be inspected without resolving its content automatically");
+      await shot("rebase-submodules-actual-conflict");
+      await press("Abort…", $(".gg-operation")!); await until(() => $(".modal"));
+      await shot("rebase-submodules-actual-abort-confirm"); await press("Abort operation", $(".modal")!);
+      await until(() => !$(".modal")); await settle(); after = await repo();
+      log(after.head === before.head && after.branch === before.branch && !after.operation && after.conflicts.length === 0, "aborting the real project's conflicting rebase restores its original HEAD and branch");
+    } else {
+      log(!$(".gg-error"), "rebase finishes through the actual UI without the terminal-only error");
+      log(after.branch === before.branch && after.head !== before.head && !after.operation && after.conflicts.length === 0, "rebase rewrites the current branch and leaves no pending operation or conflicts");
+      const details = await invoke<{ parents: string[]; message: string }>("git_commit_details", { path, commit: after.head, base: null });
+      log(details.parents.length === 1 && details.parents[0] === base.id && details.message === beforeDetails.message, "rebased commit has the selected destination as its actual parent and retains its message");
+    }
+    const nestedAfter = await repo(path + "/.worktrees");
+    const sentinel = await h.api.grepContext(path + "/.worktrees/keep.txt", 1, 0, 1);
+    log(nestedAfter.head === nestedBefore.head && sentinel.length === 1 && sentinel[0][1] === "nested repository sentinel", "unstage, local exclusion and rebase preserve the nested repository HEAD and sentinel");
+    if (moduleBefore) {
+      const moduleAfter = await repo(path + "/module");
+      const topic = await h.api.grepContext(path + "/topic.txt", 1, 0, 0), upstream = await h.api.grepContext(path + "/upstream.txt", 1, 0, 0);
+      log(topic.some(([, line]) => line === "topic content") && upstream.some(([, line]) => line === "upstream content"), "rebased working tree retains both topic and upstream contents");
+      log(moduleAfter.head === moduleBefore.head, "rebase preserves the initialized submodule checkout");
+      const moduleEdit = await h.api.grepContext(path + "/module/module.txt", 1, 0, 1), moduleUntracked = await h.api.grepContext(path + "/module/keep.txt", 1, 0, 1);
+      log(moduleEdit.length === 1 && moduleEdit[0][1] === "module local edit" && moduleUntracked.length === 1 && moduleUntracked[0][1] === "keep untracked content", "rebase preserves tracked edits and untracked submodule contents with recursive configuration enabled");
+    }
+    await sleep(200); await shot("rebase-submodules-after");
+    await h.updateSettings({ keyboardProfile: "explorer" });
+    const row = await until(baseRow); if (!row) throw new Error("Destination branch disappeared after rebase");
+    click(row); row.focus(); await sleep(100); key("r", {}, row); await sleep(150);
+    log(!$(".modal") && (await repo()).head === after.head, "r does not trigger rebase when Vim keys are disabled");
+  } catch (e) { log(false, "Rebase with submodules scenario", String(e)); await shot("rebase-submodules-failure"); }
   await h.finish();
 }

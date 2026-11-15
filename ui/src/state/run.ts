@@ -26,7 +26,13 @@ export function run(a: Action) {
     case "copyFolderPath": A.copyPaths([], path); break;
     case "togglePin": A.togglePin(path); break;
     case "compare": A.compareSelection(b); break;
-    case "gitGraph": A.openOverlay({ type: "gitGraph", path }); break;
+    case "gitGraph":
+      // Outside a repository there is nothing to show: warn instead of opening an empty window.
+      void api.gitRoot(path).catch(() => null).then((root) => {
+        if (root) A.openOverlay({ type: "gitGraph", path });
+        else void A.trustGitFolder(path).then((refused) => { if (!refused) A.notify("This folder is not inside a Git repository", "warn"); });
+      });
+      break;
     case "compareFolders": A.comparePanelFolders(b); break;
     case "compareClipboard":
     case "compareGitCommit":
@@ -70,7 +76,7 @@ export function run(a: Action) {
     }
     case "paste": A.paste(b); break;
     case "pasteAsLinks": A.pasteAsLinks(b); break;
-    case "refresh": refreshAll(); A.refreshDrives(); break;
+    case "refresh": refreshAll(); A.refreshDrives(); A.invalidateAllFolderSizes(); break;
     case "toggleHidden": A.updateSettings({ showHidden: !getState().settings!.showHidden }); break;
     case "toggleColumns": A.toggleColumns(b); break;
     case "toggleSidebar": setState((s) => ({ sidebarVisible: !s.sidebarVisible })); break;

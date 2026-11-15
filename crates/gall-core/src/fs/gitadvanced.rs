@@ -1,13 +1,15 @@
 //! Explicit advanced Git workflows. Reads never change HEAD; writes are reviewed,
 //! stale-checked and serialized by the application adapter.
-use super::gitgraph::{git, has_content_filters, root};
+use super::gitgraph::{git, has_content_filters, joined, root};
 use crate::{CoreError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+#[cfg(windows)]
+use std::process::Command;
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -69,6 +71,11 @@ pub enum Request {
     RemoveWorktree {
         destination: String,
     },
+    /// Like `RemoveWorktree`, but also deletes ignored files (caches, build output). Tracked
+    /// changes and untracked files that are not ignored still block removal.
+    RemoveWorktreeWithIgnored {
+        destination: String,
+    },
     LockWorktree {
         destination: String,
     },
@@ -100,6 +107,10 @@ pub enum Request {
     },
     ApplyPatch {
         file: String,
+    },
+    /// The same as `ApplyPatch`, for patch text pasted from the clipboard.
+    ApplyPatchText {
+        text: String,
     },
     Init {
         branch: String,
@@ -142,8 +153,11 @@ fn branch_name(path: &Path, name: &str) -> Result<()> {
 }
 
 fn git_path(path: &Path, name: &str) -> Result<PathBuf> {
+    if let Some(found) = super::gitfacts::marker(path, name) {
+        return Ok(found);
+    }
     let value = git(path, &["rev-parse", "--git-path", name])?;
-    Ok(path.join(value.trim()))
+    Ok(path.join(super::gitexec::host_path(path, value.trim())))
 }
 
 fn read_marker(path: &Path, name: &str) -> Result<Option<String>> {
@@ -162,6 +176,113 @@ fn read_marker(path: &Path, name: &str) -> Result<Option<String>> {
     }
 }
 
+/// A local core.worktree value, only when this file can be read unambiguously without
+/// following includes. Git's generated submodule configuration uses this format.
+fn configured_worktree(text: &str) -> Option<String> {
+    let mut core = false;
+    let mut result = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            let end = line.find(']')?;
+            let section = line[1..end].trim();
+            if section.to_ascii_lowercase().starts_with("include") {
+                return None;
+            }
+            core = section.eq_ignore_ascii_case("core");
+        } else if core {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            if !key.trim().eq_ignore_ascii_case("worktree") {
+                continue;
+            }
+            let mut value_chars = value.trim_start().chars();
+            let (mut parsed, mut quoted, mut kept) = (String::new(), false, 0);
+            while let Some(ch) = value_chars.next() {
+                match ch {
+                    '"' => quoted = !quoted,
+                    '#' | ';' if !quoted => break,
+                    '\\' => {
+                        parsed.push(match value_chars.next()? {
+                            'n' => '\n',
+                            't' => '\t',
+                            'b' => '\u{8}',
+                            '\\' => '\\',
+                            '"' => '"',
+                            _ => return None,
+                        });
+                        kept = parsed.len();
+                    }
+                    _ => {
+                        parsed.push(ch);
+                        if quoted || !ch.is_whitespace() {
+                            kept = parsed.len();
+                        }
+                    }
+                }
+            }
+            if quoted {
+                return None;
+            }
+            parsed.truncate(kept);
+            result = Some(parsed);
+        }
+    }
+    result.filter(|value| !value.is_empty())
+}
+
+fn worktree_metadata_path(root: &Path, base: &Path, value: &str) -> PathBuf {
+    if super::gitexec::place(root).is_some() && value.starts_with('/') {
+        super::gitexec::host_path(root, value)
+    } else {
+        base.join(value)
+    }
+}
+
+fn worktree_git_dir(root: &Path) -> Option<PathBuf> {
+    if super::gitexec::place(root).is_none() {
+        return super::gitfacts::git_dir(root);
+    }
+    // An absolute gitdir inside WSL is a Linux path, not an absolute Windows path.
+    let dot = root.join(".git");
+    if dot.is_dir() {
+        return Some(dot);
+    }
+    let text = std::fs::read_to_string(dot).ok()?;
+    let value = text.lines().next()?.strip_prefix("gitdir:")?.trim();
+    Some(worktree_metadata_path(root, root, value))
+}
+
+/// Git lists the common Git directory as the main worktree of a submodule or a
+/// separate Git directory. Recover the actual folder, including from a linked worktree,
+/// without another Git process. Never replace a bare entry or an ambiguous config value.
+fn main_worktree_path(root: &Path, listed: &Path) -> Option<PathBuf> {
+    // Ordinary main and linked worktrees need no metadata/configuration reads. In WSL
+    // each unnecessary read or canonicalization through the host share costs a round trip.
+    if root == listed || listed.join(".git").is_dir() {
+        return None;
+    }
+    let canonical = crate::nav::path::canonicalize;
+    let git_dir = worktree_git_dir(root)?;
+    let common = match std::fs::read_to_string(git_dir.join("commondir")) {
+        Ok(value) => worktree_metadata_path(root, &git_dir, value.trim()),
+        Err(_) => git_dir.clone(),
+    };
+    let common = canonical(&common).ok()?;
+    if canonical(listed).ok()? != common {
+        return None;
+    }
+    if canonical(&git_dir).ok()? == common {
+        return canonical(root).ok();
+    }
+    let config = std::fs::read_to_string(common.join("config")).ok()?;
+    let value = configured_worktree(&config)?;
+    let candidate = canonical(&worktree_metadata_path(root, &common, &value)).ok()?;
+    let candidate_git_dir = worktree_git_dir(&candidate)?;
+    (canonical(&candidate_git_dir).ok()? == common).then_some(candidate)
+}
+
 fn worktrees(path: &Path) -> Result<Vec<Worktree>> {
     let output = git(path, &["worktree", "list", "--porcelain", "-z"])?;
     if output.contains('\u{fffd}') {
@@ -171,8 +292,13 @@ fn worktrees(path: &Path) -> Result<Vec<Worktree>> {
     for field in output.split('\0') {
         if let Some(value) = field.strip_prefix("worktree ") {
             result.push(Worktree {
-                // Git prints `C:/dir` on Windows; the rest of the app uses `C:\dir`.
-                path: if cfg!(windows) {
+                // Git prints `C:/dir` on Windows; the rest of the app uses `C:\dir`. A
+                // repository in WSL prints Linux paths, which become `\\wsl.localhost\…`.
+                path: if super::gitexec::place(path).is_some() {
+                    super::gitexec::host_path(path, value)
+                        .to_string_lossy()
+                        .into_owned()
+                } else if cfg!(windows) {
                     value.replace('/', "\\")
                 } else {
                     value.into()
@@ -195,6 +321,11 @@ fn worktrees(path: &Path) -> Result<Vec<Worktree>> {
             } else if field == "prunable" || field.starts_with("prunable ") {
                 current.prunable = true;
             }
+        }
+    }
+    if let Some(first) = result.first_mut().filter(|entry| !entry.bare) {
+        if let Some(root) = main_worktree_path(path, Path::new(&first.path)) {
+            first.path = root.to_string_lossy().into_owned();
         }
     }
     Ok(result)
@@ -231,7 +362,7 @@ fn no_symlink_parents(path: &Path, relative: &str) -> Result<()> {
     Ok(())
 }
 
-fn initialized_submodule(path: &Path, file: &str) -> Result<()> {
+fn submodule_marker(path: &Path, file: &str) -> Result<PathBuf> {
     let module = path.join(file);
     let marker = module
         .join(".git")
@@ -240,7 +371,10 @@ fn initialized_submodule(path: &Path, file: &str) -> Result<()> {
     if marker.is_symlink() {
         return Err(fail("Symlink submodule Git directories are unsupported"));
     }
-    let actual = root(&module)?;
+    Ok(module)
+}
+
+fn same_folder(module: &Path, actual: &Path) -> Result<()> {
     if actual.canonicalize().map_err(|e| fail(e.to_string()))?
         != module.canonicalize().map_err(|e| fail(e.to_string()))?
     {
@@ -249,6 +383,12 @@ fn initialized_submodule(path: &Path, file: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn initialized_submodule(path: &Path, file: &str) -> Result<()> {
+    let module = submodule_marker(path, file)?;
+    let actual = root(&module)?;
+    same_folder(&module, &actual)
 }
 
 fn submodules(path: &Path) -> Result<Vec<Submodule>> {
@@ -262,18 +402,10 @@ fn submodules(path: &Path) -> Result<Vec<Submodule>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(fail(e.to_string())),
     }
-    git(
-        path,
-        &[
-            "config",
-            "--no-includes",
-            "--null",
-            "--file",
-            ".gitmodules",
-            "--list",
-        ],
-    )?;
-    let output = git(
+    // Every Git process costs a round trip (about 70 ms inside WSL), so the questions that do
+    // not depend on each other run side by side, and those about all submodules are asked
+    // once: the validity check, the paths and the URLs together, then the recorded commits.
+    let combined = git(
         path,
         &[
             "config",
@@ -282,14 +414,52 @@ fn submodules(path: &Path) -> Result<Vec<Submodule>> {
             "--file",
             ".gitmodules",
             "--get-regexp",
-            "^submodule\\..*\\.path$",
+            "^submodule\\..*\\.(path|url)$",
         ],
-    )
-    .unwrap_or_default();
+    );
+    let combined = match combined {
+        Ok(text) => text,
+        Err(_) => {
+            // No match also fails: only a file Git cannot read at all is an error.
+            git(
+                path,
+                &[
+                    "config",
+                    "--no-includes",
+                    "--null",
+                    "--file",
+                    ".gitmodules",
+                    "--list",
+                ],
+            )?;
+            String::new()
+        }
+    };
+    let mut output = String::new();
+    let mut urls: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for field in combined.split('\0').filter(|f| !f.is_empty()) {
+        let Some((key, value)) = field.split_once('\n') else {
+            continue;
+        };
+        if key.ends_with(".path") {
+            output.push_str(field);
+            output.push('\0');
+        } else if let Some(name) = key
+            .strip_prefix("submodule.")
+            .and_then(|k| k.strip_suffix(".url"))
+        {
+            urls.insert(name.to_owned(), value.trim_end().to_owned());
+        }
+    }
     if output.contains('\u{fffd}') {
         return Err(fail("Submodule paths must contain valid UTF-8"));
     }
-    let mut result = Vec::new();
+    let literals: Vec<String> = output
+        .split('\0')
+        .filter_map(|f| f.split_once('\n'))
+        .map(|(_, file)| format!(":(literal){file}"))
+        .collect();
+    let mut records: Vec<(&str, &str)> = Vec::new();
     for field in output.split('\0').filter(|v| !v.is_empty()) {
         let (key, file) = field
             .split_once('\n')
@@ -301,53 +471,189 @@ fn submodules(path: &Path) -> Result<Vec<Submodule>> {
         if name.chars().any(char::is_control) {
             return Err(fail("Unsupported submodule name"));
         }
-        let url = git(
-            path,
-            &[
-                "config",
-                "--no-includes",
-                "--file",
-                ".gitmodules",
-                "--get",
-                &format!("submodule.{name}.url"),
-            ],
-        )
-        .unwrap_or_default()
-        .trim_end()
-        .to_owned();
-        let literal = format!(":(literal){file}");
-        let index = git(path, &["ls-files", "--stage", "-z", "--", &literal])?;
-        let id = index
-            .split('\t')
-            .next()
-            .and_then(|v| v.strip_prefix("160000 "))
-            .and_then(|v| v.split_whitespace().next())
-            .unwrap_or_default()
-            .to_owned();
-        let state = if no_symlink_parents(path, file).is_err() {
-            "unsupportedPath".to_owned()
-        } else if !path.join(file).join(".git").exists() {
-            "notInitialized".into()
-        } else if initialized_submodule(path, file).is_err() {
-            "unsupportedPath".into()
-        } else {
-            let actual =
-                git(&path.join(file), &["rev-parse", "--verify", "HEAD"]).unwrap_or_default();
-            if actual.trim() == id {
-                "current".into()
-            } else {
-                "differentCommit".into()
-            }
-        };
-        result.push(Submodule {
-            name: name.into(),
-            path: file.into(),
-            url,
-            id,
-            state,
-        });
+        records.push((name, file));
     }
-    Ok(result)
+    // The recorded commits of all submodules in one call.
+    let read_ids = || -> Result<std::collections::HashMap<String, String>> {
+        let mut ids = std::collections::HashMap::new();
+        if literals.is_empty() {
+            return Ok(ids);
+        }
+        let mut args = vec!["ls-files", "--stage", "-z", "--"];
+        args.extend(literals.iter().map(String::as_str));
+        for record in git(path, &args)?.split('\0') {
+            if let Some((meta, file)) = record.split_once('\t') {
+                if let Some(id) = meta
+                    .strip_prefix("160000 ")
+                    .and_then(|v| v.split_whitespace().next())
+                {
+                    ids.entry(file.to_owned()).or_insert_with(|| id.to_owned());
+                }
+            }
+        }
+        Ok(ids)
+    };
+    // What can be said about a submodule without knowing its recorded commit: a fixed
+    // state, or the HEAD it is at.
+    let head_of = |file: &str| -> std::result::Result<String, &'static str> {
+        if no_symlink_parents(path, file).is_err() {
+            return Err("unsupportedPath");
+        }
+        let module = path.join(file);
+        if !module.join(".git").exists() {
+            return Err("notInitialized");
+        }
+        // One Git process answers both questions (its work tree and its HEAD); when it
+        // fails (no commit yet, a foreign Git directory) the questions are asked apart.
+        let quick = submodule_marker(path, file).and_then(|module| {
+            let both = git(&module, &["rev-parse", "--show-toplevel", "HEAD"])?;
+            let mut lines = both.lines();
+            let top = lines.next().ok_or_else(|| fail("No work tree"))?;
+            same_folder(&module, &super::gitexec::host_path(&module, top))?;
+            Ok(lines.next().unwrap_or_default().to_owned())
+        });
+        match quick {
+            Ok(head) => Ok(head),
+            Err(_) => {
+                let (initialized, head) = std::thread::scope(|scope| {
+                    let head = scope.spawn(|| {
+                        git(&module, &["rev-parse", "--verify", "HEAD"]).unwrap_or_default()
+                    });
+                    (
+                        initialized_submodule(path, file),
+                        head.join().unwrap_or_default(),
+                    )
+                });
+                initialized.map(|_| head).map_err(|_| "unsupportedPath")
+            }
+        }
+    };
+    // The commits and all the submodules are read at once.
+    let (ids, heads) = std::thread::scope(|scope| {
+        let ids = scope.spawn(read_ids);
+        let heads: Vec<_> = records
+            .iter()
+            .map(|(_, file)| scope.spawn(|| head_of(file)))
+            .collect();
+        (
+            ids.join()
+                .unwrap_or_else(|_| Err(fail("Submodule listing failed"))),
+            heads
+                .into_iter()
+                .map(|h| h.join().unwrap_or(Err("unsupportedPath")))
+                .collect::<Vec<_>>(),
+        )
+    });
+    let ids = ids?;
+    Ok(records
+        .into_iter()
+        .zip(heads)
+        .map(|((name, file), head)| {
+            let id = ids.get(file).cloned().unwrap_or_default();
+            let state = match head {
+                Err(fixed) => fixed.to_owned(),
+                Ok(head) if head.trim() == id => "current".to_owned(),
+                Ok(_) => "differentCommit".to_owned(),
+            };
+            Submodule {
+                name: name.into(),
+                path: file.into(),
+                url: urls.get(name).cloned().unwrap_or_default(),
+                id,
+                state,
+            }
+        })
+        .collect())
+}
+
+/// One submodule at any depth below the opened repository.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmoduleNode {
+    /// Path from the opened repository, for example `libs/a/inner`.
+    pub label: String,
+    /// Path relative to the submodule's parent repository.
+    pub name: String,
+    /// Folder of the submodule (native path of the parent joined with the relative path).
+    pub path: String,
+    pub state: String,
+    pub depth: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmoduleTree {
+    pub repository: Option<String>,
+    pub entries: Vec<SubmoduleNode>,
+}
+
+const MAX_SUBMODULE_DEPTH: usize = 4;
+
+fn collect_submodules(
+    repository: &Path,
+    prefix: &str,
+    depth: usize,
+    entries: &mut Vec<SubmoduleNode>,
+) -> Result<()> {
+    let modules = submodules(repository)?;
+    // The nested lists of the submodules are read side by side, then put in order.
+    let nested: Vec<Vec<SubmoduleNode>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = modules
+            .iter()
+            .map(|module| {
+                let usable = matches!(module.state.as_str(), "current" | "differentCommit")
+                    && depth + 1 < MAX_SUBMODULE_DEPTH;
+                scope.spawn(move || {
+                    let mut nested = Vec::new();
+                    // A broken nested module must not hide its siblings.
+                    if usable
+                        && collect_submodules(
+                            &repository.join(&module.path),
+                            &format!("{prefix}{}/", module.path),
+                            depth + 1,
+                            &mut nested,
+                        )
+                        .is_err()
+                    {
+                        nested.clear();
+                    }
+                    nested
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_default())
+            .collect()
+    });
+    for (module, nested) in modules.into_iter().zip(nested) {
+        entries.push(SubmoduleNode {
+            label: format!("{prefix}{}", module.path),
+            name: module.path.clone(),
+            path: repository.join(&module.path).to_string_lossy().into_owned(),
+            state: module.state,
+            depth,
+        });
+        entries.extend(nested);
+    }
+    Ok(())
+}
+
+/// Lists submodules recursively (depth first) without loading the full advanced snapshot,
+/// which is far slower for every level.
+pub fn submodule_tree(path: &Path) -> Result<SubmoduleTree> {
+    let Ok(repository) = root(path) else {
+        return Ok(SubmoduleTree {
+            repository: None,
+            entries: Vec::new(),
+        });
+    };
+    let mut entries = Vec::new();
+    collect_submodules(&repository, "", 0, &mut entries)?;
+    Ok(SubmoduleTree {
+        repository: Some(repository.to_string_lossy().into_owned()),
+        entries,
+    })
 }
 
 fn bisect(path: &Path) -> Result<Option<Bisect>> {
@@ -389,6 +695,17 @@ fn nonrepo_token(path: &Path) -> Result<String> {
 }
 
 pub fn snapshot(path: &Path, commit: Option<&str>) -> Result<AdvancedSnapshot> {
+    // Another Git client, or Gall's own background index refresh, may rewrite the index
+    // or a reference once while this reads: one more try before reporting it.
+    match snapshot_once(path, commit) {
+        Err(CoreError::Other(message)) if message.starts_with("Repository changed while") => {
+            snapshot_once(path, commit)
+        }
+        result => result,
+    }
+}
+
+fn snapshot_once(path: &Path, commit: Option<&str>) -> Result<AdvancedSnapshot> {
     let repository = match root(path) {
         Ok(repository) => repository,
         Err(_) => {
@@ -402,23 +719,41 @@ pub fn snapshot(path: &Path, commit: Option<&str>) -> Result<AdvancedSnapshot> {
             })
         }
     };
-    let state = super::gitrepository::snapshot(&repository)?;
-    let worktrees = worktrees(&repository)?;
-    let submodules = submodules(&repository)?;
-    let bisect = bisect(&repository)?;
-    let notes = match commit {
-        Some(commit) => {
-            let commit = concrete_commit(&repository, commit)?;
-            git(
-                &repository,
+    // Everything is read side by side, between two light tokens (references, HEAD,
+    // configuration, stashes, operation markers and the index file) that have to agree.
+    // This used to be two full repository snapshots, one before and one after, with the
+    // details read one by one in between: twice the work tree status and some thirty
+    // processes in a row. A work tree change during the load still changes the token of
+    // the repository snapshot, so an action that starts from this snapshot is refused.
+    let repo = &repository;
+    let before = super::gitrepository::light_token(repo)?;
+    let (state, worktrees, submodules, bisect, notes) = std::thread::scope(|scope| {
+        let worktrees = scope.spawn(|| worktrees(repo));
+        let submodules = scope.spawn(|| submodules(repo));
+        let bisect = scope.spawn(|| bisect(repo));
+        let notes = scope.spawn(|| -> Result<String> {
+            let Some(commit) = commit else {
+                return Ok(String::new());
+            };
+            let commit = concrete_commit(repo, commit)?;
+            Ok(git(
+                repo,
                 &["notes", "--ref=refs/notes/commits", "show", &commit],
             )
-            .unwrap_or_default()
-        }
-        None => String::new(),
-    };
-    let after = super::gitrepository::snapshot(&repository)?;
-    if state.token != after.token {
+            .unwrap_or_default())
+        });
+        let state = super::gitrepository::snapshot(repo);
+        (
+            state,
+            joined(worktrees),
+            joined(submodules),
+            joined(bisect),
+            joined(notes),
+        )
+    });
+    let state = state?;
+    let (worktrees, submodules, bisect, notes) = (worktrees??, submodules??, bisect??, notes??);
+    if before != super::gitrepository::light_token(repo)? {
         return Err(fail(
             "Repository changed while loading advanced Git details. Refresh to review again",
         ));
@@ -471,18 +806,14 @@ fn run(
     if cancel.load(Ordering::Relaxed) {
         return Err(fail("Git operation cancelled before starting"));
     }
-    let mut command = Command::new("git");
+    let mut command = super::gitexec::command(path, super::gitstatus::program());
     command
+        .args(["--no-pager", "-c", "core.fsmonitor=false", "-c"])
+        .arg(format!(
+            "core.hooksPath={}",
+            super::gitexec::null_device(path)
+        ))
         .args([
-            "--no-pager",
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            if cfg!(windows) {
-                "core.hooksPath=NUL"
-            } else {
-                "core.hooksPath=/dev/null"
-            },
             "-c",
             "protocol.ext.allow=never",
             "-c",
@@ -493,14 +824,21 @@ fn run(
             "submodule.recurse=false",
             "-C",
         ])
-        .arg(path)
+        .arg(super::gitexec::dir_arg(path))
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GCM_INTERACTIVE", "never")
-        .env("GIT_ASKPASS", if cfg!(windows) { "" } else { "/bin/false" })
+        .env(
+            "GIT_ASKPASS",
+            if cfg!(windows) && super::gitexec::place(path).is_none() {
+                ""
+            } else {
+                "/bin/false"
+            },
+        )
         .env(
             "GIT_ALLOW_PROTOCOL",
             if args.contains(&"clone")
@@ -525,6 +863,7 @@ fn run(
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
     }
+    super::gitexec::forward_env(&mut command);
     let mut child = command.spawn().map_err(|e| fail(e.to_string()))?;
     let (tx, rx) = mpsc::sync_channel(32);
     for (is_error, mut pipe) in [
@@ -688,6 +1027,13 @@ fn clean_worktree(path: &Path, allow_submodules: bool) -> Result<()> {
 /// even when ordinary status is clean. Refuse all untracked content, regardless
 /// of ignore rules, before delegating either destructive filesystem operation.
 fn no_untracked_content(path: &Path, operation: &str) -> Result<()> {
+    // Plain untracked files can never be deleted by "remove with ignored files", so name them
+    // differently and the UI does not offer that second step.
+    if !git(path, &["ls-files", "--others", "--exclude-standard", "-z"])?.is_empty() {
+        return Err(fail(format!(
+            "Untracked files are present. Commit or move them outside this worktree before {operation}"
+        )));
+    }
     if !git(path, &["ls-files", "--others", "--directory", "-z"])?.is_empty() {
         return Err(fail(format!(
             "Untracked or ignored files are present. Move them outside this worktree before {operation}"
@@ -776,6 +1122,7 @@ pub fn execute(
     cancel: &AtomicBool,
     progress: impl Fn(String),
 ) -> Result<String> {
+    let _busy = super::gitfacts::mutating();
     if cancel.load(Ordering::Relaxed) {
         return Err(fail("Git operation cancelled before starting"));
     }
@@ -788,10 +1135,11 @@ pub fn execute(
     let current = state.repository.as_deref().map(Path::new);
     let p = current.unwrap_or(path);
     let worktree_action = match &request {
-        Request::RemoveWorktree { .. } => "remove",
+        Request::RemoveWorktree { .. } | Request::RemoveWorktreeWithIgnored { .. } => "remove",
         Request::LockWorktree { .. } => "lock",
         _ => "unlock",
     };
+    let ignored_ok = matches!(&request, Request::RemoveWorktreeWithIgnored { .. });
     let invoke = |args: &[&str]| -> Result<String> {
         let bytes = run(p, args, cancel, &progress, 1024 * 1024)?;
         Ok(String::from_utf8_lossy(&bytes).into_owned())
@@ -815,13 +1163,17 @@ pub fn execute(
                 let _ = std::fs::remove_dir(&destination);
                 return Err(fail("Destination must be UTF-8"));
             };
+            // Git inside WSL needs the destination as a Linux path.
+            let destination_arg = super::gitexec::path_arg(p, Path::new(destination_text))
+                .to_string_lossy()
+                .into_owned();
             let output = match invoke(&[
                 "clone",
                 "--no-checkout",
                 "--progress",
                 "--",
                 &url,
-                destination_text,
+                &destination_arg,
             ]) {
                 Ok(output) => output,
                 Err(error) => {
@@ -873,6 +1225,10 @@ pub fn execute(
             let destination = destination
                 .to_str()
                 .ok_or_else(|| fail("Destination must be UTF-8"))?;
+            let destination = super::gitexec::path_arg(p, Path::new(destination))
+                .to_string_lossy()
+                .into_owned();
+            let destination = destination.as_str();
             let mut args = vec!["worktree", "add"];
             if let Some(name) = &branch {
                 branch_name(p, name)?;
@@ -884,6 +1240,7 @@ pub fn execute(
             invoke(&args)
         }
         Request::RemoveWorktree { destination }
+        | Request::RemoveWorktreeWithIgnored { destination }
         | Request::LockWorktree { destination }
         | Request::UnlockWorktree { destination } => {
             let selected = state
@@ -898,10 +1255,15 @@ pub fn execute(
                 ));
             }
             if worktree_action == "remove" {
-                no_untracked_content(selected_path, "removing it")?;
+                if !ignored_ok {
+                    no_untracked_content(selected_path, "removing it")?;
+                }
                 clean_worktree(selected_path, true)?;
             }
-            invoke(&["worktree", worktree_action, "--", &selected.path])
+            let selected_arg = super::gitexec::path_arg(p, selected_path)
+                .to_string_lossy()
+                .into_owned();
+            invoke(&["worktree", worktree_action, "--", &selected_arg])
         }
         Request::InitSubmodule { file } | Request::UpdateSubmodule { file } => {
             let module = state
@@ -1109,45 +1471,98 @@ pub fn execute(
             if bytes.len() > 16 * 1024 * 1024 {
                 return Err(fail("Patch file exceeds the 16 MiB limit"));
             }
-            // Keep the reviewed bytes immutable between --check and --index. A file
-            // supplied by another application may be rewritten while Git runs.
-            let scratch = git_path(
-                p,
-                &format!(
-                    "gall-patch-{}-{}.patch",
-                    std::process::id(),
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_err(|e| fail(e.to_string()))?
-                        .as_nanos()
-                ),
-            )?;
-            let mut temporary = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&scratch)
-                .map_err(|e| fail(e.to_string()))?;
-            temporary
-                .write_all(&bytes)
-                .map_err(|e| fail(e.to_string()))?;
-            drop(temporary);
-            let name = scratch
-                .to_str()
-                .ok_or_else(|| fail("Git directory must be UTF-8"))?;
-            let result = (|| {
-                invoke(&["apply", "--check", "--index", "--", name])?;
-                if snapshot(p, None)?.token != expected {
-                    return Err(fail(
-                        "Repository changed while checking the patch. Review again",
-                    ));
-                }
-                recover_head(p)?;
-                invoke(&["apply", "--index", "--", name])
-            })();
-            let _ = std::fs::remove_file(scratch);
-            result
+            apply_reviewed_patch(p, &bytes, expected, &invoke)
+        }
+        Request::ApplyPatchText { text } => {
+            if state.bisect.is_some() {
+                return Err(fail("Reset the active bisect before applying a patch"));
+            }
+            clean_worktree(p, false)?;
+            let bytes = clipboard_patch_bytes(&text)?;
+            apply_reviewed_patch(p, &bytes, expected, &invoke)
         }
     }
+}
+
+/// Patch text from the clipboard as the bytes to apply. Some clipboards turn every line break into
+/// CRLF; a patch whose own header line ends in CRLF was converted that way (a patch of a CRLF file
+/// has LF-only headers and CRLF only inside its content lines), so it is restored to LF.
+fn clipboard_patch_bytes(text: &str) -> Result<Vec<u8>> {
+    if text.len() > 16 * 1024 * 1024 {
+        return Err(fail("Patch exceeds the 16 MiB limit"));
+    }
+    let text = text.trim_start_matches('\u{feff}');
+    let looks_like_patch = text.lines().any(|line| {
+        line.starts_with("diff --git ")
+            || line.starts_with("--- ")
+            || line.starts_with("@@ ")
+            || line.starts_with("GIT binary patch")
+    });
+    if !looks_like_patch {
+        return Err(fail("The clipboard does not contain a patch"));
+    }
+    let first_line_is_crlf = text
+        .split_once('\n')
+        .is_some_and(|(line, _)| line.ends_with('\r'));
+    let mut bytes = if first_line_is_crlf {
+        text.replace("\r\n", "\n").into_bytes()
+    } else {
+        text.as_bytes().to_vec()
+    };
+    if !bytes.ends_with(b"\n") {
+        bytes.push(b'\n');
+    }
+    Ok(bytes)
+}
+
+/// Checks the exact bytes against the index and working folder, then applies them to both. The
+/// reviewed bytes stay immutable between `--check` and `--index`: a file supplied by another
+/// application may be rewritten while Git runs.
+fn apply_reviewed_patch(
+    p: &Path,
+    bytes: &[u8],
+    expected: &str,
+    invoke: &dyn Fn(&[&str]) -> Result<String>,
+) -> Result<String> {
+    let scratch = git_path(
+        p,
+        &format!(
+            "gall-patch-{}-{}.patch",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| fail(e.to_string()))?
+                .as_nanos()
+        ),
+    )?;
+    let mut temporary = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&scratch)
+        .map_err(|e| fail(e.to_string()))?;
+    temporary
+        .write_all(bytes)
+        .map_err(|e| fail(e.to_string()))?;
+    drop(temporary);
+    let name = scratch
+        .to_str()
+        .ok_or_else(|| fail("Git directory must be UTF-8"))?;
+    let name = super::gitexec::path_arg(p, Path::new(name))
+        .to_string_lossy()
+        .into_owned();
+    let name = name.as_str();
+    let result = (|| {
+        invoke(&["apply", "--check", "--index", "--", name])?;
+        if snapshot(p, None)?.token != expected {
+            return Err(fail(
+                "Repository changed while checking the patch. Review again",
+            ));
+        }
+        recover_head(p)?;
+        invoke(&["apply", "--index", "--", name])
+    })();
+    let _ = std::fs::remove_file(scratch);
+    result
 }
 
 #[cfg(test)]
@@ -1194,6 +1609,112 @@ mod tests {
             &AtomicBool::new(false),
             |_| {},
         )
+    }
+
+    #[test]
+    fn main_worktree_config_preserves_quoted_paths_and_rejects_ambiguity() {
+        assert_eq!(
+            configured_worktree("[core]\nworktree = ../../../module with spaces č\n"),
+            Some("../../../module with spaces č".into())
+        );
+        assert_eq!(
+            configured_worktree("[Core]\nworktree = \"../space \\\"quote\\\" \\t č \" ; comment\n"),
+            Some("../space \"quote\" \t č ".into())
+        );
+        assert_eq!(
+            configured_worktree("[core]\nworktree = \"C:\\\\source\\\\module\"\n"),
+            Some("C:\\source\\module".into())
+        );
+        for config in [
+            "[core]\nworktree = \"unterminated\n",
+            "[core]\nworktree = ../bad\\q\n",
+            "[core]\nworktree = ../one\n[include]\npath = other\n",
+        ] {
+            assert_eq!(configured_worktree(config), None);
+        }
+    }
+
+    #[test]
+    fn separate_git_directory_lists_its_actual_main_worktree() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("working folder");
+        fs::create_dir(&root).unwrap();
+        init(&root);
+        fs::write(root.join("file.txt"), "content\n").unwrap();
+        commit(&root, "First");
+        let metadata = reported(directory.path()).join("separate metadata");
+        git(
+            &root,
+            &[
+                "init",
+                "-q",
+                "--separate-git-dir",
+                metadata.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        let trees = worktrees(&reported(&root)).unwrap();
+        assert_eq!(trees.len(), 1);
+        assert_eq!(Path::new(&trees[0].path), reported(&root));
+    }
+
+    #[test]
+    fn submodule_worktree_paths_identify_actual_folders_from_main_and_linked_trees() {
+        let source = tempfile::tempdir().unwrap();
+        init(source.path());
+        fs::write(source.path().join("file.txt"), "content\n").unwrap();
+        commit(source.path(), "Source");
+        let parent = tempfile::tempdir().unwrap();
+        init(parent.path());
+        git(
+            parent.path(),
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "-c",
+                "core.autocrlf=false",
+                "submodule",
+                "add",
+                "--",
+                source.path().to_str().unwrap(),
+                "module with spaces č",
+            ],
+        )
+        .unwrap();
+        commit(parent.path(), "Add submodule");
+        let module = reported(&parent.path().join("module with spaces č"));
+        git(&module, &["config", "core.autocrlf", "false"]).unwrap();
+        let trees = worktrees(&module).unwrap();
+        assert_eq!(trees.len(), 1);
+        assert_eq!(Path::new(&trees[0].path), module);
+        assert!(act(
+            &module,
+            Request::RemoveWorktree {
+                destination: trees[0].path.clone(),
+            },
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("current or main worktree"));
+        let linked = reported(parent.path()).join("linked module");
+        git(
+            &module,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "linked",
+                linked.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        for current in [&module, &linked] {
+            let trees = worktrees(current).unwrap();
+            assert_eq!(trees.len(), 2);
+            assert_eq!(Path::new(&trees[0].path), module);
+            assert_eq!(Path::new(&trees[1].path), linked);
+        }
     }
 
     #[test]
@@ -1284,6 +1805,11 @@ mod tests {
         .is_err());
     }
 
+    /// Git 2.51 dropped the quotes around the term ("first bad commit").
+    fn found_first_bad(log: &str) -> bool {
+        log.contains("first 'bad' commit") || log.contains("first bad commit")
+    }
+
     #[test]
     fn bisect_finds_bad_commit_and_returns_to_start() {
         let directory = tempfile::tempdir().unwrap();
@@ -1304,7 +1830,7 @@ mod tests {
         .unwrap();
         for _ in 0..8 {
             let state = snapshot(root, None).unwrap().bisect.unwrap();
-            if state.log.contains("first 'bad' commit") {
+            if found_first_bad(&state.log) {
                 break;
             }
             let position = commits.iter().position(|id| *id == state.current).unwrap();
@@ -1320,7 +1846,7 @@ mod tests {
         }
         let state = snapshot(root, None).unwrap().bisect.unwrap();
         assert!(
-            state.log.contains("first 'bad' commit"),
+            found_first_bad(&state.log),
             "{}\nCurrent: {}\nCandidate: {}",
             state.log,
             state.current,
@@ -1433,6 +1959,58 @@ mod tests {
             fs::read_to_string(root.join("file.txt")).unwrap(),
             "second\n"
         );
+    }
+
+    #[test]
+    fn copied_commit_patch_applies_from_clipboard_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        init(root);
+        fs::write(root.join("file.txt"), "first\n").unwrap();
+        let first = commit(root, "First");
+        fs::write(root.join("file.txt"), "second\n").unwrap();
+        fs::write(root.join("added.txt"), "new\n").unwrap();
+        let second = commit(root, "Second");
+        let text = super::super::gitinspect::commit_patch_text(root, &second).unwrap();
+        assert!(text.contains("Subject: [PATCH] Second") && text.contains("+second"));
+        // A root commit has a patch too.
+        assert!(super::super::gitinspect::commit_patch_text(root, &first)
+            .unwrap()
+            .contains("+first"));
+
+        // Not a patch: refused before anything changes.
+        git(root, &["checkout", "--detach", "-q", &first]).unwrap();
+        assert!(act(
+            root,
+            Request::ApplyPatchText {
+                text: "just some text".into()
+            }
+        )
+        .is_err());
+        assert_eq!(
+            fs::read_to_string(root.join("file.txt")).unwrap(),
+            "first\n"
+        );
+
+        // A clipboard that turned every line break into CRLF still applies.
+        act(
+            root,
+            Request::ApplyPatchText {
+                text: text.replace('\n', "\r\n"),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("file.txt")).unwrap(),
+            "second\n"
+        );
+        assert_eq!(fs::read_to_string(root.join("added.txt")).unwrap(), "new\n");
+        assert!(git(root, &["diff", "--cached", "--no-ext-diff"])
+            .unwrap()
+            .contains("+second"));
+        assert_eq!(git(root, &["rev-parse", "HEAD"]).unwrap().trim(), first);
+        // The same patch cannot be applied twice.
+        assert!(act(root, Request::ApplyPatchText { text }).is_err());
     }
 
     #[test]
@@ -1591,6 +2169,57 @@ mod tests {
         )
         .unwrap();
         assert!(invalid.join("file.txt").exists());
+    }
+
+    #[test]
+    fn submodule_tree_lists_nested_submodules_depth_first() {
+        let allow = [
+            "-c",
+            "protocol.file.allow=always",
+            "-c",
+            "core.autocrlf=false",
+        ];
+        let add = |host: &Path, source: &Path, name: &str| {
+            let mut args = allow.to_vec();
+            args.extend(["submodule", "add", "--", source.to_str().unwrap(), name]);
+            git(host, &args).unwrap();
+        };
+        let leaf = tempfile::tempdir().unwrap();
+        init(leaf.path());
+        fs::write(leaf.path().join("file.txt"), "leaf\n").unwrap();
+        commit(leaf.path(), "Leaf");
+        let middle = tempfile::tempdir().unwrap();
+        init(middle.path());
+        add(middle.path(), leaf.path(), "inner");
+        commit(middle.path(), "Middle");
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path();
+        init(root);
+        add(root, middle.path(), "mid");
+        add(root, leaf.path(), "zlast");
+        commit(root, "Outer");
+        let mut update = allow.to_vec();
+        update.extend(["submodule", "update", "--init"]);
+        git(&root.join("mid"), &update).unwrap();
+        let tree = submodule_tree(root).unwrap();
+        let listed: Vec<_> = tree
+            .entries
+            .iter()
+            .map(|e| (e.label.as_str(), e.name.as_str(), e.depth))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                ("mid", "mid", 0),
+                ("mid/inner", "inner", 1),
+                ("zlast", "zlast", 0)
+            ]
+        );
+        assert!(tree.entries[1].path.ends_with("inner"));
+        assert!(submodule_tree(outer.path().join("zlast").as_path())
+            .unwrap()
+            .entries
+            .is_empty());
     }
 
     #[test]
@@ -1861,6 +2490,53 @@ mod tests {
         fs::remove_dir(tree.join("empty-cache")).unwrap();
         act(p, Request::RemoveWorktree { destination }).unwrap();
         assert!(!tree.exists());
+    }
+
+    #[test]
+    fn worktree_removal_with_ignored_files_still_refuses_other_untracked_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let p = directory.path();
+        init(p);
+        fs::write(p.join(".gitignore"), "cache\n").unwrap();
+        let head = commit(p, "Ignore local caches");
+        let destinations = tempfile::tempdir().unwrap();
+        let tree = reported(destinations.path()).join("worktree");
+        let destination = tree.to_str().unwrap().to_owned();
+        act(
+            p,
+            Request::CreateWorktree {
+                destination: destination.clone(),
+                target: head,
+                branch: Some("topic".into()),
+            },
+        )
+        .unwrap();
+        fs::write(tree.join("cache"), "ignored cache\n").unwrap();
+        fs::write(tree.join("notes.txt"), "not ignored\n").unwrap();
+        assert!(act(
+            p,
+            Request::RemoveWorktreeWithIgnored {
+                destination: destination.clone()
+            }
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("Commit or stash local changes"));
+        assert!(tree.join("cache").is_file() && tree.join("notes.txt").is_file());
+        let plain = act(
+            p,
+            Request::RemoveWorktree {
+                destination: destination.clone(),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(plain.contains("Untracked files are present"), "{plain}");
+        assert!(!plain.contains("ignored"), "{plain}");
+        fs::remove_file(tree.join("notes.txt")).unwrap();
+        act(p, Request::RemoveWorktreeWithIgnored { destination }).unwrap();
+        assert!(!tree.exists());
+        assert_eq!(snapshot(p, None).unwrap().worktrees.len(), 1);
     }
 
     #[test]

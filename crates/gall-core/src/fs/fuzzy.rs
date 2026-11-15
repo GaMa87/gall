@@ -139,6 +139,8 @@ pub fn fold_char(c: char) -> char {
 
 impl Query {
     pub fn parse(q: &str) -> Self {
+        // Names are matched composed (NFC), see `util::unicode`.
+        let q = crate::util::unicode::nfc(q);
         let mut raw: Vec<&str> = q.split_whitespace().collect();
         // A trailing separator ("proj/", "src/comp/") asks for directories: drop it
         // from the last term (directory paths are indexed without one).
@@ -204,6 +206,15 @@ impl Query {
     /// Scores `path`, whose file name starts at byte `name_start`.
     /// Returns `None` when any term fails.
     pub fn score(&self, path: &str, name_start: usize, s: &mut Scratch) -> Option<Match> {
+        // A decomposed (NFD) name, as macOS volumes and some archives give, is matched
+        // composed; positions then count the composed characters.
+        if !path.is_ascii() {
+            let composed = crate::util::unicode::nfc(path);
+            if composed != path {
+                let start = crate::util::unicode::nfc(&path[..name_start.min(path.len())]).len();
+                return self.score(&composed, start, s);
+            }
+        }
         if !self.prefilter(path) {
             return None;
         }

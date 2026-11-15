@@ -4,7 +4,7 @@
 // The leader key (Space by default) opens a which-key menu of grouped
 // commands. Sequences are resolved here as pure data so they are testable;
 // App.tsx feeds key tokens in and runs the resulting action.
-import { altGrChar, buildKeymap, normalizeChord, optionChar, type Action, type Keymap } from "./keymap";
+import { altGrChar, buildKeymap, IS_MAC, normalizeChord, optionChar, type Action, type Keymap } from "./keymap";
 
 export interface KeyNode {
   label: string;
@@ -390,12 +390,12 @@ export function resolve(tree: KeyNode, seq: string[]): Resolved {
 }
 
 /** Converts a keyboard event into a vim key token; letter case follows Shift, not Caps Lock. */
-export function vimToken(e: { key: string; code?: string; ctrlKey: boolean; metaKey: boolean; altKey: boolean; shiftKey?: boolean; getModifierState?: (k: "AltGraph") => boolean }): string | null {
+export function vimToken(e: { key: string; code?: string; ctrlKey: boolean; metaKey: boolean; altKey: boolean; shiftKey?: boolean; getModifierState?: (k: "AltGraph") => boolean }, mac = IS_MAC): string | null {
   if (["Control", "Shift", "Alt", "Meta", "CapsLock", "AltGraph"].includes(e.key)) return null;
   // "[", "~" or "\" typed with AltGr (Ctrl+Alt on Windows) or Option (macOS) are those
   // keys. An Option chord that is a shortcut (Option+C) still reaches the shortcut map:
   // its character is bound to no vim key.
-  if (altGrChar(e) || optionChar(e, () => false)) return e.key;
+  if (altGrChar(e) || optionChar(e, () => false, mac)) return e.key;
   if (e.altKey) return null;
   if (e.ctrlKey || e.metaKey) {
     // Ctrl+Shift+letter belongs to the normal shortcuts (Ctrl+Shift+D compare,

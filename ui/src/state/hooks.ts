@@ -162,6 +162,36 @@ export function useNonce(): number {
  * or when off. Refreshed when the folder changes and when the window gets the focus
  * back (after a commit in a terminal); one request at a time.
  */
+const gitSubs = new Set<() => void>();
+/** Reloads every folder's Git status and trust state (after a refused repository was trusted). */
+export function bumpGitStatus() {
+  gitSubs.forEach((f) => f());
+}
+
+/**
+ * The repository path when Git refuses the folder's repository as owned by another user
+ * ("dubious ownership"), which hides the branch and the badges; null otherwise. Only asked
+ * while there is no status (`hasGit` false), so a working repository costs nothing.
+ */
+export function useGitUntrusted(path: string, enabled: boolean, hasGit: boolean): string | null {
+  const [state, setState] = useState<{ path: string; repo: string | null } | null>(null);
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    const again = () => setTick((n) => n + 1);
+    gitSubs.add(again);
+    return () => { gitSubs.delete(again); };
+  }, []);
+  useEffect(() => {
+    if (!enabled || !path || hasGit || archiveOf(path)) { setState(null); return; }
+    let alive = true;
+    api.gitUntrusted(path)
+      .then((repo) => alive && setState({ path, repo }))
+      .catch(() => alive && setState({ path, repo: null }));
+    return () => { alive = false; };
+  }, [path, enabled, hasGit, tick]);
+  return state && state.path === path ? state.repo : null;
+}
+
 export function useGitStatus(path: string, enabled: boolean): GitStatus | null {
   const [st, setSt] = useState<{ path: string; st: GitStatus | null } | null>(null);
   useEffect(() => {
@@ -188,10 +218,12 @@ export function useGitStatus(path: string, enabled: boolean): GitStatus | null {
     load();
     const off = onFolderChanged(path, soon);
     window.addEventListener("focus", soon);
+    gitSubs.add(soon);
     return () => {
       alive = false;
       clearTimeout(timer);
       off();
+      gitSubs.delete(soon);
       window.removeEventListener("focus", soon);
     };
   }, [path, enabled]);

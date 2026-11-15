@@ -2,10 +2,11 @@
 import { archiveOf, createFormatFor, isBrowsableArchive, type ArchiveFormat } from "../core/archive";
 import { api, events, setMediaBase, type FavCmd, type MarkCmd, type SessionCmd } from "../api/ipc";
 import type { ConflictInfo, ConflictPolicy, DiffSource, Drive, FileEntry, Layout, Settings, TaskKind, Volume } from "../api/types";
+import { coalesced } from "../core/coalesce";
 import { etaSeconds, updateRate, type Rate } from "../core/eta";
 import { ancestors, backOutside, basename, isInside, join, parent, splitExt, tildify } from "../core/path";
 import { controller, emitFolderChanged, refreshAll } from "./controllers";
-import { bumpSearchHidden } from "./hooks";
+import { bumpGitStatus, bumpSearchHidden } from "./hooks";
 import { getState, setState, type DialogSpec, type FolderSize, type MenuItem, type NoteKind, type Overlay, type UiState } from "./store";
 import { formatSize } from "../core/format";
 import { keyboardSettings } from "../core/keymap";
@@ -34,8 +35,8 @@ function scheduleNotes() {
   }, Math.max(50, next - Date.now()));
 }
 
-export function notify(text: string, kind: NoteKind = "info", action?: { label: string; run: () => void }) {
-  const n = { id: noteSeq++, kind, text, at: Date.now(), action };
+export function notify(text: string, kind: NoteKind = "info", action?: { label: string; run: () => void }, expected = false) {
+  const n = { id: noteSeq++, kind, text, at: Date.now(), action, expected };
   setState((s) => ({
     notifications: [...s.notifications.filter((o) => o.text !== text || o.kind !== kind), n].slice(-5),
     notificationLog: [n, ...s.notificationLog].slice(0, 100),
@@ -68,8 +69,14 @@ export function holdNotes(hold: boolean) {
   scheduleNotes();
 }
 
+/** An error that `readableError` turned into plain words is an everyday condition (no permission,
+ *  name taken, file in use), not a Gall bug, so its toast gets no "Report a bug" button. */
+function errorNote(raw: string, text = readableError(raw)) {
+  notify(text, "error", undefined, text !== raw);
+}
+
 export function fail(err: unknown) {
-  notify(readableError(String(err)), "error");
+  errorNote(String(err));
   api.uiLog("error", String(err)).catch(() => {});
 }
 
@@ -206,6 +213,25 @@ export async function confirm(title: string, message: string, okLabel = "OK", da
   return r?.button === "ok";
 }
 
+/**
+ * Git refuses a repository owned by another user (a WSL folder opened from Windows, a network
+ * share). After a confirmation, adds exactly the path Git names to its global safe.directory.
+ * Returns false when Git does not refuse the folder, so the caller can say it is no repository.
+ */
+export async function trustGitFolder(path: string): Promise<boolean> {
+  const repo = await api.gitUntrusted(path).catch(() => null);
+  if (!repo) return false;
+  const ok = await confirm("Trust this Git repository?",
+    `Git refuses to read this repository because it belongs to another user (for example a WSL folder opened from Windows, or a network share):\n\n${repo}\n\nTrusting adds it to Git's global safe.directory list. Only do this for repositories you trust: their configuration can run commands.`, "Trust");
+  if (!ok) return true;
+  try {
+    await api.gitTrust(path);
+    bumpGitStatus();
+    notify("Git repository trusted");
+  } catch (e) { notify(`Could not trust the repository: ${e}`, "error"); }
+  return true;
+}
+
 export async function promptText(title: string, value: string, okLabel = "OK", select?: [number, number]): Promise<string | null> {
   const r = await dialog({ title, input: { value, select }, buttons: [{ id: "cancel", label: "Cancel" }, { id: "ok", label: okLabel, primary: true }] });
   return r && r.button !== "cancel" ? r.value : null;
@@ -218,6 +244,7 @@ export function showMenu(x: number, y: number, items: MenuItem[]) {
 // ───────────── bootstrap ─────────────
 
 export async function bootstrap() {
+  const began = performance.now();
   // Startup timing goes to the log: slow calls show up there.
   const timed = <T,>(name: string, p: Promise<T>): Promise<T> => {
     const t = performance.now();
@@ -226,82 +253,114 @@ export async function bootstrap() {
       if (ms > 50) api.uiLog("info", `startup: ${name} took ${Math.round(ms)} ms`).catch(() => {});
     });
   };
-  const [info, settings, session, favorites, marks, history, drives, args] = await Promise.all([
+  // The history and the drives are not needed to show the folders, and both can be slow
+  // (the history looks at every folder in it, a network share that does not answer
+  // included; the drives ask every mount): they are asked for at once, but the window
+  // does not wait for the history at all and for the drives only briefly, so the
+  // sidebar is normally complete when it appears.
+  const history = timed("history", api.historyGet()).then((history) => setState({ history })).catch(() => {});
+  const drives = timed("drives", api.listDrives()).then((drives) => setState({ drives })).catch(() => {});
+  void history;
+  // The listeners are registered while the state loads (one message each): events of
+  // the first folders must find them.
+  const listening = listen();
+  const [info, settings, session, favorites, marks, args] = await Promise.all([
     timed("appInfo", api.appInfo()), timed("settings", api.getSettings()), timed("session", api.sessionGet()),
-    timed("favorites", api.favoritesGet()), timed("marks", api.marksGet()), timed("history", api.historyGet()),
-    timed("drives", api.listDrives()), timed("args", api.startupArgs()),
+    timed("favorites", api.favoritesGet()), timed("marks", api.marksGet()), timed("args", api.startupArgs()),
   ]);
+  const fetched = performance.now();
+  await Promise.race([drives, new Promise((done) => setTimeout(done, 150))]);
+  const withDrives = performance.now();
+  await listening;
+  api.uiLog("info", `startup: state fetched ${Math.round(fetched - began)} ms, drives +${Math.round(withDrives - fetched)} ms, listeners +${Math.round(performance.now() - withDrives)} ms`).catch(() => {});
   setMediaBase(info.mediaBase);
-  setState({ info, settings: keyboardSettings(settings), session, favorites, marks, history, drives, sidebarVisible: true });
+  setState({ info, settings: keyboardSettings(settings), session, favorites, marks, sidebarVisible: true });
   if (info.startupNotice) notify(info.startupNotice, "warn");
   applyCliArgs(args);
   // First start: the welcome setup (not during self-tests, which start with fresh settings).
   if (info.firstRun && !args.selftest) openOverlay({ type: "welcome" });
   if (args.selftest) setTimeout(() => import("../selftest").then((m) => (args.selftestMode === "demo" ? m.runDemo() : args.selftestMode === "design" ? m.runDesignShots() : args.selftestMode === "audit" ? m.runUiAudit() : m.runSelfTest())), 1500);
-
-  await events.fsChanged(({ path, storm }) => {
-    if (storm) setStormNotice(path);
-    invalidateFolderSizes(path);
-    emitFolderChanged(path, storm);
-  });
-  await events.task((ev) => {
-    if (ev.state === "progress") {
-      // Bytes when known (copy/move), else items (delete).
-      const byBytes = ev.totalBytes > 0;
-      const now = Date.now();
-      const r = updateRate(taskRates.get(ev.id), now, byBytes ? ev.doneBytes : ev.doneItems);
-      taskRates.set(ev.id, r);
-      const eta = etaSeconds(r, byBytes ? ev.totalBytes : ev.totalItems, now);
-      setState((s) => ({ tasks: { ...s.tasks, [ev.id]: { ...ev, eta } } }));
-      return;
-    }
-    taskRates.delete(ev.id);
-    const replaceReq = replaceRequests.get(ev.id);
-    replaceRequests.delete(ev.id);
-    const cutPaths = cutPastes.get(ev.id);
-    cutPastes.delete(ev.id);
-    // Not when a permanent replace is about to be offered: that retries the move.
-    const retrying = !!replaceReq && ev.state === "failed" && String(ev.error).startsWith("no-trash:");
-    if (cutPaths && ev.state !== "done" && !retrying) void restoreCut(cutPaths);
-    setState((s) => {
-      const t = { ...s.tasks };
-      delete t[ev.id];
-      return { tasks: t };
-    });
-    const verb: Record<TaskKind, string> = { copy: "Copied", move: "Moved", delete: "Deleted", compress: "Created", extract: "Extracted", duplicate: "Duplicated" };
-    if (ev.state === "done" && (ev.kind === "compress" || (ev.kind === "extract" && ev.items === 1))) {
-      notify(ev.kind === "compress" ? `Created “${ev.name}”` : `Extracted to “${ev.name}”`, "success", { label: "Undo", run: undo });
-    } else if (ev.state === "done") {
-      const what = ev.name && ev.items === 1 ? `“${ev.name}”` : items(ev.items);
-      const to = ev.to && ev.kind !== "delete" ? ` to ${ev.to}` : "";
-      const text = ev.name && ev.items === 0 && ev.skipped
-        ? `Skipped “${ev.name}”`
-        : `${verb[ev.kind]} ${what}${to}${ev.skipped ? `, skipped ${ev.skipped}` : ""}`;
-      notify(text, "success",
-        ev.kind !== "delete" ? { label: "Undo", run: undo } : undefined);
-    } else if (ev.state === "failed" && replaceReq && String(ev.error).startsWith("no-trash:")) {
-      void offerPermanentReplace(replaceReq, String(ev.error));
-    } else if (ev.state === "failed") {
-      const msg = readableError(String(ev.error));
-      notify(msg.startsWith("Cannot ") ? msg : `${ev.kind} failed: ${msg}`, "error");
-    }
-    else notify(`${ev.kind} cancelled`, "warn");
-    refreshUndo();
-    invalidateAllFolderSizes();
-    // A folder deleted or moved away leaves the history (the backend drops gone folders).
-    if (ev.kind === "delete" || ev.kind === "move") {
-      api.historyGet().then((history) => setState({ history })).catch(() => {});
-    }
-  });
-  await events.folderSizeProgress(applyFolderSizeProgress);
-  await events.secondInstance((a) => applyCliArgs(a));
-  // Backend warnings and errors: never only in the log file.
-  await events.backendLog((l) => notify(l.msg, l.level));
-  for (const l of await api.logBacklog().catch(() => [])) notify(l.msg, l.level);
-  setInterval(refreshDrives, 5000);
+  // Backend warnings and errors from before the UI listened: never only in the log file.
+  // Not awaited: the window appears without waiting for them.
+  void api.logBacklog().then((lines) => { for (const l of lines) notify(l.msg, l.level); }).catch(() => {});
+  // Drives are asked for every few seconds (each time a walk over the mounts and, on
+  // Linux, two `lsblk` processes): not while the window is hidden (minimized, on another
+  // desktop), and at once when it shows again.
+  const visible = () => typeof document === "undefined" || !document.hidden;
+  setInterval(() => { if (visible()) void refreshDrives(); }, 5000);
   refreshCloud();
   // Clients can be installed or signed in while Gall runs.
-  setInterval(refreshCloud, 60_000);
+  setInterval(() => { if (visible()) void refreshCloud(); }, 60_000);
+  document.addEventListener("visibilitychange", () => {
+    if (visible()) {
+      void refreshDrives();
+      void refreshCloud();
+    }
+  });
+}
+
+/** Registers the backend listeners, all at once. */
+function listen(): Promise<unknown> {
+  return Promise.all([
+    events.fsChanged(({ path, storm }) => {
+      if (storm) setStormNotice(path);
+      invalidateFolderSizes(path);
+      emitFolderChanged(path, storm);
+    }),
+    events.task((ev) => {
+      if (ev.state === "progress") {
+        // Bytes when known (copy/move), else items (delete).
+        const byBytes = ev.totalBytes > 0;
+        const now = Date.now();
+        const r = updateRate(taskRates.get(ev.id), now, byBytes ? ev.doneBytes : ev.doneItems);
+        taskRates.set(ev.id, r);
+        const eta = etaSeconds(r, byBytes ? ev.totalBytes : ev.totalItems, now);
+        setState((s) => ({ tasks: { ...s.tasks, [ev.id]: { ...ev, eta } } }));
+        return;
+      }
+      taskRates.delete(ev.id);
+      const replaceReq = replaceRequests.get(ev.id);
+      replaceRequests.delete(ev.id);
+      const cutPaths = cutPastes.get(ev.id);
+      cutPastes.delete(ev.id);
+      // Not when a permanent replace is about to be offered: that retries the move.
+      const retrying = !!replaceReq && ev.state === "failed" && String(ev.error).startsWith("no-trash:");
+      if (cutPaths && ev.state !== "done" && !retrying) void restoreCut(cutPaths);
+      setState((s) => {
+        const t = { ...s.tasks };
+        delete t[ev.id];
+        return { tasks: t };
+      });
+      const verb: Record<TaskKind, string> = { copy: "Copied", move: "Moved", delete: "Deleted", compress: "Created", extract: "Extracted", duplicate: "Duplicated" };
+      if (ev.state === "done" && (ev.kind === "compress" || (ev.kind === "extract" && ev.items === 1))) {
+        notify(ev.kind === "compress" ? `Created “${ev.name}”` : `Extracted to “${ev.name}”`, "success", { label: "Undo", run: undo });
+      } else if (ev.state === "done") {
+        const what = ev.name && ev.items === 1 ? `“${ev.name}”` : items(ev.items);
+        const to = ev.to && ev.kind !== "delete" ? ` to ${ev.to}` : "";
+        const text = ev.name && ev.items === 0 && ev.skipped
+          ? `Skipped “${ev.name}”`
+          : `${verb[ev.kind]} ${what}${to}${ev.skipped ? `, skipped ${ev.skipped}` : ""}`;
+        notify(text, "success",
+          ev.kind !== "delete" ? { label: "Undo", run: undo } : undefined);
+      } else if (ev.state === "failed" && replaceReq && String(ev.error).startsWith("no-trash:")) {
+        void offerPermanentReplace(replaceReq, String(ev.error));
+      } else if (ev.state === "failed") {
+        const msg = readableError(String(ev.error));
+        notify(msg.startsWith("Cannot ") ? msg : `${ev.kind} failed: ${msg}`, "error", undefined, msg !== String(ev.error));
+      }
+      else notify(`${ev.kind} cancelled`, "warn");
+      refreshUndo();
+      invalidateAllFolderSizes();
+      // A folder deleted or moved away leaves the history (the backend drops gone folders).
+      if (ev.kind === "delete" || ev.kind === "move") {
+        api.historyGet().then((history) => setState({ history })).catch(() => {});
+      }
+    }),
+    events.folderSizeProgress(applyFolderSizeProgress),
+    events.secondInstance((a) => applyCliArgs(a)),
+    // Backend warnings and errors: never only in the log file.
+    events.backendLog((l) => notify(l.msg, l.level)),
+  ]);
 }
 
 let stormShown = 0;
@@ -439,18 +498,29 @@ export async function refreshCloud() {
 
 // ───────────── settings ─────────────
 
-export async function updateSettings(patch: Partial<Settings>) {
-  const s = getState().settings;
-  if (!s) return;
-  const next = keyboardSettings(s, patch);
-  const changedKeys = next.keyboardProfile !== s.keyboardProfile || next.leaderKey !== s.leaderKey || next.leaderKeyBasic !== s.leaderKeyBasic;
-  setState({ settings: next, ...(changedKeys ? { keySeq: [] } : {}) });
+/** Writes the settings to the backend; a field that changes with every key (text, a
+ *  colour being picked) waits for a pause, because each write is a file synced to disk
+ *  and makes every browser ask for its folder's view again. */
+const settingsSave = coalesced(async (next: Settings) => {
   try {
     await api.setSettings(next);
     setState({ settingsRev: getState().settingsRev + 1 });
   } catch (e) {
     fail(e);
   }
+}, 300);
+if (typeof window !== "undefined") window.addEventListener("pagehide", () => void settingsSave.flush());
+
+/** Changes settings. The UI has them at once; with `whileTyping` they are saved after a
+ *  short pause, else now (and the promise waits for it). */
+export async function updateSettings(patch: Partial<Settings>, whileTyping = false) {
+  const s = getState().settings;
+  if (!s) return;
+  const next = keyboardSettings(s, patch);
+  const changedKeys = next.keyboardProfile !== s.keyboardProfile || next.leaderKey !== s.leaderKey || next.leaderKeyBasic !== s.leaderKeyBasic;
+  setState({ settings: next, ...(changedKeys ? { keySeq: [] } : {}) });
+  if (whileTyping) settingsSave.later(next);
+  else await settingsSave.now(next);
 }
 
 /** Forgets the sort and view kept for every folder (Settings › View). */
@@ -471,6 +541,7 @@ export async function resetAllSettings() {
     "Every setting, shortcut, folder colour, remembered program and folder view goes back to the default. Favourites, colour tags, history and open tabs stay.",
     "Reset", true))) return;
   try {
+    await settingsSave.flush();
     const settings = await api.resetSettings();
     setState({ settings: keyboardSettings(settings), keySeq: [], settingsRev: getState().settingsRev + 1 });
     notify("Settings reset to defaults");
@@ -585,7 +656,7 @@ export function columnsShown(s: Pick<UiState, "session" | "settings">, b: number
   const layout = s.session?.layout ?? "standard";
   const own = s.session?.browsers[b]?.columns?.[layout];
   if (own != null) return own;
-  return layout === "standard" ? s.settings?.showNavColumns ?? true : layout === "columns";
+  return layout === "standard" ? s.settings?.showNavColumns ?? false : layout === "columns";
 }
 
 /** Switches columns / breadcrumbs of one browser in the current layout; remembered with the session. */
@@ -1037,6 +1108,8 @@ async function runUndo(call: (permanent: boolean) => Promise<string>) {
     }
   }
   refreshUndo();
+  // Also after a failure: part of the operation may be undone.
+  invalidateAllFolderSizes();
 }
 
 type ConflictChoice = { policy: ConflictPolicy; merge: boolean };
@@ -1232,9 +1305,11 @@ export async function trashPaths(paths: string[]) {
     refreshAll();
     notify(`Moved ${named(paths)} to trash`, "info", { label: "Undo", run: undo });
     refreshUndo();
+    invalidateAllFolderSizes();
   } catch (e) {
     refreshAll();
     refreshUndo(); // part of the items may be in the trash
+    invalidateAllFolderSizes();
     const msg = String(e);
     if (!msg.startsWith("trash:")) return fail(e);
     // No trash here (network share, read-only trash, …): offer to delete for good.
@@ -1509,7 +1584,7 @@ export async function paste(b: number) {
         const r = await dialog({
           title: "Paste link",
           message: ext.url,
-          buttons: [{ id: "cancel", label: "Cancel" }, { id: "text", label: "As text file" }, { id: "url", label: "As link shortcut", primary: true }],
+          buttons: [{ id: "cancel", label: "Cancel" }, { id: "text", label: "As text file", key: "t" }, { id: "url", label: "As link shortcut", primary: true, key: "l" }],
         });
         if (!r || r.button === "cancel") return;
         const p = await api.clipPasteAsFile(dir, r.button as "text" | "url");
@@ -1608,18 +1683,24 @@ export function invalidateFolderSizes(path: string) {
   staleFolderSizes((p) => isInside(path, p));
 }
 
-/** A finished file task changed folders the watcher does not see (only the visible folders
- *  are watched, not the subfolders listed in them), so every cached total goes stale. */
+/** A finished file task, undo, trash or sync changed folders the watcher does not see (only
+ *  the visible folders are watched, not the subfolders listed in them), so every cached
+ *  total goes stale. */
 export function invalidateAllFolderSizes() {
   staleFolderSizes(() => true);
 }
 
 function staleFolderSizes(affects: (path: string) => boolean) {
+  // One new map and one update for all of them: an update per folder copied the whole
+  // map each time, which is felt after every file task once thousands are cached.
+  let folderSizes: Record<string, FolderSize> | undefined;
   for (const [p, f] of Object.entries(getState().folderSizes)) {
     if (!affects(p)) continue;
     sizeRevisions.set(p, (sizeRevisions.get(p) ?? 0) + 1);
-    putFolderSize(p, { ...f, at: 0 });
+    folderSizes ??= { ...getState().folderSizes };
+    folderSizes[p] = { ...f, at: 0 };
   }
+  if (folderSizes) setState({ folderSizes });
   scheduleFolderSizeRefresh();
 }
 

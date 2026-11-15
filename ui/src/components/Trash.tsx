@@ -86,7 +86,8 @@ export function TrashWindow() {
   };
 
   const restore = (list: TrashEntry[]) => list.length && run(async () => {
-    await api.trashRestore(list.map((e) => e.id));
+    // Also after a failure: part of the items may be restored.
+    await api.trashRestore(list.map((e) => e.id)).finally(A.invalidateAllFolderSizes);
     const first = list[0];
     const path = join(first.originalParent, first.name);
     A.notify(`Restored ${what(list)}`, "success", {
@@ -165,7 +166,7 @@ export function TrashWindow() {
   };
 
   const head = (key: SortKey, label: string, cls = "") => (
-    <span className={`h ${cls} ${sort.key === key ? "on" : ""}`} onClick={() => setSort((s) => ({ key, desc: s.key === key ? !s.desc : key === "deleted" || key === "size" }))}>
+    <span className={`h ${cls} ${sort.key === key ? "on" : ""}`} title={`Sort by ${label}`} onClick={() => setSort((s) => ({ key, desc: s.key === key ? !s.desc : key === "deleted" || key === "size" }))}>
       {label}{sort.key === key ? (sort.desc ? " ↓" : " ↑") : ""}
     </span>
   );
@@ -219,7 +220,7 @@ export function TrashWindow() {
           <button className="btn primary" disabled={!picked.length || busy} onClick={() => restore(picked)}>
             Restore{picked.length > 1 ? ` ${picked.length} items` : ""}
           </button>
-          <button className="btn" disabled={!picked.length || busy} onClick={() => purge(picked)}>Delete permanently</button>
+          <button className="btn" disabled={!picked.length || busy} title="Del" onClick={() => purge(picked)}>Delete permanently</button>
           <span className="tw-hint">Enter restore · Del delete · Ctrl+A all</span>
           <button className="btn danger" disabled={!items?.length || busy} onClick={empty}>Empty trash</button>
         </div>

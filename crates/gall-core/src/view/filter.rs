@@ -5,6 +5,11 @@ pub fn quick_filter_matches(name: &str, query: &str) -> bool {
     if query.is_empty() {
         return true;
     }
+    let (name, query) = (
+        crate::util::unicode::nfc(name),
+        crate::util::unicode::nfc(query),
+    );
+    let (name, query): (&str, &str) = (&name, &query);
     // Typed without accents, "porocilo" also finds "Poročilo" (see `fuzzy::fold_char`).
     let fold = query.chars().all(|c| crate::fs::fuzzy::fold_char(c) == c);
     let n: String = if fold {
@@ -53,5 +58,14 @@ mod tests {
         assert!(!m("Report.pdf.txt", ".pdf"));
         assert!(!m(".bashrc", ".bash"), "dot-files have no extension");
         assert!(m("anything", ""));
+    }
+
+    /// macOS volumes hand out decomposed names ("c" + U+030C); typing "č" or "c" finds them.
+    #[test]
+    fn decomposed_names_match_composed_and_plain_queries() {
+        let nfd = "Poroc\u{30c}ilo.txt";
+        assert!(m(nfd, "poročilo"));
+        assert!(m(nfd, "porocilo"));
+        assert!(m("Poročilo.txt", "poroc\u{30c}ilo"));
     }
 }

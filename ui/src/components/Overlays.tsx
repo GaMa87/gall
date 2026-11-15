@@ -112,6 +112,9 @@ function MenuList({ items, x, y, onClose, depth = 0, active = true, onBack, star
       const vim = (getState().settings?.vimKeys ?? false) && !e.ctrlKey && !e.altKey && !e.metaKey;
       const k = vim ? ({ j: "ArrowDown", k: "ArrowUp", l: "ArrowRight", h: "ArrowLeft", q: "Escape" } as Record<string, string>)[e.key] ?? e.key : e.key;
       const cur = kb >= 0 ? items[kb] : undefined;
+      // An item's own accelerator wins over the Vim navigation keys (items never use h j k l q).
+      const accelerated = !e.ctrlKey && !e.altKey && !e.metaKey ? items.find((it) => it.accel === e.key && !it.separator && !it.disabled && !it.submenu) : undefined;
+      if (accelerated) { accelerated.run?.(); onClose(); } else
       if (k === "Escape" || (k === "ArrowLeft" && (depth > 0 || vim))) {
         if (depth > 0 && onBack) onBack();
         else onClose();
@@ -158,7 +161,7 @@ function MenuList({ items, x, y, onClose, depth = 0, active = true, onBack, star
             <span style={{ width: 16, display: "inline-flex" }}>{it.swatch ? <span className={`swatch ${it.checked ? "on" : ""}`} style={{ background: it.swatch }} /> : it.checked ? <Icon name="check" size={14} /> : it.icon ? <Icon name={it.icon} size={14} /> : null}</span>
             <span className="lbl">{ctrlHeld && it.ctrl ? it.ctrl.label : it.label}</span>
             {(() => {
-              const sc = it.action ? keys.action(it.action) : it.shortcut ? keys.chord(it.shortcut) : null;
+              const sc = it.action ? keys.action(it.action) : it.shortcut ? keys.chord(it.shortcut) : it.accel ?? null;
               return sc && <span className="sc">{sc}</span>;
             })()}
             {it.submenu && <Icon name="chevronRight" size={12} />}
@@ -198,9 +201,7 @@ export function ContextMenu() {
 
 /** Button label with its accelerator letter underlined (first occurrence, any case). */
 function AccelLabel({ label, k }: { label: string; k: string }) {
-  const i = label.toLowerCase().indexOf(k.toLowerCase());
-  if (i < 0) return <>{label}</>;
-  return <>{label.slice(0, i)}<u className="accel">{label[i]}</u>{label.slice(i + 1)}</>;
+  return <>{label} <span className="accel-key">({k})</span></>;
 }
 
 const dialogKeys = new WeakMap<DialogSpec, number>();
@@ -243,9 +244,10 @@ function Dialog({ d }: { d: DialogSpec }) {
           const plain = !e.ctrlKey && !e.altKey && !e.metaKey;
           // Vim keys (no text field to type into): h/l move between buttons, q cancels.
           const vimKey = vim && plain && !d.input ? e.key : "";
-          const left = e.key === "ArrowLeft" || vimKey === "h";
-          const right = e.key === "ArrowRight" || vimKey === "l";
           const accel = plain && !d.input && e.key.length === 1 ? d.buttons.find((b) => b.key === e.key.toLowerCase()) : undefined;
+          // A button's own accelerator wins over the Vim h/l navigation (e.g. `h` for a hard reset).
+          const left = e.key === "ArrowLeft" || (vimKey === "h" && !accel);
+          const right = e.key === "ArrowRight" || (vimKey === "l" && !accel);
           if (e.key === "Escape" || (vimKey === "q" && !accel)) finish(null);
           else if ((left || right) && plain && !d.input) {
             // Move focus between the buttons; Enter then presses the focused one.
@@ -280,8 +282,7 @@ function Dialog({ d }: { d: DialogSpec }) {
         </div>
         <div className="buttons" ref={buttonsRef}>
           {d.buttons.map((b) => (
-            <button key={b.id} data-id={b.id} className={`btn ${b.primary ? "primary" : ""} ${b.danger ? "danger" : ""}`} onClick={() => finish(b.id)}
-              title={b.key && !d.input ? `${b.label} (${b.key.toUpperCase()})` : undefined}>
+            <button key={b.id} data-id={b.id} className={`btn ${b.primary ? "primary" : ""} ${b.danger ? "danger" : ""}`} onClick={() => finish(b.id)}>
               {b.key && !d.input ? <AccelLabel label={b.label} k={b.key} /> : b.label}{b.hint && <small>{b.hint}</small>}
             </button>
           ))}
@@ -545,7 +546,7 @@ function TagPopup({ paths }: { paths: string[] }) {
           <p>Press a number key or click a colour. 0 removes the tag.</p>
           <div className="tags">
             {TAG_COLORS.map((c, i) => (
-              <button key={i} style={{ background: c || "var(--bg-3)", color: c ? "#fff" : "var(--fg)" }} onClick={() => apply(i)}>{i}</button>
+              <button key={i} style={{ background: c || "var(--bg-3)", color: c ? "#fff" : "var(--fg)" }} title={i === 0 ? "No colour tag" : `Colour tag ${i}`} onClick={() => apply(i)}>{i}</button>
             ))}
           </div>
         </div>
@@ -838,7 +839,7 @@ export function Notifications() {
             <span className="ti"><Icon name={NOTE_ICON[n.kind]} size={n.kind === "error" ? 18 : 16} /></span>
             <span className="t">{n.text}</span>
             {n.action && <button onClick={(e) => { e.stopPropagation(); n.action!.run(); A.dismiss(n.id); }}>{n.action.label}</button>}
-            {n.kind === "error" && <button onClick={(e) => { e.stopPropagation(); A.openOverlay({ type: "bugReport" }); }}>Report a bug</button>}
+            {n.kind === "error" && !n.expected && <button onClick={(e) => { e.stopPropagation(); A.openOverlay({ type: "bugReport" }); }}>Report a bug</button>}
             {n.kind === "error" && <span className="tx" title="Dismiss"><Icon name="close" size={12} /></span>}
           </div>
         ))}

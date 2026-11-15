@@ -65,15 +65,26 @@ pub fn work_tree(dir: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-/// The Git program to start for queries: the real executable from Git's own program folder
-/// (`git --exec-path`), found once, or plain `git` from `PATH` when that fails.
+/// The key of a status entry: macOS volumes may hold decomposed names while Git prints them
+/// composed, so there the key is composed and the UI looks names up composed. Elsewhere two
+/// names that differ only in normalization are two files.
+fn status_key(name: &str) -> String {
+    if cfg!(target_os = "macos") {
+        crate::util::unicode::nfc(name).into_owned()
+    } else {
+        name.to_string()
+    }
+}
+
+/// The Git program to start for every command: the real executable from Git's own program
+/// folder (`git --exec-path`), found once, or plain `git` from `PATH` when that fails.
 ///
 /// The `git` on `PATH` is often only a launcher that starts the real program: `cmd\git.exe`
 /// of Git for Windows, a Scoop shim in front of it, `xcrun` on macOS. Every hop is one more
 /// process, which about doubles the cost of a call on Windows, and a view makes dozens of
 /// them. The real program sets up its own environment (helper folders on `PATH`), so the
-/// result is the same. If it disappears (Git was updated while the app runs), `git` from
-/// `PATH` is used again.
+/// result is the same, credential helpers, `ssh` and LFS included. If it disappears (Git
+/// was updated while the app runs), `git` from `PATH` is used again.
 pub(super) fn program() -> &'static Path {
     static REAL: OnceLock<Option<PathBuf>> = OnceLock::new();
     match REAL.get_or_init(real_program) {
@@ -106,32 +117,38 @@ fn real_program() -> Option<PathBuf> {
 /// A git command with the protections described in the module docs; `overrides` are
 /// more `-c key=value` settings.
 fn git(dir: &Path, overrides: &[String]) -> Command {
-    let mut cmd = Command::new(program());
+    // In WSL the command runs inside the distribution (see `gitexec`), where a folder of
+    // the Windows temp directory does not exist and the null device does the same.
+    let hooks = if super::gitexec::place(dir).is_some() {
+        "core.hooksPath=/dev/null".to_string()
+    } else {
+        format!(
+            "core.hooksPath={}",
+            std::env::temp_dir().join("gall-no-git-hooks").display()
+        )
+    };
+    let mut cmd = super::gitexec::command(dir, program());
     cmd.env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
         .args(["-c", "core.fsmonitor=false", "-c"])
-        .arg(format!(
-            "core.hooksPath={}",
-            std::env::temp_dir().join("gall-no-git-hooks").display()
-        ));
+        .arg(hooks);
     for o in overrides {
         cmd.arg("-c").arg(o);
     }
     cmd.arg("-C")
-        .arg(dir)
+        .arg(super::gitexec::dir_arg(dir))
         .stdin(Stdio::null())
         .stderr(Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
     cmd
 }
 
 /// Runs `cmd` and returns its output, or None on failure or after [`TIMEOUT`].
 fn output(mut cmd: Command) -> Option<Vec<u8>> {
+    super::gitexec::forward_env(&mut cmd);
+    // For a repository in WSL: a shell that is already running in the distribution.
+    if let Some(answer) = super::gitexec::run(&cmd, TIMEOUT) {
+        return answer.ok().filter(|o| o.status.success()).map(|o| o.stdout);
+    }
     let mut child = cmd.stdout(Stdio::piped()).spawn().ok()?;
     let mut stdout = child.stdout.take()?;
     // The reader reports the end of the output, so the result is there the moment git
@@ -154,15 +171,11 @@ fn output(mut cmd: Command) -> Option<Vec<u8>> {
 /// Status of the items in `dir`; None outside a repository or when git is missing.
 pub fn status(dir: &Path) -> Option<GitStatus> {
     let root = work_tree(dir)?;
-    // The repository's filter commands, to switch them off for this call.
-    let mut cfg = git(dir, &[]);
-    cfg.args(["config", "-z", "--name-only", "--get-regexp"])
-        .arg(r"^filter\..*\.(clean|smudge|process)$");
-    let filters = output(cfg).unwrap_or_default();
-    let off: Vec<String> = filters
-        .split(|&b| b == 0)
-        .filter(|k| !k.is_empty())
-        .map(|k| format!("{}=", String::from_utf8_lossy(k)))
+    // The repository's filter commands, to switch them off for this call. They are asked
+    // for once and again when the configuration changes (see `gitfacts::filters`).
+    let off: Vec<String> = super::gitfacts::filters(&root)
+        .iter()
+        .map(|(key, _)| format!("{key}="))
         .collect();
     let mut cmd = git(dir, &off);
     cmd.args([
@@ -176,33 +189,239 @@ pub fn status(dir: &Path) -> Option<GitStatus> {
         "--",
         ".",
     ]);
-    let out = output(cmd)?;
+    let Some(out) = output(cmd) else {
+        // No answer: Git may refuse the repository now (see `untrusted`).
+        if let Ok(mut known) = trusted().lock() {
+            known.remove(&root);
+        }
+        return None;
+    };
     let rel = dir.strip_prefix(&root).ok()?;
     let mut prefix = rel.to_string_lossy().replace('\\', "/");
     if !prefix.is_empty() {
         prefix.push('/');
     }
     let mut st = parse(&out, &prefix);
-    let mut summary = git(dir, &off);
-    summary.args(["log", "--no-show-signature", "-1", "--format=%s", "HEAD"]);
-    st.subject = output(summary).map(|out| String::from_utf8_lossy(&out).trim_end().to_string());
-    if st.branch.is_none() {
-        let mut branches = git(dir, &off);
-        branches.args([
-            "for-each-ref",
-            "--contains=HEAD",
-            "--format=%(refname:short)",
-            "refs/heads/",
-        ]);
-        st.containing_branches = output(branches)
-            .unwrap_or_default()
-            .split(|b| *b == b'\n')
-            .filter(|line| !line.is_empty())
-            .map(|line| String::from_utf8_lossy(line).into_owned())
-            .collect();
-    }
+    // The subject and, for a detached HEAD, the branches containing it depend only on the
+    // commit: asked once per commit, not on every refresh and in every folder.
+    let head = branch_oid(&out);
+    let detached = st.branch.is_none();
+    let about = head_facts(&root, &head, detached, || {
+        std::thread::scope(|scope| {
+            let branches = scope.spawn(|| {
+                if !detached {
+                    return Vec::new();
+                }
+                let mut branches = git(dir, &off);
+                branches.args([
+                    "for-each-ref",
+                    "--contains=HEAD",
+                    "--format=%(refname:short)",
+                    "refs/heads/",
+                ]);
+                output(branches)
+                    .unwrap_or_default()
+                    .split(|b| *b == b'\n')
+                    .filter(|line| !line.is_empty())
+                    .map(|line| String::from_utf8_lossy(line).into_owned())
+                    .collect()
+            });
+            let mut summary = git(dir, &off);
+            summary.args(["log", "--no-show-signature", "-1", "--format=%s", "HEAD"]);
+            let subject =
+                output(summary).map(|out| String::from_utf8_lossy(&out).trim_end().to_string());
+            (subject, branches.join().unwrap_or_default())
+        })
+    });
+    (st.subject, st.containing_branches) = about;
     st.root = root;
+    accept(&st.root);
     Some(st)
+}
+
+/// The commit in the `# branch.oid` header of a status (empty before the first commit).
+fn branch_oid(out: &[u8]) -> String {
+    out.split(|&b| b == 0)
+        .take_while(|f| f.starts_with(b"# "))
+        .find_map(|f| f.strip_prefix(b"# branch.oid "))
+        .map(|oid| String::from_utf8_lossy(oid).into_owned())
+        .unwrap_or_default()
+}
+
+type HeadFacts = (Option<String>, Vec<String>);
+
+/// The subject of the HEAD commit and, when detached, the local branches containing it:
+/// `ask` runs once per repository, commit and local branch set. The branch set is the
+/// modification time of `refs/heads` and `packed-refs`, which change when a branch is
+/// created, deleted or moved by Git.
+fn head_facts(
+    root: &Path,
+    head: &str,
+    detached: bool,
+    ask: impl FnOnce() -> HeadFacts,
+) -> HeadFacts {
+    type Key = (String, bool, Vec<Option<std::time::SystemTime>>);
+    static KNOWN: std::sync::Mutex<Option<std::collections::HashMap<PathBuf, (Key, HeadFacts)>>> =
+        std::sync::Mutex::new(None);
+    // Branch tips only matter for the list of containing branches.
+    let refs = if detached {
+        heads_changed(root)
+    } else {
+        Vec::new()
+    };
+    let key = (head.to_owned(), detached, refs);
+    if !head.is_empty() && head != "(initial)" {
+        if let Ok(known) = KNOWN.lock() {
+            if let Some((k, facts)) = known.as_ref().and_then(|k| k.get(root)) {
+                if *k == key {
+                    return facts.clone();
+                }
+            }
+        }
+    }
+    let facts = ask();
+    // A failed query (no subject) is asked again next time.
+    if facts.0.is_some() {
+        if let Ok(mut known) = KNOWN.lock() {
+            let known = known.get_or_insert_with(Default::default);
+            if known.len() >= 256 {
+                known.clear();
+            }
+            known.insert(root.to_path_buf(), (key, facts.clone()));
+        }
+    }
+    facts
+}
+
+/// When the local branches last changed, as far as the files tell: `packed-refs` and the
+/// folders of `refs/heads` (a branch `feature/x` is a file in a folder), in the common Git
+/// directory.
+fn heads_changed(root: &Path) -> Vec<Option<std::time::SystemTime>> {
+    let Some(mut dir) = super::gitfacts::git_dir(root) else {
+        return vec![Some(std::time::SystemTime::now())]; // unknown: never equal
+    };
+    if let Ok(common) = std::fs::read_to_string(dir.join("commondir")) {
+        dir = dir.join(common.trim());
+    }
+    let modified = |p: &Path| p.metadata().ok().and_then(|m| m.modified().ok());
+    let mut times = vec![modified(&dir.join("packed-refs"))];
+    let mut folders = vec![dir.join("refs").join("heads")];
+    while let Some(folder) = folders.pop() {
+        times.push(modified(&folder));
+        let Ok(entries) = std::fs::read_dir(&folder) else {
+            continue;
+        };
+        let mut inner: Vec<PathBuf> = entries
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .map(|e| e.path())
+            .collect();
+        inner.sort();
+        folders.extend(inner);
+    }
+    times
+}
+
+/// Notes that Git answered a query about the work tree `root`: it accepts the repository.
+pub(super) fn accept(root: &Path) {
+    if let Ok(mut known) = trusted().lock() {
+        if !known.contains(root) {
+            if known.len() >= 1024 {
+                known.clear();
+            }
+            known.insert(root.to_path_buf());
+        }
+    }
+}
+
+/// Whether Git answered a query about the work tree `root` and no status failed since.
+pub(super) fn accepted(root: &Path) -> bool {
+    trusted().lock().is_ok_and(|known| known.contains(root))
+}
+
+/// Work tree roots Git answered for: it accepts them, so [`untrusted`] has nothing to
+/// ask. A status without an answer takes its root out again.
+fn trusted() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
+    static TRUSTED: OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+        OnceLock::new();
+    TRUSTED.get_or_init(Default::default)
+}
+
+/// The repository path as Git spells it, when Git refuses the repository around `dir`
+/// because another user owns it ("dubious ownership": folders on a network share, a WSL
+/// distribution opened from Windows, a repository copied from another account). None when
+/// `dir` is outside a repository or Git accepts it. Git's own spelling is what
+/// `safe.directory` has to contain, so it is read from the message.
+pub fn untrusted(dir: &Path) -> Option<PathBuf> {
+    // A repository in WSL is read by the Git inside the distribution, as its owner.
+    if super::gitexec::place(dir).is_some() {
+        return None;
+    }
+    let root = work_tree(dir)?;
+    // Git answered a status here: it does not refuse the repository. This runs on every
+    // navigation, and ownership does not change while the app runs.
+    if accepted(&root) {
+        return None;
+    }
+    let mut cmd = git(&root, &[]);
+    // A fixed language: the message is parsed.
+    cmd.args(["rev-parse", "--git-dir"])
+        .env("LC_ALL", "C")
+        .env("LANGUAGE", "C")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    super::gitexec::forward_env(&mut cmd);
+    let out = cmd.output().ok()?;
+    if out.status.success() {
+        return None;
+    }
+    parse_untrusted(&String::from_utf8_lossy(&out.stderr))
+}
+
+/// The path in Git's "detected dubious ownership in repository at '<path>'" error.
+fn parse_untrusted(stderr: &str) -> Option<PathBuf> {
+    let line = stderr
+        .lines()
+        .find_map(|l| l.split_once("dubious ownership in repository at '"))?
+        .1
+        .trim_end();
+    let path = line.strip_suffix('\'')?;
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+/// Adds the repository around `dir` to the user's global `safe.directory`, only when Git
+/// itself refuses it as untrusted; returns the trusted path. The path comes from Git's
+/// message, never from the caller, so this cannot trust an arbitrary folder.
+pub fn trust(dir: &Path) -> Result<PathBuf, String> {
+    let path = untrusted(dir).ok_or("Git does not refuse this folder")?;
+    let global = |args: &[&str]| {
+        let mut cmd = Command::new(program());
+        cmd.args(["config", "--global"])
+            .args(args)
+            .env("LC_ALL", "C")
+            .stdin(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        cmd.output().map_err(|e| e.to_string())
+    };
+    let known = global(&["--get-all", "safe.directory"])?;
+    let wanted = path.to_string_lossy();
+    if String::from_utf8_lossy(&known.stdout)
+        .lines()
+        .any(|l| l.trim_end() == wanted)
+    {
+        return Ok(path);
+    }
+    let added = global(&["--add", "safe.directory", &wanted])?;
+    if added.status.success() {
+        Ok(path)
+    } else {
+        Err(String::from_utf8_lossy(&added.stderr).trim().to_string())
+    }
 }
 
 /// Parses `git status --porcelain=v2 -z --branch` output for the folder whose path in
@@ -230,7 +449,7 @@ pub fn parse(out: &[u8], prefix: &str) -> GitStatus {
         if state == GitState::Ignored && child != trimmed {
             return;
         }
-        let e = st.entries.entry(child.to_string()).or_insert(state);
+        let e = st.entries.entry(status_key(child)).or_insert(state);
         *e = (*e).max(state);
     };
     while let Some(f) = fields.next() {
@@ -339,6 +558,36 @@ mod tests {
         assert_eq!(st.all, Some(GitState::Untracked));
         let st = parse(&out(&["! build/"]), "build/");
         assert_eq!(st.all, Some(GitState::Ignored));
+    }
+
+    #[test]
+    fn the_untrusted_path_is_read_from_gits_message() {
+        let msg = "fatal: detected dubious ownership in repository at '//wsl.localhost/Ubuntu-26.04/home/u/SW/G800'\n'//wsl.localhost/Ubuntu-26.04/home/u/SW/G800' may refer to a non-local directory\nTo add an exception for this directory, call:\n\n\tgit config --global --add safe.directory ...\n";
+        assert_eq!(
+            parse_untrusted(msg),
+            Some(PathBuf::from("//wsl.localhost/Ubuntu-26.04/home/u/SW/G800"))
+        );
+        assert_eq!(parse_untrusted("fatal: not a git repository\n"), None);
+        assert_eq!(parse_untrusted(""), None);
+    }
+
+    #[test]
+    fn an_accepted_or_missing_repository_is_not_untrusted() {
+        let t = tempfile::tempdir().unwrap();
+        assert_eq!(untrusted(t.path()), None, "outside a repository");
+        let r = t.path().join("repo");
+        std::fs::create_dir(&r).unwrap();
+        let init = Command::new("git")
+            .arg("-C")
+            .arg(&r)
+            .args(["init", "-q"])
+            .status();
+        if !init.is_ok_and(|s| s.success()) {
+            eprintln!("git not installed: skipped");
+            return;
+        }
+        assert_eq!(untrusted(&r), None, "own repository");
+        assert!(trust(&r).is_err(), "nothing to trust");
     }
 
     #[test]

@@ -7,6 +7,7 @@ import { useStore } from "../state/store";
 import { copyPaths, openOverlay, setLayout } from "../state/actions";
 import { useKeyLabels } from "../state/keyLabels";
 import { tildify } from "../core/path";
+import { IS_MAC } from "../core/keymap";
 import { Icon } from "./Icon";
 import { PanelMap } from "./PanelMap";
 
@@ -84,7 +85,15 @@ export function TitleBar() {
   }, [shown]);
 
   return (
-    <header className="titlebar" data-tauri-drag-region>
+    <header className={`titlebar${IS_MAC ? " mac" : ""}`} data-tauri-drag-region>
+      {IS_MAC && (
+        // macOS: the window has no native frame, so the traffic lights are drawn on the left.
+        <div className="tb-lights">
+          <button className="tb-light close" title="Close" aria-label="Close" onClick={() => win?.close()} />
+          <button className="tb-light min" title="Minimize" aria-label="Minimize" onClick={() => win?.minimize()} />
+          <button className="tb-light zoom" title={maximized ? "Restore" : "Zoom"} aria-label="Zoom" onClick={() => win?.toggleMaximize()} />
+        </div>
+      )}
       <div className="tb-brand" data-tauri-drag-region>
         <button className="tb-logo" title={`Settings${settingsKeys ? ` (${settingsKeys})` : ""}`} onClick={() => openOverlay({ type: "settings" })}>
           <Logo />
@@ -96,7 +105,7 @@ export function TitleBar() {
       </div>
       <PanelMap />
       <LayoutSwitch />
-      <div className="tb-controls">
+      {!IS_MAC && <div className="tb-controls">
         <button className="tb-btn" title="Minimize" onClick={() => win?.minimize()}>
           <svg width="10" height="10" viewBox="0 0 10 10"><path d="M1 5h8" /></svg>
         </button>
@@ -110,7 +119,7 @@ export function TitleBar() {
         <button className="tb-btn close" title="Close" onClick={() => win?.close()}>
           <svg width="10" height="10" viewBox="0 0 10 10"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7" /></svg>
         </button>
-      </div>
+      </div>}
     </header>
   );
 }

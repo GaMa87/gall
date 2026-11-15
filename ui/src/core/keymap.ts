@@ -198,6 +198,12 @@ export function altGrChar(e: KeyLike): boolean {
 
 export const IS_MAC = typeof navigator !== "undefined" && /Mac/i.test(navigator.platform || navigator.userAgent || "");
 
+/** A shortcut label as the platform writes it: macOS has no Ctrl key for these chords, Cmd
+ *  does them ("Ctrl+P" → "Cmd+P"; Option instead of Alt). Chords are stored with Ctrl. */
+export function platformLabel(label: string, mac = IS_MAC): string {
+  return mac ? label.replace(/\bCtrl\b/g, "Cmd").replace(/\bAlt\b/g, "Option") : label;
+}
+
 /** macOS: a character typed with Option, the Mac's AltGr ("@" is Option+L, "[" Option+5
  *  on German and Slovenian layouts). It is typed text unless the chord is a shortcut
  *  (`isShortcut`: Option+C stays "Copy to other browser"). */

@@ -12,7 +12,7 @@ const choices: { id: MergeChoice; label: string; key: string }[] = [
 ];
 const hasMarkers = (text: string) => /^(<{7}|={7}|>{7})( |$)/m.test(text);
 
-export function GitMergeEditor({ conflict, vim, busy, onConfirm, onOpenExternal }: { conflict: Side; vim: boolean; busy: boolean; onConfirm: (content: string) => Promise<void>; onOpenExternal: () => void }) {
+export function GitMergeEditor({ conflict, vim, busy, onConfirm, onOpenExternal, onDirty }: { conflict: Side; vim: boolean; busy: boolean; onConfirm: (content: string) => Promise<void>; onOpenExternal: () => void; onDirty?: (dirty: boolean) => void }) {
   const chunks = useMemo(() => mergeThreeWay(conflict.base, conflict.ours, conflict.theirs), [conflict.base, conflict.ours, conflict.theirs]);
   const conflictIds = useMemo(() => chunks.flatMap((chunk, index) => (chunk.conflict ? [index] : [])), [chunks]);
   const [picked, setPicked] = useState<Record<number, MergeChoice | undefined>>({});
@@ -22,6 +22,10 @@ export function GitMergeEditor({ conflict, vim, busy, onConfirm, onOpenExternal 
   const live = useMemo(() => composeResult(chunks, picked), [chunks, picked]);
   useEffect(() => { setPicked({}); setManual(null); setEditing(false); setActive(conflictIds[0] ?? -1); root.current?.focus(); }, [conflict.file, conflict.base, conflict.ours, conflict.theirs, conflictIds]);
   useEffect(() => { root.current?.querySelectorAll(`[data-chunk="${active}"]`).forEach((element) => element.scrollIntoView({ block: "nearest" })); }, [active]);
+  // Unsaved work: any chosen side or hand edit that has not been staged yet.
+  const unsaved = manual !== null || Object.values(picked).some(Boolean);
+  useEffect(() => { onDirty?.(unsaved); }, [unsaved, onDirty]);
+  useEffect(() => () => onDirty?.(false), [onDirty]);
   const unresolved = manual === null ? live.unresolved : hasMarkers(manual) ? 1 : 0;
   const releaseManual = async () => {
     if (manual === null) return true;
@@ -81,7 +85,7 @@ export function GitMergeEditor({ conflict, vim, busy, onConfirm, onOpenExternal 
         return <Fragment key={index}>
           <span className={`gm-toolbar ${active === index ? "active" : ""}`} data-chunk={index}>
             <b>Conflict {conflictIds.indexOf(index) + 1}/{conflictIds.length}</b>
-            {choices.map((c) => <button key={c.id} disabled={busy} aria-pressed={choice === c.id} onClick={() => void choose(index, c.id)} title={vim ? `Key ${c.key}` : undefined}>{c.label}</button>)}
+            {choices.map((c) => <button key={c.id} disabled={busy} aria-pressed={choice === c.id} onClick={() => void choose(index, c.id)} title={vim ? `Key ${c.key}` : undefined}>{c.label}{vim && <> <kbd>{c.key}</kbd></>}</button>)}
           </span>
           <span className={`gm-chunk conflict ${resolvedClass(choice)} ${active === index ? "active" : ""}`} onClick={() => setActive(index)}>{lines.join("") || "(empty)\n"}</span>
         </Fragment>;

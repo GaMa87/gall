@@ -153,14 +153,82 @@ mod imp {
     }
 }
 
+#[cfg(target_os = "macos")]
+mod imp {
+    use super::*;
+    use crate::fs::mactrash::{items, purge as purge_items, restore as restore_items, Item};
+
+    fn id(i: &Item) -> String {
+        i.trashed.to_string_lossy().into_owned()
+    }
+
+    fn entry(i: &Item) -> TrashEntry {
+        let meta = std::fs::symlink_metadata(&i.trashed).ok();
+        let is_dir = meta.as_ref().is_some_and(|m| m.is_dir());
+        let size = if is_dir {
+            walkdir::WalkDir::new(&i.trashed)
+                .follow_links(false)
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.metadata().ok())
+                .filter(|m| m.is_file())
+                .map(|m| m.len())
+                .sum()
+        } else {
+            meta.map(|m| m.len()).unwrap_or(0)
+        };
+        TrashEntry {
+            id: id(i),
+            name: i
+                .original
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            original_parent: i
+                .original
+                .parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            deleted: i.time_ms.div_euclid(1000),
+            is_dir,
+            size,
+        }
+    }
+
+    fn pick(ids: &[String]) -> Result<Vec<Item>> {
+        let picked: Vec<Item> = items()
+            .into_iter()
+            .filter(|i| ids.contains(&id(i)))
+            .collect();
+        if picked.is_empty() && !ids.is_empty() {
+            return Err(CoreError::Trash(
+                "the items are no longer in the trash".into(),
+            ));
+        }
+        Ok(picked)
+    }
+
+    pub fn list() -> Result<Vec<TrashEntry>> {
+        let mut out: Vec<TrashEntry> = items().iter().map(entry).collect();
+        out.sort_by(|a, b| b.deleted.cmp(&a.deleted).then_with(|| a.name.cmp(&b.name)));
+        Ok(out)
+    }
+    pub fn restore(ids: &[String]) -> Result<()> {
+        restore_items(pick(ids)?)
+    }
+    pub fn purge(ids: &[String]) -> Result<()> {
+        purge_items(&pick(ids)?)
+    }
+    /// Empties what Gall put in the Trash; items other apps put there are left alone.
+    pub fn empty() -> Result<()> {
+        purge_items(&items())
+    }
+}
+
 #[cfg(not(any(
     target_os = "windows",
-    all(
-        unix,
-        not(target_os = "macos"),
-        not(target_os = "ios"),
-        not(target_os = "android")
-    )
+    target_os = "macos",
+    all(unix, not(target_os = "ios"), not(target_os = "android"))
 )))]
 mod imp {
     use super::*;

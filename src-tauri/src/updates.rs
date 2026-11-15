@@ -78,6 +78,15 @@ pub async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
     // No task can start between the active-task check and process replacement.
     let _gate = INSTALL_GATE.lock().map_err(|e| e.to_string())?;
     update_ready(app.state())?;
-    update.install(bytes).map_err(|e| e.to_string())?;
+    // The installer ends this process (Windows) and `restart` exits without a
+    // `RunEvent::Exit`, so the session is closed here; otherwise the next start
+    // reports "previous session did not close normally" after every update.
+    // The session is written in the background: the last state has to be on disk too.
+    app.state::<crate::state::AppState>().flush_session();
+    crate::bug_report::clean();
+    if let Err(e) = update.install(bytes) {
+        crate::bug_report::reopen();
+        return Err(e.to_string());
+    }
     app.restart();
 }

@@ -10,11 +10,15 @@ export interface Notification {
   text: string;
   at: number;
   action?: { label: string; run: () => void };
+  /** An expected failure (not a Gall bug): no "Report a bug" button. */
+  expected?: boolean;
 }
 
 export interface MenuItem {
   label?: string;
   shortcut?: string;
+  /** A key that runs this item while the menu is open (shown at its right edge). Give none of h j k l q: Vim keys navigate with them. */
+  accel?: string;
   /** Shows this action's keys in the current mode (vim / leader / chord) as the shortcut. */
   action?: Action;
   icon?: string;

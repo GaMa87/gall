@@ -106,10 +106,37 @@ pub fn remote_mounts() -> std::collections::HashSet<PathBuf> {
             .map(|t| parse_remote_mounts(&t))
             .unwrap_or_default()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        macos_remote_mounts()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         Default::default()
     }
+}
+
+/// macOS: mounted SMB, NFS, AFP and WebDAV shares (under `/Volumes`), from `getmntinfo`.
+#[cfg(target_os = "macos")]
+fn macos_remote_mounts() -> std::collections::HashSet<PathBuf> {
+    use std::ffi::CStr;
+    use std::os::unix::ffi::OsStrExt;
+    let mut buf: *mut libc::statfs = std::ptr::null_mut();
+    // SAFETY: getmntinfo fills `buf` with a library-owned array of `n` entries that stays
+    // valid until the next call; the entries are only read here.
+    let n = unsafe { libc::getmntinfo(&mut buf, libc::MNT_NOWAIT) };
+    let mut out = std::collections::HashSet::new();
+    if n <= 0 || buf.is_null() {
+        return out;
+    }
+    for fs in unsafe { std::slice::from_raw_parts(buf, n as usize) } {
+        let kind = unsafe { CStr::from_ptr(fs.f_fstypename.as_ptr()) }.to_string_lossy();
+        if matches!(kind.as_ref(), "smbfs" | "nfs" | "afpfs" | "webdav" | "cifs") {
+            let at = unsafe { CStr::from_ptr(fs.f_mntonname.as_ptr()) };
+            out.insert(PathBuf::from(std::ffi::OsStr::from_bytes(at.to_bytes())));
+        }
+    }
+    out
 }
 
 /// The remote mount points in a `/proc/self/mounts` text (`\040` = space, …).
@@ -163,6 +190,13 @@ pub fn is_system_skip(path: &Path) -> bool {
             "/snap",
             "/var/lib/docker",
             "/var/lib/containers",
+            // macOS: firmlinked system volumes (the data is reached through `/`), swap, and
+            // the metadata folders of Spotlight and the file system events log.
+            "/System/Volumes",
+            "/private/var/vm",
+            "/.Spotlight-V100",
+            "/.fseventsd",
+            "/.vol",
         ];
         SKIP.iter().any(|s| path == Path::new(s))
     }

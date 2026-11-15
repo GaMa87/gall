@@ -28,7 +28,9 @@ pub struct SortSpec {
 
 /// Natural, case-insensitive comparison: "file2" < "file10".
 pub fn natural_cmp(a: &str, b: &str) -> Ordering {
-    let (mut ai, mut bi) = (a.chars().peekable(), b.chars().peekable());
+    // Composed and decomposed spellings of a name sort together (see `util::unicode`).
+    let (ca, cb) = (crate::util::unicode::nfc(a), crate::util::unicode::nfc(b));
+    let (mut ai, mut bi) = (ca.chars().peekable(), cb.chars().peekable());
     loop {
         match (ai.peek().copied(), bi.peek().copied()) {
             (None, None) => return a.cmp(b), // stable tie-break on exact bytes
@@ -185,5 +187,18 @@ pub(crate) mod tests {
         ];
         sort_entries(&mut v, &SortSpec::default());
         assert_eq!(names(&v), ["a.txt", "b", "c.txt"]);
+    }
+
+    #[test]
+    fn composed_and_decomposed_names_sort_together() {
+        // Without normalization NFD "č" sorted as "c" + a mark (before "da") and NFC "č"
+        // after "z": one folder, two places. Both spellings now sort the same way.
+        for other in ["ba", "ca", "da", "z", "zz"] {
+            assert_eq!(
+                natural_cmp("c\u{30c}a", other),
+                natural_cmp("ča", other),
+                "{other}"
+            );
+        }
     }
 }

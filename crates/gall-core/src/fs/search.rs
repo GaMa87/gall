@@ -12,13 +12,17 @@ pub struct Wildcard {
     substring: bool,
     /// No accented letters typed: "porocilo" also finds "Poročilo" (see `fuzzy::fold_char`).
     fold: bool,
+    /// The pattern as bytes when it is plain ASCII: most names are too, and those are
+    /// then matched as they are, without building a lower-case copy of every name.
+    ascii: Option<Vec<u8>>,
 }
 
 impl Wildcard {
     pub fn new(pattern: &str) -> Self {
-        let p = pattern.trim().to_lowercase();
+        let p = crate::util::unicode::nfc(pattern.trim()).to_lowercase();
         let substring = !p.contains('*') && !p.contains('?');
         Wildcard {
+            ascii: p.is_ascii().then(|| p.as_bytes().to_vec()),
             fold: p.chars().all(|c| super::fuzzy::fold_char(c) == c),
             pat: p.chars().collect(),
             substring,
@@ -26,7 +30,15 @@ impl Wildcard {
     }
 
     pub fn matches(&self, name: &str) -> bool {
-        let lower = name.to_lowercase();
+        if let (Some(pat), true) = (&self.ascii, name.is_ascii()) {
+            let name = name.as_bytes();
+            if self.substring {
+                return pat.is_empty()
+                    || name.windows(pat.len()).any(|w| w.eq_ignore_ascii_case(pat));
+            }
+            return glob(pat, name, |p, c| p == c.to_ascii_lowercase());
+        }
+        let lower = crate::util::unicode::nfc(name).to_lowercase();
         let n: Vec<char> = if self.fold {
             lower.chars().map(super::fuzzy::fold_char).collect()
         } else {
@@ -38,19 +50,20 @@ impl Wildcard {
             }
             return n.windows(self.pat.len()).any(|w| w == self.pat.as_slice());
         }
-        glob(&self.pat, &n)
+        glob(&self.pat, &n, |p, c| p == c)
     }
 }
 
 /// Iterative glob match with single backtrack point (linear for typical input).
-fn glob(p: &[char], s: &[char]) -> bool {
+fn glob<T: Copy + PartialEq + From<u8>>(p: &[T], s: &[T], same: impl Fn(T, T) -> bool) -> bool {
+    let (any_one, any_run) = (T::from(b'?'), T::from(b'*'));
     let (mut pi, mut si) = (0, 0);
     let (mut star, mut mark) = (None, 0);
     while si < s.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == s[si]) {
+        if pi < p.len() && (p[pi] == any_one || same(p[pi], s[si])) {
             pi += 1;
             si += 1;
-        } else if pi < p.len() && p[pi] == '*' {
+        } else if pi < p.len() && p[pi] == any_run {
             star = Some(pi);
             mark = si;
             pi += 1;
@@ -62,7 +75,7 @@ fn glob(p: &[char], s: &[char]) -> bool {
             return false;
         }
     }
-    while pi < p.len() && p[pi] == '*' {
+    while pi < p.len() && p[pi] == any_run {
         pi += 1;
     }
     pi == p.len()
@@ -147,24 +160,55 @@ pub fn search(
             wb.overrides(o);
         }
     }
-    for item in wb.build() {
-        if cancel.load(Ordering::Relaxed) {
-            break;
-        }
-        let Ok(item) = item else { continue };
-        if item.depth() == 0 {
-            continue;
-        }
-        if wc.matches(&item.file_name().to_string_lossy()) {
-            if let Ok(meta) = item.path().symlink_metadata() {
-                on_hit(FileEntry::from_meta(item.path(), &meta));
-                hits += 1;
-                if hits >= opts.max_results {
-                    break;
-                }
+    // The folders are walked on several threads (the walk is most of the time in a large
+    // tree); the hits come back to this thread, which hands them on in the order they
+    // are found.
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(8));
+    let done = AtomicBool::new(false);
+    // Bounded, so a slow receiver holds the walk back instead of letting every match of
+    // the tree queue up in memory.
+    let (found, results) = std::sync::mpsc::sync_channel::<FileEntry>(4096);
+    std::thread::scope(|scope| {
+        let (wc, done) = (&wc, &done);
+        let walker = wb.threads(threads).build_parallel();
+        scope.spawn(move || {
+            walker.run(|| {
+                let found = found.clone();
+                Box::new(move |item| {
+                    if cancel.load(Ordering::Relaxed) || done.load(Ordering::Relaxed) {
+                        return ignore::WalkState::Quit;
+                    }
+                    let Ok(item) = item else {
+                        return ignore::WalkState::Continue;
+                    };
+                    if item.depth() > 0 && wc.matches(&item.file_name().to_string_lossy()) {
+                        if let Ok(meta) = item.path().symlink_metadata() {
+                            if found
+                                .send(FileEntry::from_meta(item.path(), &meta))
+                                .is_err()
+                            {
+                                return ignore::WalkState::Quit;
+                            }
+                        }
+                    }
+                    ignore::WalkState::Continue
+                })
+            });
+        });
+        for entry in results {
+            // Nothing is handed on after a cancel, also not what was already found.
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            on_hit(entry);
+            hits += 1;
+            if hits >= opts.max_results {
+                done.store(true, Ordering::Relaxed);
+                break;
             }
         }
-    }
+        done.store(true, Ordering::Relaxed);
+    });
     hits
 }
 
@@ -244,6 +288,127 @@ mod tests {
             search(d.path(), "*", SearchOptions::default(), &cancel, |_| {}),
             0
         );
+    }
+
+    /// Names that are plain ASCII are matched without building a lower-case copy: the
+    /// answer has to be the one the general way gives.
+    #[test]
+    fn ascii_names_match_as_the_general_way_does() {
+        let patterns = [
+            "",
+            "a",
+            "A",
+            "txt",
+            ".TXT",
+            "*",
+            "?",
+            "*.txt",
+            "*.TXT",
+            "a*",
+            "*a",
+            "a?c",
+            "a*c*",
+            "??",
+            "*?*",
+            "re*me.md",
+            "Read?e*",
+            "a.b.c",
+            "**",
+            "*.*",
+            "no such name here",
+            "x*y?z",
+            "file[1]",
+            "a b",
+        ];
+        let names = [
+            "",
+            "a",
+            "A",
+            "abc",
+            "ABC",
+            "a.txt",
+            "A.TXT",
+            "readme.md",
+            "README.MD",
+            "ReadMe.md",
+            "a*c",
+            "a?c",
+            "*",
+            "?",
+            "a.b.c",
+            ".txt",
+            "txt",
+            "file[1]",
+            "a b",
+            "xAAyBz",
+            "xyz",
+        ];
+        for pattern in patterns {
+            let fast = Wildcard::new(pattern);
+            assert!(fast.ascii.is_some());
+            let general = Wildcard {
+                ascii: None,
+                ..fast.clone()
+            };
+            for name in names {
+                assert_eq!(
+                    fast.matches(name),
+                    general.matches(name),
+                    "pattern {pattern:?}, name {name:?}"
+                );
+            }
+        }
+    }
+
+    /// The folders are walked on several threads: every match is still found exactly
+    /// once, the limit is kept exactly, and nothing arrives after a cancel.
+    #[test]
+    fn many_folders_give_every_hit_once_and_keep_the_limit() {
+        let d = tempfile::tempdir().unwrap();
+        let mut expected = vec![];
+        for a in 0..12 {
+            for b in 0..12 {
+                let dir = d.path().join(format!("a{a}/b{b}"));
+                std::fs::create_dir_all(&dir).unwrap();
+                for f in 0..10 {
+                    let hit = f % 2 == 0;
+                    let name = if hit {
+                        format!("{a}-{b}-{f}.md")
+                    } else {
+                        format!("{a}-{b}-{f}.txt")
+                    };
+                    std::fs::write(dir.join(&name), "").unwrap();
+                    if hit {
+                        expected.push(dir.join(name));
+                    }
+                }
+            }
+        }
+        expected.sort();
+        let cancel = AtomicBool::new(false);
+        let mut found = vec![];
+        let n = search(d.path(), "*.md", SearchOptions::default(), &cancel, |e| {
+            found.push(std::path::PathBuf::from(e.path))
+        });
+        found.sort();
+        assert_eq!(n, expected.len());
+        assert_eq!(found, expected);
+
+        let few = SearchOptions {
+            max_results: 37,
+            ..Default::default()
+        };
+        let mut got = 0;
+        assert_eq!(search(d.path(), "*.md", few, &cancel, |_| got += 1), 37);
+        assert_eq!(got, 37);
+
+        // Cancelled from the first hit: no further hit is handed on.
+        let mut got = 0;
+        search(d.path(), "*.md", SearchOptions::default(), &cancel, |_| {
+            got += 1;
+            cancel.store(true, Ordering::Relaxed);
+        });
+        assert_eq!(got, 1);
     }
 
     #[test]

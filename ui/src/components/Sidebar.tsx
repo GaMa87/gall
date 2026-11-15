@@ -1,5 +1,6 @@
 // Sidebar: drives, favourite groups, history and the main toolbar (S-01…S-04, W-08).
 import { useState } from "react";
+import { platformLabel } from "../core/keymap";
 import { api } from "../api/ipc";
 import type { CloudProvider, FavoriteGroup } from "../api/types";
 import { formatSize } from "../core/format";
@@ -31,7 +32,7 @@ function DrivesGroup({ current }: { current: string }) {
       <div className="group-head" onDoubleClick={() => setHidden((h) => !h)}>
         <span className="title">Drives</span>
         <button className="icon-btn" title="More" onClick={(e) => A.showMenu(e.clientX, e.clientY, [
-          { label: "Refresh everything", shortcut: "F5", run: () => { A.refreshDrives(); refreshAll(); } },
+          { label: "Refresh everything", shortcut: "F5", run: () => { A.refreshDrives(); refreshAll(); A.invalidateAllFolderSizes(); } },
           { label: hidden ? "Show drives" : "Collapse group", run: () => setHidden((h) => !h) },
         ])}><Icon name="more" /></button>
       </div>
@@ -356,12 +357,12 @@ export function Sidebar() {
     <>
       <div className="sidebar" style={{ width: w }}>
         <div className="sb-search">
-          <button className="search-pill" title="Go to file (Ctrl+P)" onClick={() => A.openOverlay({ type: "quickOpen" })}>
+          <button className="search-pill" title={`Go to file (${platformLabel("Ctrl+P")})`} onClick={() => A.openOverlay({ type: "quickOpen" })}>
             <Icon name="search" size={14} />
             <span>Search files…</span>
-            <kbd>Ctrl P</kbd>
+            <kbd>{platformLabel("Ctrl P")}</kbd>
           </button>
-          <button className="icon-btn" title="Find in files (Ctrl+F, Ctrl+Shift+F everywhere)" onClick={() => A.openOverlay({ type: "grep", root: A.activePath(A.activeBrowser()), scope: "folder" })}><Icon name="text" size={15} /></button>
+          <button className="icon-btn" title={platformLabel("Find in files (Ctrl+F, Ctrl+Shift+F everywhere)")} onClick={() => A.openOverlay({ type: "grep", root: A.activePath(A.activeBrowser()), scope: "folder" })}><Icon name="text" size={15} /></button>
         </div>
         <div className="sidebar-scroll">
           {settings.showDrives && <DrivesGroup current={current} />}

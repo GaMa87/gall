@@ -1,3 +1,4 @@
+import { ThemedSelect } from "./ThemedSelect";
 // Table comparison (CSV/TSV, Excel, ODS): sheets as tabs, columns matched by name,
 // rows by a key column or by position, changed cells shown as old → new.
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -132,12 +133,12 @@ export function TableDiff({ left, right, onText }: { left: string; right: string
         {s && (
           <label className="tb-key" title="Rows are matched by this column. Position = row by row.">
             Match rows by
-            <select value={opts.key ?? s.key ?? ""} onChange={(e) => setOpts((o) => ({ ...o, key: e.target.value }))}>
+            <ThemedSelect value={opts.key ?? s.key ?? ""} onChange={(e) => setOpts((o) => ({ ...o, key: e.target.value }))}>
               <option value="">position</option>
               {s.columns.filter((c) => c.left != null && c.right != null).map((c) => (
                 <option key={c.name} value={c.name}>{c.name}{s.keyCandidates.includes(c.name) ? " (unique)" : ""}</option>
               ))}
-            </select>
+            </ThemedSelect>
           </label>
         )}
         <div className="dv-toggles">

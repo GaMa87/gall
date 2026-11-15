@@ -5,7 +5,7 @@ use notify::{
     event::{AccessKind, AccessMode},
     Event, EventKind, RecursiveMode,
 };
-use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, RecommendedCache};
+use notify_debouncer_full::{new_debouncer_opt, DebounceEventResult, Debouncer, NoCache};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -18,7 +18,7 @@ pub type ChangeFn = dyn Fn(&Path, bool) + Send + Sync + 'static;
 struct Watched {
     /// None when watching failed (an unreadable folder): the reference still counts, so
     /// its unwatch pairs with it; a later watch tries again.
-    debouncer: Option<Debouncer<notify::RecommendedWatcher, RecommendedCache>>,
+    debouncer: Option<Debouncer<notify::RecommendedWatcher, NoCache>>,
     refs: usize,
 }
 
@@ -85,11 +85,16 @@ impl FolderWatcher {
         Ok(())
     }
 
-    fn start(&self, dir: &Path) -> Result<Debouncer<notify::RecommendedWatcher, RecommendedCache>> {
+    fn start(&self, dir: &Path) -> Result<Debouncer<notify::RecommendedWatcher, NoCache>> {
         let cb = self.on_change.clone();
         let folder = dir.to_path_buf();
         let window: Mutex<Vec<Instant>> = Mutex::new(Vec::new());
-        let mut debouncer = new_debouncer(self.debounce, None, move |res: DebounceEventResult| {
+        // No file ID cache. The default one on Windows and macOS opens every entry of the
+        // folder when the watch starts, to follow renames by file ID: in a folder of
+        // thousands of entries (AppData, a profile folder) that took longer than listing
+        // it, on every navigation, while holding the lock an `unwatch` waits for. Gall
+        // only needs to hear that something in the folder changed.
+        let handler = move |res: DebounceEventResult| {
             if let Ok(events) = res {
                 if !events.iter().any(|event| changes_contents(event)) {
                     return;
@@ -103,7 +108,14 @@ impl FolderWatcher {
                 };
                 cb(&folder, storm);
             }
-        })?;
+        };
+        let mut debouncer = new_debouncer_opt::<_, notify::RecommendedWatcher, NoCache>(
+            self.debounce,
+            None,
+            handler,
+            NoCache::new(),
+            notify::Config::default(),
+        )?;
         debouncer.watch(dir, RecursiveMode::NonRecursive)?;
         Ok(debouncer)
     }

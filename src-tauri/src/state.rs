@@ -8,7 +8,7 @@ use gall_core::storage::json_store::LoadedFrom;
 use gall_core::storage::{Db, Favorites, JsonStore, Marks, Settings};
 use gall_core::util::appdirs::AppDirs;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 /// Files placed on Gall's clipboard with Ctrl+C / Ctrl+X.
@@ -166,11 +166,50 @@ impl AppState {
         self.tasks.journal()
     }
 
+    /// Saves the session without making the caller wait. Writing it means a sync to
+    /// disk, a re-read and a backup copy, and this runs on every navigation before the
+    /// folder is even asked for; on a slow disk that was most of the wait. The state is
+    /// handed to a writer thread, which always writes the newest one it was given.
     pub fn save_session(&self) {
-        let s = self.session.lock().unwrap().clone();
-        if let Err(e) = self.session_store.save(&s) {
-            log::error!("saving session: {e}");
+        // The number is taken while the session is locked, so a later state never gets
+        // the lower one.
+        let (s, generation) = {
+            let session = self.session.lock().unwrap();
+            let generation = SESSION_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+            (session.clone(), generation)
+        };
+        let sender = SESSION_WRITER.get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<(u64, Session)>();
+            let store = JsonStore::new(self.session_store.path().to_path_buf());
+            std::thread::spawn(move || {
+                while let Ok(mut newest) = rx.recv() {
+                    // Several navigations in a row: only the last state is written.
+                    while let Ok(later) = rx.try_recv() {
+                        newest = later;
+                    }
+                    write_session(&store, newest.0, &newest.1);
+                }
+            });
+            std::sync::Mutex::new(tx)
+        });
+        let sent = sender
+            .lock()
+            .is_ok_and(|tx| tx.send((generation, s.clone())).is_ok());
+        if !sent {
+            write_session(&self.session_store, generation, &s);
         }
+    }
+
+    /// Writes the current session and waits for it: before the app exits.
+    pub fn flush_session(&self) {
+        // The number is taken while the session is locked, so a later state never gets
+        // the lower one.
+        let (s, generation) = {
+            let session = self.session.lock().unwrap();
+            let generation = SESSION_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+            (session.clone(), generation)
+        };
+        write_session(&self.session_store, generation, &s);
     }
 
     pub fn save_favorites(&self) {
@@ -182,5 +221,26 @@ impl AppState {
 
     pub fn save_marks(&self, m: &Marks) -> gall_core::error::Result<()> {
         self.marks_store.save(m)
+    }
+}
+
+/// Counts the session states handed to [`AppState::save_session`].
+static SESSION_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The channel to the thread that writes the session.
+static SESSION_WRITER: std::sync::OnceLock<
+    std::sync::Mutex<std::sync::mpsc::Sender<(u64, Session)>>,
+> = std::sync::OnceLock::new();
+/// The generation of the session state on disk. Held while writing, so two writers never
+/// write at once and an older state never replaces a newer one.
+static SESSION_WRITTEN: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+
+fn write_session(store: &JsonStore, generation: u64, session: &Session) {
+    let mut written = SESSION_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    if generation <= *written {
+        return;
+    }
+    match store.save(session) {
+        Ok(()) => *written = generation,
+        Err(e) => log::error!("saving session: {e}"),
     }
 }

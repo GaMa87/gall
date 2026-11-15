@@ -14,8 +14,8 @@ Updater-enabled builds check the latest stable GitHub release at startup and fro
 **Settings → Updates → Check for updates**. Signed in-app installation targets
 Windows installers, Linux AppImage and macOS application bundles. Portable Windows
 ZIPs and Linux system packages instead need a manual upgrade: download a new ZIP,
-or use the package manager that installed Gall. Preserve portable `UserData` when
-replacing application files. Do not replace a package-managed installation with an
+or use the package manager that installed Gall. Settings live in the user profile, so replacing
+application files keeps them (preserve `UserData` only if a `portable` marker is used). Do not replace a package-managed installation with an
 AppImage or Windows installer through the updater.
 
 Release signing setup, publication and the required real upgrade checks are in
@@ -42,8 +42,8 @@ local unit tests do not establish that a published upgrade works.
 
 ### Scoop
 
-Scoop suits Gall well because the portable zip keeps all data in `UserData` next to `gall.exe`,
-so Scoop's `persist` keeps settings across updates.
+Scoop suits Gall well: the portable zip needs no installer and keeps settings in the user profile
+(`%APPDATA%\gall`), so they survive updates. `persist: UserData` only matters if a `portable` marker is added.
 
 1. **Own bucket (do it right away):** create `GaMa87/scoop-bucket`, add `bucket/gall.json` from
    [`scoop/gall.json`](scoop/gall.json) and fill in the hash from `SHA256SUMS`. Users then run:

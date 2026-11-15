@@ -1,6 +1,7 @@
 /** What `y` can copy about a commit, like lazygit's "Copy commit attribute to clipboard" menu. */
 export type CommitCopyInfo = { id: string; author: string; email: string; date: string; message: string; tags: string[]; url: string | null };
-export type CopyChoice = { label: string; text: string | (() => Promise<string>) };
+/** `key` is the accelerator pressed in the open menu (Vim keys); none of them is a menu navigation key (h j k l q). */
+export type CopyChoice = { label: string; key: string; text: string | (() => Promise<string>) };
 
 /** Subject is the first line; the body is everything after the blank line that follows it. */
 export function splitMessage(message: string): { subject: string; body: string } {
@@ -24,19 +25,21 @@ export function commitUrl(remoteUrl: string, id: string): string | null {
 }
 
 /** The menu entries, in lazygit's order; entries that would copy nothing are left out. */
-export function copyChoices(info: CommitCopyInfo, diff: () => Promise<string>): CopyChoice[] {
+export function copyChoices(info: CommitCopyInfo, diff: () => Promise<string>, patch: () => Promise<string>): CopyChoice[] {
   const { subject, body } = splitMessage(info.message);
   const choices: CopyChoice[] = [
-    { label: "Commit hash", text: info.id },
-    { label: "Abbreviated hash", text: info.id.slice(0, 8) },
-    { label: "Commit subject", text: subject },
+    { label: "Commit hash", key: "y", text: info.id },
+    { label: "Abbreviated hash", key: "i", text: info.id.slice(0, 8) },
+    { label: "Commit subject", key: "s", text: subject },
   ];
-  if (body) choices.push({ label: "Commit message body", text: body });
-  choices.push({ label: "Full commit message", text: info.message.replace(/\s+$/, "") });
-  choices.push({ label: "Author", text: info.email ? `${info.author} <${info.email}>` : info.author });
-  choices.push({ label: "Date", text: info.date });
-  if (info.url) choices.push({ label: "Commit URL", text: info.url });
-  choices.push({ label: "Commit diff", text: diff });
-  if (info.tags.length) choices.push({ label: "Tags", text: info.tags.join("\n") });
+  if (body) choices.push({ label: "Commit message body", key: "b", text: body });
+  choices.push({ label: "Full commit message", key: "m", text: info.message.replace(/\s+$/, "") });
+  choices.push({ label: "Author", key: "a", text: info.email ? `${info.author} <${info.email}>` : info.author });
+  choices.push({ label: "Date", key: "e", text: info.date });
+  if (info.url) choices.push({ label: "Commit URL", key: "u", text: info.url });
+  choices.push({ label: "Commit diff", key: "d", text: diff });
+  // The email-style patch that "Apply patch from clipboard" (and git am / git apply) accepts.
+  choices.push({ label: "Commit patch", key: "p", text: patch });
+  if (info.tags.length) choices.push({ label: "Tags", key: "t", text: info.tags.join("\n") });
   return choices;
 }

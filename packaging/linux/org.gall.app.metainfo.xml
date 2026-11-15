@@ -16,7 +16,7 @@
       <li>Previews for images, PDF, video, audio, STL 3D models, text, code and Markdown; zip, 7z and tar archives open like folders</li>
       <li>A Git workspace with a history graph, line-by-line staging, commits, branches, stashes, interactive rebase and a conflict editor</li>
       <li>Git status in the file list, folder sizes, colour tags, notes and file templates</li>
-      <li>Dark and light themes, Nerd Font icons and custom CSS themes (Catppuccin and Gruvbox included)</li>
+      <li>Dark and light themes, Nerd Font icons and custom CSS themes (Gruvbox and Night Owl included)</li>
     </ul>
   </description>
   <launchable type="desktop-id">Gall.desktop</launchable>
@@ -35,5 +35,5 @@
     <screenshot><caption>Every shortcut in one searchable sheet</caption><image>https://raw.githubusercontent.com/GaMa87/gall/main/docs/screenshots/key-sheet.png</image></screenshot>
     <screenshot><caption>Light theme with a thumbnail grid</caption><image>https://raw.githubusercontent.com/GaMa87/gall/main/docs/screenshots/light-grid.png</image></screenshot>
   </screenshots>
-  <releases><release version="0.2.1" date="2026-11-11"/><release version="0.2.0" date="2026-11-09"/><release version="0.1.3" date="2026-11-05"/><release version="0.1.2" date="2026-11-04"/><release version="0.1.1" date="2026-11-03"/><release version="0.1.0" date="2026-10-31"/></releases>
+  <releases><release version="0.2.2" date="2026-11-15"/><release version="0.2.1" date="2026-11-11"/><release version="0.2.0" date="2026-11-09"/><release version="0.1.3" date="2026-11-05"/><release version="0.1.2" date="2026-11-04"/><release version="0.1.1" date="2026-11-03"/><release version="0.1.0" date="2026-10-31"/></releases>
 </component>

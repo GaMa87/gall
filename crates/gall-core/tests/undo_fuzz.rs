@@ -7,9 +7,6 @@
 //! `cargo test -p gall-core --test undo_fuzz -- --ignored --nocapture`
 //! (`GALL_FUZZ_SEEDS=400 GALL_FUZZ_STEPS=60` for a longer run). Its trash items are
 //! purged at the end.
-// Restoring from the trash (and so undoing a delete) is not available on macOS.
-#![cfg(any(windows, all(unix, not(target_os = "macos"))))]
-
 use gall_core::fs::ops::*;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -275,15 +272,36 @@ fn random_operations_undo_completely() {
         }
     }
     // Purge what this test put in the trash.
-    let mine: Vec<_> = trash::os_limited::list()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|i| {
-            let p = i.original_path();
-            p.starts_with(base.path()) || other.as_ref().is_some_and(|o| p.starts_with(o.path()))
-        })
-        .collect();
-    let _ = trash::os_limited::purge_all(mine);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mine: Vec<_> = trash::os_limited::list()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|i| {
+                let p = i.original_path();
+                p.starts_with(base.path())
+                    || other.as_ref().is_some_and(|o| p.starts_with(o.path()))
+            })
+            .collect();
+        let _ = trash::os_limited::purge_all(mine);
+    }
+    // macOS: Gall's own trash index lists what it trashed.
+    #[cfg(target_os = "macos")]
+    {
+        let ids: Vec<String> = gall_core::fs::trashbin::list()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|i| {
+                let p = Path::new(&i.original_parent);
+                p.starts_with(base.path())
+                    || other.as_ref().is_some_and(|o| p.starts_with(o.path()))
+            })
+            .map(|i| i.id)
+            .collect();
+        if !ids.is_empty() {
+            let _ = gall_core::fs::trashbin::purge(&ids);
+        }
+    }
     assert!(
         failures.is_empty(),
         "{} of {seeds} seeds failed:\n{}",

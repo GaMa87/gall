@@ -11,7 +11,7 @@ Open source (MIT) · Linux, Windows and macOS · Built with Rust, Tauri and Reac
 [![CI](https://github.com/GaMa87/gall/actions/workflows/ci.yml/badge.svg)](https://github.com/GaMa87/gall/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/GaMa87/gall?include_prereleases&sort=semver)](https://github.com/GaMa87/gall/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20macOS%20(experimental)-informational)](#install)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20macOS-informational)](#install)
 [![Buy me a coffee](https://img.shields.io/badge/%E2%98%95%20buy%20me%20a%20coffee-revolut.me%2Fgama87-5b7f60)](https://revolut.me/gama87)
 
 **[Download](#install)** · [Website](https://gama87.github.io/gall/) · [Features](#highlights) · [Shortcuts](#usage) · [Git workspace](#git-workspace) · [Build from source](#build-from-source) · [Roadmap](#roadmap)
@@ -85,8 +85,18 @@ other browser.
 
 Select two files and press `Ctrl+Shift+D` (or `= =` in Vim mode), or drop one file onto another.
 
-- **Text and code:** side by side or unified, word-level highlights, syntax colouring, moved
-  blocks detected. Edit, merge changes across and save.
+- **Text and code:** side by side or unified, syntax colouring, moved blocks detected. The diff
+  is structural: code is compared by its tokens, so reformatting (line breaks, indentation,
+  spacing) shows dimmed and is not counted, and only what really changed is marked; `t` switches
+  to the plain line diff. Git diffs are shown the same way. Edit, merge changes across and save.
+  Whitespace stays literal in prose, YAML, markup and JSX/TSX, in shell files containing
+  heredocs or backslash escapes, C preprocessor directives and JavaScript lines after an ambiguous `/`.
+  C-family files containing raw strings, text blocks or continued directives also
+  use literal comparison. Lua files with long bracket strings and INI-style configuration
+  files (including `.properties`) also use literal comparison to preserve value whitespace.
+  The comparison uses a lexer rather than full language parsers; these conservative
+  cases may mark formatting as a change. Git hunks lack preceding
+  comment/string context, so their token marks can be inaccurate; lines remain visible.
 - **Excel, ODS and CSV:** cell by cell. Rows are matched by a detected key column, and
   added or removed rows and columns are listed.
 - **Images:** side by side, swipe, onion skin, or a pixel difference with the share of pixels changed.
@@ -168,7 +178,7 @@ your marks with their folders. Marks are kept between sessions. With Vim keys th
 
 Monospace type, a dark theme by default, and file icons from Nerd Fonts and Catppuccin.
 If no Nerd Font is installed, Gall falls back to SVG icons. Colour-coded file age, folder colours,
-a light theme and an accent colour are built in, and [themes](docs/themes/README.md) restyle the rest: Catppuccin and Gruvbox are included.
+a light theme and an accent colour are built in, and [themes](docs/themes/README.md) restyle the rest: Gruvbox and Night Owl are included.
 
 ### 📊 A small system monitor in the sidebar
 
@@ -225,7 +235,7 @@ Full feature status: [docs/04-compatibility-matrix.md](docs/04-compatibility-mat
 ## Install
 
 Download a package for your system from **[Releases](https://github.com/GaMa87/gall/releases)**.
-Linux and Windows are equally well tested; macOS builds are experimental.
+Gall is supported on Linux, Windows and macOS (Apple silicon and Intel).
 
 | System | Package | Install |
 |---|---|---|
@@ -243,7 +253,8 @@ Flathub, AUR, Scoop, winget and Homebrew packages are in preparation; see [packa
 if you would like to help.
 
 **Portable (Windows):** `Gall-<version>-windows-x64-portable.zip` needs no installation. Unzip it
-anywhere (a USB drive works) and run `gall.exe`; everything stays in `UserData` next to it.
+anywhere and run `gall.exe`; settings stay in `%APPDATA%\gall`, so a newer version you unzip finds them.
+For a USB drive, create an empty file named `portable` next to `gall.exe` to keep everything in `UserData` beside it.
 Build it yourself with `./scripts/portable.ps1` on Windows or `./scripts/portable.sh` on Linux
 (cross-compiled with [cargo-xwin](https://github.com/rust-cross/cargo-xwin)); the output is in `dist/`.
 
@@ -403,7 +414,7 @@ shows the exact folders on every system. A file named
 `portable` next to the executable switches storage to `./UserData` (settings, data, logs and the
 webview's cache).
 
-**Themes:** Catppuccin and Gruvbox are included; pick them in *Settings › Appearance › Custom theme*.
+**Themes:** Gruvbox and Night Owl are included; pick them in *Settings › Appearance › Custom theme*.
 For other themes, put `mytheme.css` into `~/.config/gall/themes/` and pick it from the same menu;
 `Ctrl+Shift+F5` reloads it while you edit. [docs/themes](docs/themes/README.md) has a guide and a
 Dracula example.
@@ -463,7 +474,8 @@ Checkout; selecting a branch alone does not switch files. With local changes,
 choose **Stash**, **Commit**, or **Discard**. Stash includes untracked files and is
 not automatically reapplied. The preparation commit stages all tracked and
 untracked changes. Discard requires a second confirmation and retains a recovery
-stash named `Gall recovery before discard`; ignored files are preserved.
+copy under `refs/gall/recovery/` (reflog message `Gall recovery before discard`),
+not in the stash list; ignored files are preserved.
 Switching does not force overwritten files. Errors leave any created stash or
 commit available for inspection.
 
@@ -489,8 +501,8 @@ large patches and files without a final newline use whole-file staging instead.
 A stale HEAD, index or file snapshot cancels the action and asks you to refresh.
 
 **Amend latest commit** pre-fills an empty message with the previous message and
-replaces the latest commit using the index; the original commit is retained for
-recovery. **File actions…** offers confirmed discard of unstaged changes, with a
+replaces the latest commit using the index; the original commit stays reachable
+through the reflog. **File actions…** offers confirmed discard of unstaged changes, with a
 recovery stash, and ignore rules for untracked files in `.gitignore` or the local
 `.git/info/exclude`. Discard preserves staged changes and unrelated files.
 
@@ -501,11 +513,15 @@ files. Select an item and use its context menu (right-click, `Shift+F10` or **�
 `?` for the commands available there; **+** creates a new item. You can create and rename branches, delete merged local branches,
 set upstreams, create lightweight or annotated tags, and delete local tags.
 Stashes can be saved, inspected, applied, popped or dropped; conflicting pop keeps
-the stash, and dropped stashes retain a recovery reference.
+the stash, and dropped stashes retain a recovery reference. The same actions are in the
+menu of a stash row in the history graph (right-click or Shift+F10); with Vim keys, Space,
+`g` and `d` on that row apply, pop and drop it.
 
 Reference actions include merge, rebase, cherry-pick, revert and soft/mixed/hard
-reset. Confirmations name the target. History rewrites retain the previous HEAD;
-hard reset also preserves tracked edits and refuses untracked or ignored files.
+reset. Confirmations name the target. While a history rewrite runs, the
+previous HEAD is kept under `refs/gall/recovery/`; Gall removes that reference when
+the rewrite succeeds (the reflog still has the commit) and keeps it if it fails or
+stops. Hard reset also preserves tracked edits and refuses untracked or ignored files.
 An in-progress operation stays visible with **Continue**, **Skip** and **Abort**.
 The Conflicts panel shows base, current Git side, incoming Git side and working
 result. Choose a side for the whole file, edit it manually, or mark the current
@@ -540,6 +556,26 @@ confirms the exact range. An edit action pauses: stage changes in Working Change
 amend that commit, then Continue. Conflicts and edit stops can be resumed after restart.
 The editor accepts at most 1,000 linear commits and does not rewrite the root or
 preserve merge topology. Use an external Git client for those cases.
+Repositories with submodules are supported: interactive rebase rewrites this repository's commits,
+including those that move a submodule pointer, and never changes a submodule's own folder.
+Edits and untracked files inside a submodule do not block it, but a submodule checked out at a
+different commit than the repository records counts as a local change. Afterwards Gall lists the
+submodules that no longer match the rewritten history; update them in Tools → Submodules.
+
+Ordinary **Rebase current branch onto selection…** also supports submodules. It leaves their
+checked-out commits, local edits and untracked files alone, even when `submodule.recurse` is
+enabled. An unstaged difference in a submodule checkout does not block ordinary rebase;
+staged submodule pointers and local changes in the parent repository must be committed or
+stashed first. If the resulting history records a different submodule commit, update the
+checkout explicitly in Tools → Submodules when ready.
+
+A staged embedded repository such as `.worktrees` is a parent-repository change, even when
+the folder is absent from both branches' committed trees. Gall lists it in **Working Changes**
+and identifies it when rebase is blocked. If it should remain local, select it in Working
+Changes and use **Unstage file** (Vim: `u` or `Space`), then select the untracked folder and
+choose **File actions… → Exclude file locally**. This changes staging and the local exclude
+list; the folder and its contents stay on disk. Retry the rebase after reviewing the remaining
+parent changes.
 
 ### Git keyboard controls and repository tools
 

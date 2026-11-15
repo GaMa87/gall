@@ -99,15 +99,15 @@ fn short_name(mount: &str, label: &str) -> String {
 /// because it is where users actually work, followed by `/`, then the rest.
 pub fn list_drives() -> Vec<Drive> {
     let disks = match Disks::new_with_refreshed_list() {
-        Ok(d) => d,
+        Ok(d) => Some(d),
         Err(e) => {
             log::warn!("cannot list disks: {e}");
-            return Vec::new();
+            None
         }
     };
     let mut seen = std::collections::HashSet::new();
     let mut out: Vec<Drive> = Vec::new();
-    for d in disks.iter() {
+    for d in disks.iter().flat_map(|disks| disks.iter()) {
         let mount = d.mount_point().to_string_lossy().into_owned();
         let fs = d.file_system().to_string_lossy().into_owned();
         if !is_user_visible(&mount, &fs) || !seen.insert(mount.clone()) {
@@ -143,6 +143,8 @@ pub fn list_drives() -> Vec<Drive> {
             out.push(v);
         }
     }
+    #[cfg(windows)]
+    windows_network::append(&mut out);
     let lockable = super::volumes::lockable_mounts();
     for d in out.iter_mut() {
         d.lockable = lockable.contains(&d.mount);
@@ -157,6 +159,105 @@ pub fn list_drives() -> Vec<Drive> {
     // WSL distributions (Windows; detected in the background, never waited for).
     out.extend(super::wsl::drives());
     out
+}
+
+// sysinfo enumerates local volume GUIDs and excludes DRIVE_REMOTE. Query the
+// current process's logical drive letters separately; do not contact a share for
+// its label or capacity, since an offline server can stall every drive refresh.
+#[cfg(any(windows, test))]
+mod windows_network {
+    use super::Drive;
+
+    #[cfg(windows)]
+    pub(super) fn append(out: &mut Vec<Drive>) {
+        use windows::core::PCWSTR;
+        use windows::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives};
+
+        // Both calls use local drive mappings, without opening a remote root.
+        let mask = unsafe { GetLogicalDrives() };
+        if mask == 0 {
+            log::warn!(
+                "cannot list logical drives: {}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        append_with(out, mask, |root| {
+            let wide: Vec<u16> = root.encode_utf16().chain([0]).collect();
+            // DRIVE_REMOTE (4), as defined by GetDriveTypeW.
+            unsafe { GetDriveTypeW(PCWSTR(wide.as_ptr())) == 4 }
+        });
+    }
+
+    fn append_with(out: &mut Vec<Drive>, mask: u32, mut is_remote: impl FnMut(&str) -> bool) {
+        for index in 0..26 {
+            if mask & (1 << index) == 0 {
+                continue;
+            }
+            let short = format!("{}:", (b'A' + index) as char);
+            let mount = format!("{short}\\");
+            if out.iter().any(|d| d.mount.eq_ignore_ascii_case(&mount)) || !is_remote(&mount) {
+                continue;
+            }
+            out.push(Drive {
+                short,
+                label: "Network".into(),
+                mount,
+                ..Drive::default()
+            });
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn mapped_letters_are_visible_without_remote_metadata() {
+            let mut out = vec![Drive {
+                mount: "C:\\".into(),
+                total: 100,
+                ..Drive::default()
+            }];
+            let mask = (1 << 2) | (1 << 22) | (1 << 23) | (1 << 24) | (1 << 25);
+            append_with(&mut out, mask, |root| {
+                matches!(root, "W:\\" | "X:\\" | "Y:\\" | "Z:\\")
+            });
+            assert_eq!(
+                out.iter().map(|d| d.mount.as_str()).collect::<Vec<_>>(),
+                ["C:\\", "W:\\", "X:\\", "Y:\\", "Z:\\"]
+            );
+            assert_eq!(out[0].total, 100);
+            for d in &out[1..] {
+                assert_eq!(d.short, d.mount.trim_end_matches('\\'));
+                assert_eq!(d.label, "Network");
+                assert_eq!((d.total, d.available), (0, 0));
+                assert!(!d.removable && !d.lockable);
+            }
+        }
+
+        #[test]
+        fn existing_letters_are_not_duplicated_and_other_drive_types_are_ignored() {
+            let mut out = vec![Drive {
+                mount: "x:\\".into(),
+                label: "Existing".into(),
+                ..Drive::default()
+            }];
+            append_with(&mut out, u32::MAX, |root| root == "X:\\");
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].label, "Existing");
+        }
+
+        #[test]
+        fn missing_local_volume_list_does_not_hide_network_letters() {
+            let mut out = Vec::new();
+            append_with(&mut out, 1 << 23, |_| true);
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].mount, "X:\\");
+            append_with(&mut out, 0, |_| panic!("no assigned letters"));
+            assert_eq!(out.len(), 1);
+        }
+    }
 }
 
 /// Marks every row whose backing device is already shown by another row: btrfs

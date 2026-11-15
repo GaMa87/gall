@@ -147,21 +147,138 @@ fn classify(stack: &ScopeStack, cache: &mut HashMap<Scope, Cat>) -> Cat {
 
 /// Colours `lines` (without line endings) as the language of file `name`.
 /// None when the language is unknown or the text too large.
+///
+/// A long text is coloured in pieces on several threads. The parser carries its state
+/// from line to line, so a piece can only start on its own where that state is the one
+/// of a fresh start: each piece begins at a line that looks like the top level, is parsed
+/// from the fresh state, and is kept only if the piece before it really ended in that
+/// state. Otherwise it is parsed again from the true state, so the result is always the
+/// one a single pass gives.
 pub fn highlight(name: &str, lines: &[String]) -> Option<Highlight> {
+    highlight_within(name, lines, BUDGET)
+}
+
+/// `highlight` with the time after which lines stay plain (counted from the moment the
+/// syntaxes are loaded).
+fn highlight_within(name: &str, lines: &[String], budget: Duration) -> Option<Highlight> {
     let bytes: usize = lines.iter().map(|l| l.len() + 1).sum();
     if bytes > MAX_BYTES {
         return None;
     }
     let ss = syntaxes();
     let syntax = find(ss, name, lines.first().map_or("", |l| l.as_str()))?;
-    let mut state = ParseState::new(syntax);
-    let mut stack = ScopeStack::new();
+    let deadline = Instant::now() + budget;
+    let fresh = (ParseState::new(syntax), ScopeStack::new());
+    // The state after an empty line at the top level: what a piece starts from, and what
+    // the piece before it has to end in. (A state that has seen no line differs from
+    // every later one, so the very first piece starts from `fresh` itself.)
+    let mut primed = fresh.clone();
+    let _ = colour(&[String::new()], &mut primed, ss, deadline);
+    let bounds = pieces(lines);
+    let mut parts: Vec<(Vec<LineRuns>, Start)> = if bounds.len() == 2 {
+        // One piece (every text of ordinary length): no thread is started for it.
+        let mut at = fresh.clone();
+        let runs = colour(lines, &mut at, ss, deadline);
+        vec![(runs, at)]
+    } else {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = bounds
+                .windows(2)
+                .enumerate()
+                .map(|(n, range)| {
+                    let mut at = if n == 0 {
+                        fresh.clone()
+                    } else {
+                        primed.clone()
+                    };
+                    let piece = &lines[range[0]..range[1]];
+                    scope.spawn(move || {
+                        let runs = colour(piece, &mut at, ss, deadline);
+                        (runs, at)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("the highlighter does not panic"))
+                .collect()
+        })
+    };
+    let mut out = Vec::with_capacity(lines.len());
+    let mut end: Option<Start> = None;
+    for (n, (runs, reached)) in parts.drain(..).enumerate() {
+        match end.take() {
+            // The piece before did not end where this one assumed: parse it again.
+            Some(mut truth) if !same_start(&truth, &primed) => {
+                let piece = &lines[bounds[n]..bounds[n + 1]];
+                out.extend(colour(piece, &mut truth, ss, deadline));
+                end = Some(truth);
+            }
+            _ => {
+                out.extend(runs);
+                end = Some(reached);
+            }
+        }
+    }
+    Some(Highlight {
+        language: syntax.name.clone(),
+        lines: out,
+    })
+}
+
+/// Where the parser is: its state and the scopes open at that point.
+type Start = (ParseState, ScopeStack);
+
+fn same_start(a: &Start, b: &Start) -> bool {
+    a.0 == b.0 && a.1.as_slice() == b.1.as_slice()
+}
+
+/// Lines per piece at least, and pieces at most.
+const PIECE_LINES: usize = 1500;
+const MAX_PIECES: usize = 8;
+
+/// Where the pieces of `lines` begin and end: the first is 0, the last `lines.len()`.
+/// A piece begins at a line that starts in the first column after an empty line or a
+/// closing bracket, where code is usually back at the top level.
+fn pieces(lines: &[String]) -> Vec<usize> {
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(MAX_PIECES)
+        .min(lines.len() / PIECE_LINES)
+        .max(1);
+    let size = lines.len().div_ceil(workers).max(1);
+    let top_level = |n: usize| {
+        let starts = lines[n].chars().next().is_some_and(|c| !c.is_whitespace());
+        let after = lines[n - 1].trim_end();
+        starts
+            && !lines[n].starts_with(['}', ')', ']'])
+            && (after.is_empty() || after.starts_with(['}', ')', ']']))
+    };
+    let mut bounds = vec![0];
+    for piece in 1..workers {
+        let from = (piece * size).max(bounds[bounds.len() - 1] + 1);
+        if from >= lines.len() {
+            break;
+        }
+        // The next such line, within a reasonable distance; else just there.
+        let at = (from..lines.len().min(from + PIECE_LINES))
+            .find(|&n| top_level(n))
+            .unwrap_or(from);
+        bounds.push(at);
+    }
+    bounds.push(lines.len());
+    bounds
+}
+
+/// Colours `lines` starting from `at`, which is left where the last line ended. Lines
+/// after `deadline` stay plain.
+fn colour(lines: &[String], at: &mut Start, ss: &SyntaxSet, deadline: Instant) -> Vec<LineRuns> {
+    let (state, stack) = at;
     let mut cache = HashMap::new();
-    let start = Instant::now();
     let mut out = Vec::with_capacity(lines.len());
     let mut buf = String::new();
     for line in lines {
-        if line.len() > MAX_LINE || start.elapsed() > BUDGET {
+        if line.len() > MAX_LINE || Instant::now() > deadline {
             out.push(Vec::new());
             continue;
         }
@@ -190,18 +307,15 @@ pub fn highlight(name: &str, lines: &[String]) -> Option<Highlight> {
         };
         for (at, op) in ops {
             if at > pos {
-                emit(pos, at, &mut u16pos, classify(&stack, &mut cache));
+                emit(pos, at, &mut u16pos, classify(stack, &mut cache));
                 pos = at.min(line.len()).max(pos);
             }
             let _ = stack.apply(&op);
         }
-        emit(pos, line.len(), &mut u16pos, classify(&stack, &mut cache));
+        emit(pos, line.len(), &mut u16pos, classify(stack, &mut cache));
         out.push(runs);
     }
-    Some(Highlight {
-        language: syntax.name.clone(),
-        lines: out,
-    })
+    out
 }
 
 #[cfg(test)]
@@ -210,6 +324,107 @@ mod tests {
 
     fn lines(s: &str) -> Vec<String> {
         s.lines().map(str::to_string).collect()
+    }
+
+    /// A long text is coloured in pieces on several threads; the result has to be the
+    /// one a single pass gives, also where a comment or a string runs across the line
+    /// at which a piece would begin.
+    #[test]
+    fn pieces_give_the_colours_of_a_single_pass() {
+        let mut src = String::new();
+        for n in 0..3600 {
+            match n % 9 {
+                0 => src.push_str(&format!("fn item_{n}(value: u32) -> u32 {{\n")),
+                1 => src.push_str("    let text = \"a string\"; // and a comment\n"),
+                2 => src.push_str("    value + 1\n"),
+                3 => src.push_str("}\n"),
+                4 => src.push('\n'),
+                // Every few hundred lines a block comment that spans the top-level
+                // looking lines after it.
+                5 if n % 450 == 5 => src.push_str("/* a comment that stays open\n"),
+                6 if n % 450 == 6 => src.push('\n'),
+                7 if n % 450 == 7 => src.push_str("struct NotCode;\n"),
+                8 if n % 450 == 8 => src.push_str("still the comment */\n"),
+                _ => src.push_str("const LIMIT: usize = 10;\n"),
+            }
+        }
+        let text = lines(&src);
+        assert!(pieces(&text).len() > 2 || std::thread::available_parallelism().unwrap().get() < 2);
+        let ss = syntaxes();
+        let syntax = find(ss, "long.rs", "").unwrap();
+        let mut single = (ParseState::new(syntax), ScopeStack::new());
+        let later = Instant::now() + Duration::from_secs(600);
+        let expected = colour(&text, &mut single, ss, later);
+        let got = highlight("long.rs", &text).unwrap();
+        assert_eq!(got.lines.len(), expected.len());
+        for (n, (a, b)) in got.lines.iter().zip(&expected).enumerate() {
+            assert_eq!(a, b, "line {n}: {}", text[n]);
+        }
+        // The comment really is one: the line inside it is not coloured as code.
+        let inside = text.iter().position(|l| l == "struct NotCode;").unwrap();
+        assert!(got.lines[inside].iter().all(|r| r.2 == Cat::Comment as u8));
+    }
+
+    /// `highlight` gives for `text` what one pass over it gives.
+    fn assert_single_pass(name: &str, text: &[String]) -> Highlight {
+        let ss = syntaxes();
+        let syntax = find(ss, name, "").unwrap();
+        let mut single = (ParseState::new(syntax), ScopeStack::new());
+        let later = Instant::now() + Duration::from_secs(600);
+        let expected = colour(text, &mut single, ss, later);
+        let got = highlight_within(name, text, Duration::from_secs(600)).unwrap();
+        assert_eq!(got.lines.len(), expected.len());
+        for (n, (a, b)) in got.lines.iter().zip(&expected).enumerate() {
+            assert_eq!(a, b, "{name} line {n}: {}", text[n]);
+        }
+        got
+    }
+
+    /// Every piece but the first begins inside one long block comment, at a line that
+    /// looks like the top level: each of them was coloured as code on its thread and has
+    /// to be parsed again from the true state.
+    #[test]
+    fn pieces_that_begin_inside_a_comment_are_parsed_again() {
+        let mut src = String::from("fn before() {}\n\n/* a comment that stays open\n");
+        for _ in 0..3000 {
+            src.push_str("\nstruct NotCode;\n");
+        }
+        src.push_str("the end of it */\n\nfn after() -> u32 {\n    1\n}\n");
+        let text = lines(&src);
+        let bounds = pieces(&text);
+        if std::thread::available_parallelism().unwrap().get() >= 2 {
+            assert!(bounds.len() > 2, "the text is coloured in pieces");
+        }
+        let got = assert_single_pass("comment.rs", &text);
+        for &start in &bounds[1..bounds.len() - 1] {
+            assert_eq!(text[start], "struct NotCode;");
+            assert!(got.lines[start].iter().all(|r| r.2 == Cat::Comment as u8));
+        }
+        // After the comment the code is code again.
+        let after = text.iter().position(|l| l.starts_with("fn after")).unwrap();
+        assert!(got.lines[after].iter().any(|r| r.2 == Cat::Keyword as u8));
+    }
+
+    /// Languages inside languages: pieces begin inside a script, a style sheet or a
+    /// fenced block, where the state is not the one of a fresh start.
+    #[test]
+    fn pieces_inside_embedded_languages_match_a_single_pass() {
+        let mut html = String::from("<html>\n<body>\n");
+        for n in 0..215 {
+            html.push_str(&format!(
+                "<div id=\"d{n}\">\n<script>\nvar a{n} = \"text\"; /* open\n\nfunction not_code() {{}}\n*/\n\nfunction f{n}() {{ return {n}; }}\n</script>\n<style>\n\np {{ color: red; }}\n</style>\n</div>\n\n"
+            ));
+        }
+        html.push_str("</body>\n</html>\n");
+        assert_single_pass("page.html", &lines(&html));
+
+        let mut md = String::new();
+        for n in 0..215 {
+            md.push_str(&format!(
+                "# Heading {n}\n\nSome *text* here.\n\n```rust\n\nfn f{n}() {{}}\n\nlet s = \"# not a heading\";\n```\n\n"
+            ));
+        }
+        assert_single_pass("notes.md", &lines(&md));
     }
 
     fn cats(h: &Highlight, line: usize, text: &str) -> Vec<(String, u8)> {

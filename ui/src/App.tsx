@@ -80,8 +80,17 @@ function useTheme() {
       apply("");
       return;
     }
-    fetch(`${fileSrc(join(join(info.configDir, "themes"), name + ".css"))}?v=${nonce}`)
-      .then((r) => (r.ok ? r.text() : null))
+    const dir = join(info.configDir, "themes");
+    // Built-in themes usually have no file of their own: look at the folder first, so the asset
+    // protocol is not asked for a file that does not exist (it logs an error for every miss).
+    const hasFile = BUILTIN_THEMES[name]
+      ? api.listDir(dir, { showHidden: false, hideTemp: true })
+          .then((es) => es.some((e) => !e.isDir && e.name.toLowerCase() === (name + ".css").toLowerCase()))
+          .catch(() => false)
+      : Promise.resolve(true);
+    hasFile
+      .then((yes) => (yes ? fetch(`${fileSrc(join(dir, name + ".css"))}?v=${nonce}`) : null))
+      .then((r) => (r && r.ok ? r.text() : null))
       .catch(() => null)
       .then((css) => {
         if (cancelled) return;
@@ -100,6 +109,9 @@ let booted = false;
 
 export function App() {
   const ready = useStore((s) => !!s.session && !!s.settings);
+  useEffect(() => {
+    if (ready) api.uiLog("info", `startup: first render done ${Math.round(performance.now())} ms after page start`).catch(() => {});
+  }, [ready]);
   const shortcuts = useStore((s) => s.settings?.shortcuts);
   const profile = useStore((s) => keyboardProfile(s.settings));
   const keymap = useMemo(() => buildKeymap(shortcuts ?? {}, profile), [shortcuts, profile]);

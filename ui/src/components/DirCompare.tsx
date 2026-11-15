@@ -147,9 +147,11 @@ export function DirCompare({ left: l0, right: r0 }: { left: string; right: strin
       A.notify(`Synced: ${r.copied} copied${r.replaced ? ` (${r.replaced} replaced, old versions in trash)` : ""}${r.trashed ? `, ${r.trashed} moved to trash` : ""}`, "success", { label: "Undo", run: () => A.undo() });
       A.refreshUndo();
       refreshAll();
+      A.invalidateAllFolderSizes();
       run(true);
     } catch (e) {
       A.fail(e);
+      A.invalidateAllFolderSizes(); // part of the plan may be applied
       run(true);
     } finally {
       setBusy(false);
@@ -215,7 +217,7 @@ export function DirCompare({ left: l0, right: r0 }: { left: string; right: strin
     return (
       <div className={`dc-side ${side}`} style={{ paddingLeft: side === "l" ? 8 + it.depth * 16 : 8 }}>
         {it.isDir ? (
-          <button className="dc-twisty" onClick={(e) => { e.stopPropagation(); toggleDir(it.rel); }}>
+          <button className="dc-twisty" title="Expand or collapse folder" onClick={(e) => { e.stopPropagation(); toggleDir(it.rel); }}>
             <Icon name={collapsed.has(it.rel) ? "chevronRight" : "chevronDown"} size={12} />
           </button>
         ) : <span className="dc-twisty" />}

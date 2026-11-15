@@ -1,0 +1,9 @@
+/* Native popup windows ignore the document's theme on WebKitGTK. Keep all menu
+   surfaces inside the document so custom themes also color groups and selection. */
+.themed-select-menu { position: fixed; z-index: 10000; overflow: auto; box-sizing: border-box; padding: 4px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-2); color: var(--fg); box-shadow: var(--shadow); font: inherit; text-align: left; }
+.themed-select-option { padding: 6px 9px; border-radius: var(--radius-sm); overflow-wrap: anywhere; cursor: pointer; }
+.themed-select-option.grouped { padding-left: 18px; }
+.themed-select-option[aria-selected="true"] { background: var(--sel-gradient); box-shadow: var(--sel-bar); }
+.themed-select-option.active { background: var(--bg-hover); outline: 1px solid var(--accent-ring); outline-offset: -1px; }
+.themed-select-option[aria-disabled="true"] { color: var(--fg-faint); cursor: default; }
+.themed-select-group-label { padding: 8px 9px 4px; color: var(--fg-dim); font-size: .9em; font-weight: 650; }

@@ -1,0 +1,36 @@
+# Time limits of the app speed test (crates/gall-core/tests/app_speed.rs), as multiples
+# of the reference time (reading and stat-ing a folder of 40 000 files, measured before
+# each row; on all threads of the machine for a row that uses threads, else on one):
+# 150 % of the slowest recorded run. Written by
+# GALL_SPEED_RECORD=1; delete a line to record that row again from scratch.
+linux	Quick Open: file01234	0.218
+linux	Quick Open: no match	0.247
+linux	Quick Open: one letter	0.570
+linux	Quick Open: two words	0.590
+linux	build the file index (115 000 entries)	11.247
+linux	compare two folders of 5 000 files (content)	3.482
+linux	compare two folders of 5 000 files (sizes and times)	0.757
+linux	diff two files of 40 000 lines	2.684
+linux	diff two files of 40 000 lines by tokens (structural)	1.775
+linux	find names: *.md in 60 000 files	2.272
+linux	find names: file01234*	1.367
+linux	highlight 40 000 lines	77.175
+linux	list AppData/Local (3 000 folders)	0.201
+linux	list a 7z archive of 5 000 files	0.179
+linux	list a folder of 46 500 entries, hidden shown	3.131
+linux	list a tar.gz archive of 20 000 files	3.139
+linux	list a zip archive of 50 000 entries	3.855
+linux	list one application folder	0.007
+linux	list the same, folders only (tree column)	1.787
+linux	list the same, hidden not shown	3.595
+linux	open an early file inside a tar.gz archive of 20 000 files	1.044
+linux	open one file inside a 7z archive of 5 000 files	0.186
+linux	open one file inside a zip archive of 50 000 entries	2.330
+linux	rename 100 tagged files among 100 000 tags	0.168
+linux	search content: a common word	0.974
+linux	search content: a rare word	11.168
+linux	search content: a regex	9.610
+linux	search content: no match	9.269
+linux	size of a folder of 60 000 files	2.727
+linux	tag 1 000 files	0.053
+linux	tags of a folder among 100 000 tags	0.030

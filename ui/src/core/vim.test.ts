@@ -153,8 +153,9 @@ describe("vim keys", () => {
   });
 
   it("tokens use Shift for case and ignore Alt", () => {
+    // Pin the platform: Node reports "MacIntel" on a Mac, which would make Option+x typed text.
     const ev = (key: string, m: Partial<{ ctrlKey: boolean; altKey: boolean; shiftKey: boolean }> = {}) =>
-      vimToken({ key, ctrlKey: false, metaKey: false, altKey: false, ...m });
+      vimToken({ key, ctrlKey: false, metaKey: false, altKey: false, ...m }, false);
     expect(ev("g", { shiftKey: true })).toBe("G");
     expect(ev(" ")).toBe("Space");
     expect(ev("D", { ctrlKey: true })).toBe("Ctrl+d");
@@ -162,6 +163,8 @@ describe("vim keys", () => {
     expect(ev("D", { ctrlKey: true, shiftKey: true })).toBeNull();
     expect(ev("L", { ctrlKey: true, shiftKey: true })).toBeNull();
     expect(ev("x", { altKey: true })).toBeNull();
+    // macOS: Option+x types "≈" (a different character), which is a plain key.
+    expect(vimToken({ key: "≈", code: "KeyX", ctrlKey: false, metaKey: false, altKey: true }, true)).toBe("≈");
     expect(ev("Shift")).toBeNull();
     expect(ev("ArrowDown")).toBeNull();
   });

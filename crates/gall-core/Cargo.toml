@@ -23,6 +23,7 @@ notify = "8.2.1"
 notify-debouncer-full = "0.7.0"
 trash = "5.2.9"
 walkdir = "2.5.0"
+unicode-normalization = "0.1"
 imagesize = "0.15.0"
 dirs = "7.0.0"
 crossbeam-channel = "0.5.17"
@@ -49,6 +50,12 @@ fontdb = "0.24.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Already pulled in by `trash`; used directly for `trashItemAtURL`, which reports where the
+# item went (the `trash` crate cannot list or restore on macOS).
+objc2 = "0.6.2"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSError", "NSFileManager", "NSString", "NSURL"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56"

@@ -1,6 +1,7 @@
 // Compare view: side-by-side or unified line diff with word-level highlights,
 // folded unchanged regions, an overview ruler and keyboard navigation between
 // changes. Binary files get a byte-level verdict.
+import { maxOf } from "../core/maxOf";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api/ipc";
 import type { DiffOptions, DiffResult, DiffSource, SyntaxHighlight } from "../api/types";
@@ -20,7 +21,7 @@ const CONTEXT = 3;
 const OPTS_KEY = "diff:opts";
 const MODE_KEY = "diff:mode";
 const WRAP_KEY = "diff:wrap";
-const defaultOpts: DiffOptions = { ignoreWhitespace: false, ignoreCase: false, ignoreEol: true, minimal: false };
+const defaultOpts: DiffOptions = { ignoreWhitespace: false, ignoreCase: false, ignoreEol: true, minimal: false, structural: true };
 
 function loadOpts(): DiffOptions {
   try {
@@ -144,7 +145,7 @@ export function DiffView({ a: a0, b: b0, back }: { a: DiffSource; b: DiffSource;
   }, [tx, src]);
   const built = useMemo(() => {
     if (!tx) return null;
-    const o = { context: fold ? CONTEXT : Infinity, expanded, moves: tx.moves };
+    const o = { context: fold ? CONTEXT : Infinity, expanded, moves: tx.moves, marks: { a: tx.leftMarks, b: tx.rightMarks } };
     return mode === "split" ? buildSplit(tx.ops, tx.pairs, o) : buildUnified(tx.ops, tx.pairs, o);
   }, [tx, mode, fold, expanded]);
   const rows = built?.rows ?? [];
@@ -188,7 +189,7 @@ export function DiffView({ a: a0, b: b0, back }: { a: DiffSource; b: DiffSource;
     if (!tx || loading) return;
     const target = dir === "toRight" ? 1 : 0;
     if (!editable(target)) return A.notify(`The ${target ? "right" : "left"} side is read-only`, "warn");
-    const op = tx.ops.filter((o) => o.tag !== "equal")[k < 0 ? 0 : k];
+    const op = tx.ops.filter((o) => o.tag !== "equal" && !o.cosmetic)[k < 0 ? 0 : k];
     if (!op) return;
     const r = applyBlock(tx.leftLines, tx.rightLines, op, dir);
     setHistory((h) => [...h, edits]);
@@ -217,6 +218,7 @@ export function DiffView({ a: a0, b: b0, back }: { a: DiffSource; b: DiffSource;
       A.refreshUndo();
       refreshAll();
     } catch (e) { A.fail(e); }
+    A.invalidateAllFolderSizes(); // also after a failure: one side may be saved
   };
 
   const copyPatch = async () => {
@@ -273,6 +275,7 @@ export function DiffView({ a: a0, b: b0, back }: { a: DiffSource; b: DiffSource;
     else if (k === "i") toggle("ignoreCase");
     else if (k === "e") toggle("ignoreEol");
     else if (k === "m") toggle("minimal");
+    else if (k === "t") toggle("structural");
     else if (k === "z") setFold((f) => !f);
     else if (k === "l") setWrap((v) => !v);
     else if (k === "s") swap();
@@ -285,7 +288,7 @@ export function DiffView({ a: a0, b: b0, back }: { a: DiffSource; b: DiffSource;
   // ── row rendering ──
   const leftLines = tx?.leftLines ?? [];
   const rightLines = tx?.rightLines ?? [];
-  const maxLen = useMemo(() => Math.max(1, ...leftLines.map((l) => l.length), ...rightLines.map((l) => l.length)), [leftLines, rightLines]);
+  const maxLen = useMemo(() => Math.max(maxOf(leftLines, (l) => l.length, 1), maxOf(rightLines, (l) => l.length, 1)), [leftLines, rightLines]);
   const digits = String(Math.max(leftLines.length, rightLines.length)).length + 1;
   const numW = `${digits}ch`;
   // Columns available for code when wrapping: the cell minus the line number
@@ -333,9 +336,9 @@ export function DiffView({ a: a0, b: b0, back }: { a: DiffSource; b: DiffSource;
     const sx = c ? hl[side === "l" ? 0 : 1]?.lines[c.n] : undefined;
     if (!c) return <div className={`dv-cell empty ${side}`}><span className="dv-num" style={{ width: numW }} /><span className="dv-code" /></div>;
     return (
-      <div className={`dv-cell ${c.t} ${side} ${c.mv != null ? "mv" : ""}`}>
+      <div className={`dv-cell ${c.t} ${side} ${c.mv != null ? "mv" : ""} ${c.fmt ? "fmt" : ""}`}>
         <span className="dv-num" style={{ width: numW }}>{c.n + 1}</span>
-        {c.mv != null ? moveSign(c.mv, side, c.n) : <span className="dv-sign">{c.t === "del" || (c.t === "chg" && side === "l") ? "−" : c.t === "ins" || (c.t === "chg" && side === "r") ? "+" : ""}</span>}
+        {c.mv != null ? moveSign(c.mv, side, c.n) : <span className="dv-sign" title={c.fmt ? "Only the formatting of this line differs" : undefined}>{c.fmt ? "≈" : c.t === "del" || (c.t === "chg" && side === "l") ? "−" : c.t === "ins" || (c.t === "chg" && side === "r") ? "+" : ""}</span>}
         <span className="dv-code"><Text text={lines[c.n] ?? ""} spans={c.spans} sx={sx} kind={c.t} /></span>
       </div>
     );
@@ -369,10 +372,10 @@ export function DiffView({ a: a0, b: b0, back }: { a: DiffSource; b: DiffSource;
     const lines = u.side === "a" ? leftLines : rightLines;
     const n = u.side === "a" ? u.an! : u.bn!;
     return (
-      <div key={i} className={`dv-row unified ${u.t} ${u.mv != null ? "mv" : ""} ${isCur ? "cur" : ""}`} style={style}>
+      <div key={i} className={`dv-row unified ${u.t} ${u.mv != null ? "mv" : ""} ${u.fmt ? "fmt" : ""} ${isCur ? "cur" : ""}`} style={style}>
         <span className="dv-num" style={{ width: numW }}>{u.an != null ? u.an + 1 : ""}</span>
         <span className="dv-num" style={{ width: numW }}>{u.bn != null ? u.bn + 1 : ""}</span>
-        {u.mv != null ? moveSign(u.mv, u.side === "a" ? "l" : "r", n) : <span className="dv-sign">{u.t === "del" ? "−" : u.t === "ins" ? "+" : ""}</span>}
+        {u.mv != null ? moveSign(u.mv, u.side === "a" ? "l" : "r", n) : <span className="dv-sign" title={u.fmt ? "Only the formatting of this line differs" : undefined}>{u.fmt ? "≈" : u.t === "del" ? "−" : u.t === "ins" ? "+" : ""}</span>}
         <span className="dv-code"><Text text={lines[n] ?? ""} spans={u.spans} sx={hl[u.side === "a" ? 0 : 1]?.lines[n]} kind={u.t} /></span>
       </div>
     );
@@ -381,6 +384,8 @@ export function DiffView({ a: a0, b: b0, back }: { a: DiffSource; b: DiffSource;
   const changes = blocks.length;
   const identical = !!tx && tx.added === 0 && tx.removed === 0;
   const anyIgnore = opts.ignoreWhitespace || opts.ignoreCase;
+  // Blocks whose content is the same and only the formatting differs (structural diff).
+  const cosmetic = tx ? tx.ops.filter((o) => o.cosmetic).length : 0;
   const total = off[rows.length] ?? 0;
 
   const fileHead = (s: DiffSource, side: "l" | "r") => (
@@ -416,6 +421,11 @@ export function DiffView({ a: a0, b: b0, back }: { a: DiffSource; b: DiffSource;
                     ⇅ {tx.moves.reduce((n, m) => n + m.len, 0)} moved
                   </span>
                 )}
+                {cosmetic > 0 && (
+                  <span className="dv-fmt" title="Places where only the formatting differs (line breaks, indentation, spacing): shown dimmed, not counted as changes">
+                    ≈ {cosmetic} formatting only
+                  </span>
+                )}
               </span>
             )}
             {/* Text-only controls: hidden for binary files, images and tables. */}
@@ -430,6 +440,7 @@ export function DiffView({ a: a0, b: b0, back }: { a: DiffSource; b: DiffSource;
               <button className={`tgl ${opts.ignoreCase ? "on" : ""}`} title="Ignore case (i)" onClick={() => toggle("ignoreCase")}>Aa</button>
               <button className={`tgl ${opts.ignoreEol ? "on" : ""}`} title="Ignore line endings CRLF/LF (e)" onClick={() => toggle("ignoreEol")}>⏎</button>
               <button className={`tgl ${opts.minimal ? "on" : ""}`} title="Minimal diff: fewest changed lines, often harder to read (m)" onClick={() => toggle("minimal")}>M</button>
+              <button className={`tgl ${opts.structural ? "on" : ""}`} title="Structural diff: compare code by its tokens, so reformatting is not a change and only what really changed is marked (t)" onClick={() => toggle("structural")}>{"{}"}</button>
               <button className={`tgl ${fold ? "on" : ""}`} title="Fold unchanged lines (z)" onClick={() => setFold((f) => !f)}>⋯</button>
               <button className={`tgl ${wrap ? "on" : ""}`} title="Wrap long lines (l)" onClick={() => setWrap((v) => !v)}>↩</button>
             </div>
@@ -491,7 +502,7 @@ export function DiffView({ a: a0, b: b0, back }: { a: DiffSource; b: DiffSource;
         )}
 
         {!tableMode && tx && identical && (
-          <div className="dv-msg same"><Icon name="check" size={16} /> No differences{anyIgnore ? " (ignoring " + [opts.ignoreWhitespace && "whitespace", opts.ignoreCase && "case"].filter(Boolean).join(" and ") + ")" : ""}
+          <div className="dv-msg same"><Icon name="check" size={16} /> {cosmetic > 0 ? `Same content: only the formatting differs in ${cosmetic} place${cosmetic === 1 ? "" : "s"}` : "No differences"}{anyIgnore ? " (ignoring " + [opts.ignoreWhitespace && "whitespace", opts.ignoreCase && "case"].filter(Boolean).join(" and ") + ")" : ""}
             {res && res.left.crlf !== res.right.crlf && " · line endings differ (CRLF vs LF)"}
             {res && res.left.finalNewline !== res.right.finalNewline && " · final newline differs"}
           </div>
@@ -544,6 +555,7 @@ export function DiffView({ a: a0, b: b0, back }: { a: DiffSource; b: DiffSource;
           <span><kbd>n</kbd>/<kbd>N</kbd> next/prev change</span>
           <span><kbd>u</kbd> view</span>
           <span><kbd>w</kbd> whitespace</span>
+          <span><kbd>t</kbd> structural</span>
           <span><kbd>z</kbd> fold</span>
           <span><kbd>l</kbd> wrap</span>
           <span><kbd>s</kbd> swap</span>

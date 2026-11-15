@@ -56,6 +56,17 @@ CREATE TABLE IF NOT EXISTS tags (path TEXT PRIMARY KEY, color INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS destinations (path TEXT PRIMARY KEY, used INTEGER NOT NULL);
 "#;
 
+/// The smallest text greater than every text that begins with `prefix` (which ends with
+/// a path separator): paths are compared byte by byte, so `path >= prefix AND path <
+/// after_prefix(prefix)` is "begins with `prefix`".
+fn after_prefix(prefix: &str) -> String {
+    let mut after = prefix.to_owned();
+    let last = after.pop().expect("a prefix ends with a separator");
+    debug_assert!(last.is_ascii());
+    after.push((last as u8 + 1) as char);
+    after
+}
+
 fn key_to_str(k: SortKey) -> &'static str {
     match k {
         SortKey::Name => "name",
@@ -88,6 +99,11 @@ impl Db {
         }
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
+        // With the write-ahead log a commit need not wait for the disk: after a power
+        // cut the last changes may be missing, the database is never damaged. And a
+        // second instance writing at the same moment is waited for, not an error.
+        conn.execute_batch("PRAGMA synchronous = NORMAL;")?;
+        conn.busy_timeout(std::time::Duration::from_secs(2))?;
         Ok(Db {
             conn: Mutex::new(conn),
         })
@@ -236,6 +252,29 @@ impl Db {
         Ok(())
     }
 
+    /// `set_tag` for many paths, all or none: one transaction, so one write to disk
+    /// instead of one per path.
+    pub fn set_tags(&self, paths: &[String], color: u8) -> Result<()> {
+        let mut c = self.conn.lock().unwrap();
+        let tx = c.transaction()?;
+        {
+            let mut st = tx.prepare(if color == 0 {
+                "DELETE FROM tags WHERE path = ?1"
+            } else {
+                "INSERT INTO tags(path, color) VALUES(?1, ?2) ON CONFLICT(path) DO UPDATE SET color = excluded.color"
+            })?;
+            for path in paths {
+                if color == 0 {
+                    st.execute(params![path])?;
+                } else {
+                    st.execute(params![path, color])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Tags of direct children of `dir` (for the file list).
     pub fn tags_in(&self, dir: &str) -> Result<Vec<Tagged>> {
         let sep = std::path::MAIN_SEPARATOR;
@@ -245,9 +284,11 @@ impl Db {
             format!("{dir}{sep}")
         };
         let c = self.conn.lock().unwrap();
+        // Everything below the folder is one range of the primary key: found through
+        // the index instead of reading every tag there is.
         let mut st =
-            c.prepare("SELECT path, color FROM tags WHERE substr(path, 1, length(?1)) = ?1")?;
-        let rows = st.query_map(params![prefix], |r| {
+            c.prepare_cached("SELECT path, color FROM tags WHERE path >= ?1 AND path < ?2")?;
+        let rows = st.query_map(params![prefix, after_prefix(&prefix)], |r| {
             Ok(Tagged {
                 path: r.get(0)?,
                 color: r.get(1)?,
@@ -282,14 +323,14 @@ impl Db {
     /// and so do those of everything inside it (a renamed folder).
     pub fn move_tag(&self, from: &str, to: &str) -> Result<()> {
         let c = self.conn.lock().unwrap();
+        // The item itself and, as one range of the primary key, everything inside it.
+        let inside = format!("{from}{}", std::path::MAIN_SEPARATOR);
         for table in ["tags", "folder_prefs"] {
-            c.execute(
-                &format!(
-                    "UPDATE OR REPLACE {table} SET path = ?2 || substr(path, length(?1) + 1) \
-                     WHERE path = ?1 OR substr(path, 1, length(?1) + 1) = ?1 || ?3"
-                ),
-                params![from, to, std::path::MAIN_SEPARATOR_STR],
-            )?;
+            c.prepare_cached(&format!(
+                "UPDATE OR REPLACE {table} SET path = ?2 || substr(path, length(?1) + 1) \
+                 WHERE path = ?1 OR (path >= ?3 AND path < ?4)"
+            ))?
+            .execute(params![from, to, inside, after_prefix(&inside)])?;
         }
         Ok(())
     }
@@ -415,5 +456,65 @@ mod tests {
         assert_eq!(db.tagged(Some(4)).unwrap()[0].path, "/d/subway.txt");
         db.set_tag("/d/z.txt", 0).unwrap();
         assert!(db.tagged(Some(2)).unwrap().is_empty());
+    }
+
+    /// Tags are found and moved through ranges of the path: names next to the folder's
+    /// own in sort order (before and after the separator) stay out of it.
+    #[test]
+    fn tags_of_a_folder_and_its_neighbours() {
+        let sep = std::path::MAIN_SEPARATOR;
+        let p = |s: &str| s.replace('/', std::path::MAIN_SEPARATOR_STR);
+        let db = Db::open_in_memory().unwrap();
+        let all = [
+            "/d/a.txt",
+            "/d/\u{17e} \u{10d}.txt",
+            "/d/sub/b.txt",
+            "/d/sub/deep/c.txt",
+            "/d-x/e.txt",
+            "/d.txt",
+            "/d0",
+            "/da/f.txt",
+            "/d",
+        ];
+        db.set_tags(&all.map(p), 5).unwrap();
+        let names = |dir: &str| {
+            let mut v: Vec<String> = db
+                .tags_in(&p(dir))
+                .unwrap()
+                .into_iter()
+                .map(|t| t.path)
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(names("/d"), [p("/d/a.txt"), p("/d/\u{17e} \u{10d}.txt")]);
+        assert_eq!(names(&format!("/d{sep}")), names("/d"));
+        assert_eq!(names("/d/sub"), [p("/d/sub/b.txt")]);
+        // Renaming the folder takes what is inside along, at any depth, and nothing else.
+        db.move_tag(&p("/d"), &p("/moved")).unwrap();
+        let mut now: Vec<String> = db
+            .tagged(None)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.path)
+            .collect();
+        now.sort();
+        let mut expected = [
+            "/moved/a.txt",
+            "/moved/\u{17e} \u{10d}.txt",
+            "/moved/sub/b.txt",
+            "/moved/sub/deep/c.txt",
+            "/d-x/e.txt",
+            "/d.txt",
+            "/d0",
+            "/da/f.txt",
+            "/moved",
+        ]
+        .map(p);
+        expected.sort();
+        assert_eq!(now, expected);
+        // Removing many at once.
+        db.set_tags(&expected, 0).unwrap();
+        assert!(db.tagged(None).unwrap().is_empty());
     }
 }

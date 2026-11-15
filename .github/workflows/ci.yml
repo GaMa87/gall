@@ -73,6 +73,43 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p gall-core
 
+  speed:
+    # Git has to stay fast on every platform: each view within the time budget and
+    # within its number of Git processes (crates/gall-core/tests/git_speed.rs). The table
+    # of measurements is in the job summary.
+    if: github.repository == 'GaMa87/gall'
+    name: Git speed – ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # On Windows the views are measured a second time for a repository inside WSL.
+      # Without a distribution that part is skipped and the summary says so.
+      - name: Set up WSL with Git
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        uses: Vampire/setup-wsl@v6
+        with:
+          distribution: Ubuntu-24.04
+          additional-packages: git
+      - name: Git speed test
+        shell: bash
+        run: |
+          export GALL_SPEED_REPORT="$GITHUB_STEP_SUMMARY"
+          cargo test -p gall-core --release --test git_speed -- --ignored --nocapture
+      - name: App speed test (listing, search, Quick Open, diff)
+        # Also when the Git rows failed: the two tables are independent.
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          export GALL_SPEED_REPORT="$GITHUB_STEP_SUMMARY"
+          cargo test -p gall-core --release --test app_speed -- --ignored --nocapture
+
   macos:
     # Only on the public repo: the private development repo runs no CI/CD.
     if: github.repository == 'GaMa87/gall'

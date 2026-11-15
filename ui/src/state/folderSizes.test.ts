@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(), convertFileSrc: (p: string) => p }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(() => Promise.resolve(() => {})) }));
 import { api } from "../api/ipc";
-import { applyFolderSizeProgress, calcFolderSizes, cancelFolderSizes, invalidateAllFolderSizes, invalidateFolderSizes } from "./actions";
+import { applyFolderSizeProgress, calcFolderSizes, cancelFolderSizes, invalidateAllFolderSizes, invalidateFolderSizes, trashPaths, undo } from "./actions";
 import { registerController, type BrowserController } from "./controllers";
 import type { Settings } from "../api/types";
 import { getState, setState } from "./store";
@@ -26,6 +26,7 @@ beforeEach(() => {
 
 afterEach(async () => {
   setState({ settings: null });
+  vi.unstubAllGlobals();
   registerController(0, null);
   await vi.runOnlyPendingTimersAsync();
   vi.useRealTimers();
@@ -163,6 +164,23 @@ describe("folder size calculations", () => {
     invalidateAllFolderSizes();
     expect(getState().folderSizes["/a"].at).toBe(0);
     expect(getState().folderSizes["/b/sub"].at).toBe(0);
+  });
+
+  it.each([
+    ["undo", () => undo()],
+    ["moving to the trash", () => trashPaths(["/a/nested/file"])],
+  ])("%s recounts a listed subfolder the watcher does not see", async (_name, act) => {
+    setState({ settings: { folderSizesAuto: true } as Settings, folderSizes: { "/a": { ...total(100), done: true, at: Date.now() } } });
+    registerController(0, { path: () => "/", entries: () => [{ path: "/a", isDir: true }] } as BrowserController);
+    vi.stubGlobal("window", globalThis); // notifications use window.setTimeout
+    vi.spyOn(api, "undo").mockResolvedValue("Removed “file”");
+    vi.spyOn(api, "trash").mockResolvedValue(undefined as never);
+    vi.spyOn(api, "undoPeek").mockResolvedValue(null);
+    const count = vi.spyOn(api, "folderSize").mockResolvedValue(total(40));
+    await act();
+    await vi.advanceTimersByTimeAsync(300);
+    expect(count).toHaveBeenCalledWith("/a", expect.any(Number));
+    expect(getState().folderSizes["/a"].bytes).toBe(40);
   });
 
   it("changes during a count keep the result stale for a follow-up count", async () => {

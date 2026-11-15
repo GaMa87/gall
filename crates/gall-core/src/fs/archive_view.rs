@@ -78,31 +78,78 @@ fn stamp(archive: &Path) -> Result<Stamp> {
     Ok((m.len(), m.modified().ok()))
 }
 
-/// Archive path → (version, items).
-type IndexCache = Mutex<HashMap<PathBuf, (Stamp, Arc<Vec<Item>>)>>;
+/// What is known about one version of an archive.
+struct Indexed {
+    stamp: Stamp,
+    items: Arc<Vec<Item>>,
+    /// No file name occurs twice in the archive. Then the first entry of a name is the
+    /// only one, and reading can stop once every wanted file was seen; with a repeated
+    /// name the last entry is the one that stays when the archive is extracted.
+    unique_files: bool,
+    /// When it was last asked for (a counter), to drop the one unused longest.
+    used: u64,
+}
+
+/// How many archives keep their list in memory. The list of a compressed tar archive
+/// costs a pass over the whole file, so going back to an archive must not read it again.
+const INDEX_CACHE: usize = 32;
+
+type IndexCache = Mutex<HashMap<PathBuf, Indexed>>;
 
 fn cache() -> &'static IndexCache {
     static C: OnceLock<IndexCache> = OnceLock::new();
     C.get_or_init(Default::default)
 }
 
+fn next_use() -> u64 {
+    static USED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    USED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// All items of `archive`, folders included, sorted by name. Cached until it changes.
 pub fn index(archive: &Path) -> Result<Arc<Vec<Item>>> {
+    Ok(index_info(archive)?.0)
+}
+
+/// [`index`] with whether every file name of the archive occurs once.
+fn index_info(archive: &Path) -> Result<(Arc<Vec<Item>>, bool)> {
     let st = stamp(archive)?;
-    if let Some((s, items)) = cache().lock().unwrap().get(archive) {
-        if *s == st {
-            return Ok(items.clone());
+    if let Some(known) = cache().lock().unwrap().get_mut(archive) {
+        if known.stamp == st {
+            known.used = next_use();
+            return Ok((known.items.clone(), known.unique_files));
         }
     }
     let (format, _) = detect(archive).ok_or_else(|| not_archive(archive))?;
     let raw = read_index(archive, format)?;
+    let unique_files = {
+        let mut names = HashSet::with_capacity(raw.len());
+        raw.iter()
+            .filter(|it| !it.is_dir)
+            .all(|it| names.insert(it.name.as_str()))
+    };
     let items = Arc::new(with_folders(raw));
     let mut c = cache().lock().unwrap();
-    if c.len() > 16 {
-        c.clear();
+    c.insert(
+        archive.to_path_buf(),
+        Indexed {
+            stamp: st,
+            items: items.clone(),
+            unique_files,
+            used: next_use(),
+        },
+    );
+    while c.len() > INDEX_CACHE {
+        let Some(oldest) = c
+            .iter()
+            .min_by_key(|(_, known)| known.used)
+            .map(|(path, _)| path.clone())
+        else {
+            break;
+        };
+        c.remove(&oldest);
     }
-    c.insert(archive.to_path_buf(), (st, items.clone()));
-    Ok(items)
+    Ok((items, unique_files))
 }
 
 // ───────────────────────────── passwords ─────────────────────────────
@@ -180,22 +227,73 @@ pub(crate) fn zip_entry<'a, R: Read + io::Seek>(
     .map_err(|e| zip_err(archive, e))
 }
 
+/// A buffered file that keeps its buffer when a seek lands inside it. The zip reader
+/// seeks before nearly every read (once per entry of the directory), and a plain
+/// `BufReader` throws its buffer away on each seek, which leaves one system call per read.
+pub(crate) struct SeekBuffered {
+    inner: io::BufReader<fs::File>,
+    at: u64,
+}
+
+impl SeekBuffered {
+    pub(crate) fn new(file: fs::File) -> Self {
+        Self {
+            inner: io::BufReader::with_capacity(64 * 1024, file),
+            at: 0,
+        }
+    }
+}
+
+impl Read for SeekBuffered {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.at += n as u64;
+        Ok(n)
+    }
+}
+
+impl io::Seek for SeekBuffered {
+    fn seek(&mut self, to: io::SeekFrom) -> io::Result<u64> {
+        let by = match to {
+            io::SeekFrom::Start(n) => i64::try_from(n as i128 - self.at as i128).ok(),
+            io::SeekFrom::Current(by) => Some(by),
+            io::SeekFrom::End(_) => None,
+        };
+        match by.and_then(|by| Some((by, self.at.checked_add_signed(by)?))) {
+            Some((by, at)) => {
+                self.inner.seek_relative(by)?;
+                self.at = at;
+            }
+            // From the end, or out of range: the file answers (and reports the error).
+            None => self.at = self.inner.seek(to)?,
+        }
+        Ok(self.at)
+    }
+}
+
 fn not_archive(p: &Path) -> CoreError {
     CoreError::Other(format!("{} is not an archive Gall can browse", p.display()))
 }
 
 /// `a/b/c.txt` → the item plus folders `a` and `a/b`; duplicates merged, sorted.
 fn with_folders(raw: Vec<Item>) -> Vec<Item> {
-    let mut all: BTreeMap<String, Item> = BTreeMap::new();
+    let mut all: HashMap<String, Item> = HashMap::with_capacity(raw.len() + raw.len() / 8);
     for it in raw {
         let mut parent = it.name.as_str();
         while let Some((p, _)) = parent.rsplit_once('/') {
-            all.entry(p.to_string()).or_insert_with(|| Item {
-                name: p.to_string(),
-                is_dir: true,
-                size: 0,
-                modified: None,
-            });
+            // A folder that is known came with all the folders above it.
+            if all.contains_key(p) {
+                break;
+            }
+            all.insert(
+                p.to_string(),
+                Item {
+                    name: p.to_string(),
+                    is_dir: true,
+                    size: 0,
+                    modified: None,
+                },
+            );
             parent = p;
         }
         match all.get_mut(&it.name) {
@@ -207,11 +305,26 @@ fn with_folders(raw: Vec<Item>) -> Vec<Item> {
             }
         }
     }
-    all.into_values().collect()
+    let mut items: Vec<Item> = all.into_values().collect();
+    items.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+    items
 }
 
 /// `/`-joined normal components, or None for names that climb out or are absolute.
 fn clean(name: &str) -> Option<String> {
+    let name = name.trim_end_matches('/');
+    // Nearly every name is already in this form; an archive has one per entry.
+    let plain = !name.is_empty()
+        && !name.contains(['\\', ':'])
+        && name.split('/').all(|part| !matches!(part, "" | "." | ".."));
+    if plain {
+        return Some(name.to_string());
+    }
+    clean_checked(name)
+}
+
+/// [`clean`] for any name: through the path components of this platform.
+fn clean_checked(name: &str) -> Option<String> {
     let rel = safe_relative(name.trim_end_matches('/'))?;
     Some(
         rel.components()
@@ -227,9 +340,22 @@ fn read_index(archive: &Path, format: ArchiveFormat) -> Result<Vec<Item>> {
     let mut out = Vec::new();
     match format {
         ArchiveFormat::Zip => {
-            let mut z = zip::ZipArchive::new(file).map_err(|e| err("zip", &e))?;
+            // The list comes from the directory at the end of the file alone: asking for
+            // an entry itself would seek to it and read its header, once per entry.
+            let z = zip::ZipArchive::new(SeekBuffered::new(file)).map_err(|e| err("zip", &e))?;
+            // Files packed together often carry the same date; converting one to local
+            // time is the dearest step per entry.
+            let mut last_time: Option<(zip::DateTime, Option<i64>)> = None;
+            let mut time_of = |d: zip::DateTime| match last_time {
+                Some((known, millis)) if known == d => millis,
+                _ => {
+                    let millis = zip_time(d);
+                    last_time = Some((d, millis));
+                    millis
+                }
+            };
             for i in 0..z.len() {
-                let f = z.by_index_raw(i).map_err(|e| err("zip", &e))?;
+                let f = z.by_index_data(i).map_err(|e| err("zip", &e))?;
                 let Some(name) = f.enclosed_name().and_then(|p| clean(&p.to_string_lossy())) else {
                     continue;
                 };
@@ -237,7 +363,7 @@ fn read_index(archive: &Path, format: ArchiveFormat) -> Result<Vec<Item>> {
                     name,
                     is_dir: f.is_dir(),
                     size: f.size(),
-                    modified: f.last_modified().and_then(zip_time),
+                    modified: f.last_modified().and_then(&mut time_of),
                 });
             }
         }
@@ -527,7 +653,7 @@ pub fn materialize(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
         let root = cache_root(&archive)?;
         let lock = extraction_lock(&root);
         let _guard = lock.lock().unwrap();
-        let items = index(&archive)?;
+        let (items, unique_files) = index_info(&archive)?;
         let members = member_paths(&items);
         let mut need: Vec<String> = Vec::new();
         for (i, inner) in &wanted {
@@ -547,7 +673,25 @@ pub fn materialize(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
         }
         if !need.is_empty() {
             fs::create_dir_all(&root).ctx("create", &root)?;
-            extract_entries(&archive, &root, &need, &members)?;
+            // Tar and 7z archives are read from the start: when every name occurs once,
+            // reading stops after the last wanted file instead of at the end.
+            let files = unique_files.then(|| {
+                items
+                    .iter()
+                    .filter(|it| !it.is_dir && wanted_by(&it.name, &need))
+                    .count()
+            });
+            if files.is_some() {
+                // Folders may come after their files in the archive (or not at all).
+                for it in items
+                    .iter()
+                    .filter(|it| it.is_dir && wanted_by(&it.name, &need))
+                {
+                    let dir = root.join("entries").join(&members[&it.name]);
+                    fs::create_dir_all(&dir).ctx("create", &dir)?;
+                }
+            }
+            extract_entries(&archive, &root, &need, &members, files)?;
         }
         let _ = filetime_touch(&root);
     }
@@ -577,7 +721,18 @@ fn extract_entries(
     root: &Path,
     wanted: &[String],
     members: &HashMap<String, PathBuf>,
+    // The number of wanted files, when reading may stop after that many (see `materialize`).
+    files: Option<usize>,
 ) -> Result<()> {
+    let mut left = files;
+    // One wanted file was written; true when it was the last one.
+    let mut last_written = |is_dir: bool| match left.as_mut() {
+        Some(n) if !is_dir => {
+            *n = n.saturating_sub(1);
+            *n == 0
+        }
+        _ => false,
+    };
     let (format, _) = detect(archive).ok_or_else(|| not_archive(archive))?;
     let file = fs::File::open(archive).ctx("open", archive)?;
     let err = |what: &str, e: &dyn std::fmt::Display| CoreError::Other(format!("{what}: {e}"));
@@ -599,11 +754,12 @@ fn extract_entries(
     };
     match format {
         ArchiveFormat::Zip => {
-            let mut z = zip::ZipArchive::new(file).map_err(|e| err("zip", &e))?;
+            let mut z =
+                zip::ZipArchive::new(SeekBuffered::new(file)).map_err(|e| err("zip", &e))?;
             for i in 0..z.len() {
-                // Names come from the raw entry: only wanted ones are decrypted.
+                // Names come from the directory: only wanted entries are read and decrypted.
                 let (name, skip) = {
-                    let f = z.by_index_raw(i).map_err(|e| err("zip", &e))?;
+                    let f = z.by_index_data(i).map_err(|e| err("zip", &e))?;
                     (
                         f.enclosed_name().and_then(|p| clean(&p.to_string_lossy())),
                         f.is_symlink(),
@@ -625,23 +781,48 @@ fn extract_entries(
             }
         }
         ArchiveFormat::SevenZ => {
-            let mut ar = sevenz_rust2::ArchiveReader::new(file, sevenz_password(archive))
+            let mut file = file;
+            let password = sevenz_password(archive);
+            let ar = sevenz_rust2::Archive::read(&mut file, &password)
                 .map_err(|e| sevenz_err(archive, e))?;
-            let mut failed: Option<CoreError> = None;
-            ar.for_each_entries(|entry, data| {
-                if let Some(name) = clean(entry.name()) {
-                    if wanted_by(&name, wanted) {
-                        if let Err(e) = write(&name, entry.is_directory(), data) {
-                            failed = Some(e);
-                            return Ok(false);
-                        }
-                    }
+            // The wanted entries by their place in the archive. Data is packed in blocks
+            // (one for all files, a few large ones, or one per file): only blocks that
+            // hold a wanted file are decoded, each up to its last wanted file. A repeated
+            // name is written again in archive order, so its last entry stays.
+            let wanted_at: Vec<Option<String>> = ar
+                .files
+                .iter()
+                .map(|f| clean(f.name()).filter(|name| wanted_by(name, wanted)))
+                .collect();
+            let block_of = &ar.stream_map.file_block_index;
+            let mut last_in_block: BTreeMap<usize, usize> = BTreeMap::new();
+            for (at, name) in wanted_at.iter().enumerate() {
+                if let (Some(_), Some(block)) = (name, block_of.get(at).copied().flatten()) {
+                    last_in_block.insert(block, at);
                 }
-                // Unwanted entries must still be read through in solid archives.
-                io::copy(data, &mut io::sink())?;
-                Ok(true)
-            })
-            .map_err(|e| sevenz_err(archive, e))?;
+            }
+            let threads = std::thread::available_parallelism().map_or(1, |n| n.get() as u32);
+            let mut failed: Option<CoreError> = None;
+            for (&block, &last) in &last_in_block {
+                let mut at = ar.stream_map.block_first_file_index[block];
+                sevenz_rust2::BlockDecoder::new(threads, block, &ar, &password, &mut file)
+                    .for_each_entries(&mut |entry, data| {
+                        let this = at;
+                        at += 1;
+                        if let Some(Some(name)) = wanted_at.get(this) {
+                            if let Err(e) = write(name, entry.is_directory(), data) {
+                                failed = Some(e);
+                                return Ok(false);
+                            }
+                        }
+                        // Entries before a wanted one are read through by the decoder.
+                        Ok(this < last)
+                    })
+                    .map_err(|e| sevenz_err(archive, e))?;
+                if failed.is_some() {
+                    break;
+                }
+            }
             if let Some(e) = failed {
                 // With a wrong password decryption yields garbage the decoder rejects.
                 return Err(if password_for(archive).is_some() {
@@ -649,6 +830,22 @@ fn extract_entries(
                 } else {
                     e
                 });
+            }
+            // Folders and empty files have no data and belong to no block. They are
+            // written last, so one whose name comes again later in the archive is left
+            // out: the later entry is the one that stays.
+            let mut last_of: HashMap<&str, usize> = HashMap::new();
+            for (at, name) in wanted_at.iter().enumerate() {
+                if let Some(name) = name {
+                    last_of.insert(name, at);
+                }
+            }
+            for (at, name) in wanted_at.iter().enumerate() {
+                if let (Some(name), None) = (name, block_of.get(at).copied().flatten()) {
+                    if last_of[name.as_str()] == at {
+                        write(name, ar.files[at].is_directory(), &mut io::empty())?;
+                    }
+                }
             }
         }
         _ => {
@@ -661,6 +858,9 @@ fn extract_entries(
                 let kind = e.header().entry_type();
                 if (kind.is_file() || kind.is_dir()) && wanted_by(&name, wanted) {
                     write(&name, kind.is_dir(), &mut e)?;
+                    if last_written(kind.is_dir()) {
+                        break;
+                    }
                 }
             }
         }
@@ -684,6 +884,266 @@ mod tests {
         }
         writer.finish().unwrap();
         path
+    }
+
+    #[test]
+    fn plain_names_are_cleaned_like_any_other() {
+        for name in [
+            "a",
+            "a/b.txt",
+            "a/b/",
+            "a//b",
+            "./a",
+            "a/./b",
+            "a/../b",
+            "../a",
+            "/a",
+            "//a",
+            "",
+            "/",
+            ".",
+            "..",
+            "a/..",
+            "a\\b",
+            "..\\a",
+            "C:\\a",
+            "C:a",
+            "a:b",
+            "a b/ć č.txt",
+            "a/b/c/d/e",
+            "a/.hidden",
+            "a/..b",
+            "a/b..",
+            "...",
+            " ",
+            "a/ /b",
+        ] {
+            assert_eq!(clean(name), clean_checked(name), "{name:?}");
+        }
+        assert_eq!(clean("a/b/").as_deref(), Some("a/b"));
+        assert_eq!(clean("../a"), None);
+    }
+
+    #[test]
+    fn folders_are_implied_once_and_the_list_is_sorted() {
+        let item = |name: &str, is_dir: bool, size: u64, modified: Option<i64>| Item {
+            name: name.into(),
+            is_dir,
+            size,
+            modified,
+        };
+        let all = with_folders(vec![
+            item("b/c/two.txt", false, 2, Some(20)),
+            item("b/one.txt", false, 1, Some(10)),
+            item("a.txt", false, 3, None),
+            // A second entry of the same name: the first one stays.
+            item("b/one.txt", false, 99, Some(99)),
+            // The folder itself, after its files: only its date is taken.
+            item("b/c", true, 0, Some(5)),
+            item("b!", true, 0, None),
+        ]);
+        let seen: Vec<_> = all
+            .iter()
+            .map(|i| (i.name.as_str(), i.is_dir, i.size, i.modified))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("a.txt", false, 3, None),
+                ("b", true, 0, None),
+                ("b!", true, 0, None),
+                ("b/c", true, 0, Some(5)),
+                ("b/c/two.txt", false, 2, Some(20)),
+                ("b/one.txt", false, 1, Some(10)),
+            ]
+        );
+    }
+
+    /// A tar archive of the entries given: `(name, Some(data))` a file, `(name, None)`
+    /// a folder.
+    fn tar_of(path: &Path, entries: &[(&str, Option<&[u8]>)]) {
+        let mut writer = tar::Builder::new(fs::File::create(path).unwrap());
+        for (name, data) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o644);
+            match data {
+                Some(data) => {
+                    header.set_size(data.len() as u64);
+                    writer.append_data(&mut header, name, *data).unwrap();
+                }
+                None => {
+                    header.set_entry_type(tar::EntryType::Directory);
+                    header.set_size(0);
+                    writer.append_data(&mut header, name, io::empty()).unwrap();
+                }
+            }
+        }
+        writer.finish().unwrap();
+    }
+
+    #[test]
+    fn a_repeated_name_still_gives_its_last_entry() {
+        let t = tempfile::tempdir().unwrap();
+        let ar = t.path().join("twice.tar");
+        tar_of(
+            &ar,
+            &[
+                ("a/one.txt", Some(b"first")),
+                ("a/two.txt", Some(b"two")),
+                ("a/one.txt", Some(b"second")),
+            ],
+        );
+        assert!(!index_info(&ar).unwrap().1);
+        let got = materialize(&[ar.join("a/one.txt")]).unwrap().remove(0);
+        assert_eq!(fs::read(&got).unwrap(), b"second");
+        fs::remove_dir_all(cache_root(&ar).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_folder_comes_out_whole_when_reading_stops_early() {
+        let t = tempfile::tempdir().unwrap();
+        let ar = t.path().join("early.tar");
+        tar_of(
+            &ar,
+            &[
+                ("a/one.txt", Some(b"one")),
+                ("a/sub/two.txt", Some(b"two")),
+                ("b/other.txt", Some(b"other")),
+                // Folders listed after their files, one of them empty.
+                ("a/sub", None),
+                ("a/empty", None),
+            ],
+        );
+        assert!(index_info(&ar).unwrap().1);
+        let folder = materialize(&[ar.join("a")]).unwrap().remove(0);
+        assert_eq!(fs::read(folder.join("one.txt")).unwrap(), b"one");
+        assert_eq!(
+            fs::read(folder.join("sub").join("two.txt")).unwrap(),
+            b"two"
+        );
+        assert!(folder.join("empty").is_dir());
+        assert!(!folder.parent().unwrap().join("b").exists());
+        fs::remove_dir_all(cache_root(&ar).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn reading_stops_after_the_last_wanted_file() {
+        let t = tempfile::tempdir().unwrap();
+        let ar = t.path().join("cut.tar");
+        tar_of(
+            &ar,
+            &[
+                ("first.txt", Some(b"first")),
+                ("second.txt", Some(&[b'x'; 4096])),
+            ],
+        );
+        let items = index(&ar).unwrap();
+        let members = member_paths(&items);
+        // The second entry loses its end: reading past the first one now fails.
+        let whole = fs::read(&ar).unwrap();
+        fs::write(&ar, &whole[..512 + 512 + 512 + 100]).unwrap();
+        let root = t.path().join("out");
+        fs::create_dir_all(&root).unwrap();
+        let wanted = ["first.txt".to_string()];
+        extract_entries(&ar, &root, &wanted, &members, Some(1)).unwrap();
+        assert_eq!(
+            fs::read(root.join("entries").join("first.txt")).unwrap(),
+            b"first"
+        );
+        // Without the count the whole archive is read, as before.
+        assert!(extract_entries(&ar, &root, &wanted, &members, None).is_err());
+    }
+
+    #[test]
+    fn the_index_cache_drops_the_archive_unused_longest() {
+        let t = tempfile::tempdir().unwrap();
+        let archive = |n: usize| t.path().join(format!("cache{n:02}.tar"));
+        for n in 0..=INDEX_CACHE {
+            tar_of(&archive(n), &[("file.txt", Some(b"x"))]);
+            index(&archive(n)).unwrap();
+            // The first one stays in use.
+            index(&archive(0)).unwrap();
+        }
+        let cached = cache().lock().unwrap();
+        assert!(cached.len() <= INDEX_CACHE);
+        assert!(cached.contains_key(&archive(0)));
+        assert!(cached.contains_key(&archive(INDEX_CACHE)));
+    }
+
+    #[test]
+    fn seven_z_members_come_from_their_blocks_only() {
+        use sevenz_rust2::{ArchiveEntry, ArchiveWriter, SourceReader};
+        let t = tempfile::tempdir().unwrap();
+        let ar = t.path().join("blocks.7z");
+        let mut w = ArchiveWriter::create(&ar).unwrap();
+        // One block of three files, then a file of its own, a folder and an empty file.
+        let solid: [(&str, &[u8]); 3] = [
+            ("a/one.txt", b"one"),
+            ("a/two.txt", b"two two"),
+            ("b/three.txt", b"three"),
+        ];
+        w.push_archive_entries(
+            solid
+                .iter()
+                .map(|(n, _)| ArchiveEntry::new_file(n))
+                .collect(),
+            solid.iter().map(|(_, d)| SourceReader::from(*d)).collect(),
+        )
+        .unwrap();
+        w.push_archive_entry(ArchiveEntry::new_file("a/four.txt"), Some(&b"four"[..]))
+            .unwrap();
+        w.push_archive_entry::<&[u8]>(ArchiveEntry::new_directory("a/empty"), None)
+            .unwrap();
+        w.push_archive_entry(ArchiveEntry::new_file("a/nothing.txt"), Some(&b""[..]))
+            .unwrap();
+        w.finish().unwrap();
+
+        // A file in the middle of the shared block, alone.
+        let two = materialize(&[ar.join("a/two.txt")]).unwrap().remove(0);
+        assert_eq!(fs::read(&two).unwrap(), b"two two");
+        assert!(!two.with_file_name("one.txt").exists());
+        // An empty file has no block.
+        let nothing = materialize(&[ar.join("a/nothing.txt")]).unwrap().remove(0);
+        assert_eq!(fs::read(&nothing).unwrap(), b"");
+        // A folder with files in two blocks, an empty file and an empty folder.
+        let folder = materialize(&[ar.join("a")]).unwrap().remove(0);
+        for (name, data) in [
+            ("one.txt", &b"one"[..]),
+            ("two.txt", b"two two"),
+            ("four.txt", b"four"),
+            ("nothing.txt", b""),
+        ] {
+            assert_eq!(fs::read(folder.join(name)).unwrap(), data, "{name}");
+        }
+        assert!(folder.join("empty").is_dir());
+        assert!(!folder.with_file_name("b").exists());
+        fs::remove_dir_all(cache_root(&ar).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn seven_z_repeated_name_gives_its_last_entry_even_after_an_empty_one() {
+        use sevenz_rust2::{ArchiveEntry, ArchiveWriter};
+        let t = tempfile::tempdir().unwrap();
+        let ar = t.path().join("twice.7z");
+        let mut w = ArchiveWriter::create(&ar).unwrap();
+        w.push_archive_entry(ArchiveEntry::new_file("x.txt"), Some(&b""[..]))
+            .unwrap();
+        w.push_archive_entry(ArchiveEntry::new_file("x.txt"), Some(&b"later"[..]))
+            .unwrap();
+        w.push_archive_entry(ArchiveEntry::new_file("y.txt"), Some(&b"data"[..]))
+            .unwrap();
+        w.push_archive_entry(ArchiveEntry::new_file("y.txt"), Some(&b""[..]))
+            .unwrap();
+        w.finish().unwrap();
+        let items = index(&ar).unwrap();
+        let members = member_paths(&items);
+        let root = t.path().join("out");
+        fs::create_dir_all(&root).unwrap();
+        let wanted = ["x.txt".to_string(), "y.txt".to_string()];
+        extract_entries(&ar, &root, &wanted, &members, None).unwrap();
+        let read = |name: &str| fs::read(root.join("entries").join(name)).unwrap();
+        assert_eq!(read("x.txt"), b"later");
+        assert_eq!(read("y.txt"), b"");
     }
 
     fn sample_zip(dir: &Path) -> PathBuf {

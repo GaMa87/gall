@@ -1,5 +1,5 @@
 .backdrop.bug-report-backdrop { z-index: 106; padding: 16px; background: rgba(0, 0, 0, .48); }
-.bug-report { display: flex; flex-direction: column; background: var(--bg-2); color: var(--fg); width: min(780px, 100%); max-height: calc(100vh - 32px); min-height: 0; border: 1px solid var(--border); border-radius: 16px; box-shadow: var(--shadow); margin: auto; overflow: hidden; }
+.bug-report { display: flex; flex-direction: column; background: var(--bg-2); color: var(--fg); width: min(780px, 100%); height: min(820px, calc(100vh - 32px)); min-height: 0; border: 1px solid var(--border); border-radius: 16px; box-shadow: var(--shadow); margin: auto; overflow: hidden; }
 .report-header { display: flex; align-items: flex-start; gap: 14px; padding: 26px 28px 22px; border-bottom: 1px solid var(--border); background: linear-gradient(120deg, var(--accent-soft), transparent 70%); }
 .report-brand { display: grid; place-items: center; width: 44px; height: 44px; flex-shrink: 0; border-radius: 13px; color: var(--accent-text); background: var(--accent-soft); border: 1px solid var(--accent-ring); }
 .report-eyebrow { display: block; color: var(--fg-dim); letter-spacing: .12em; font-size: 10px; font-weight: 600; margin-bottom: 5px; }
@@ -7,7 +7,7 @@
 .report-header p { color: var(--fg-dim); line-height: 1.6; margin: 7px 0 0; font-size: 12px; }
 .report-close { display: grid; place-items: center; border: 0; border-radius: 8px; background: transparent; padding: 6px; margin-left: auto; color: var(--fg-dim); cursor: pointer; }
 .report-close:hover { background: var(--bg-hover); color: var(--fg); }
-.report-scroll { padding: 22px 28px; min-height: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; }
+.report-scroll { flex: 1 1 auto; padding: 22px 28px; min-height: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; }
 .bug-report input:not([type="checkbox"]):not([type="file"]), .bug-report textarea { display: block; width: 100%; min-width: 0; padding: 11px 12px; border-radius: 8px; background: var(--bg); line-height: 1.6; }
 .bug-report textarea { min-height: 100px; resize: vertical; max-height: 220px; }
 .bug-report .report-label { display: flex; align-items: baseline; gap: 10px; margin: 18px 0 8px; font-weight: 600; font-size: 12px; }

@@ -27,13 +27,21 @@ it("never puts credentials into a copied URL", () => {
 
 it("offers lazygit's attributes and skips empty ones", () => {
   const info = { id: "0123456789abcdef", author: "Ana", email: "ana@example.com", date: "2026-11-09", message: "Subject\n\nBody\n", tags: [], url: null };
-  const labels = copyChoices(info, async () => "diff").map((choice) => choice.label);
-  expect(labels).toEqual(["Commit hash", "Abbreviated hash", "Commit subject", "Commit message body", "Full commit message", "Author", "Date", "Commit diff"]);
-  const full = copyChoices({ ...info, message: "Only subject", tags: ["v1", "v1.1"], url: "https://github.com/o/r/commit/x" }, async () => "diff");
+  const labels = copyChoices(info, async () => "diff", async () => "patch").map((choice) => choice.label);
+  expect(labels).toEqual(["Commit hash", "Abbreviated hash", "Commit subject", "Commit message body", "Full commit message", "Author", "Date", "Commit diff", "Commit patch"]);
+  const full = copyChoices({ ...info, message: "Only subject", tags: ["v1", "v1.1"], url: "https://github.com/o/r/commit/x" }, async () => "diff", async () => "patch");
   expect(full.map((choice) => choice.label)).toContain("Tags");
   expect(full.map((choice) => choice.label)).toContain("Commit URL");
   expect(full.map((choice) => choice.label)).not.toContain("Commit message body");
   expect(full.find((choice) => choice.label === "Abbreviated hash")?.text).toBe("01234567");
   expect(full.find((choice) => choice.label === "Author")?.text).toBe("Ana <ana@example.com>");
   expect(full.find((choice) => choice.label === "Tags")?.text).toBe("v1\nv1.1");
+});
+
+it("gives every entry a distinct accelerator that does not clash with menu navigation", () => {
+  const info = { id: "0123456789abcdef", author: "Ana", email: "", date: "d", message: "Subject\n\nBody", tags: ["v1"], url: "https://github.com/o/r/commit/x" };
+  const keys = copyChoices(info, async () => "diff", async () => "patch").map((choice) => choice.key);
+  expect(new Set(keys).size).toBe(keys.length);
+  expect(keys.filter((key) => "hjklq".includes(key))).toEqual([]);
+  expect(keys).toEqual(expect.arrayContaining(["m", "y", "s", "b", "a", "u", "d", "p", "t"]));
 });

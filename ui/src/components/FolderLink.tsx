@@ -13,7 +13,7 @@ export function FolderLink({ path, label, before }: { path: string; label?: stri
   const { dual, side } = useBrowserSide();
   const ready = async () => { await before?.().catch(() => {}); };
   const inGall = async (b?: number) => { await ready(); A.showFolder(path, b); };
-  const inSystem = async () => { await ready(); api.openPath(path).catch((err) => A.notify(String(err), "error")); };
+  const inSystem = async () => { await ready(); api.openPath(path).catch((err) => A.notify(String(err), "error", undefined, true)); };
   if (!path) return null;
 
   const menu = (e: React.MouseEvent) => {

@@ -39,9 +39,9 @@ jobs:
           cp site/* _site/
           cp assets/icon.png docs/social-preview.png _site/
           cp docs/screenshots/main.png docs/screenshots/compare-excel.png _site/screenshots/
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/configure-pages@v6
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: _site
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

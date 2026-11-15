@@ -1,22 +1,23 @@
 // Turns a line diff (ops from the backend) into display rows for the compare view:
 // side-by-side or unified, with long unchanged stretches folded. Pure, so it is
 // unit-tested; the view only renders rows.
-import type { DiffLinePair, DiffMove, DiffOp } from "../api/types";
+import type { DiffLinePair, DiffMarks, DiffMove, DiffOp } from "../api/types";
 
 export type Spans = [number, number][];
 
 /**
  * One side of a split row. `t`: eq = unchanged, del/ins = only on this side, chg = changed line.
  * `mv`: the line was moved (index into the moves), not removed / added.
+ * `fmt`: only the layout of the line differs (structural diff), its content is unchanged.
  */
-export interface Cell { n: number; t: "eq" | "del" | "ins" | "chg"; spans?: Spans; mv?: number }
+export interface Cell { n: number; t: "eq" | "del" | "ins" | "chg"; spans?: Spans; mv?: number; fmt?: boolean }
 
 export type SplitRow =
   | { kind: "line"; l?: Cell; r?: Cell; block?: number }
   | { kind: "fold"; id: string; count: number; a: number; b: number };
 
 export type UnifiedRow =
-  | { kind: "line"; t: "eq" | "del" | "ins"; an?: number; bn?: number; side: "a" | "b"; spans?: Spans; block?: number; mv?: number }
+  | { kind: "line"; t: "eq" | "del" | "ins"; an?: number; bn?: number; side: "a" | "b"; spans?: Spans; block?: number; mv?: number; fmt?: boolean }
   | { kind: "fold"; id: string; count: number; a: number; b: number };
 
 export interface BuildOptions {
@@ -26,6 +27,19 @@ export interface BuildOptions {
   expanded: Set<string>;
   /** Moved blocks (removed lines that reappear among the added ones). */
   moves?: DiffMove[];
+  /** Structural diff: what changed on the lines of changed blocks, per side. */
+  marks?: { a: DiffMarks; b: DiffMarks };
+}
+
+/**
+ * Spans and layout-only flag of a changed line: from the structural marks when the line
+ * has one (an empty mark = layout only), else the word spans of its pair. In a cosmetic
+ * block every line is layout only.
+ */
+function lineMark(marks: DiffMarks | undefined, n: number, cosmetic: boolean | undefined, fallback?: Spans): { spans?: Spans; fmt?: boolean } {
+  const m = marks?.[n];
+  if (cosmetic || (m && m.length === 0)) return { fmt: true };
+  return { spans: m ?? fallback };
 }
 
 /** Line → move index, for each side. */
@@ -85,8 +99,9 @@ export function buildSplit(ops: DiffOp[], pairs: DiffLinePair[], o: BuildOptions
       if (k1) for (let j = k1[0]; j < k1[1]; j++) rows.push({ kind: "line", l: { n: op.a + j, t: "eq" }, r: { n: op.b + j, t: "eq" } });
       return;
     }
-    const block = blocks.length;
-    blocks.push(rows.length);
+    // A block where only the layout differs is shown, but is no change to step to or merge.
+    const block = op.cosmetic ? undefined : blocks.length;
+    if (!op.cosmetic) blocks.push(rows.length);
     // Paired lines (edits of each other) share a row; between pairs, removed and
     // added lines sit side by side without being compared.
     const ps: DiffLinePair[] = [];
@@ -101,14 +116,14 @@ export function buildSplit(ops: DiffOp[], pairs: DiffLinePair[], o: BuildOptions
         rows.push({
           kind: "line",
           block,
-          l: k < dl ? { n: ca + k, t: "del", mv: mv.a.get(ca + k) } : undefined,
-          r: k < dr ? { n: cb + k, t: "ins", mv: mv.b.get(cb + k) } : undefined,
+          l: k < dl ? { n: ca + k, t: "del", mv: mv.a.get(ca + k), ...lineMark(o.marks?.a, ca + k, op.cosmetic) } : undefined,
+          r: k < dr ? { n: cb + k, t: "ins", mv: mv.b.get(cb + k), ...lineMark(o.marks?.b, cb + k, op.cosmetic) } : undefined,
         });
       }
     };
     for (const p of ps) {
       gap(p.a, p.b);
-      rows.push({ kind: "line", block, l: { n: p.a, t: "chg", spans: p.aSpans }, r: { n: p.b, t: "chg", spans: p.bSpans } });
+      rows.push({ kind: "line", block, l: { n: p.a, t: "chg", ...lineMark(o.marks?.a, p.a, op.cosmetic, p.aSpans) }, r: { n: p.b, t: "chg", ...lineMark(o.marks?.b, p.b, op.cosmetic, p.bSpans) } });
       ca = p.a + 1;
       cb = p.b + 1;
     }
@@ -132,10 +147,10 @@ export function buildUnified(ops: DiffOp[], pairs: DiffLinePair[], o: BuildOptio
       if (k1) for (let j = k1[0]; j < k1[1]; j++) rows.push(eq(j));
       return;
     }
-    const block = blocks.length;
-    blocks.push(rows.length);
-    for (let j = 0; j < op.aLen; j++) rows.push({ kind: "line", t: "del", an: op.a + j, side: "a", spans: sp.a.get(op.a + j), block, mv: mv.a.get(op.a + j) });
-    for (let j = 0; j < op.bLen; j++) rows.push({ kind: "line", t: "ins", bn: op.b + j, side: "b", spans: sp.b.get(op.b + j), block, mv: mv.b.get(op.b + j) });
+    const block = op.cosmetic ? undefined : blocks.length;
+    if (!op.cosmetic) blocks.push(rows.length);
+    for (let j = 0; j < op.aLen; j++) rows.push({ kind: "line", t: "del", an: op.a + j, side: "a", block, mv: mv.a.get(op.a + j), ...lineMark(o.marks?.a, op.a + j, op.cosmetic, sp.a.get(op.a + j)) });
+    for (let j = 0; j < op.bLen; j++) rows.push({ kind: "line", t: "ins", bn: op.b + j, side: "b", block, mv: mv.b.get(op.b + j), ...lineMark(o.marks?.b, op.b + j, op.cosmetic, sp.b.get(op.b + j)) });
   });
   return { rows, blocks };
 }

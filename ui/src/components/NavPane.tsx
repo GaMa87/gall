@@ -153,7 +153,7 @@ function MillerColumn({ b, dir, onPath, width, isCurrent, onHover }: ColProps) {
         <div className="mcol-filter">
           <Icon name="search" size={12} />
           {filter}
-          <button className="icon-btn" onClick={() => setFilter("")}>×</button>
+          <button className="icon-btn" title="Clear filter" onClick={() => setFilter("")}>×</button>
         </div>
       )}
       <div className="mcol-list" ref={listRef}>{sorted.map(item)}</div>

@@ -12,6 +12,17 @@ const listeners = new Set<() => void>();
 function set(next: UpdateState) { state = next; listeners.forEach((listener) => listener()); }
 export function useUpdates() { return useSyncExternalStore((listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; }, () => state); }
 
+const UPDATED_KEY = "gall.updatedTo";
+
+/** The version that was just installed, once, on the first start after an update. */
+export function takeUpdatedVersion(): string | null {
+  try {
+    const version = localStorage.getItem(UPDATED_KEY);
+    localStorage.removeItem(UPDATED_KEY);
+    return version;
+  } catch { return null; }
+}
+
 export async function checkUpdates(manual = true) {
   if (state.phase === "checking" || state.phase === "installing") return;
   set({ phase: "checking" });
@@ -38,8 +49,13 @@ export async function installUpdate() {
   try {
     if (Object.keys(getState().tasks).length) throw new Error("Wait for file operations to finish before installing an update.");
     const unlisten = await listen<number>("update-progress", (event) => set({ ...available, phase: "installing", bytes: event.payload }));
+    // Remembered across the restart so the next start can say the update worked.
+    try { localStorage.setItem(UPDATED_KEY, available.version ?? ""); } catch { /* storage unavailable */ }
     try { await invoke("install_update"); } finally { unlisten(); }
-  } catch (error) { set({ ...available, phase: "available", error: String(error) }); }
+  } catch (error) {
+    try { localStorage.removeItem(UPDATED_KEY); } catch { /* storage unavailable */ }
+    set({ ...available, phase: "available", error: String(error) });
+  }
 }
 
 export function postponeUpdate() {

@@ -39,10 +39,15 @@ export interface DiffOptions {
   ignoreEol: boolean;
   /** Fewest changed lines (Myers) instead of the more readable histogram diff. */
   minimal: boolean;
+  /** Compare changed lines by tokens: layout changes are told apart from content changes. */
+  structural: boolean;
 }
 
 export interface DiffSide { label: string; path: string | null; size: number; crlf: boolean; finalNewline: boolean }
-export interface DiffOp { tag: "equal" | "delete" | "insert" | "replace"; a: number; aLen: number; b: number; bLen: number }
+/** `cosmetic`: both sides hold the same tokens, only the layout differs (structural diff). */
+export interface DiffOp { tag: "equal" | "delete" | "insert" | "replace"; a: number; aLen: number; b: number; bLen: number; cosmetic?: boolean }
+/** Structural diff, line → changed ranges: an empty list means only the layout of the line differs; a line not listed changed as a whole. */
+export type DiffMarks = Record<number, [number, number][]>;
 /** `len` lines removed at left `a` reappear unchanged at right `b`. */
 export interface DiffMove { a: number; b: number; len: number }
 export interface DiffLinePair { a: number; b: number; aSpans: [number, number][]; bSpans: [number, number][] }
@@ -55,7 +60,7 @@ export interface SyntaxHighlight {
 export interface DiffResult {
   left: DiffSide;
   right: DiffSide;
-  text: { leftLines: string[]; rightLines: string[]; ops: DiffOp[]; pairs: DiffLinePair[]; added: number; removed: number; ratio: number; moves: DiffMove[] } | null;
+  text: { leftLines: string[]; rightLines: string[]; ops: DiffOp[]; pairs: DiffLinePair[]; added: number; removed: number; ratio: number; moves: DiffMove[]; leftMarks: DiffMarks; rightMarks: DiffMarks } | null;
   binary: { identical: boolean; firstDifference: number | null; reason: string } | null;
 }
 

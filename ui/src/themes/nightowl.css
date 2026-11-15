@@ -1,0 +1,76 @@
+/* Night Owl for Gall: Night Owl in dark mode, Light Owl in light mode.
+   Palette: https://github.com/sdras/night-owl-vscode-theme (MIT, Sarah Drasner).
+   Built into Gall: pick "Night Owl" in Settings › Appearance › Custom theme. A file
+   <settings>/themes/nightowl.css takes its place. See docs/themes/README.md. */
+
+/* ── Night Owl (dark) ─────────────────────────────────────── */
+:root:root[data-theme="dark"] {
+  --accent: #82aaff !important; /* blue; !important beats the accent picked in Settings */
+  --brand-b: #c792ea;           /* purple: second colour of the header and disk-bar gradient */
+  --accent-2: #7fdbca;          /* cyan: second colour of the focused-pane border */
+
+  --bg: #011220;        /* canvas behind the panes */
+  --bg-2: #011627;      /* editor background: panes, sidebar */
+  --bg-3: #0b253a;      /* buttons, inputs */
+  --bg-hover: #1d3b53;  /* selection */
+  --fg: #d6deeb;
+  --fg-dim: #a2aebd;
+  --fg-faint: #5f7e97;
+  --border: #122d42;
+  --border-soft: rgba(214, 222, 235, 0.06);
+  --glass: rgba(1, 22, 39, 0.86);
+  --hover: rgba(214, 222, 235, 0.05);
+
+  --mark: #ecc48d;      /* search highlight: yellow */
+  --mark-fg: #010e1a;
+  --folder: #ecc48d;
+  --danger: #ef5350;
+  --ok: #addb67;
+  --warn: #f78c6c;
+
+  --sm-cpu: #82aaff;    /* system monitor rings */
+  --sm-gpu: #f78c6c;
+  --sm-mem: #addb67;
+}
+:root:root[data-theme="dark"] {
+  --sx-comment: #637777; --sx-string: #ecc48d; --sx-number: #f78c6c; --sx-keyword: #c792ea;
+  --sx-operator: #7fdbca; --sx-function: #82aaff; --sx-type: #ffcb8b; --sx-variable: #c5e478;
+  --sx-attr: #c5e478;
+}
+:root:root[data-theme="dark"] .wordmark { background-image: linear-gradient(100deg, #82aaff 0%, #d6deeb 45%, #c792ea 100%); }
+
+/* ── Light Owl (light) ────────────────────────────────────── */
+:root:root[data-theme="light"] {
+  --accent: #4876d6 !important;
+  --brand-b: #994cc3;
+  --accent-2: #0c969b;
+
+  --bg: #e4e6ea;        /* canvas behind the panes */
+  --bg-2: #fbfbfb;      /* panes, sidebar */
+  --bg-3: #f0f0f0;      /* buttons, inputs */
+  --bg-hover: #e0e7ea;
+  --fg: #403f53;
+  --fg-dim: #5f6379;
+  --fg-faint: #989fb1;
+  --border: #dde1e5;
+  --border-soft: rgba(64, 63, 83, 0.08);
+  --glass: rgba(251, 251, 251, 0.88);
+  --hover: rgba(64, 63, 83, 0.05);
+
+  --mark: rgba(201, 142, 29, 0.35);
+  --mark-fg: inherit;
+  --folder: #c9922e;
+  --danger: #de3d3b;
+  --ok: #08916a;
+  --warn: #c96765;
+
+  --sm-cpu: #4876d6;
+  --sm-gpu: #c96765;
+  --sm-mem: #08916a;
+}
+:root:root[data-theme="light"] {
+  --sx-comment: #989fb1; --sx-string: #4876d6; --sx-number: #aa0982; --sx-keyword: #994cc3;
+  --sx-operator: #0c969b; --sx-function: #4876d6; --sx-type: #111111; --sx-variable: #4876d6;
+  --sx-attr: #4876d6;
+}
+:root:root[data-theme="light"] .wordmark { background-image: linear-gradient(100deg, #4876d6 0%, #403f53 50%, #994cc3 100%); }

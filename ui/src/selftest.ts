@@ -333,8 +333,60 @@ async function runPreviewShortcutsSelfTest() {
   await api.selftestDone(results.join("\n") + `\n\n${failures} failure(s)`);
 }
 
+/** Uses an existing Windows mapping; the runner never creates or deletes shares. */
+async function runMappedDrivesSelfTest() {
+  const A = await import("./state/actions");
+  const { controller } = await import("./state/controllers");
+  try {
+    // The local fixture's last component is the expected mapped letter. Startup
+    // paths may canonicalize mapped drives to UNC, losing the letter under test.
+    const local = activePath(0);
+    const letter = local.split(/[/\\]/).pop() ?? "";
+    if (!/^[a-z]$/i.test(letter)) throw new Error(`Expected a letter-named local fixture, got ${local}`);
+    const root = `${letter.toUpperCase()}:\\`;
+    const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
+    await A.refreshDrives();
+    const matches = getState().drives.filter((d) => same(d.mount, root));
+    log(matches.length === 1, "mapped drive returned exactly once through IPC", root);
+    log(matches[0]?.label === "Network" && !matches[0]?.removable, "network row is identified and has no eject action");
+    const driveRow = () => $$(".sidebar .drive").find((e) => same($("b", e)?.textContent ?? "", root.slice(0, 2)));
+    log(!!await until(driveRow), "mapped drive appears in sidebar");
+    for (const profile of ["explorer", "vim"] as const) {
+      await updateSettings({ keyboardProfile: profile, showHidden: true, hideTemp: false });
+      A.navigate(0, local);
+      if (!await until(() => same(activePath(0), local) && same(controller(0)?.path() ?? "", local))) throw new Error("Cannot return to local fixture");
+      await focusPane(0);
+      const expected = (await api.listDir(root, { showHidden: true, hideTemp: false })).map((e) => e.name).sort();
+      const item = driveRow();
+      if (!item) throw new Error("Mapped drive row is missing");
+      click(item);
+      const loaded = await until(() => {
+        const ctl = controller(0);
+        if (!same(activePath(0), root) || !same(ctl?.path() ?? "", root)) return false;
+        const actual = ctl?.entries().map((e) => e.name).sort() ?? [];
+        const listingVisible = actual.length > 0 || !!$(".fp-list .empty-msg:not(.error)", browserEl(0)!);
+        return listingVisible && JSON.stringify(actual) === JSON.stringify(expected);
+      }, 15000);
+      log(!!loaded, `sidebar opens mapped drive and renders its listing (${profile})`);
+      log(!$(".fp-list .error", browserEl(0)!), `mapped folder has no listing error (${profile})`);
+      log(driveRow()?.classList.contains("current") ?? false, `mapped drive is highlighted (${profile})`);
+      await shot(`mapped-drive-${profile}`);
+      await A.refreshDrives();
+      log(getState().drives.filter((d) => same(d.mount, root)).length === 1, `refresh preserves one mapped row (${profile})`);
+    }
+  } catch (error) {
+    log(false, "mapped drive integration", String(error));
+    await shot("mapped-drive-error");
+  }
+  await api.selftestDone(results.join("\n") + `\n\n${failures} failure(s)`);
+}
+
 export async function runSelfTest() {
+  if ((await api.startupArgs()).selftestMode === "mapped-drives") return runMappedDrivesSelfTest();
+  if ((await api.startupArgs()).selftestMode === "themed-select") return (await import("./selftestThemedSelect")).runThemedSelectSelfTest(gitSelftest);
+  if ((await api.startupArgs()).selftestMode === "git-rebase-submodules") return (await import("./selftestGitWorkspace")).runGitRebaseSubmodulesSelfTest(gitSelftest);
   if ((await api.startupArgs()).selftestMode === "git-compare") return runGitCompareSelfTest();
+  if ((await api.startupArgs()).selftestMode === "structural-diff") return runStructuralDiffSelfTest();
   if ((await api.startupArgs()).selftestMode === "git-workspace") return (await import("./selftestGitWorkspace")).runGitWorkspaceSelfTest(gitSelftest);
   if ((await api.startupArgs()).selftestMode === "preview-shortcuts") return runPreviewShortcutsSelfTest();
   if ((await api.startupArgs()).selftestMode === "quick-open") return runQuickOpenSelfTest();
@@ -365,6 +417,10 @@ export async function runSelfTest() {
     log(!$(".details"), "details pane hidden by default");
     await shot("01-startup");
   });
+
+  // These scenarios exercise name ordering and Miller columns explicitly; the
+  // first-start defaults are date ordering and breadcrumbs.
+  await updateSettings({ defaultSort: "name", defaultDescending: false, showNavColumns: true });
 
   await step("open folder (double click)", async () => {
     mouse((await until(() => row(0, "Documents")))!, "dblclick");
@@ -605,6 +661,14 @@ export async function runSelfTest() {
       navigate(0, root + "/Sizes");
       const restored = await until(() => size("small") === "300 B", 5000);
       log(!!restored, "automatic folder size refreshes after undo", `small: ${size("small")}`);
+      // From the parent: the changed subfolder is only listed, so no watcher reports it.
+      const { trashPaths, undo } = await import("./state/actions");
+      await trashPaths([root + "/Sizes/small/a.bin"]);
+      const listedTrashed = await until(() => size("small") === "0 B", 5000);
+      log(!!listedTrashed, "automatic size of a listed subfolder refreshes after moving its contents to the trash", `small: ${size("small")}`);
+      await undo();
+      const listedUndone = await until(() => size("small") === "300 B", 5000);
+      log(!!listedUndone, "automatic size of a listed subfolder refreshes after undo", `small: ${size("small")}`);
     } finally {
       await updateSettings({ folderSizesAuto: autoBefore });
     }
@@ -1242,7 +1306,7 @@ export async function runSelfTest() {
     navigate(0, root + "/Documents");
     navigate(1, root + "/Projects");
     await until(() => rowNames(0).includes("file1.txt") && rowNames(1).includes("Alpha"));
-    const leftBefore = rowNames(0).join(",");
+    const leftBefore = rowNames(0).slice().sort().join(",");
     log(!$('.main-toolbar [title^="Undo"]'), "undo moved out of the sidebar toolbar");
     await focusPane(1);
     newFolder(1);
@@ -1256,7 +1320,7 @@ export async function runSelfTest() {
     log((btn?.title ?? "").includes("add “PanelUndo”"), "undo button says what it will undo", btn?.title ?? "");
     if (btn) click(btn);
     log(!!(await until(() => !rowNames(1).includes("PanelUndo"), 4000)), "panel undo removes the folder created there");
-    log(rowNames(0).join(",") === leftBefore, "left panel unchanged by right panel undo");
+    log(!!(await until(() => activePath(0) === root + "/Documents" && rowNames(0).slice().sort().join(",") === leftBefore)), "left panel unchanged by right panel undo", rowNames(0).join(","));
   });
 
   await step("compare: two selected files", async () => {
@@ -1453,7 +1517,7 @@ export async function runSelfTest() {
     let back = false;
     for (let k = 0; k < 40 && !back; k++) { back = await exists(R + "/only-right-dir/f.txt"); if (!back) await sleep(100); }
     log(back, "Undo restores what the mirror removed");
-    const text = await api.diffCompare({ kind: "file", path: R + "/newer-right.txt" }, { kind: "text", label: "t", text: "right newer version\n" }, { ignoreWhitespace: false, ignoreCase: false, ignoreEol: true, minimal: false });
+    const text = await api.diffCompare({ kind: "file", path: R + "/newer-right.txt" }, { kind: "text", label: "t", text: "right newer version\n" }, { ignoreWhitespace: false, ignoreCase: false, ignoreEol: true, minimal: false, structural: false });
     log(!!text.text && text.text.added === 0 && text.text.removed === 0, "Undo restores the replaced file's content");
     key("r", {}, $(".dircmp")!);
     log(!!(await until(() => $(".dircmp .dc-row"), 4000)), "compare again shows the differences after undo");
@@ -1475,11 +1539,15 @@ export async function runSelfTest() {
     const { navigate } = await import("./state/actions");
     navigate(0, root + "/Sync");
     await until(() => rowNames(0).includes("L") && rowNames(0).includes("R"));
+    await focusPane(0);
     await selectRow(0, "L");
     click(row0("R")!, { ctrlKey: true });
-    await sleep(150);
+    const { controller } = await import("./state/controllers");
+    const selected = () => controller(0)?.selection().map((entry) => entry.path).sort().join(",");
+    const expected = [root + "/Sync/L", root + "/Sync/R"].sort().join(",");
+    log(!!(await until(() => selected() === expected)), "two folders are selected before comparison", selected());
     key("D", { ctrlKey: true, shiftKey: true }, pane(0));
-    log(!!(await until(() => $(".dircmp .dc-row"), 5000)), "Ctrl+Shift+D on two selected folders compares them");
+    log(!!(await until(() => $(".dircmp .dc-row"), 5000)), "Ctrl+Shift+D on two selected folders compares them", `selected=${selected()} active=${getState().session?.activeBrowser} overlay=${getState().overlay?.type}`);
     const win = getCurrentWindow();
     await win.unmaximize();
     await win.setSize(new LogicalSize(800, 600));
@@ -1515,7 +1583,7 @@ export async function runSelfTest() {
     await until(() => $(".dv-file.r .dv-dirty"), 3000);
     key("s", { ctrlKey: true }, dv);
     log(!!(await until(() => !$(".dv-file.r .dv-dirty"), 4000)), "Ctrl+S saves the right file");
-    const saved = await api.diffCompare({ kind: "file", path: R }, { kind: "text", label: "x", text: "alpha\nbeta\ngamma\ndelta\nepsilon\n" }, { ignoreWhitespace: false, ignoreCase: false, ignoreEol: false, minimal: false });
+    const saved = await api.diffCompare({ kind: "file", path: R }, { kind: "text", label: "x", text: "alpha\nbeta\ngamma\ndelta\nepsilon\n" }, { ignoreWhitespace: false, ignoreCase: false, ignoreEol: false, minimal: false, structural: false });
     log(!!saved.text && saved.text.added + saved.text.removed === 0, "saved file has the merged content (final newline kept)");
     key("Escape", {}, dv);
     await until(() => !$(".diffv"));
@@ -1523,7 +1591,7 @@ export async function runSelfTest() {
     await undo();
     let restored = false;
     for (let k = 0; k < 30 && !restored; k++) {
-      const r = await api.diffCompare({ kind: "file", path: R }, { kind: "text", label: "x", text: "alpha\nBETA\ngamma\ndelta\nepsilon\n" }, { ignoreWhitespace: false, ignoreCase: false, ignoreEol: false, minimal: false });
+      const r = await api.diffCompare({ kind: "file", path: R }, { kind: "text", label: "x", text: "alpha\nBETA\ngamma\ndelta\nepsilon\n" }, { ignoreWhitespace: false, ignoreCase: false, ignoreEol: false, minimal: false, structural: false });
       restored = !!r.text && r.text.added + r.text.removed === 0;
       if (!restored) await sleep(100);
     }
@@ -1699,7 +1767,7 @@ export async function runSelfTest() {
     const applied = await until(() => css().getPropertyValue("--bg-2").trim() === "rgb(1, 2, 3)" && css().getPropertyValue("--accent").trim() === "rgb(4, 5, 6)", 3000);
     log(!!applied, "choosing it applies the theme (and its !important accent)", `${css().getPropertyValue("--bg-2")} / ${css().getPropertyValue("--accent")}`);
     await shot("15b-custom-theme");
-    log([...sel.options].some((o) => o.value === "catppuccin") && [...sel.options].some((o) => o.value === "gruvbox"), "Catppuccin and Gruvbox are included");
+    log([...sel.options].some((o) => o.value === "nightowl") && [...sel.options].some((o) => o.value === "gruvbox"), "Night Owl and Gruvbox are included");
     Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")!.set!.call(sel, "gruvbox");
     sel.dispatchEvent(new Event("change", { bubbles: true }));
     const tn = await until(() => css().getPropertyValue("--bg-2").trim().toLowerCase() === "#282828", 3000);
@@ -1851,6 +1919,94 @@ export async function runSelfTest() {
   await api.selftestDone(results.join("\n"));
 }
 
+/** Structural diff: reformatting is told apart from changes in the compare view and in both Git patch views. */
+async function runStructuralDiffSelfTest() {
+  const marked = (selector: string) => $$(selector).map((m) => m.textContent ?? "");
+  try {
+    // Exercise the real hook and IPC while only the language changes. Render synchronously
+    // to inspect the frame before the new request returns, when stale marks used to leak.
+    const { createElement } = await import("react");
+    const { createRoot } = await import("react-dom/client");
+    const { flushSync } = await import("react-dom");
+    const { usePatchMarks } = await import("./components/PatchMarks");
+    const host = document.createElement("div");
+    const root = createRoot(host);
+    const patch = "@@ -1 +1 @@\n-a();\n+a( );\n";
+    function Probe({ name }: { name: string }) {
+      return createElement("span", null, JSON.stringify(usePatchMarks(name, patch)));
+    }
+    try {
+      flushSync(() => root.render(createElement(Probe, { name: "a.rs" })));
+      log(!!await until(() => host.textContent === "[null,[],[]]"), "patch hook loads Rust formatting marks through IPC", host.textContent ?? "");
+      flushSync(() => root.render(createElement(Probe, { name: "a.txt" })));
+      log(host.textContent === "null", "changing language clears marks before the next response");
+      log(!!await until(() => host.textContent !== "null" && host.textContent !== "[null,[],[]]"), "plain text keeps the same patch's whitespace as content", host.textContent ?? "");
+    } finally {
+      flushSync(() => root.unmount());
+    }
+    await updateSettings({ keyboardProfile: "vim", leaderKey: "Space", shortcuts: {} });
+    const A = await import("./state/actions");
+    const file = activePath(0) + "/calc.rs";
+    A.openOverlay({ type: "diff", a: { kind: "gitHead", path: file }, b: { kind: "file", path: file } });
+    log(!!await until(() => $(".diffv .dv-cell.fmt")), "compare view dims the line that was only reformatted");
+    log($$(".diffv .dv-cell.fmt").length === 2 && $$(".diffv .dv-cell.fmt .dv-sign").every((s) => s.textContent === "≈"), "the reformatted line is dimmed on both sides", `${$$(".diffv .dv-cell.fmt").length} cells`);
+    log(marked(".diffv mark.dv-word").join(",") === "2,3", "only the changed number is marked", marked(".diffv mark.dv-word").join(","));
+    log($(".diffv .dv-count")?.textContent?.trim() === "– / 1", "the reformatted line is not counted as a change", $(".diffv .dv-count")?.textContent ?? "");
+    log(!!$(".diffv .dv-fmt")?.textContent?.includes("1 formatting only") && !!$(".diffv .dv-stat")?.textContent?.includes("+1"), "the header counts one change and one formatting-only place", $(".diffv .dv-stat")?.textContent ?? "");
+    await shot("structural-compare-split");
+    key("n", {}, $(".diffv"));
+    log(!!await until(() => $(".diffv .dv-row.cur mark.dv-word")), "n goes to the real change, past the reformatted line");
+    key("u", {}, $(".diffv"));
+    log(!!await until(() => $$(".diffv .dv-row.unified.fmt").length === 2), "unified view dims the reformatted lines");
+    await shot("structural-compare-unified");
+    key("u", {}, $(".diffv"));
+    key("t", {}, $(".diffv"));
+    log(!!await until(() => $(".diffv .dv-row") && !$(".diffv .dv-cell.fmt") && $(".diffv .dv-count")?.textContent?.trim() === "– / 2"), "t turns the structural diff off: both lines are changes again", $(".diffv .dv-count")?.textContent ?? "");
+    await shot("structural-compare-off");
+    key("t", {}, $(".diffv"));
+    log(!!await until(() => $(".diffv .dv-cell.fmt")), "t turns it on again");
+    key("Escape", {}, $(".diffv"));
+    await until(() => !$(".diffv"));
+
+    for (const [name, before, after] of [
+      ["escaped.sh", "printf '<%s>\\n' a\\ b", "printf '<%s>\\n' a\\  b"],
+      ["long-string.lua", "return [=[a b]=]", "return [=[a  b]=]"],
+      ["value.properties", "message=hello world", "message=hello  world"],
+    ]) {
+      A.openOverlay({ type: "diff", a: { kind: "text", label: name, text: before + "\n" }, b: { kind: "text", label: name, text: after + "\n" } });
+      log(!!await until(() => $(".diffv .dv-row") && $(".diffv .dv-count")?.textContent?.trim() === "– / 1"), `${name}: significant spaces count as a change`, $(".diffv .dv-count")?.textContent ?? "");
+      log(!$(".diffv .dv-cell.fmt"), `${name}: significant spaces are not dimmed as formatting`);
+      key("n", {}, $(".diffv"));
+      log(!!await until(() => $(".diffv .dv-row.cur")), `${name}: next change reaches the whitespace edit`);
+      await shot(`structural-whitespace-${name}`);
+      key("Escape", {}, $(".diffv"));
+      await until(() => !$(".diffv"));
+    }
+
+    A.openOverlay({ type: "gitGraph", path: activePath(0) });
+    await until(() => $(".git-graph-lines .gg-row"));
+    $(".git-graph")?.focus();
+    key("Enter");
+    log(!!await until(() => $(".gc-file")), "Working Changes lists the changed file");
+    log(!!await until(() => $$(".gc-diff-line.fmt").length === 2), "Working Changes dims the reformatted lines", `${$$(".gc-diff-line.fmt").length} lines`);
+    log(marked(".gc-patch mark.patch-token").join(",") === "2,3", "Working Changes marks only the changed number", marked(".gc-patch mark.patch-token").join(","));
+    log($$(".gc-diff-line.fmt input[type=checkbox]").length === 2, "reformatted lines can still be selected for staging");
+    await shot("structural-git-changes");
+    const commit = $$(".git-graph-lines .gg-row").find((row) => row.textContent?.includes("reflow the call"));
+    if (commit) click(commit);
+    log(!!await until(() => $(".gcd-patch .gcd-fmt")), "commit details dim the lines of the reflowed call");
+    // The reflowed call also gained a trailing comma, two characters after the changed index.
+    log(marked(".gcd-patch mark.patch-token").join(" ") === "1 2],", "commit details mark only the changed argument and the new trailing comma", marked(".gcd-patch mark.patch-token").join(" "));
+    $(".gcd-patch .gcd-fmt")?.scrollIntoView({ block: "center" });
+    await sleep(150);
+    await shot("structural-git-commit");
+  } catch (e) {
+    log(false, "structural diff self-test", String(e));
+    await shot("structural-diff-error");
+  }
+  await api.selftestDone(results.join("\n") + `\n\n${failures} failure(s)`);
+}
+
 async function runGitCompareSelfTest() {
   try {
     await updateSettings({ keyboardProfile: "vim", leaderKey: "Space", shortcuts: {} });
@@ -1939,7 +2095,7 @@ async function runGitCompareSelfTest() {
     click($(".gg-checkout")!);
     log(!!await until(() => getState().overlay?.type === "dialog"), "dirty switch asks how to handle changes");
     await shot("git-graph-dirty");
-    click($$("button").find((b) => b.textContent === "Stash")!);
+    click($$("button").find((b) => b.textContent?.startsWith("Stash"))!);
     log(!!await until(() => $$(".git-graph-lines button").some((b) => b.textContent?.includes("HEAD") && b.textContent?.includes("first")) && !$(".git-graph [role=status]"), 5000), "stash and revision switch complete");
     log(!!await until(() => $(".fp-status .git", browserEl(0)!)?.textContent?.includes("first") && $(".fp-status .git", browserEl(0)!)?.textContent?.includes("main")), "detached revision status shows containing branch and commit message");
     await shot("git-graph-detached-working");

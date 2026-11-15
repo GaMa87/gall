@@ -49,3 +49,6 @@
 .gcd-notice { margin: 0; padding: 12px 16px; color: var(--fg-dim); font-size: 11px; }
 .gcd-foot { padding: 6px 16px; font-size: 10px; color: var(--fg-dim); border-top: 1px solid var(--border-soft); }
 @media (max-width: 800px) { .gcd-heading > div { align-items: flex-start; flex-direction: column; gap: 3px; }.gcd-hash { max-width: 65vw; }.gcd-metadata { max-height: 115px; }.gcd-history small { display: none; }.gcd-file-count { display: none; }.gcd-tabs { margin-left: 0; }.gcd-foot { white-space: nowrap; overflow: auto; }.gcd-files { min-width: 140px; } }
+/* Structural diff: changed tokens stand out, lines that were only reformatted are dimmed. */
+.gcd-patch mark.patch-token { color: inherit; border-radius: 2px; background: color-mix(in srgb, currentColor 26%, transparent); }
+.gcd-patch .gcd-fmt { color: var(--fg-dim); }

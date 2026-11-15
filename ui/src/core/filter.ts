@@ -3,6 +3,9 @@ import { foldText, wantsFold } from "./fuzzy";
 
 export function quickFilterMatches(name: string, query: string): boolean {
   if (!query) return true;
+  // macOS may hand out decomposed (NFD) names; match them composed, like the Rust side.
+  name = name.normalize("NFC");
+  query = query.normalize("NFC");
   // Typed without accents, "porocilo" also finds "Poročilo".
   const n = (wantsFold(query) ? foldText(name) : name).toLowerCase();
   const q = query.toLowerCase();

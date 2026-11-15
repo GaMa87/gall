@@ -194,7 +194,7 @@ img { -webkit-user-drag: none; }
 .tab { flex: 0 1 180px; min-width: 28px; display: flex; align-items: center; gap: 6px; padding: 5px 8px; border-radius: var(--radius) var(--radius) 0 0; background: var(--bg-3); cursor: pointer; position: relative; overflow: hidden; border: 1px solid transparent; border-bottom: none; }
 .tab:hover { background: var(--bg-hover); }
 .tab.active { background: var(--bg-2); border-color: var(--border); flex-shrink: 0.3; }
-.browser.active .tab.active { border-top: 2px solid var(--accent); }
+.browser.active .tab.active { border-top-color: var(--accent); }
 .tab .label { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tab .close { visibility: hidden; padding: 0 2px; border: none; background: transparent; border-radius: 3px; cursor: pointer; color: var(--fg-dim); }
 .tab:hover .close.armed, .tab.active:hover .close.armed { visibility: visible; }
@@ -414,7 +414,7 @@ img { -webkit-user-drag: none; }
 .btn small { opacity: 0.7; margin-left: 6px; font-weight: 400; }
 /* Buttons reached with ←/→ or Tab show a ring (outlines are off globally). */
 .btn:focus-visible, .dc-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.btn u.accel { text-decoration-thickness: 1px; text-underline-offset: 2px; }
+.btn .accel-key { opacity: 0.7; font-family: var(--mono, monospace); font-size: 0.9em; }
 .menu { position: fixed; z-index: 80; background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); padding: 4px; min-width: 200px; }
 .menu .mi { display: flex; align-items: center; gap: 8px; padding: 5px 10px; border-radius: var(--radius); cursor: pointer; white-space: nowrap; position: relative; }
 .menu .mi:hover, .menu .mi.kb { background: var(--hover); }
@@ -634,9 +634,9 @@ kbd { border-color: var(--border); background: var(--bg-3); color: var(--fg-dim)
    below it (light themes), so the props carry their own rule. */
 .details .props { border-top: 1px solid var(--border); }
 
-/* overlays: glass */
+/* overlays: a dimmed backdrop. It is not blurred: a full-window backdrop-filter is drawn
+   again whenever the window above it changes and stalls scrolling without a fast GPU. */
 .backdrop { background: rgba(5, 7, 10, 0.42); animation: fade 140ms ease-out; }
-.backdrop.glass { backdrop-filter: blur(3px) saturate(1.1); -webkit-backdrop-filter: blur(3px) saturate(1.1); }
 :root[data-theme="light"] .backdrop { background: rgba(30, 40, 60, 0.18); }
 @keyframes fade { from { opacity: 0; } }
 @keyframes pop { from { opacity: 0; transform: translateY(-6px) scale(0.985); } }
@@ -784,10 +784,12 @@ kbd.vim { color: var(--accent-text); border-color: var(--accent-ring); backgroun
 .kh-legend-label { font-size: 0.74em; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--fg-dim); }
 .kh-legend small { flex-basis: 100%; color: var(--fg-dim); font-size: 0.76em; }
 .kh-scroll { flex: 1; min-height: 0; overflow-y: auto; }
-.kh-cols { padding: 16px 18px; columns: 3 290px; column-gap: 18px; }
-.kh-cols section { break-inside: avoid; margin-bottom: 18px; padding: 0 12px 4px; border: 1px solid var(--border); border-radius: var(--radius-lg); }
+/* Columns are split in WhichKey.tsx (sheetColumns), not by CSS `columns`: see there. */
+.kh-cols { padding: 16px 18px; display: flex; align-items: flex-start; gap: 18px; }
+.kh-col { flex: 1 1 0; min-width: 0; }
+.kh-cols section { margin-bottom: 18px; padding: 0 12px 4px; border: 1px solid var(--border); border-radius: var(--radius-lg); }
 .kh-cols h4 { margin: 0 -12px 2px; padding: 11px 12px; border-bottom: 1px solid var(--border); background: var(--bg-3); font-size: 0.76em; text-transform: uppercase; letter-spacing: 0.08em; color: var(--fg-dim); border-radius: calc(var(--radius-lg) - 1px) calc(var(--radius-lg) - 1px) 0 0; }
-.kh-row { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; padding: 9px 0; break-inside: avoid; border-bottom: 1px solid var(--border-soft); }
+.kh-row { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; padding: 9px 0; border-bottom: 1px solid var(--border-soft); }
 .kh-row:last-child { border-bottom: 0; }
 .kh-action { font-size: 0.88em; line-height: 1.45; overflow-wrap: anywhere; }
 .kh-empty { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 48px 18px; text-align: center; color: var(--fg-dim); }
@@ -834,6 +836,14 @@ kbd.vim { color: var(--accent-text); border-color: var(--accent-ring); backgroun
 .tb-path:hover { background: var(--hover); color: var(--fg); }
 .tb-path:active { background: var(--accent-soft); }
 .tb-controls { display: flex; align-self: stretch; }
+/* macOS: traffic lights on the left, no Windows-style buttons on the right. */
+.titlebar.mac { padding: 0 12px 0 14px; }
+.tb-lights { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.tb-light { width: 12px; height: 12px; padding: 0; border: 1px solid rgba(0, 0, 0, 0.18); border-radius: 50%; cursor: default; }
+.tb-light.close { background: #ff5f57; }
+.tb-light.min { background: #febc2e; }
+.tb-light.zoom { background: #28c840; }
+.tb-lights:not(:hover) .tb-light { filter: saturate(0.85); }
 .font-pick { display: inline-flex; flex-direction: column; align-items: flex-end; gap: 2px; }
 .font-pick .font-note { color: var(--fg-faint); font-size: 0.8em; }
 .tb-layouts { display: flex; align-items: center; gap: 1px; padding: 2px; border-radius: var(--radius); background: var(--bg-2); }
@@ -928,8 +938,11 @@ kbd.vim { color: var(--accent-text); border-color: var(--accent-ring); backgroun
 }
 .browser.active {
   background: linear-gradient(var(--bg-2), var(--bg-2)) padding-box,
-              linear-gradient(45deg, color-mix(in srgb, var(--accent) 38%, var(--border)), color-mix(in srgb, var(--accent-2) 28%, var(--border))) border-box;
+              linear-gradient(var(--accent), var(--accent)) border-box;
 }
+
+/* Same cue as the selected folder or commit: a 2px accent edge on the left that follows the rounded corners. */
+.browser.active::before { content: ""; position: absolute; inset: 0; border-radius: inherit; box-shadow: inset 2px 0 var(--accent); z-index: 5; pointer-events: none; }
 
 /* Notifications: solid rounded cards, edge and wash coloured by kind. */
 .toast {
@@ -963,6 +976,7 @@ kbd.vim { color: var(--accent-text); border-color: var(--accent-ring); backgroun
 .fp-status button.mod.git { appearance: none; margin-left: auto; padding: 1px 9px; border: none; border-radius: var(--radius-pill); background: var(--well-bg); color: var(--fg-dim); font: inherit; cursor: pointer; transition: background .14s ease, box-shadow .14s ease, color .14s ease; }
 .fp-status button.mod.git:hover { background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent-ring); color: var(--fg); }
 .fp-status button.mod.git:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.fp-status button.mod.git.refused { color: var(--warn); background: color-mix(in srgb, var(--warn) 14%, var(--well-bg)); }
 .nf { font-style: normal; font-family: "JetBrainsMono Nerd Font", "JetBrainsMono NF", "Symbols Nerd Font", "Symbols Nerd Font Mono", "FiraCode Nerd Font", "Hack Nerd Font", var(--font); font-size: 1.15em; line-height: 1; opacity: 0.9; }
 
 /* ═════════════════════ Folder header ═════════════════════
@@ -1126,6 +1140,10 @@ kbd.vim { color: var(--accent-text); border-color: var(--accent-ring); backgroun
 .dv-sign.mv { color: var(--accent-text); cursor: pointer; font-weight: 700; }
 .dv-sign.mv:hover { background: var(--accent-soft); border-radius: 2px; }
 .dv-moved { color: var(--accent-text); }
+/* Structural diff: the line's content is unchanged, only its formatting differs. */
+.dv-row > .dv-cell.fmt.l, .dv-row > .dv-cell.fmt.r, .dv-canvas .dv-row.unified.fmt { background: color-mix(in srgb, var(--fg-dim) 9%, transparent); }
+.dv-row > .dv-cell.fmt.l .dv-sign, .dv-row > .dv-cell.fmt.r .dv-sign, .dv-canvas .dv-row.unified.fmt .dv-sign { color: var(--fg-dim); }
+.dv-fmt { color: var(--fg-dim); }
 .dv-cell.empty { background: repeating-linear-gradient(135deg, transparent 0 5px, var(--border-soft) 5px 6px); }
 mark.dv-word { color: inherit; border-radius: 2px; padding: 0; }
 .dv-cell.l mark.dv-word, .dv-row.unified.del mark.dv-word { background: var(--dv-del-hi); }
@@ -1596,6 +1614,18 @@ label.wc-row { cursor: pointer; }
 .search-win .r.on:hover, .suggest .s.on:hover, .fav.current:hover, .drive.current:hover, .mcol-item.on-path:hover, .fif-match.on:hover { background: var(--sel-gradient); }
 /* Toggles and chips that are switched on: accent tint with a ring, as in the Git side tabs. */
 .tgl.on, .chip.on, .pill.on, .dc-chip.on, .tb-sheet.on, .tb-layout.on { box-shadow: inset 0 0 0 1px var(--accent-ring); }
+
+/* ═════════════════════ Scrolling surfaces ═════════════════════
+   A list that scrolls paints its own opaque background, the colour of the surface under
+   it. At 100 % display scaling the web view moves a scrolling area on the compositor only
+   when its background is opaque; a transparent one is drawn again in full on every scroll
+   step and every cursor move (measured without a GPU: 14 times the raster work in the file
+   list). Give a new scrolling list the colour of its surface here. Lists on the gradient of
+   a dialog (.modal) stay transparent, so the gradient shows through. */
+.fp-list:not(.bg-image), .mcol-list, .details .props, .kh-scroll, .qo-list, .fif-list,
+.dv-body, .hx-body, .tb-body, .dc-list { background-color: var(--bg-2); }
+.mcol.current-col .mcol-list { background-color: color-mix(in srgb, var(--accent) 3%, var(--bg-2)); }
+.sidebar-scroll { background-color: var(--bg); }
 .git-graph { background: var(--bg-2); border: 1px solid var(--border-soft); border-radius: var(--radius-xl); width: min(1100px, 95vw); height: 85vh; padding: 20px; display: flex; flex-direction: column; gap: 12px; }
 .git-graph header { display: flex; align-items: center; justify-content: space-between; }
 .git-graph h2, .git-graph p { margin: 0; }
@@ -1648,10 +1678,25 @@ label.wc-row { cursor: pointer; }
 
 .gg-working .gg-message b { font-style: italic; font-weight: 600; }
 .gg-working-dot { stroke-dasharray: 2 2; }
-.gg-with-changes .git-graph-lines { flex: 0 0 27%; min-height: 100px; }
 .gg-working-details { flex: 1; min-height: 0; display: flex; flex-direction: column; border-top: 1px solid var(--border-soft); }
 .gg-working-title { display: flex; justify-content: space-between; align-items: center; padding: 5px 18px; font-size: 12px; }
 .gg-working-details .gc-commit textarea { min-height: 42px; }
 .gg-working-details .gc-tools { padding-top: 5px; padding-bottom: 5px; }
 .gg-reflog { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; font-size: 12px; cursor: pointer; }
 .gg-reflog input { accent-color: var(--accent); }
+
+/* Form controls: WebKitGTK draws native, unthemed selects (bevelled, white popup) and
+   cramped number spinners. Draw them ourselves so they match the theme on every platform. */
+select {
+  -webkit-appearance: none;
+  appearance: none;
+  padding-right: 28px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23999' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  cursor: pointer;
+}
+select option { background: var(--bg-2); color: var(--fg); }
+input[type="number"] { -moz-appearance: textfield; appearance: textfield; padding-right: 6px; }
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
