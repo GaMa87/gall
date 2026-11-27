@@ -71,6 +71,9 @@ impl JsonStore {
             std::fs::create_dir_all(dir).ctx("create folder", dir)?;
         }
         let data = serde_json::to_vec_pretty(value)?;
+        if std::fs::read(&self.path).ok().as_deref() == Some(data.as_slice()) {
+            return Ok(());
+        }
         let tmp = self.path.with_extension("tmp");
         {
             let mut f = std::fs::File::create(&tmp).ctx("write", &tmp)?;
@@ -142,5 +145,29 @@ mod tests {
                 .path,
             "/left/sub"
         );
+    }
+
+    #[test]
+    fn save_skips_unchanged_content() {
+        let d = tempfile::tempdir().unwrap();
+        let store = JsonStore::new(d.path().join("session.json"));
+        let mut m = BTreeMap::new();
+        m.insert("k".to_string(), 1);
+        store.save(&m).unwrap();
+        assert!(
+            !store.backup_path().exists(),
+            "first save creates no backup"
+        );
+
+        // Saving identical content must not rewrite the file or create a redundant backup.
+        store.save(&m).unwrap();
+        assert!(
+            !store.backup_path().exists(),
+            "identical save must skip backup copy and rewrite"
+        );
+
+        m.insert("k".to_string(), 2);
+        store.save(&m).unwrap();
+        assert!(store.backup_path().exists(), "changed save rotates backup");
     }
 }

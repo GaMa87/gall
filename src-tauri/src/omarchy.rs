@@ -209,7 +209,8 @@ pub fn is_tiling_wm() -> bool {
 mod linux {
     use super::*;
     use notify_debouncer_full::notify::{
-        Config as NotifyConfig, RecommendedWatcher, RecursiveMode,
+        event::{AccessKind, AccessMode},
+        Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode,
     };
     use notify_debouncer_full::{new_debouncer_opt, DebounceEventResult, Debouncer, NoCache};
     use std::collections::HashMap;
@@ -415,6 +416,18 @@ mod linux {
         }
     }
 
+    /// Ignore read-only inotify access events (`Open`, `Close(NoWrite)`, `Read`):
+    /// reading `colors.toml` / `fonts.conf` inside `refresh_and_emit` would otherwise
+    /// trigger another watch batch every 80 ms in an infinite loop.
+    pub(super) fn is_mutation_event(event: &Event) -> bool {
+        event.need_rescan()
+            || match event.kind {
+                EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
+                EventKind::Access(_) => false,
+                _ => true,
+            }
+    }
+
     fn spawn_fs_watcher(
         app: tauri::AppHandle,
         paths: OmarchyPaths,
@@ -439,7 +452,7 @@ mod linux {
 
                 while let Ok(res) = rx.recv() {
                     if let Ok(events) = res {
-                        if events.is_empty() {
+                        if !events.iter().any(|ev| is_mutation_event(ev)) {
                             continue;
                         }
                         // Re-arm watches in case `current/theme` was replaced atomically (`rm -rf && mv`).
@@ -1680,5 +1693,36 @@ mod tests {
         assert_eq!(read_language(&dir.join("missing"), &locales).code, "en");
         assert_eq!(read_language(&file, &dir.join("missing.json")).code, "en");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn watcher_ignores_read_only_access_events() {
+        use notify_debouncer_full::notify::{
+            event::{AccessKind, AccessMode, CreateKind, ModifyKind},
+            Event, EventKind,
+        };
+        for access in [
+            AccessKind::Any,
+            AccessKind::Read,
+            AccessKind::Open(AccessMode::Any),
+            AccessKind::Open(AccessMode::Read),
+            AccessKind::Close(AccessMode::Any),
+            AccessKind::Close(AccessMode::Read),
+        ] {
+            assert!(
+                !linux::is_mutation_event(&Event::new(EventKind::Access(access))),
+                "read-only access {access:?} must not retrigger omarchy-watch"
+            );
+        }
+        assert!(linux::is_mutation_event(&Event::new(EventKind::Access(
+            AccessKind::Close(AccessMode::Write)
+        ))));
+        assert!(linux::is_mutation_event(&Event::new(EventKind::Create(
+            CreateKind::File
+        ))));
+        assert!(linux::is_mutation_event(&Event::new(EventKind::Modify(
+            ModifyKind::Any
+        ))));
     }
 }

@@ -114,6 +114,10 @@ interface Props {
   compact?: boolean;
 }
 
+// Shared across panes in this window so switching between left and right panels still updates
+// `selection.json`, while redundant folder refreshes with unchanged selection skip IPC.
+let lastPublishedSelection: string | null = null;
+
 export function FolderPane({ b, path, active, compact }: Props) {
   const settings = useStore((s) => s.settings)!;
   // Chords that are shortcuts: an Option character (macOS) typed with one is not text.
@@ -474,8 +478,14 @@ export function FolderPane({ b, path, active, compact }: Props) {
   useEffect(() => {
     if (!active) return;
     const t = setTimeout(() => {
-      const items = sel.size ? visible.filter((e) => sel.has(e.path)) : [];
-      api.selectionPublish(path, items.map((e) => e.path), focusedEntry?.path ?? null).catch(() => {});
+      const items = sel.size ? visible.filter((e) => sel.has(e.path)).map((e) => e.path) : [];
+      const focusedPath = focusedEntry?.path ?? null;
+      const key = `${path}\0${focusedPath ?? ""}\0${items.join("\0")}`;
+      if (lastPublishedSelection === key) return;
+      lastPublishedSelection = key;
+      api.selectionPublish(path, items, focusedPath).catch(() => {
+        if (lastPublishedSelection === key) lastPublishedSelection = null;
+      });
     }, 200);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps

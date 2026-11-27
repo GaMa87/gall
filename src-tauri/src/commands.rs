@@ -319,9 +319,18 @@ pub async fn list_drives() -> R<Vec<drives::Drive>> {
 /// Cloud storage folders (OneDrive, Dropbox, Google Drive, iCloud, …) on this computer.
 #[tauri::command]
 pub async fn list_cloud_folders() -> R<Vec<gall_core::fs::cloud::CloudFolder>> {
-    tauri::async_runtime::spawn_blocking(|| gall_core::fs::cloud::detect(&drives::list_drives()))
-        .await
-        .map_err(e)
+    tauri::async_runtime::spawn_blocking(|| {
+        // On Windows/macOS, Google Drive for Desktop appears as a drive labelled "Google Drive".
+        // On Linux, cloud folders live in $HOME or $XDG_RUNTIME_DIR/gvfs, so avoid re-walking mounts.
+        let drives = if cfg!(any(windows, target_os = "macos")) {
+            drives::list_drives()
+        } else {
+            Vec::new()
+        };
+        gall_core::fs::cloud::detect(&drives)
+    })
+    .await
+    .map_err(e)
 }
 
 // ───────────────────────── compare ─────────────────────────
@@ -1408,9 +1417,14 @@ pub async fn volume_repair_mount(id: String) -> R<String> {
 /// Unlocks and mounts an encrypted volume; returns where (None on Windows, which
 /// shows its own dialog).
 #[tauri::command]
-pub async fn volume_unlock(id: String, passphrase: String) -> R<Option<String>> {
+pub async fn volume_unlock(
+    id: String,
+    passphrase: String,
+    remember: Option<bool>,
+) -> R<Option<String>> {
+    let remember = remember.unwrap_or(false);
     tauri::async_runtime::spawn_blocking(move || {
-        gall_core::fs::volumes::unlock_volume(&id, &passphrase)
+        gall_core::fs::volumes::unlock_volume(&id, &passphrase, remember)
     })
     .await
     .map_err(e)?
@@ -3615,6 +3629,22 @@ pub async fn index_query(
     priority: Option<String>,
 ) -> R<gall_core::fs::index::IndexResult> {
     let include_ignored = include_ignored.unwrap_or(false);
+    let clamped_limit = limit.clamp(1, 500);
+    if gall_core::fs::index::is_path_prefix_query(&query) {
+        let include_hidden = include_ignored || state.settings.read().unwrap().index_hidden;
+        return tauri::async_runtime::spawn_blocking(move || {
+            gall_core::fs::index::query_path_prefix(&query, include_hidden, clamped_limit)
+                .unwrap_or(gall_core::fs::index::IndexResult {
+                    hits: Vec::new(),
+                    total: 0,
+                    searched: 0,
+                    elapsed_ms: 0,
+                    scanning: false,
+                })
+        })
+        .await
+        .map_err(e);
+    }
     let scope = scope.map(PathBuf::from);
     let roots = index_options(&state.settings.read().unwrap()).0;
     if include_ignored && !query.trim().is_empty() {
@@ -3690,7 +3720,7 @@ pub async fn index_hidden_count(
     {
         prev.store(true, Ordering::Relaxed);
     }
-    if query.trim().is_empty() {
+    if query.trim().is_empty() || gall_core::fs::index::is_path_prefix_query(&query) {
         return Ok(gall_core::fs::search_filter::HiddenCount::default());
     }
     let (roots, filter_cfg) = {
@@ -5048,9 +5078,21 @@ pub fn selection_publish(
     if state.compare_wait_window(window.label()).is_some() {
         return Ok(());
     }
+    let key = crate::state::PublishedSelection {
+        window: window.label().to_string(),
+        folder: folder.clone(),
+        selection: selection.clone(),
+        focused: focused.clone(),
+    };
+    {
+        let last = state.last_selection.lock().unwrap();
+        if last.as_ref() == Some(&key) {
+            return Ok(());
+        }
+    }
     let snap = crate::headless::SelectionSnapshot {
         pid: std::process::id(),
-        window: window.label().to_string(),
+        window: key.window.clone(),
         folder,
         selection,
         focused,
@@ -5059,7 +5101,9 @@ pub fn selection_publish(
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0),
     };
-    crate::headless::write_selection(&state.dirs, &snap).map_err(e)
+    crate::headless::write_selection(&state.dirs, &snap).map_err(e)?;
+    *state.last_selection.lock().unwrap() = Some(key);
+    Ok(())
 }
 
 /// Debug builds with a self-test: raw payloads of the file targets on the clipboard

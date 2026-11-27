@@ -20,8 +20,8 @@ let latest: SysStats | null = null;
 const listeners = new Set<() => void>();
 let timer: number | null = null;
 
-async function tick() {
-  if (document.hidden) return;
+async function tick(force = false) {
+  if (document.hidden || (!force && typeof document.hasFocus === "function" && !document.hasFocus())) return;
   try {
     const s = await api.systemStats();
     latest = s;
@@ -37,12 +37,17 @@ function useStats(enabled: boolean) {
     if (!enabled) return;
     const f = () => force((n) => n + 1);
     listeners.add(f);
+    const onActive = () => { if (!document.hidden) void tick(true); };
     if (timer === null) {
-      tick();
-      timer = window.setInterval(tick, POLL_MS);
+      void tick(true);
+      timer = window.setInterval(() => void tick(false), POLL_MS);
     }
+    window.addEventListener("focus", onActive);
+    document.addEventListener("visibilitychange", onActive);
     return () => {
       listeners.delete(f);
+      window.removeEventListener("focus", onActive);
+      document.removeEventListener("visibilitychange", onActive);
       if (!listeners.size && timer !== null) {
         clearInterval(timer);
         timer = null;

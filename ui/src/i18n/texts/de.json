@@ -100,7 +100,7 @@
   "Quick Open index and find in files.": "Index für Schnellöffnung und Dateiinhalte durchsuchen.",
   "Quick Open index (Ctrl+P)": "Index für Schnellöffnung (Ctrl+P)",
   "Indexed folders": "Indizierte Ordner",
-  "Separate with ; — empty = the whole system (/ or every drive). Rebuilt in the background.": "Mit ; trennen — leer = das ganze System (/ oder jedes Laufwerk). Wird im Hintergrund neu erstellt.",
+  "Separate with ; — empty = your home folder (or every local drive on Windows); type /path in Quick Open to browse anywhere.": "Mit ; trennen — leer = persönlicher Ordner (oder alle lokalen Laufwerke unter Windows); /Pfad in der Schnellöffnung durchsucht beliebige Orte live.",
   "Never index or search": "Nie indizieren oder durchsuchen",
   "Comma separated names or globs (gitignore syntax), e.g. node_modules, *.iso. Applies to Quick Open, find in files and name search. Folders tagged as caches (CACHEDIR.TAG) are skipped too. Per project: a .gallignore file (gitignore syntax, also outside git) in a folder applies to it and everything below; right-click › Hide from search adds an item to it. Alt+I in a search includes all of these.": "Kommagetrennte Namen oder Glob-Muster (gitignore-Syntax), z. B. node_modules, *.iso. Gilt für Schnellöffnung, Dateiinhalte und Namenssuche. Ordner mit Cache-Markierung (CACHEDIR.TAG) werden ebenfalls übersprungen. Pro Projekt gilt eine Datei `.gallignore` (gitignore-Syntax, auch außerhalb von Git) für den Ordner und alle Unterordner; per Rechtsklick › „Aus Suche ausblenden“ wird ein Element dort eingetragen. Mit Alt+I werden bei einer Suche alle diese Elemente einbezogen.",
   "Index hidden files and folders": "Versteckte Dateien und Ordner indizieren",
@@ -2712,5 +2712,6 @@
   "Live Tab Pairs bridge": "Live-Tab-Paar-Brücke",
   "Show the center bridge control in the title bar and pair actions on tabs (Linked, Tandem walk, Flow). Turning off restores classic independent panels.": "Zeigt die Brückensteuerung in der Titelleiste und Kopplungsaktionen auf Tabs (Verknüpft, Tandem, Flow). Deaktivieren stellt klassische unabhängige Bereiche wieder her.",
   "Pair Gravity ghost tab suggestions": "Pair-Gravity-Ghost-Tab-Vorschläge",
-  "Suggest a translucent ghost tab (🧲) on the opposite tab bar based on learned folder pairs and sibling Git worktrees.": "Schlägt einen halbtransparenten Ghost-Tab (🧲) in der gegenüberliegenden Tab-Leiste anhand gelernter Ordnerpaare und verwandter Git-Worktrees vor."
+  "Suggest a translucent ghost tab (🧲) on the opposite tab bar based on learned folder pairs and sibling Git worktrees.": "Schlägt einen halbtransparenten Ghost-Tab (🧲) in der gegenüberliegenden Tab-Leiste anhand gelernter Ordnerpaare und verwandter Git-Worktrees vor.",
+  "Remember passphrase in system keyring": "Passwort im System-Schlüsselbund speichern"
 }

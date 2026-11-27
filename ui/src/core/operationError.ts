@@ -88,7 +88,7 @@ export function operationError(raw: string, platform?: string): OperationError {
   }
   if (raw.startsWith("cannot safely restore conflicting entry ")) return expected("C" + raw.slice(1));
 
-  if (/^(?:Wrong passphrase|Not authorized to mount this volume|not an encrypted volume|unlocking is not supported here)$| is not mounted$/s.test(raw)) {
+  if (/^(?:Wrong passphrase|Passphrase required|Not authorized to mount this volume|not an encrypted volume|unlocking is not supported here)$| is not mounted$/s.test(raw)) {
     return expected(raw[0].toUpperCase() + raw.slice(1), "warn");
   }
 

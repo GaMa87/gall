@@ -203,7 +203,7 @@ function NetworkGroup({ current }: { current: string }) {
     if (!linux) return;
     void A.refreshNetwork();
     // Only the focused window polls: every other window (and every picker) catches up on focus.
-    const t = setInterval(() => { if (!document.hidden && document.hasFocus()) void A.refreshNetwork(); }, 5000);
+    const t = setInterval(() => { if (!document.hidden && document.hasFocus()) void A.refreshNetwork(); }, 15_000);
     const onVisible = () => { if (!document.hidden) void A.refreshNetwork(); };
     document.addEventListener("visibilitychange", onVisible);
     window.addEventListener("focus", onVisible);
@@ -313,7 +313,7 @@ function FavGroup({ g, current, dual }: { g: FavoriteGroup; current: string; dua
           <div
             key={f.path}
             className={`fav ${real === current ? "current" : ""} ${dropOn === i ? "drop" : ""} ${dropIdx === i ? "insert-before" : ""}`}
-            title={f.path}
+            title={isTrash ? label : f.path}
             draggable
             onDragStart={(e) => startFavDrag(e, g.id, i, f.path)}
             onDragOver={(e) => {
@@ -351,22 +351,32 @@ function FavGroup({ g, current, dual }: { g: FavoriteGroup; current: string; dua
               dropInto(e, real);
             }}
             onClick={() => A.navigate(b, f.path)}
-            onMouseDown={(e) => { if (e.button === 1) { e.preventDefault(); A.sessionCmd({ op: "newTab", b, path: real, activate: false }); } }}
+            onMouseDown={(e) => {
+              if (e.button === 1) {
+                e.preventDefault();
+                if (isTrash) A.navigate(b, f.path);
+                else A.sessionCmd({ op: "newTab", b, path: real, activate: false });
+              }
+            }}
             onContextMenu={(e) => {
               e.preventDefault();
               A.showMenuFor(e, [
-                { label: t("menu.openNewTab"), run: () => A.sessionCmd({ op: "newTab", b, path: real }) },
-                ...(A.hasOtherTarget(b) ? [{ label: t("menu.openOtherBrowser"), run: () => A.openInOther(b, real) }] : []),
+                ...(isTrash
+                  ? [{ label: tt("Open"), run: () => A.navigate(b, f.path) }]
+                  : [
+                      { label: t("menu.openNewTab"), run: () => A.sessionCmd({ op: "newTab", b, path: real }) },
+                      ...(A.hasOtherTarget(b) ? [{ label: t("menu.openOtherBrowser"), run: () => A.openInOther(b, real) }] : []),
+                    ]),
                 { separator: true },
                 { label: t("sidebar.changeAlias"), run: async () => { const v = await A.promptText("Alias", label, "Save"); if (v !== null) A.favCmd({ op: "alias", id: g.id, index: i, alias: v }); } },
                 { label: t("sidebar.removeAlias"), disabled: !f.alias, run: () => A.favCmd({ op: "alias", id: g.id, index: i, alias: null }) },
-                { label: t("sidebar.removeFromGroup"), danger: true, disabled: f.path.startsWith("trash:"), run: () => A.favCmd({ op: "removeItem", id: g.id, index: i }) },
+                { label: t("sidebar.removeFromGroup"), danger: true, disabled: isTrash, run: () => A.favCmd({ op: "removeItem", id: g.id, index: i }) },
               ]);
             }}
           >
             {ic.name === "folder" ? <FileIcon entry={{ isDir: true, ext: "", name: basename(real), path: real }} size={16} /> : <Icon name={ic.name} size={16} color={ic.color} />}
             <span className="label">{label}</span>
-            {dual && <PanePick className="pick" onPick={(t) => A.navigate(t, f.path)} />}
+            {dual && !isTrash && <PanePick className="pick" onPick={(t) => A.navigate(t, f.path)} />}
           </div>
         );
       })}

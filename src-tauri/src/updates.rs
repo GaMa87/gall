@@ -398,6 +398,7 @@ async fn apply_staged_inner(app: &AppHandle) -> Result<(), String> {
         // Close the crash marker and flush session synchronously before exiting so the next
         // launch never reports an irregular shutdown.
         state.flush_session();
+        state.db.checkpoint();
         crate::bug_report::clean();
 
         let active_path = gall_core::updater::active_overlay_path(&cap.updates_dir);
@@ -499,6 +500,7 @@ pub async fn revert_overlay_update(app: AppHandle) -> Result<(), String> {
         }
 
         state.flush_session();
+        state.db.checkpoint();
         crate::bug_report::clean();
 
         let active_path = gall_core::updater::active_overlay_path(&cap.updates_dir);

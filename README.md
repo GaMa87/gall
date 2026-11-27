@@ -158,7 +158,7 @@ Dark and light themes are built in alongside **Gruvbox**, **Night Owl**, custom 
 | **File list &amp; previews** | Natural sort per folder, collapsible groups (`Ctrl+F7` / `,g`), accent-insensitive type-to-filter, per-pane hidden toggle (`.` / `Ctrl+H`), 5 views (`Ctrl+wheel` thumbnail sizing). Previews (`Alt+P` pane, `Space`/`i` modal): syntax-highlighted code, Markdown, PDF, zoomable images, video/audio with frame-step, 3D STL models, archives, and `.2do` notes. |
 | **Archives &amp; folder sizes** | Open `zip`, `7z`, and `tar` (`gz`, `xz`, `bz2`, `zst`) read-only like folders (including encrypted zip/7z); extract/compress from the context menu. Calculate folder totals on demand (`Ctrl+Alt+S`) or automatically in the background (deduplicating hard links, skipping `/proc`/`/sys`). |
 | **Rename &amp; undo** | Smart `F2` rename (cycles name / extension / full) and batch rename with templates (`Trip {n:2}`, `{date}`, `{folder}`), regex find/replace, case transforms, or multi-line text editing. `Ctrl+Z` undoes copy, move, rename, batch rename, merge, extract, and trash. |
-| **Tags, sidebar &amp; updates** | Colour tags (`Ctrl+Alt+T` / `c`), folder colours, file templates (`Ctrl+N`), drives with mount/eject/encrypted unlock, cloud folders, favourites groups, Trash window, honest drag-and-drop modifiers (`Ctrl` copy, `Shift` move, `Alt` link), and signed background updates. |
+| **Tags, sidebar &amp; updates** | Colour tags (`Ctrl+Alt+T` / `c`), folder colours, file templates (`Ctrl+N`), drives with mount/eject/encrypted unlock (with KDE KWallet &amp; GNOME Keyring support on Linux), cloud folders, favourites groups, Trash window, honest drag-and-drop modifiers (`Ctrl` copy, `Shift` move, `Alt` link), and signed background updates. |
 | **Git &amp; open-with** | Inline Git status (`M`/`S`/`U`/`!`) and branch ahead/behind in the status bar without running repository hooks; full [Git workspace](#git-workspace) (`g r`); native `Ctrl+Enter` Open-with rules per file/folder/project, `F10` terminal here, and `Ctrl+Alt+E` / `F4` editor. |
 
 Full platform coverage: [docs/04-compatibility-matrix.md](docs/04-compatibility-matrix.md).
@@ -276,7 +276,7 @@ Quick Open (<kbd>Ctrl+P</kbd>) searches the **open folder and its subfolders** f
 !important.log
 ```
 
-- Quick Open reads unindexed folders (WSL, network shares, outside configured roots) on demand while you type; configure permanent roots in *Settings › Search › Indexed folders* and global exclusions in *Settings › Search › Never index or search*.
+- On Unix, the system index defaults to `$HOME` and refreshes on demand when Quick Open opens; typing `/path`, `~/path`, or `C:\path` performs live single-directory completion (`Tab` completes directories). Quick Open also reads unindexed folders (WSL, network shares, outside configured roots) on demand while you type; configure permanent roots in *Settings › Search › Indexed folders* and global exclusions in *Settings › Search › Never index or search*.
 - Folders containing a valid `CACHEDIR.TAG` are skipped automatically. Inside archives, Quick Open searches the system index (`Alt+I` and folder scope are unavailable).
 - Hidden matches are counted cleanly in the empty state or footer; `Alt+I` reveals them dimmed with a `hidden` badge. `Ctrl+H` / `.` only toggles hidden files in the file list and does not override search exclusions.
 

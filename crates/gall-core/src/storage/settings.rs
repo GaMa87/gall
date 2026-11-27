@@ -305,7 +305,7 @@ pub struct Settings {
 }
 
 /// The newest change of defaults `Settings::migrate_defaults` knows.
-pub const DEFAULTS_VERSION: u32 = 2;
+pub const DEFAULTS_VERSION: u32 = 3;
 
 impl Settings {
     /// Moves values that still equal an old default to the current one, once per change:
@@ -326,8 +326,15 @@ impl Settings {
                 self.column_min_width = 120;
             }
         }
-        // Grouping by type is for new installs: an older one keeps the order it had.
-        self.group = GroupMode::from_folders_on_top(self.folders_on_top);
+        if self.defaults_version < 2 {
+            // Grouping by type is for new installs: an older one keeps the order it had.
+            self.group = GroupMode::from_folders_on_top(self.folders_on_top);
+        }
+        if self.defaults_version < 3 && self.index_refresh_minutes == 15 {
+            // 0.3.0 and before re-indexed every 15 minutes in the background; now on-demand
+            // when Quick Open opens so idle sessions do zero background directory sweeps.
+            self.index_refresh_minutes = 0;
+        }
         self.defaults_version = DEFAULTS_VERSION;
         true
     }
@@ -486,7 +493,7 @@ impl Default for Settings {
             index_hidden: false,
             index_respect_gitignore: true,
             index_exclude: crate::fs::index::default_excludes(),
-            index_refresh_minutes: 15,
+            index_refresh_minutes: 0,
             search_respect_gitignore: true,
 
             keyboard_profile: None,
@@ -561,6 +568,32 @@ mod defaults_tests {
     #[test]
     fn fresh_settings_need_no_migration() {
         assert!(!Settings::default().migrate_defaults());
+    }
+
+    #[test]
+    fn index_refresh_migrates_to_on_demand_once() {
+        use crate::view::sort::GroupMode;
+        let mut s: Settings = serde_json::from_str(
+            r#"{"defaultsVersion":2,"group":"type","indexRefreshMinutes":15}"#,
+        )
+        .unwrap();
+        assert!(s.migrate_defaults());
+        assert_eq!(s.index_refresh_minutes, 0);
+        // Existing v2 grouping choice must not be overwritten by the v3 migration.
+        assert_eq!(s.group, GroupMode::Type);
+        assert_eq!(s.defaults_version, DEFAULTS_VERSION);
+
+        // Explicit custom interval or re-selecting 15 at v3 survives.
+        let mut custom: Settings =
+            serde_json::from_str(r#"{"defaultsVersion":2,"indexRefreshMinutes":30}"#).unwrap();
+        assert!(custom.migrate_defaults());
+        assert_eq!(custom.index_refresh_minutes, 30);
+
+        s.index_refresh_minutes = 15;
+        let mut again: Settings =
+            serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert!(!again.migrate_defaults());
+        assert_eq!(again.index_refresh_minutes, 15);
     }
 }
 

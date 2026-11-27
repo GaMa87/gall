@@ -861,13 +861,16 @@ pub fn run() {
                     .data
                     .join("macos-trash.json"),
             );
-            // Build the Quick Open index shortly after start, then keep it fresh.
+            // Build the Quick Open index shortly after start (unless set to 0 = "only on demand"),
+            // then keep it fresh at the configured interval.
             let h4 = handle.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_secs(2));
                 loop {
                     let st = h4.state::<state::AppState>();
-                    commands::index_rebuild_bg(&h4, &st, 30);
+                    if st.settings.read().unwrap().index_refresh_minutes > 0 {
+                        commands::index_rebuild_bg(&h4, &st, 30);
+                    }
                     // The interval is read again while waiting: 0 ("only on demand")
                     // pauses the refresh instead of ending it, and a new or shorter
                     // interval applies without a restart.
@@ -1208,6 +1211,7 @@ pub fn run() {
                             finish_interrupted_compare(&wait, state.window_is_ready(&label));
                         }
                         state.flush_session();
+                        state.db.checkpoint();
                         // Only our own selection file: another instance may have written it.
                         if headless::read_selection(&state.dirs)
                             .is_ok_and(|s| s.pid == std::process::id())

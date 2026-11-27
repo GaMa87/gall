@@ -44,6 +44,28 @@ export function measureCompareResponses(observer?: typeof compareMeasure) {
   compareMeasure = observer;
 }
 
+// Background polls and high-frequency cursor previews fire without user action (or on every
+// arrow key). Recording their routine successes would flood the 200-event ring buffer and keep
+// rewriting `diagnostics.json` while Gall is idle; failures are still recorded below.
+const QUIET_SUCCESS_COMMANDS = new Set([
+  "system_stats",
+  "list_drives",
+  "other_volumes",
+  "gvfs_network_mounts",
+  "list_cloud_folders",
+  "selection_publish",
+  "grep_context",
+]);
+
+export function shouldRecordSuccessCommand(command: string): boolean {
+  return (
+    !command.startsWith("bug_report_") &&
+    !command.startsWith("selftest_") &&
+    command !== "ui_log" &&
+    !QUIET_SUCCESS_COMMANDS.has(command)
+  );
+}
+
 function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   const start = performance.now();
   const record = !command.startsWith("bug_report_") && !command.startsWith("selftest_") && command !== "ui_log";
@@ -53,7 +75,7 @@ function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> 
     if (compareMeasure && command.startsWith("diff_page_")) {
       compareMeasure(command, performance.now() - start, new TextEncoder().encode(JSON.stringify(value)).length);
     }
-    if (record) note("command", `${command} ok ${Math.round(performance.now() - start)}ms`);
+    if (shouldRecordSuccessCommand(command)) note("command", `${command} ok ${Math.round(performance.now() - start)}ms`);
     return value;
   }, (error) => {
     if (record) {
@@ -170,7 +192,8 @@ export const api = {
   volumeMount: (id: string) => invoke<string>("volume_mount", { id }),
   volumePowerOff: (id: string) => invoke<void>("volume_power_off", { id }),
   volumeRepairMount: (id: string) => invoke<string>("volume_repair_mount", { id }),
-  volumeUnlock: (id: string, passphrase: string) => invoke<string | null>("volume_unlock", { id, passphrase }),
+  volumeUnlock: (id: string, passphrase: string, remember = false) =>
+    invoke<string | null>("volume_unlock", { id, passphrase, remember }),
   driveLock: (mount: string) => invoke<void>("drive_lock", { mount }),
   resolvePrefs: (path: string) => invoke<T.ResolvedPrefs>("resolve_prefs", { path }),
   setPrefs: (path: string, prefs: T.FolderPrefs) => invoke<void>("set_prefs", { path, prefs }),

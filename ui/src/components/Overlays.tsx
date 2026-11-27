@@ -227,6 +227,7 @@ function dialogKey(d: DialogSpec): number {
 
 function Dialog({ d }: { d: DialogSpec }) {
   const [value, setValue] = useState(d.input?.value ?? "");
+  const [checked, setChecked] = useState(d.checkbox?.checked ?? false);
   const inputRef = useRef<HTMLInputElement | HTMLTextAreaElement>(null);
   const toggle = useRef(0);
   // The window the dialog was asked from (it stays open beneath) gets the keyboard back.
@@ -242,7 +243,7 @@ function Dialog({ d }: { d: DialogSpec }) {
     el.setSelectionRange(a, b);
   }, [d]);
   const primary = d.buttons.find((b) => b.primary) ?? d.buttons[d.buttons.length - 1];
-  const finish = (id: string | null) => d.resolve(id === null ? null : { button: id, value });
+  const finish = (id: string | null) => d.resolve(id === null ? null : { button: id, value, checked: d.checkbox ? checked : undefined });
   const buttonsRef = useRef<HTMLDivElement>(null);
   const vim = useStore((s) => s.settings?.vimKeys ?? false);
   const focusedButton = () => (document.activeElement as HTMLElement | null)?.closest?.(".buttons [data-id]") as HTMLElement | null;
@@ -292,6 +293,12 @@ function Dialog({ d }: { d: DialogSpec }) {
         <div className="body">
           {d.message && <p>{tt(d.message)}</p>}
           {d.input && (d.input.multiline ? <><textarea ref={(element) => { inputRef.current = element; }} className="dialog-multiline" aria-label={tt(d.title)} value={value} placeholder={d.input.placeholder} onChange={(e) => setValue(e.target.value)} spellCheck={false} /><small>{tt("Ctrl+Enter saves · Escape cancels")}</small></> : <input ref={(element) => { inputRef.current = element; }} type={d.input.password ? "password" : "text"} autoComplete="off" value={value} placeholder={d.input.placeholder} onChange={(e) => setValue(e.target.value)} spellCheck={false} />)}
+          {d.checkbox && (
+            <label className="dialog-check">
+              <input type="checkbox" checked={checked} onChange={(e) => setChecked(e.target.checked)} />
+              <span>{tt(d.checkbox.label)}</span>
+            </label>
+          )}
         </div>
         <div className="buttons" ref={buttonsRef}>
           {d.buttons.map((b) => (

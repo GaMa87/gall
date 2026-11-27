@@ -50,4 +50,20 @@ describe("a dialog asked from inside another window", () => {
     expect(await second).toBe(true);
     expect(getState().overlay?.type).toBe("settings");
   });
+
+  it("carries optional checkbox state through dialog resolution", async () => {
+    setState({ overlay: null });
+    const p = A.dialog({
+      title: "Unlock",
+      input: { value: "", password: true },
+      checkbox: { label: "Remember passphrase in system keyring", checked: false },
+      buttons: [{ id: "cancel", label: "Cancel" }, { id: "ok", label: "Unlock", primary: true }],
+    });
+    const o = getState().overlay;
+    if (o?.type !== "dialog") throw new Error("expected dialog");
+    expect(o.dialog.checkbox).toEqual({ label: "Remember passphrase in system keyring", checked: false });
+    o.dialog.resolve({ button: "ok", value: "secret", checked: true });
+    expect(await p).toEqual({ button: "ok", value: "secret", checked: true });
+    expect(getState().overlay).toBeNull();
+  });
 });

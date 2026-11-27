@@ -165,7 +165,7 @@ export function openOverlay(o: Overlay | null) {
   setState({ overlay: o, menu: null });
 }
 
-export function dialog(spec: Omit<DialogSpec, "resolve">): Promise<{ button: string; value: string } | null> {
+export function dialog(spec: Omit<DialogSpec, "resolve">): Promise<{ button: string; value: string; checked?: boolean } | null> {
   // Asked from a window (compare view, trash, settings): that window stays open under the
   // dialog and is back once it is answered, instead of being closed (losing its state).
   // A dialog still waiting is cancelled, so whoever awaits it is not left hanging.
@@ -293,20 +293,29 @@ export async function bootstrap() {
   // Backend warnings and errors from before the UI listened: never only in the log file.
   // Not awaited: the window appears without waiting for them.
   void api.logBacklog().then((lines) => { for (const l of lines) notify(l.msg, l.level, undefined, l.level === "error" ? l.msg : undefined); }).catch(() => {});
-  // Drives are asked for every few seconds (each time a walk over the mounts and, on
-  // Linux, two `lsblk` processes): not while the window is hidden (minimized, on another
-  // desktop), and at once when it shows again.
+  // Poll drives and cloud only while this window is visible and focused so unfocused
+  // background windows stay completely quiet, catching up immediately when refocused.
   const visible = () => typeof document === "undefined" || !document.hidden;
-  setInterval(() => { if (visible()) void refreshDrives(); }, 5000);
+  const focused = () => visible() && (typeof document === "undefined" || typeof document.hasFocus !== "function" || document.hasFocus());
+  let lastFocusRefresh = 0;
+  const catchUp = () => {
+    if (!visible()) return;
+    const now = Date.now();
+    if (now - lastFocusRefresh < 2000) return;
+    lastFocusRefresh = now;
+    void refreshDrives();
+  };
+  setInterval(() => { if (focused()) void refreshDrives(); }, 15_000);
   refreshCloud();
   // Clients can be installed or signed in while Gall runs.
-  setInterval(() => { if (visible()) void refreshCloud(); }, 60_000);
+  setInterval(() => { if (focused()) void refreshCloud(); }, 120_000);
   document.addEventListener("visibilitychange", () => {
     if (visible()) {
-      void refreshDrives();
+      catchUp();
       void refreshCloud();
     }
   });
+  window.addEventListener("focus", catchUp);
 }
 
 /** Registers the backend listeners, all at once. */
@@ -381,7 +390,11 @@ function setStormNotice(path: string) {
   }
 }
 
+let drivesInFlight = false;
+
 export async function refreshDrives() {
+  if (drivesInFlight) return;
+  drivesInFlight = true;
   try {
     const [drives, volumes] = await Promise.all([api.listDrives(), api.otherVolumes().catch(() => getState().volumes)]);
     const old = getState().drives;
@@ -395,6 +408,8 @@ export async function refreshDrives() {
     if (JSON.stringify(getState().volumes) !== JSON.stringify(volumes)) setState({ volumes });
   } catch {
     /* ignore transient */
+  } finally {
+    drivesInFlight = false;
   }
 }
 
@@ -448,20 +463,45 @@ export async function mountVolume(v: Volume) {
       setTimeout(refreshDrives, 3000);
       return;
     } else {
-      let message = `${v.label} is encrypted. Enter its passphrase to unlock and mount it.`;
-      for (;;) {
-        const r = await dialog({
-          title: tt("Unlock {name}", { name }),
-          message,
-          input: { value: "", password: true, placeholder: "Passphrase" },
-          buttons: [{ id: "cancel", label: "Cancel" }, { id: "ok", label: "Unlock", primary: true }],
-        });
-        if (!r || r.button !== "ok" || !r.value) return;
-        try {
-          mount = await api.volumeUnlock(v.id, r.value);
-          break;
-        } catch (e) {
-          message = `${String(e)}. Try again.`;
+      // First check whether the desktop keyring already holds the saved passphrase
+      // (zero Gall prompt when unlocked previously in Dolphin/KWallet or GNOME Files/Keyring).
+      let needPrompt = false;
+      try {
+        mount = await api.volumeUnlock(v.id, "");
+      } catch (e) {
+        const err = String(e);
+        if (err === "Passphrase required" || err === "Wrong passphrase") {
+          needPrompt = true;
+        } else {
+          throw e;
+        }
+      }
+      if (needPrompt) {
+        let message = v.removable
+          ? `${v.label} is encrypted. Enter its passphrase to unlock and mount it.`
+          : `${v.label} is an encrypted internal partition. Enter its encryption passphrase (your system may then also ask for your administrator password to authorize unlocking it).`;
+        let remember = false;
+        for (;;) {
+          const r = await dialog({
+            title: tt("Unlock {name}", { name }),
+            message,
+            input: { value: "", password: true, placeholder: "Passphrase" },
+            checkbox: { label: "Remember passphrase in system keyring", checked: remember },
+            buttons: [{ id: "cancel", label: "Cancel" }, { id: "ok", label: "Unlock", primary: true }],
+          });
+          if (!r || r.button !== "ok" || !r.value) return;
+          remember = !!r.checked;
+          try {
+            mount = await api.volumeUnlock(v.id, r.value, remember);
+            break;
+          } catch (e) {
+            const err = String(e);
+            if (err === "Wrong passphrase") {
+              message = `${err}. Try again.`;
+              continue;
+            }
+            throw e;
+          }
         }
       }
     }
@@ -552,13 +592,19 @@ export async function lockDrive(d: Drive) {
   }
 }
 
-/** Looks up the cloud folders again (start-up, drive changes, every minute). */
+let cloudInFlight = false;
+
+/** Looks up the cloud folders again (start-up, drive changes, periodically while focused). */
 export async function refreshCloud() {
+  if (cloudInFlight) return;
+  cloudInFlight = true;
   try {
     const cloud = await api.listCloudFolders();
     if (JSON.stringify(getState().cloud) !== JSON.stringify(cloud)) setState({ cloud });
   } catch {
     /* ignore transient */
+  } finally {
+    cloudInFlight = false;
   }
 }
 

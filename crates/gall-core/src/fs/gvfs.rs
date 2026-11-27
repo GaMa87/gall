@@ -772,15 +772,47 @@ fn query_gio_mount_list() -> Vec<GioMountInfo> {
 }
 
 #[cfg(target_os = "linux")]
+static GVFS_GIO_CACHE: std::sync::Mutex<Option<(Vec<String>, Vec<GioMountInfo>)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(target_os = "linux")]
+fn invalidate_gio_cache() {
+    if let Ok(mut guard) = GVFS_GIO_CACHE.lock() {
+        *guard = None;
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn resolve_live_gvfs() -> (Vec<Drive>, Vec<NetworkMount>) {
     let entries = read_gvfs_entries();
-    let has_relevant = entries
+    let mut key: Vec<String> = entries
         .iter()
-        .any(|e| matches!(e.kind, GvfsKind::Device | GvfsKind::Network));
-    if !has_relevant {
+        .filter(|e| matches!(e.kind, GvfsKind::Device | GvfsKind::Network))
+        .map(|e| e.mount_path.clone())
+        .collect();
+    if key.is_empty() {
+        invalidate_gio_cache();
         return (Vec::new(), Vec::new());
     }
-    let gio = query_gio_mount_list();
+    key.sort();
+    let gio = {
+        let mut guard = GVFS_GIO_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((cached_key, cached_gio)) = guard.as_ref() {
+            if *cached_key == key {
+                cached_gio.clone()
+            } else {
+                let fresh = query_gio_mount_list();
+                *guard = Some((key, fresh.clone()));
+                fresh
+            }
+        } else {
+            let fresh = query_gio_mount_list();
+            *guard = Some((key, fresh.clone()));
+            fresh
+        }
+    };
     resolve_gvfs_mounts(&entries, &gio)
 }
 
@@ -852,6 +884,7 @@ pub fn connect_server(uri: &str) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         let (ok, stderr) = run_gio(&["mount", "--", &valid], std::time::Duration::from_secs(60))?;
+        invalidate_gio_cache();
         if ok || stderr.to_ascii_lowercase().contains("already mounted") {
             return Ok(());
         }
@@ -882,6 +915,7 @@ pub fn disconnect_mount(mount_path_or_uri: &str) -> Result<()> {
             &["mount", "-u", "--", target],
             std::time::Duration::from_secs(30),
         )?;
+        invalidate_gio_cache();
         if ok {
             return Ok(());
         }
@@ -914,6 +948,7 @@ pub fn eject_gvfs(mount_path: &str) -> Result<()> {
             .args(["mount", "-e", "--", target])
             .stdin(Stdio::null())
             .output();
+        invalidate_gio_cache();
         if let Ok(o) = &eject_out {
             if o.status.success() || !Path::new(target).exists() {
                 return Ok(());

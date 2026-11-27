@@ -101,7 +101,7 @@
   "Quick Open index and find in files.": "Índice de Apertura rápida y búsqueda en archivos.",
   "Quick Open index (Ctrl+P)": "Índice de Apertura rápida (Ctrl+P)",
   "Indexed folders": "Carpetas indexadas",
-  "Separate with ; — empty = the whole system (/ or every drive). Rebuilt in the background.": "Separa con ; — vacío = todo el sistema (/ o todas las unidades). Se reconstruye en segundo plano.",
+  "Separate with ; — empty = your home folder (or every local drive on Windows); type /path in Quick Open to browse anywhere.": "Separa con ; — vacío = tu carpeta personal (o todas las unidades locales en Windows); escribe /ruta en Apertura rápida para explorar cualquier lugar.",
   "Never index or search": "No indexar ni buscar",
   "Comma separated names or globs (gitignore syntax), e.g. node_modules, *.iso. Applies to Quick Open, find in files and name search. Folders tagged as caches (CACHEDIR.TAG) are skipped too. Per project: a .gallignore file (gitignore syntax, also outside git) in a folder applies to it and everything below; right-click › Hide from search adds an item to it. Alt+I in a search includes all of these.": "Nombres separados por comas o patrones glob (sintaxis de gitignore), p. ej., node_modules, *.iso. Se aplica a Apertura rápida, búsqueda en archivos y búsqueda por nombre. También se omiten las carpetas marcadas como caché (CACHEDIR.TAG). Por proyecto: un archivo .gallignore (sintaxis de gitignore, también fuera de Git) en una carpeta se aplica a ella y a todo lo que contiene; haz clic derecho › Ocultar de la búsqueda para añadir un elemento. Alt+I en una búsqueda incluye todos estos elementos.",
   "Index hidden files and folders": "Indexar archivos y carpetas ocultos",
@@ -2712,5 +2712,6 @@
   "Live Tab Pairs bridge": "Puente de pares de pestañas en vivo",
   "Show the center bridge control in the title bar and pair actions on tabs (Linked, Tandem walk, Flow). Turning off restores classic independent panels.": "Muestra el control de puente central en la barra de título y las acciones de vinculación en las pestañas (Vinculadas, Tándem, Flujo). Desactivarlo restaura los paneles independientes clásicos.",
   "Pair Gravity ghost tab suggestions": "Sugerencias de pestaña fantasma (Pair Gravity)",
-  "Suggest a translucent ghost tab (🧲) on the opposite tab bar based on learned folder pairs and sibling Git worktrees.": "Sugiere una pestaña fantasma translúcida (🧲) en la barra opuesta según pares de carpetas aprendidos y worktrees de Git relacionados."
+  "Suggest a translucent ghost tab (🧲) on the opposite tab bar based on learned folder pairs and sibling Git worktrees.": "Sugiere una pestaña fantasma translúcida (🧲) en la barra opuesta según pares de carpetas aprendidos y worktrees de Git relacionados.",
+  "Remember passphrase in system keyring": "Recordar frase de contraseña en el llavero del sistema"
 }

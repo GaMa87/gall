@@ -13,6 +13,9 @@ pub struct AppDirs {
     /// Machine-local data (Windows `%LOCALAPPDATA%`, Unix `XDG_DATA_HOME`), used for
     /// large executables such as in-app updates so they never roam across Windows profiles.
     pub local_data: PathBuf,
+    /// Ephemeral per-user runtime files (Linux `$XDG_RUNTIME_DIR/gall`, typically tmpfs in RAM;
+    /// falls back to `local_data` on platforms without a runtime directory or in portable mode).
+    pub runtime: PathBuf,
     /// True when running from a folder with a `portable` marker.
     pub portable: bool,
 }
@@ -35,10 +38,14 @@ impl AppDirs {
         let local_data = dirs::data_local_dir()
             .map(|p| p.join("gall"))
             .unwrap_or_else(|| data.clone());
+        let runtime = dirs::runtime_dir()
+            .map(|p| p.join("gall"))
+            .unwrap_or_else(|| local_data.clone());
         AppDirs {
             config,
             data,
             local_data,
+            runtime,
             portable: false,
         }
     }
@@ -48,6 +55,7 @@ impl AppDirs {
             config: root.to_path_buf(),
             data: root.to_path_buf(),
             local_data: root.to_path_buf(),
+            runtime: root.to_path_buf(),
             portable: false,
         }
     }
@@ -114,6 +122,8 @@ mod tests {
         assert_eq!(d.settings(), root.join("settings.json"));
         assert!(d.webview().starts_with(&root) && d.logs().starts_with(&root));
         assert_eq!(d.updates(), root.join("updates"));
+        assert_eq!(d.runtime, root);
         assert_eq!(AppDirs::at(&root).updates(), root.join("updates"));
+        assert_eq!(AppDirs::at(&root).runtime, root);
     }
 }

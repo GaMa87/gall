@@ -95,7 +95,7 @@ const SECTIONS: Section[] = [
   {
     id: "search", title: "Search", icon: "search", desc: "Quick Open index and find in files.", groups: [
       { title: "Quick Open index (Ctrl+P)", opts: [
-        { key: "indexRoots", label: "Indexed folders", hint: "Separate with ; — empty = the whole system (/ or every drive). Rebuilt in the background.", type: "list" },
+        { key: "indexRoots", label: "Indexed folders", hint: "Separate with ; — empty = your home folder (or every local drive on Windows); type /path in Quick Open to browse anywhere.", type: "list" },
         { key: "indexExclude", label: "Never index or search", hint: "Comma separated names or globs (gitignore syntax), e.g. node_modules, *.iso. Applies to Quick Open, find in files and name search. Folders tagged as caches (CACHEDIR.TAG) are skipped too. Per project: a .gallignore file (gitignore syntax, also outside git) in a folder applies to it and everything below; right-click › Hide from search adds an item to it. Alt+I in a search includes all of these.", type: "list" },
         { key: "indexHidden", label: "Index hidden files and folders", hint: "Also applies to find in files (Ctrl+F)", type: "bool" },
         { key: "indexRespectGitignore", label: "Skip files ignored by .gitignore", type: "bool" },

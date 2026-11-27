@@ -47,7 +47,9 @@ impl Default for IndexOptions {
     }
 }
 
-/// Default roots for a whole-system index: `/` on Unix, every drive on Windows.
+/// Default roots for the Quick Open index: the user's home folder on Unix (avoiding
+/// background sweeps of `/etc`, `/opt`, `/usr`, `/var` — typing `/path` in Quick Open
+/// still browses anywhere live), and every local drive on Windows.
 pub fn system_roots() -> Vec<PathBuf> {
     #[cfg(windows)]
     {
@@ -76,7 +78,9 @@ pub fn system_roots() -> Vec<PathBuf> {
     }
     #[cfg(not(windows))]
     {
-        vec![PathBuf::from("/")]
+        dirs::home_dir()
+            .map(|h| vec![h])
+            .unwrap_or_else(|| vec![PathBuf::from("/")])
     }
 }
 
@@ -678,6 +682,174 @@ impl FileIndex {
     }
 }
 
+/// True when `query` is a direct filesystem path prefix (`/…`, `~/…`, `~`, or `C:\…`)
+/// that Quick Open completes live from a single `read_dir` without touching the index.
+pub fn is_path_prefix_query(query: &str) -> bool {
+    let raw = query.trim_start();
+    if raw.is_empty() {
+        return false;
+    }
+    if raw.starts_with('/') || raw == "~" || raw.starts_with("~/") || raw.starts_with("~\\") {
+        return true;
+    }
+    let b = raw.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/')
+}
+
+/// Live single-directory completion for absolute / home-relative path queries (`/etc/ng`,
+/// `~/Proj`, `C:\Win`). Reads only the target parent directory (zero recursive walking).
+pub fn query_path_prefix(query: &str, include_hidden: bool, limit: usize) -> Option<IndexResult> {
+    if !is_path_prefix_query(query) {
+        return None;
+    }
+    let t0 = Instant::now();
+    let raw = query.trim_start();
+    let expanded = if raw == "~" {
+        let mut h = dirs::home_dir()?.to_string_lossy().into_owned();
+        if !h.ends_with('/') && !h.ends_with('\\') {
+            h.push(std::path::MAIN_SEPARATOR);
+        }
+        h
+    } else if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
+        let mut h = dirs::home_dir()?.to_string_lossy().into_owned();
+        if !h.ends_with('/') && !h.ends_with('\\') {
+            h.push(std::path::MAIN_SEPARATOR);
+        }
+        h.push_str(rest);
+        h
+    } else {
+        raw.to_string()
+    };
+
+    let split_at = if cfg!(windows) {
+        expanded.rfind(['/', '\\'])?
+    } else {
+        expanded.rfind('/')?
+    };
+    let dir_str = if split_at == 0 {
+        "/"
+    } else if cfg!(windows) && split_at == 2 && expanded.as_bytes().get(1) == Some(&b':') {
+        &expanded[..=2]
+    } else {
+        &expanded[..split_at]
+    };
+    let needle = &expanded[split_at + 1..];
+    let dir = Path::new(dir_str);
+
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Some(IndexResult {
+            hits: Vec::new(),
+            total: 0,
+            searched: 0,
+            elapsed_ms: t0.elapsed().as_millis() as u64,
+            scanning: false,
+        });
+    };
+
+    let show_dots = include_hidden || needle.starts_with('.');
+    let parsed = (!needle.is_empty()).then(|| Query::parse(needle));
+    let mut scratch = Scratch::default();
+    let mut searched = 0usize;
+    let mut scored: Vec<(i32, bool, String, String, Vec<u32>)> = Vec::new();
+
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') && !show_dots {
+            continue;
+        }
+        searched += 1;
+        let path = entry.path();
+        let is_dir = entry
+            .file_type()
+            .ok()
+            .map(|ft| {
+                if ft.is_symlink() {
+                    path.is_dir()
+                } else {
+                    ft.is_dir()
+                }
+            })
+            .unwrap_or(false);
+        let path_str = path.to_string_lossy().into_owned();
+        if let Some(q) = parsed.as_ref() {
+            if q.dirs_only() && !is_dir {
+                continue;
+            }
+            let Some(mut m) = q.score(&name, 0, &mut scratch) else {
+                continue;
+            };
+            let prefix_chars = path_str
+                .chars()
+                .count()
+                .saturating_sub(name.chars().count());
+            for pos in &mut m.positions {
+                *pos += prefix_chars;
+            }
+            let positions = utf16_positions(&path_str, &m.positions);
+            scored.push((m.score, is_dir, name, path_str, positions));
+        } else {
+            scored.push((0, is_dir, name, path_str, Vec::new()));
+        }
+    }
+
+    let total = scored.len();
+    if parsed.is_some() {
+        scored.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| a.2.len().cmp(&b.2.len()))
+                .then_with(|| a.2.to_lowercase().cmp(&b.2.to_lowercase()))
+        });
+    } else {
+        scored.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| a.2.to_lowercase().cmp(&b.2.to_lowercase()))
+                .then_with(|| a.2.cmp(&b.2))
+        });
+    }
+    scored.truncate(limit.max(1));
+
+    let hits = scored
+        .into_iter()
+        .map(|(score, is_dir, name, path, positions)| IndexHit {
+            path,
+            name,
+            is_dir,
+            score,
+            positions,
+            hidden: false,
+        })
+        .collect();
+
+    Some(IndexResult {
+        hits,
+        total,
+        searched,
+        elapsed_ms: t0.elapsed().as_millis() as u64,
+        scanning: false,
+    })
+}
+
+/// Lowers the calling thread's I/O scheduling class to idle on Linux so background
+/// indexing stays polite to foreground work and security monitors.
+fn set_idle_io_priority() {
+    #[cfg(target_os = "linux")]
+    {
+        const IOPRIO_WHO_PROCESS: libc::c_int = 1;
+        const IOPRIO_CLASS_IDLE: libc::c_int = 3 << 13;
+        // SAFETY: `ioprio_set(IOPRIO_WHO_PROCESS, 0, ...)` targets only the calling thread;
+        // errors (e.g. restricted sandbox) are benign and ignored.
+        unsafe {
+            libc::syscall(
+                libc::SYS_ioprio_set,
+                IOPRIO_WHO_PROCESS,
+                0,
+                IOPRIO_CLASS_IDLE,
+            );
+        }
+    }
+}
+
 /// Whether the system index (built from `roots`) holds what is in `path`. Not for a
 /// folder outside every root (a WSL distribution `\\wsl.localhost\…` on Windows, whose
 /// default roots are the drives; a folder outside custom indexed folders) or on a
@@ -931,7 +1103,7 @@ fn build(roots: &[PathBuf], opts: &IndexOptions, cancel: &AtomicBool) -> Snapsho
                 std::thread::available_parallelism()
                     .map(|n| n.get())
                     .unwrap_or(4)
-                    .min(8),
+                    .min(4),
             );
         super::ignorefile::configure(&mut wb, !opts.everything);
         if !opts.everything && !opts.exclude.is_empty() {
@@ -944,6 +1116,7 @@ fn build(roots: &[PathBuf], opts: &IndexOptions, cancel: &AtomicBool) -> Snapsho
             }
         }
         wb.build_parallel().run(|| {
+            set_idle_io_priority();
             let collected = &collected;
             let count = &count;
             let restricted_dirs = &restricted_dirs;
@@ -1634,5 +1807,108 @@ mod tests {
             Path::new("/Users/alice/Library"),
             None
         ));
+    }
+
+    #[test]
+    fn path_prefix_query_detects_direct_paths_only() {
+        assert!(is_path_prefix_query("/"));
+        assert!(is_path_prefix_query("/etc/ng"));
+        assert!(is_path_prefix_query("  /var/log/"));
+        assert!(is_path_prefix_query("~"));
+        assert!(is_path_prefix_query("~/Projects"));
+        assert!(is_path_prefix_query("C:\\Windows"));
+        assert!(is_path_prefix_query("D:/src"));
+
+        // Normal fuzzy queries and trailing-slash folder filters must stay index queries.
+        assert!(!is_path_prefix_query(""));
+        assert!(!is_path_prefix_query("   "));
+        assert!(!is_path_prefix_query("src/"));
+        assert!(!is_path_prefix_query("main.rs"));
+        assert!(!is_path_prefix_query("ext:rs"));
+        assert!(!is_path_prefix_query("~foo"));
+    }
+
+    #[test]
+    fn path_prefix_query_completes_single_directory_live() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("alpha/nested")).unwrap();
+        std::fs::write(root.join("alpha/nested/deep.txt"), "x").unwrap();
+        std::fs::write(root.join("almanac.md"), "x").unwrap();
+        std::fs::write(root.join("beta.txt"), "x").unwrap();
+        std::fs::write(root.join(".hidden"), "x").unwrap();
+
+        // Trailing separator lists direct children only (never recurses into alpha/nested),
+        // folders first, hiding dotfiles unless asked.
+        let sep = std::path::MAIN_SEPARATOR;
+        let listed = query_path_prefix(&format!("{}{sep}", root.display()), false, 50).unwrap();
+        let names: Vec<&str> = listed.hits.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(names, ["alpha", "almanac.md", "beta.txt"]);
+        assert!(listed.hits[0].is_dir);
+        assert!(!listed.scanning);
+        assert_eq!(
+            Path::new(&listed.hits[0].path),
+            root.join("alpha"),
+            "hit paths point into the listed folder"
+        );
+
+        // Fuzzy filter narrows within that directory and highlights characters inside the filename.
+        let filtered = query_path_prefix(&format!("{}{sep}al", root.display()), false, 50).unwrap();
+        let fnames: Vec<&str> = filtered.hits.iter().map(|h| h.name.as_str()).collect();
+        assert!(fnames.contains(&"alpha") && fnames.contains(&"almanac.md"));
+        assert!(!fnames.contains(&"beta.txt"));
+        for hit in &filtered.hits {
+            assert!(!hit.positions.is_empty(), "matched hit must have positions");
+        }
+
+        // Dot prefix reveals hidden entries even when include_hidden is false.
+        let dots = query_path_prefix(&format!("{}{sep}.hid", root.display()), false, 50).unwrap();
+        assert_eq!(dots.hits.len(), 1);
+        assert_eq!(dots.hits[0].name, ".hidden");
+
+        // Missing directory returns empty without falling back to the index.
+        let missing = query_path_prefix(
+            &format!("{}{sep}no-such-dir{sep}x", root.display()),
+            false,
+            50,
+        )
+        .unwrap();
+        assert!(missing.hits.is_empty());
+
+        // Unix default system_roots() targets the user's home folder instead of `/`.
+        #[cfg(unix)]
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(system_roots(), vec![home]);
+        }
+
+        #[cfg(windows)]
+        {
+            // `C:/…` with forward slashes reads the same folder as `C:\…`.
+            let fwd = format!("{}/al", root.display()).replace('\\', "/");
+            let fwd_names: Vec<String> = query_path_prefix(&fwd, false, 50)
+                .unwrap()
+                .hits
+                .into_iter()
+                .map(|h| h.name)
+                .collect();
+            assert!(
+                fwd_names.contains(&"alpha".into()) && fwd_names.contains(&"almanac.md".into())
+            );
+            assert!(!fwd_names.contains(&"beta.txt".into()));
+
+            // A bare drive root `C:\` lists that drive, not the current directory.
+            let drive = &root.to_string_lossy()[..2];
+            let at_root = query_path_prefix(&format!("{drive}\\"), true, 500).unwrap();
+            assert!(!at_root.hits.is_empty(), "drive root must list entries");
+            for hit in &at_root.hits {
+                let parent = Path::new(&hit.path).parent().map(Path::to_path_buf);
+                assert_eq!(
+                    parent,
+                    Some(PathBuf::from(format!("{drive}\\"))),
+                    "{}",
+                    hit.path
+                );
+            }
+        }
     }
 }

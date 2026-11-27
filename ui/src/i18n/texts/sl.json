@@ -101,7 +101,7 @@
   "Quick Open index and find in files.": "Kazalo hitrega odpiranja in iskanje po datotekah.",
   "Quick Open index (Ctrl+P)": "Kazalo hitrega odpiranja (Ctrl+P)",
   "Indexed folders": "Indeksirane mape",
-  "Separate with ; — empty = the whole system (/ or every drive). Rebuilt in the background.": "Ločite s ; — prazno = celoten sistem (/ ali vsi pogoni). Obnovi se v ozadju.",
+  "Separate with ; — empty = your home folder (or every local drive on Windows); type /path in Quick Open to browse anywhere.": "Ločite s ; — prazno = domača mapa (ali vsi lokalni pogoni v sistemu Windows); v Hitro odpiranje vtipkajte /pot za brskanje kjerkoli.",
   "Never index or search": "Nikoli ne indeksiraj ali išči",
   "Comma separated names or globs (gitignore syntax), e.g. node_modules, *.iso. Applies to Quick Open, find in files and name search. Folders tagged as caches (CACHEDIR.TAG) are skipped too. Per project: a .gallignore file (gitignore syntax, also outside git) in a folder applies to it and everything below; right-click › Hide from search adds an item to it. Alt+I in a search includes all of these.": "Imena ali vzorci (sintaksa gitignore), ločeni z vejicami, npr. node_modules, *.iso. Velja za hitro odpiranje, iskanje po datotekah in iskanje po imenu. Mape, označene kot predpomnilnik (CACHEDIR.TAG), so prav tako preskočene. Za posamezen projekt: datoteka .gallignore (sintaksa gitignore, tudi zunaj gita) v mapi velja zanjo in vse pod njo; desni klik › Skrij pred iskanjem ji doda element. Alt+I pri iskanju vključi vse našteto.",
   "Index hidden files and folders": "Indeksiraj skrite datoteke in mape",
@@ -2712,5 +2712,6 @@
   "Live Tab Pairs bridge": "Most živih parov zavihkov",
   "Show the center bridge control in the title bar and pair actions on tabs (Linked, Tandem walk, Flow). Turning off restores classic independent panels.": "Prikaže osrednji most v naslovni vrstici in možnosti parjenja na zavihkih (Povezana, Tandem hoja, Tok). Izklop povrne klasična neodvisna panela.",
   "Pair Gravity ghost tab suggestions": "Predlogi ghost zavihkov (Pair Gravity)",
-  "Suggest a translucent ghost tab (🧲) on the opposite tab bar based on learned folder pairs and sibling Git worktrees.": "Predlaga prosojen ghost zavihek (🧲) v nasprotni vrstici zavihkov na podlagi naučenih parov map in sorodnih Git worktreejev."
+  "Suggest a translucent ghost tab (🧲) on the opposite tab bar based on learned folder pairs and sibling Git worktrees.": "Predlaga prosojen ghost zavihek (🧲) v nasprotni vrstici zavihkov na podlagi naučenih parov map in sorodnih Git worktreejev.",
+  "Remember passphrase in system keyring": "Zapomni si geslo v sistemski ključavnici"
 }

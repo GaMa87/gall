@@ -176,6 +176,15 @@ impl CompareSlot {
     }
 }
 
+/// Last `(window, folder, selection, focused)` written to `selection.json`, to skip no-op writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedSelection {
+    pub window: String,
+    pub folder: String,
+    pub selection: Vec<String>,
+    pub focused: Option<String>,
+}
+
 pub struct AppState {
     pub dirs: AppDirs,
     pub settings: RwLock<Settings>,
@@ -243,6 +252,8 @@ pub struct AppState {
     /// Cancels the running folder comparison or sync.
     pub(crate) compare_slots: Mutex<HashMap<String, CompareSlot>>,
     pub dircmp_cancel: Mutex<Option<Arc<AtomicBool>>>,
+    /// Last published selection snapshot written to `selection.json`, to skip no-op writes.
+    pub last_selection: Mutex<Option<PublishedSelection>>,
 }
 
 pub struct FolderScan {
@@ -384,6 +395,7 @@ impl AppState {
             monitor: Arc::new(Mutex::new(None)),
             compare_slots: Mutex::new(HashMap::new()),
             dircmp_cancel: Mutex::new(None),
+            last_selection: Mutex::new(None),
         }
     }
 
@@ -537,10 +549,26 @@ impl AppState {
             (store.clone(), generation)
         };
         let sender = SESSION_WRITER.get_or_init(|| {
+            const SESSION_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(3);
             let (tx, rx) = std::sync::mpsc::channel::<(u64, WorkspaceStore)>();
             let store = JsonStore::new(self.session_store.path().to_path_buf());
             std::thread::spawn(move || {
                 while let Ok(mut newest) = rx.recv() {
+                    // Coalesce bursts of navigation/focus changes into a single fsynced write;
+                    // `flush_session()` still persists synchronously on clean exit or restart.
+                    let deadline = std::time::Instant::now() + SESSION_DEBOUNCE;
+                    loop {
+                        let remaining =
+                            deadline.saturating_duration_since(std::time::Instant::now());
+                        if remaining.is_zero() {
+                            break;
+                        }
+                        match rx.recv_timeout(remaining) {
+                            Ok(later) => newest = later,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                            | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        }
+                    }
                     while let Ok(later) = rx.try_recv() {
                         newest = later;
                     }

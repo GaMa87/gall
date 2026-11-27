@@ -92,6 +92,7 @@ export function QuickOpen({ initial }: { initial?: string }) {
   const here = A.activePath(b);
   const inArchive = !!archiveOf(here);
   const cmdMode = q.startsWith(">");
+  const pathMode = !cmdMode && /^\s*(\/|~(?:[/\\]|$)|[A-Za-z]:[/\\])/.test(q);
 
   useEffect(() => {
     inputRef.current?.focus();
@@ -267,7 +268,7 @@ export function QuickOpen({ initial }: { initial?: string }) {
       return list;
     }
     const list: Row[] = hits.map((hit) => ({ kind: "file" as const, hit }));
-    if (zox?.length) {
+    if (zox?.length && !pathMode) {
       const matched = new Map<string, number[]>();
       const extra = mergeZoxide(zox, hits.map((h) => h.path), (p) => {
         const m = fuzzyMatch(q.trim(), p);
@@ -277,7 +278,7 @@ export function QuickOpen({ initial }: { initial?: string }) {
       for (const p of extra) list.push({ kind: "file", zoxide: true, hit: { path: p, name: zoxideName(p), isDir: true, score: 0, positions: matched.get(p) ?? [] } });
     }
     return list;
-  }, [cmdMode, q, commands, extraCmds, hits, zox, recent, history, scopeHere, here, existingRecent]);
+  }, [cmdMode, pathMode, q, commands, extraCmds, hits, zox, recent, history, scopeHere, here, existingRecent]);
 
   const activeIdx = Math.min(idx, rows.length - 1);
   const cur = rows[activeIdx];
@@ -350,6 +351,14 @@ export function QuickOpen({ initial }: { initial?: string }) {
     if (e.key === "ArrowUp" || (e.ctrlKey && (e.key === "k" || e.key === "p"))) return move(-1);
     if (e.key === "PageDown") return move(10);
     if (e.key === "PageUp") return move(-10);
+    if (e.key === "Tab" && pathMode && cur?.kind === "file") {
+      e.preventDefault();
+      const sep = cur.hit.path.includes("\\") ? "\\" : "/";
+      const next = cur.hit.isDir && !cur.hit.path.endsWith(sep) ? cur.hit.path + sep : cur.hit.path;
+      setQ(next);
+      setIdx(0);
+      return;
+    }
     if (e.key === "Tab" && !cmdMode && !inArchive) {
       e.preventDefault();
       setScopeHere((v) => !v);
@@ -431,7 +440,7 @@ export function QuickOpen({ initial }: { initial?: string }) {
                     onHover={() => i !== idx && setIdx(i)} onClick={(e) => accept(r, primaryMod(e) ? "reveal" : "open")} />
                 ),
               )}
-              {scopeHere && !cmdMode && q.trim() && rows.length > 0 && (
+              {scopeHere && !cmdMode && !pathMode && q.trim() && rows.length > 0 && (
                 <div className="qo-row qo-wider" onClick={() => { setScopeHere(false); inputRef.current?.focus(); }}>
                   <Icon name="drive" size={14} />
                   <span className="qo-name">{tt("Search everywhere for “")}{q.trim()}”</span>

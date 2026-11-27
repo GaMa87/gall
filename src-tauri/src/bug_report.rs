@@ -126,14 +126,15 @@ pub fn init(dirs: &gall_core::util::appdirs::AppDirs) {
             }
         });
     }
-    // Ordinary events (one per UI command) stay in memory; this thread writes them out.
-    // A crash loses at most the last two seconds of them: errors and panics are written
-    // at once and a normal exit writes everything (`clean`). The file is written after the
-    // lock is released, so recording never waits for the disk.
+    // Ordinary events (one per UI command) stay in memory; this thread writes them out
+    // periodically when dirty. A hard crash loses at most the last 30 seconds of ordinary
+    // events: errors and panics are written at once and a normal exit writes everything
+    // (`clean`). The file is written after the lock is released, so recording never waits
+    // for the disk.
     let _ = std::thread::Builder::new()
         .name("diagnostics-flush".into())
         .spawn(|| loop {
-            std::thread::sleep(std::time::Duration::from_secs(2));
+            std::thread::sleep(std::time::Duration::from_secs(30));
             let pending = DIAGNOSTICS
                 .get()
                 .map(|d| d.lock().unwrap_or_else(|e| e.into_inner()))

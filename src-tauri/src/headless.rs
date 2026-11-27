@@ -27,7 +27,7 @@ pub struct SelectionSnapshot {
 }
 
 pub fn selection_file(dirs: &AppDirs) -> PathBuf {
-    dirs.local_data.join("gall").join("selection.json")
+    dirs.runtime.join("selection.json")
 }
 
 /// Writes the snapshot atomically (temp file + rename).
@@ -352,6 +352,7 @@ mod tests {
             config: root.join("config"),
             data: root.join("data"),
             local_data: root.join("local"),
+            runtime: root.join("runtime"),
             portable: false,
         }
     }
@@ -438,6 +439,7 @@ mod tests {
     fn selection_round_trips_and_needs_a_live_app() {
         let t = tempfile::tempdir().unwrap();
         let d = dirs(t.path());
+        assert_eq!(selection_file(&d), d.runtime.join("selection.json"));
         assert!(read_selection(&d).is_err(), "nothing published yet");
         let snap = SelectionSnapshot {
             pid: std::process::id(),

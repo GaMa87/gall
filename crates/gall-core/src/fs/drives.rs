@@ -461,13 +461,15 @@ pub fn eject(mount: &str) -> crate::Result<()> {
             return super::wsl::terminate(&w.distro);
         }
     }
-    eject_inner(mount).map_err(|e| {
+    let res = eject_inner(mount).map_err(|e| {
         let who = holders(mount);
         if who.is_empty() {
             return e;
         }
         crate::CoreError::Other(in_use_message(&who))
-    })
+    });
+    super::volumes::invalidate_block_cache();
+    res
 }
 
 /// Unmounts the drive at `mount` and then powers its whole device off, so it can be unplugged.

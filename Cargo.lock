@@ -1665,7 +1665,7 @@ dependencies = [
 
 [[package]]
 name = "gall"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "arboard",
  "block2",
@@ -1707,7 +1707,7 @@ dependencies = [
 
 [[package]]
 name = "gall-compare"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "imara-diff",
  "serde",
@@ -1718,7 +1718,7 @@ dependencies = [
 
 [[package]]
 name = "gall-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "base64 0.23.1",
  "bzip2-rs",
@@ -1779,7 +1779,7 @@ dependencies = [
 
 [[package]]
 name = "gall-portal"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "blocking",
  "serde_json",

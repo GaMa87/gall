@@ -178,8 +178,9 @@ impl Monitor {
         }
         #[cfg(not(windows))]
         {
-            st.gpu = gpu_busy();
-            (st.gpu_mem_used, st.gpu_mem_total) = gpu_mem_sysfs().unzip();
+            let (busy, mem) = gpu_sysfs();
+            st.gpu = busy;
+            (st.gpu_mem_used, st.gpu_mem_total) = mem.unzip();
         }
         let disk = self.disk_bytes();
         if let (Some((r0, w0)), Some((r1, w1))) = (self.last_disk, disk) {
@@ -488,51 +489,40 @@ mod win_gpu {
     }
 }
 
-/// Dedicated GPU memory in use and in total (Linux: amdgpu's `mem_info_vram_*`; the card
-/// with the most memory of its own).
+/// GPU busy % and dedicated VRAM usage from Linux sysfs in a single `/sys/class/drm` pass.
 #[cfg_attr(windows, allow(dead_code))]
-fn gpu_mem_sysfs() -> Option<(u64, u64)> {
+fn gpu_sysfs() -> (Option<f32>, Option<(u64, u64)>) {
     if !cfg!(target_os = "linux") {
-        return None;
+        return (None, None);
     }
-    let read = |p: std::path::PathBuf| std::fs::read_to_string(p).ok()?.trim().parse::<u64>().ok();
-    std::fs::read_dir("/sys/class/drm")
-        .ok()?
-        .flatten()
-        .filter(|e| {
-            let n = e.file_name().to_string_lossy().into_owned();
-            n.starts_with("card") && !n.contains('-')
-        })
-        .filter_map(|e| {
-            let dev = e.path().join("device");
-            Some((
-                read(dev.join("mem_info_vram_used"))?,
-                read(dev.join("mem_info_vram_total"))?,
-            ))
-        })
-        .filter(|(_, total)| *total > 0)
-        .max_by_key(|(_, total)| *total)
-}
-/// GPU busy % from sysfs (amdgpu, recent i915/xe expose `gpu_busy_percent`).
-#[cfg_attr(windows, allow(dead_code))]
-fn gpu_busy() -> Option<f32> {
-    if !cfg!(target_os = "linux") {
-        return None;
-    }
-    let rd = std::fs::read_dir("/sys/class/drm").ok()?;
-    let mut best: Option<f32> = None;
+    let Ok(rd) = std::fs::read_dir("/sys/class/drm") else {
+        return (None, None);
+    };
+    let read_u64 =
+        |p: std::path::PathBuf| std::fs::read_to_string(p).ok()?.trim().parse::<u64>().ok();
+    let mut best_busy: Option<f32> = None;
+    let mut best_mem: Option<(u64, u64)> = None;
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
         if !name.starts_with("card") || name.contains('-') {
             continue;
         }
-        if let Ok(s) = std::fs::read_to_string(e.path().join("device/gpu_busy_percent")) {
+        let dev = e.path().join("device");
+        if let Ok(s) = std::fs::read_to_string(dev.join("gpu_busy_percent")) {
             if let Ok(v) = s.trim().parse::<f32>() {
-                best = Some(best.map_or(v, |b: f32| b.max(v)));
+                best_busy = Some(best_busy.map_or(v, |b| b.max(v)));
+            }
+        }
+        if let (Some(used), Some(total)) = (
+            read_u64(dev.join("mem_info_vram_used")),
+            read_u64(dev.join("mem_info_vram_total")),
+        ) {
+            if total > 0 && best_mem.is_none_or(|(_, prev_total)| total > prev_total) {
+                best_mem = Some((used, total));
             }
         }
     }
-    best
+    (best_busy, best_mem)
 }
 
 /// Total sectors read/written by whole disks (Linux /proc/diskstats). Partitions,

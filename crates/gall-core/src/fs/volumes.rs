@@ -35,6 +35,7 @@ pub struct BlockDev {
     pub mountpoint: Option<String>,
     pub rm: Option<serde_json::Value>,
     pub hotplug: Option<serde_json::Value>,
+    pub uuid: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -136,14 +137,32 @@ pub fn unmounted_from(devs: &[BlockDev]) -> Vec<Volume> {
 }
 
 #[cfg(target_os = "linux")]
-fn lsblk() -> Vec<BlockDev> {
+static LSBLK_CACHE: std::sync::Mutex<Option<(String, Vec<BlockDev>)>> = std::sync::Mutex::new(None);
+
+/// Clears the cached `lsblk` snapshot so the next query reads fresh device state.
+pub fn invalidate_block_cache() {
+    #[cfg(target_os = "linux")]
+    if let Ok(mut guard) = LSBLK_CACHE.lock() {
+        *guard = None;
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn block_fingerprint() -> Option<String> {
+    let parts = std::fs::read_to_string("/proc/partitions").ok()?;
+    let mounts = std::fs::read_to_string("/proc/self/mounts").ok()?;
+    Some(format!("{parts}\0{mounts}"))
+}
+
+#[cfg(target_os = "linux")]
+fn run_lsblk() -> Vec<BlockDev> {
     let out = std::process::Command::new("lsblk")
         .args([
             "-J",
             "-b",
             "-l",
             "-o",
-            "PATH,KNAME,PKNAME,TYPE,FSTYPE,LABEL,PARTTYPE,SIZE,MOUNTPOINT,RM,HOTPLUG",
+            "PATH,KNAME,PKNAME,TYPE,FSTYPE,LABEL,PARTTYPE,SIZE,MOUNTPOINT,RM,HOTPLUG,UUID",
         ])
         .output();
     match out {
@@ -152,6 +171,27 @@ fn lsblk() -> Vec<BlockDev> {
             .unwrap_or_default(),
         _ => Vec::new(),
     }
+}
+
+/// Returns block devices from `lsblk`, reusing the last snapshot while `/proc/partitions`
+/// and `/proc/self/mounts` are unchanged so periodic sidebar refreshes never spawn idle
+/// `lsblk` processes.
+#[cfg(target_os = "linux")]
+fn lsblk() -> Vec<BlockDev> {
+    let fp = block_fingerprint();
+    let mut guard = LSBLK_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let (Some(ref key), Some((cached_key, cached))) = (&fp, guard.as_ref()) {
+        if cached_key == key {
+            return cached.clone();
+        }
+    }
+    let fresh = run_lsblk();
+    if let Some(key) = fp {
+        *guard = Some((key, fresh.clone()));
+    }
+    fresh
 }
 
 /// Volumes that can be mounted or unlocked.
@@ -228,14 +268,16 @@ pub fn mount_volume(id: &str) -> Result<String> {
     }
     #[cfg(target_os = "linux")]
     {
-        match udisksctl(&["mount", "-b", id], None) {
+        let res = match udisksctl(&["mount", "-b", id], None) {
             Ok(out) => udisks_path_after(&out, " at ")
                 .ok_or_else(|| CoreError::Other(format!("mounted, but where? {out}"))),
             Err(e) if e.contains("AlreadyMounted") || e.contains("already mounted") => {
                 udisks_path_after(&e, "mounted at ").ok_or(CoreError::Other(e))
             }
             Err(e) => Err(CoreError::Other(friendly(&e))),
-        }
+        };
+        invalidate_block_cache();
+        res
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -321,10 +363,13 @@ pub fn device_of_mount(mount: &str) -> Option<String> {
 pub fn power_off_volume(id: &str) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
+        invalidate_block_cache();
         let disk = power_off_target(&lsblk(), id).map_err(CoreError::Other)?;
-        udisksctl(&["power-off", "-b", &disk], None)
+        let res = udisksctl(&["power-off", "-b", &disk], None)
             .map(|_| ())
-            .map_err(|e| CoreError::Other(friendly(&e)))
+            .map_err(|e| CoreError::Other(friendly(&e)));
+        invalidate_block_cache();
+        res
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -394,19 +439,293 @@ pub fn repair_mount_volume(id: &str) -> Result<String> {
     }
 }
 
+/// The mount point of `device` in an `lsblk` listing (pure, for tests).
+pub fn mountpoint_in(devs: &[BlockDev], device: &str) -> Option<String> {
+    devs.iter()
+        .find(|d| d.path == device)
+        .and_then(|d| d.mountpoint.as_deref())
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+}
+
+/// Checks if the desktop automounter already mounted `clear` right after unlocking so we
+/// do not race it with an extra `udisksctl mount` (and a second polkit prompt).
+#[cfg(target_os = "linux")]
+fn wait_for_automount(clear: &str) -> Option<String> {
+    for step in 0..5 {
+        invalidate_block_cache();
+        if let Some(mp) = mountpoint_in(&lsblk(), clear) {
+            return Some(mp);
+        }
+        if step < 4 {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+        }
+    }
+    None
+}
+
+/// Parses KDE's `~/.config/kwalletrc` for `[Wallet] Default Wallet=...` (pure, for tests).
+pub fn parse_kwallet_default(text: &str) -> Option<String> {
+    let mut in_wallet = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_wallet = &line[1..line.len() - 1] == "Wallet";
+            continue;
+        }
+        if in_wallet {
+            if let Some((k, v)) = line.split_once('=') {
+                if k.trim() == "Default Wallet" {
+                    let name = v.trim();
+                    return (!name.is_empty()).then(|| name.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn kwallet_default_name() -> String {
+    dirs::config_dir()
+        .and_then(|c| std::fs::read_to_string(c.join("kwalletrc")).ok())
+        .and_then(|text| parse_kwallet_default(&text))
+        .unwrap_or_else(|| "kdewallet".into())
+}
+
+#[cfg(target_os = "linux")]
+fn run_secret_lookup(program: &std::path::Path, args: &[&str]) -> (Option<i32>, Option<String>) {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    let Ok(mut child) = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return (None, None);
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return (None, None);
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut out = String::new();
+        let _ = stdout.read_to_string(&mut out);
+        let _ = tx.send(out);
+    });
+    match rx.recv_timeout(std::time::Duration::from_millis(1500)) {
+        Ok(out) => {
+            let status = child.wait().ok();
+            let code = status.and_then(|s| s.code());
+            let ok = status.is_some_and(|s| s.success());
+            let secret = out.trim_end_matches(['\r', '\n']);
+            (code, (ok && !secret.is_empty()).then(|| secret.to_string()))
+        }
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            (None, None)
+        }
+    }
+}
+
+/// Desktop keyring backend used to store a saved Linux LUKS/BitLocker passphrase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyringBackend {
+    KWallet,
+    SecretTool,
+}
+
+/// Chooses which desktop keyring tool to prefer for saving (and ordering reads) on Linux
+/// (pure, for tests). Prefers KDE KWallet on KDE Plasma desktops so Dolphin/Solid share
+/// the entry, and GNOME Keyring (`secret-tool`) everywhere else (Omarchy/Hyprland, GNOME,
+/// XFCE, Cinnamon, COSMIC…), falling back to whichever tool is installed.
+pub fn preferred_keyring(
+    desktop: &str,
+    has_kwallet: bool,
+    has_secret_tool: bool,
+) -> Option<KeyringBackend> {
+    let is_kde = desktop
+        .split(':')
+        .any(|part| part.trim().eq_ignore_ascii_case("KDE"));
+    if is_kde && has_kwallet {
+        return Some(KeyringBackend::KWallet);
+    }
+    if has_secret_tool {
+        return Some(KeyringBackend::SecretTool);
+    }
+    if has_kwallet {
+        return Some(KeyringBackend::KWallet);
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn run_secret_store(program: &std::path::Path, args: &[&str], secret: &str) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let Ok(mut child) = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        if stdin.write_all(secret.as_bytes()).is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return false;
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+/// Looks up a LUKS/BitLocker passphrase previously saved in the user's desktop keyring:
+/// - KDE Plasma KWallet (`SolidLuks` folder via `kwallet-query`, matching Dolphin/Solid)
+/// - GNOME Keyring / Secret Service (`gvfs-luks-uuid` via `secret-tool`, matching Nautilus/Disks)
+///
+/// Checks the current desktop's preferred keyring first so non-KDE desktops do not wake
+/// `kwalletd` when `secret-tool` already holds the entry.
+#[cfg(target_os = "linux")]
+fn lookup_saved_passphrase(id: &str) -> Option<String> {
+    let dev = lsblk().into_iter().find(|d| d.path == id)?;
+    let uuid = dev.uuid.as_deref().map(str::trim).filter(|u| !u.is_empty());
+    let kwallet = find_program("kwallet-query");
+    let secret_tool = find_program("secret-tool");
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+
+    let lookup_kwallet = |tool: &std::path::Path| -> Option<String> {
+        let wallet = kwallet_default_name();
+        let udi = (!dev.kname.is_empty())
+            .then(|| format!("/org/freedesktop/UDisks2/block_devices/{}", dev.kname));
+        let keys: Vec<&str> = uuid.into_iter().chain(udi.as_deref()).collect();
+        for key in keys {
+            let (code, secret) = run_secret_lookup(tool, &["-f", "SolidLuks", "-r", key, &wallet]);
+            if secret.is_some() {
+                return secret;
+            }
+            // kwallet-query exit codes 1..=3 mean wallet/folder unavailable or locked;
+            // only code 4 ("entry not found") warrants trying the alternate key.
+            if code != Some(4) {
+                break;
+            }
+        }
+        None
+    };
+
+    let lookup_secret_tool = |tool: &std::path::Path| -> Option<String> {
+        let uuid = uuid?;
+        run_secret_lookup(tool, &["lookup", "gvfs-luks-uuid", uuid]).1
+    };
+
+    match preferred_keyring(&desktop, kwallet.is_some(), secret_tool.is_some()) {
+        Some(KeyringBackend::KWallet) => kwallet
+            .as_deref()
+            .and_then(lookup_kwallet)
+            .or_else(|| secret_tool.as_deref().and_then(lookup_secret_tool)),
+        Some(KeyringBackend::SecretTool) => secret_tool
+            .as_deref()
+            .and_then(lookup_secret_tool)
+            .or_else(|| kwallet.as_deref().and_then(lookup_kwallet)),
+        None => None,
+    }
+}
+
+/// Best-effort save of a verified LUKS/BitLocker passphrase into the desktop keyring so
+/// future unlocks in Gall, Dolphin, or GNOME Files do not ask for the passphrase again.
+#[cfg(target_os = "linux")]
+fn store_saved_passphrase(id: &str, passphrase: &str) {
+    let Some(dev) = lsblk().into_iter().find(|d| d.path == id) else {
+        return;
+    };
+    let Some(uuid) = dev.uuid.as_deref().map(str::trim).filter(|u| !u.is_empty()) else {
+        return;
+    };
+    let kwallet = find_program("kwallet-query");
+    let secret_tool = find_program("secret-tool");
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+
+    match preferred_keyring(&desktop, kwallet.is_some(), secret_tool.is_some()) {
+        Some(KeyringBackend::KWallet) => {
+            if let Some(tool) = kwallet {
+                let wallet = kwallet_default_name();
+                let _ =
+                    run_secret_store(&tool, &["-f", "SolidLuks", "-w", uuid, &wallet], passphrase);
+            }
+        }
+        Some(KeyringBackend::SecretTool) => {
+            if let Some(tool) = secret_tool {
+                let name = dev.label.as_deref().filter(|l| !l.is_empty()).unwrap_or(id);
+                let label = format!("LUKS passphrase for {name}");
+                let _ = run_secret_store(
+                    &tool,
+                    &["store", "--label", &label, "gvfs-luks-uuid", uuid],
+                    passphrase,
+                );
+            }
+        }
+        None => {}
+    }
+}
+
 /// Unlocks an encrypted device with `passphrase`, mounts it and returns where.
+/// On Linux, an empty `passphrase` first checks the desktop keyring (KDE KWallet
+/// `SolidLuks` and GNOME Keyring `gvfs-luks-uuid`) and returns `"Passphrase required"`
+/// when no saved secret exists. When `remember` is true and a non-empty passphrase
+/// succeeds, the passphrase is saved to the desktop keyring (best-effort).
 /// Windows: shows the system BitLocker dialog instead (the passphrase is unused).
-pub fn unlock_volume(id: &str, passphrase: &str) -> Result<Option<String>> {
+pub fn unlock_volume(id: &str, passphrase: &str, remember: bool) -> Result<Option<String>> {
     #[cfg(target_os = "linux")]
     {
+        let owned;
+        let secret = if passphrase.is_empty() {
+            let Some(saved) = lookup_saved_passphrase(id) else {
+                return Err(CoreError::Other("Passphrase required".into()));
+            };
+            owned = saved;
+            owned.as_str()
+        } else {
+            passphrase
+        };
+        let mut unlocked_now = false;
         let clear = match udisksctl(
             &["unlock", "-b", id, "--key-file", "/dev/stdin"],
-            Some(passphrase),
+            Some(secret),
         ) {
-            Ok(out) => udisks_path_after(&out, " as ")
-                .ok_or_else(|| CoreError::Other(format!("unlocked, but which device? {out}")))?,
+            Ok(out) => {
+                unlocked_now = true;
+                udisks_path_after(&out, " as ")
+                    .ok_or_else(|| CoreError::Other(format!("unlocked, but which device? {out}")))?
+            }
             // Unlocked meanwhile (e.g. by the desktop): find the mapped device.
             Err(e) if e.contains("already unlocked") || e.contains("AlreadyUnlocked") => {
+                invalidate_block_cache();
                 udisks_path_after(&e, " as ")
                     .or_else(|| {
                         let devs = lsblk();
@@ -419,17 +738,22 @@ pub fn unlock_volume(id: &str, passphrase: &str) -> Result<Option<String>> {
             }
             Err(e) => return Err(CoreError::Other(friendly(&e))),
         };
-        // The desktop may mount it by itself right after unlocking; mount_volume handles both.
+        if unlocked_now && remember && !passphrase.is_empty() {
+            store_saved_passphrase(id, passphrase);
+        }
+        if let Some(mp) = wait_for_automount(&clear) {
+            return Ok(Some(mp));
+        }
         mount_volume(&clear).map(Some)
     }
     #[cfg(windows)]
     {
-        let _ = passphrase;
+        let _ = (passphrase, remember);
         win::unlock_dialog(id).map(|_| None)
     }
     #[cfg(not(any(target_os = "linux", windows)))]
     {
-        let _ = (id, passphrase);
+        let _ = (id, passphrase, remember);
         Err(CoreError::Other("unlocking is not supported here".into()))
     }
 }
@@ -484,6 +808,7 @@ pub fn lockable_from(devs: &[BlockDev]) -> Vec<String> {
 pub fn lock_mount(mount: &str) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
+        invalidate_block_cache();
         let devs = lsblk();
         let clear = devs
             .iter()
@@ -496,9 +821,11 @@ pub fn lock_mount(mount: &str) -> Result<()> {
             .ok_or_else(|| CoreError::Other("not an encrypted volume".into()))?;
         udisksctl(&["unmount", "-b", &clear.path], None)
             .map_err(|e| CoreError::Other(friendly(&e)))?;
-        udisksctl(&["lock", "-b", &parent.path], None)
-            .map_err(|e| CoreError::Other(friendly(&e)))?;
-        Ok(())
+        let res = udisksctl(&["lock", "-b", &parent.path], None)
+            .map(|_| ())
+            .map_err(|e| CoreError::Other(friendly(&e)));
+        invalidate_block_cache();
+        res
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -749,6 +1076,63 @@ mod tests {
             Some("/run/media/a/X")
         );
         assert_eq!(friendly("Error unlocking /dev/sdb: GDBus.Error:org.freedesktop.UDisks2.Error.Failed: Error unlocking /dev/sdb: Failed to activate device: Incorrect passphrase"), "Wrong passphrase");
+    }
+
+    #[test]
+    fn mountpoint_lookup_finds_mounted_clear_device() {
+        let devs = parse(SAMPLE);
+        assert_eq!(
+            mountpoint_in(&devs, "/dev/mapper/luks-1").as_deref(),
+            Some("/run/media/a/Backup")
+        );
+        assert_eq!(mountpoint_in(&devs, "/dev/sdc1"), None);
+        assert_eq!(mountpoint_in(&devs, "/dev/no-such"), None);
+    }
+
+    #[test]
+    fn parses_kwallet_default_wallet_name() {
+        assert_eq!(
+            parse_kwallet_default("[Wallet]\nDefault Wallet=mywallet\nEnabled=true\n").as_deref(),
+            Some("mywallet")
+        );
+        assert_eq!(
+            parse_kwallet_default(
+                "[Other]\nDefault Wallet=wrong\n[Wallet]\nDefault Wallet = kdewallet\n"
+            )
+            .as_deref(),
+            Some("kdewallet")
+        );
+        assert_eq!(parse_kwallet_default("[Wallet]\nDefault Wallet=\n"), None);
+        assert_eq!(parse_kwallet_default("[Other]\nEnabled=true\n"), None);
+    }
+
+    #[test]
+    fn picks_preferred_keyring_backend_for_desktop() {
+        assert_eq!(
+            preferred_keyring("KDE", true, true),
+            Some(KeyringBackend::KWallet)
+        );
+        assert_eq!(
+            preferred_keyring("fedora:KDE", true, true),
+            Some(KeyringBackend::KWallet)
+        );
+        assert_eq!(
+            preferred_keyring("KDE", false, true),
+            Some(KeyringBackend::SecretTool)
+        );
+        assert_eq!(
+            preferred_keyring("Hyprland", true, true),
+            Some(KeyringBackend::SecretTool)
+        );
+        assert_eq!(
+            preferred_keyring("GNOME", true, true),
+            Some(KeyringBackend::SecretTool)
+        );
+        assert_eq!(
+            preferred_keyring("", true, false),
+            Some(KeyringBackend::KWallet)
+        );
+        assert_eq!(preferred_keyring("KDE", false, false), None);
     }
 }
 
