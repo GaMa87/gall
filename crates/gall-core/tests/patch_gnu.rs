@@ -13,17 +13,33 @@ fn works(program: &Path) -> bool {
         .arg("--version")
         .output()
         .is_ok_and(|o| {
-            o.status.success()
-                && String::from_utf8_lossy(&o.stdout)
-                    .to_ascii_lowercase()
-                    .contains("gnu")
+            if !o.status.success() {
+                return false;
+            }
+            let out = String::from_utf8_lossy(&o.stdout).to_ascii_lowercase();
+            // Reject Strawberry Perl's ancient Windows GNU patch 2.5.x (asserts on LF hunks
+            // and lacks quoted filename support); require modern GNU diffutils / patch 2.7+.
+            out.contains("gnu") && !out.contains("patch 2.5.")
         })
 }
 
-/// The program of a GNU tool: the one on the `PATH` (including Homebrew's `gdiff`/`gpatch`
-/// on macOS, where `/usr/bin/patch` is BSD `patch 2.0-12u11-Apple`), or on Windows the copy
-/// Git for Windows ships in `usr\bin` (Git's `--exec-path` is `<Git>\mingw64\libexec\git-core`).
+/// The program of a GNU tool: on Windows prefer Git for Windows' `usr\bin` copy (Git's
+/// `--exec-path` is `<Git>\mingw64\libexec\git-core`) over legacy ports on `PATH` such as
+/// Strawberry Perl's `patch 2.5.9`; elsewhere use `PATH` (including Homebrew's `gdiff`/`gpatch`
+/// on macOS, where `/usr/bin/patch` is BSD `patch 2.0-12u11-Apple`).
 fn tool(name: &str) -> Option<PathBuf> {
+    if cfg!(windows) {
+        if let Ok(exec) = Command::new("git").arg("--exec-path").output() {
+            let exec = PathBuf::from(String::from_utf8_lossy(&exec.stdout).trim());
+            if let Some(found) = exec
+                .ancestors()
+                .map(|dir| dir.join("usr").join("bin").join(format!("{name}.exe")))
+                .find(|candidate| candidate.is_file() && works(candidate))
+            {
+                return Some(found);
+            }
+        }
+    }
     let plain = PathBuf::from(name);
     if works(&plain) {
         return Some(plain);
@@ -34,14 +50,7 @@ fn tool(name: &str) -> Option<PathBuf> {
             return Some(gnu_prefixed);
         }
     }
-    if !cfg!(windows) {
-        return None;
-    }
-    let exec = Command::new("git").arg("--exec-path").output().ok()?;
-    let exec = PathBuf::from(String::from_utf8_lossy(&exec.stdout).trim());
-    exec.ancestors()
-        .map(|dir| dir.join("usr").join("bin").join(format!("{name}.exe")))
-        .find(|candidate| candidate.is_file() && works(candidate))
+    None
 }
 
 fn gnu() -> bool {
