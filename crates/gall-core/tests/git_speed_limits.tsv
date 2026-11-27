@@ -81,13 +81,13 @@ linux	working changes	2.37
 linux	worktrees for the switcher	0.01
 linux	worktrees to clean up	0.43
 linux	worktrees, submodules, bisect	2.62
-macos	an image of a commit	0.13
-macos	blame	0.48
-macos	branches that remember changes	0.07
-macos	checkout another branch	5.85
+macos	an image of a commit	0.14
+macos	blame	0.57
+macos	branches that remember changes	0.11
+macos	checkout another branch	6.03
 macos	cherry-pick 3 commits	4.47
 macos	cherry-pick a commit	3.56
-macos	commit as a patch	0.15
+macos	commit as a patch	0.16
 macos	commit details	0.01
 macos	commit diff	0.14
 macos	commit the staged files	2.55
@@ -96,70 +96,70 @@ macos	commits of the staged changes	2.53
 macos	conflict forecast of a branch	0.58
 macos	content of a file in a commit	0.22
 macos	create a branch	1.54
-macos	create a worktree in the preset folder	23.04
-macos	create a worktree with linked folders	26.30
+macos	create a worktree in the preset folder	27.00
+macos	create a worktree with linked folders	48.66
 macos	delete a branch	2.12
-macos	discard selected lines	7.33
+macos	discard selected lines	7.91
 macos	fetch (nothing new, local remote)	2.50
 macos	git root of a folder	0.01
-macos	graph view with the reflog	2.01
+macos	graph view with the reflog	3.97
 macos	graph view, 200 commits	2.59
 macos	graph view, 2000 commits	2.06
 macos	history of a file	0.37
-macos	history of three lines	0.71
+macos	history of three lines	0.93
 macos	history query	2.27
-macos	interactive rebase: conflict check of 10 commits	0.12
+macos	interactive rebase: conflict check of 10 commits	0.27
 macos	interactive rebase: messages of 10 commits	0.11
-macos	interactive rebase: plan of 10 commits	1.74
+macos	interactive rebase: plan of 10 commits	6.66
 macos	linked worktree: graph view	1.39
 macos	linked worktree: status badges	1.81
-macos	linked worktree: working changes	3.65
+macos	linked worktree: working changes	4.34
 macos	list .cache/pkg001/lib1	0.01
 macos	list node_modules (500 folders)	0.02
 macos	list the root	0.01
 macos	location of a new worktree (live preview)	0.01
 macos	merge a branch	2.62
-macos	nested submodule: working changes	0.31
+macos	nested submodule: working changes	0.32
 macos	operation journal	0.01
 macos	patch of a changed file	1.40
 macos	patch of one file of a commit	0.14
-macos	push one commit (local remote)	2.59
-macos	rebase 3 commits onto a branch	3.15
+macos	push one commit (local remote)	3.17
+macos	rebase 3 commits onto a branch	3.35
 macos	reflog as a list	0.06
-macos	repository snapshot	1.84
-macos	scrub 20 revisions of a file	0.61
+macos	repository snapshot	2.43
+macos	scrub 20 revisions of a file	0.75
 macos	search: abbreviated hash	0.27
-macos	search: author in the whole history	0.55
+macos	search: author in the whole history	0.68
 macos	search: file in the whole history	38.70
 macos	search: message in the whole history	0.99
 macos	selectable patch of a changed file	1.64
 macos	stage a file	2.05
-macos	stage selected lines	3.42
-macos	stash a staged file	4.40
+macos	stage selected lines	4.41
+macos	stash a staged file	4.73
 macos	stashes with files	0.43
 macos	state of a worktree	2.19
 macos	status badges: .cache (hidden, ignored)	0.45
 macos	status badges: node_modules (ignored)	0.43
-macos	status badges: node_modules/pkg001	0.27
+macos	status badges: node_modules/pkg001	0.31
 macos	status badges: root	1.42
 macos	status badges: src/mod001	0.36
-macos	status badges: untracked/d1	0.21
+macos	status badges: untracked/d1	0.26
 macos	status badges: vendor (folder of submodules)	0.25
-macos	status badges: vendor/big (a submodule)	0.91
-macos	status badges: vendor/big/src/mod001	0.20
+macos	status badges: vendor/big (a submodule)	1.14
+macos	status badges: vendor/big/src/mod001	0.24
 macos	submodule tree (3 submodules, one nested)	0.40
 macos	submodule: graph view	0.97
 macos	submodule: working changes	0.83
-macos	the same with the notes of a commit	1.94
-macos	undo a cherry-pick	1.97
+macos	the same with the notes of a commit	3.04
+macos	undo a cherry-pick	2.24
 macos	undo a created worktree	25.89
 macos	undo a worktree with linked folders	22.26
-macos	unstage a file	2.11
+macos	unstage a file	2.21
 macos	untrusted repository check	0.01
-macos	working changes	1.35
+macos	working changes	2.36
 macos	worktrees for the switcher	0.01
-macos	worktrees to clean up	0.36
-macos	worktrees, submodules, bisect	2.14
+macos	worktrees to clean up	0.45
+macos	worktrees, submodules, bisect	2.30
 windows	an image of a commit	0.60
 windows	blame	2.15
 windows	branches that remember changes	0.83

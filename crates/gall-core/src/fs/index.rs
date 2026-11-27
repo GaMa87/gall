@@ -1270,8 +1270,17 @@ mod tests {
         let before = idx.status().entries;
         assert_eq!(idx.forget_under(&p.join("ui")), 4);
         assert_eq!(idx.status().entries, before - 4);
-        assert_eq!(idx.query("FolderPane", None, 10).total, 0);
-        assert_eq!(idx.query("ui2", None, 10).total, 1);
+        assert_eq!(idx.query("'FolderPane", None, 10).total, 0);
+        // Use an exact query and filter by name so random tempdir paths on Windows
+        // (`C:\Users\runneradmin\...\tmp...2...`) cannot fuzzy-match `"ui2"`.
+        assert_eq!(
+            idx.query("'ui2", None, 10)
+                .hits
+                .iter()
+                .filter(|h| h.name == "ui2")
+                .count(),
+            1
+        );
         assert_eq!(idx.forget_under(&p.join("ui")), 0);
 
         // After a .gallignore entry, a rebuild keeps it out.
