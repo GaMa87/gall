@@ -183,13 +183,13 @@ impl Db {
         // With the write-ahead log a commit need not wait for the disk: after a power
         // cut the last changes may be missing, the database is never damaged. And a
         // second instance writing at the same moment is waited for, not an error.
-        // Cap the WAL below SQLite's 1000-page (~4 MB) default without triggering
-        // synchronous NTFS checkpoints during bulk tag writes, and truncate back to
-        // WAL_SIZE_LIMIT after checkpoints (and to 0 bytes on clean shutdown).
-        const WAL_SIZE_LIMIT: i64 = 524_288;
+        // Keep SQLite's default 1000-page (~4 MiB) autocheckpoint so bulk tag
+        // writes and renames do not trigger synchronous NTFS checkpoint/truncate
+        // thrashing on Windows, while bounding retained WAL size to 1 MiB after
+        // checkpoints (and truncating to 0 bytes on clean shutdown / oversized open).
+        const WAL_SIZE_LIMIT: i64 = 1_048_576;
         conn.execute_batch(&format!(
             "PRAGMA synchronous = NORMAL;
-             PRAGMA wal_autocheckpoint = 512;
              PRAGMA journal_size_limit = {WAL_SIZE_LIMIT};"
         ))?;
         let wal_path = {
@@ -878,12 +878,12 @@ mod tests {
         let wal = dir.path().join("gall.db-wal");
 
         let db = Db::open(&file).unwrap();
-        for i in 0..700 {
+        for i in 0..1200 {
             db.record_visit(&format!("/folder/{i:04}"), 50).unwrap();
         }
         let wal_len = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
         assert!(
-            wal_len <= 2_621_440,
+            wal_len <= 5_242_880,
             "WAL grew too large during repeated visits: {wal_len} bytes"
         );
         db.checkpoint();
@@ -892,7 +892,7 @@ mod tests {
         drop(db);
 
         // Simulate an oversized WAL left on disk by an older version or unclean exit:
-        // write > 512 KiB of WAL frames without checkpointing, snapshot the db + wal
+        // write > 1 MiB of WAL frames without checkpointing, snapshot the db + wal
         // pair to a fresh path with no competing connections, and verify Db::open shrinks it.
         let legacy = dir.path().join("legacy.db");
         let legacy_wal = dir.path().join("legacy.db-wal");
@@ -900,7 +900,7 @@ mod tests {
             let raw = Connection::open(&file).unwrap();
             raw.execute_batch("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;")
                 .unwrap();
-            for i in 0..250 {
+            for i in 0..400 {
                 raw.execute(
                     "INSERT INTO history(path, visited) VALUES(?1, ?2) ON CONFLICT(path) DO UPDATE SET visited = excluded.visited",
                     params![format!("/legacy/{i:04}"), i as i64],
@@ -908,7 +908,7 @@ mod tests {
                 .unwrap();
             }
             assert!(
-                std::fs::metadata(&wal).unwrap().len() > 524_288,
+                std::fs::metadata(&wal).unwrap().len() > 1_048_576,
                 "precondition: oversized legacy WAL"
             );
             std::fs::copy(&file, &legacy).unwrap();
