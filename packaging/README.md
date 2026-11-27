@@ -51,7 +51,7 @@ local unit tests alone do not establish that a published upgrade works.
 | winget | Windows | 🔜 planned | (generated with `wingetcreate`) |
 | Arch source package `gall` | Arch, Manjaro, EndeavourOS (`x86_64`, `aarch64`) | 📝 PKGBUILD ready (checksum set after tagging) | [`arch/gall/PKGBUILD`](arch/gall/PKGBUILD) |
 | Omarchy package repository (`omacom/omarchy-pkgs`) | Omarchy (`x86_64`, `aarch64`) | 📝 template drafted | [`omarchy-pkgs/package.json`](omarchy-pkgs/package.json), [`omarchy/README.md`](omarchy/README.md) |
-| AUR `gall-bin` | Arch, Manjaro, EndeavourOS (`x86_64`) | 📝 PKGBUILD drafted (repackages the v0.2.2 `.deb`) | [`aur/gall-bin/PKGBUILD`](aur/gall-bin/PKGBUILD) |
+| AUR `gall-bin` | Arch, Manjaro, EndeavourOS (`x86_64`) | 📝 PKGBUILD drafted (repackages the v0.3.0 `.deb`) | [`aur/gall-bin/PKGBUILD`](aur/gall-bin/PKGBUILD) |
 | Flathub | all Linux | 🔜 planned | [`linux/org.gall.app.metainfo.xml`](linux/org.gall.app.metainfo.xml) |
 | Fedora COPR | Fedora, RHEL clones | ✅ available (`dnf copr enable gama87/gall`) | [`copr/gall.spec`](copr/gall.spec), [`scripts/copr-build.sh`](../scripts/copr-build.sh) |
 | AppImageHub | all Linux | 🔜 planned | |

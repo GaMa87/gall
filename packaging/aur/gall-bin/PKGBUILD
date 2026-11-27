@@ -2,7 +2,7 @@
 #
 # AUR package "gall-bin": repackages the official .deb from GitHub Releases.
 # Bump: set pkgver (pkgrel=1), run `updpkgsums && makepkg --printsrcinfo > .SRCINFO`. The checksums
-# below are those of the published v0.2.2 release (`SHA256SUMS`); every release needs new ones.
+# below are those of the published v0.3.0 release (`SHA256SUMS`); every release needs new ones.
 #
 # This package repackages the .deb, whose Gall has no GALL_PACKAGE_MANAGED flag: it updates through the
 # signed user-space overlay (the system files under /usr stay as pacman installed them). The source
@@ -18,7 +18,7 @@
 #   /usr/share/gall/actions.d/50-omarchy.json (0.3.0+)
 pkgname=gall-bin
 _pkgname=gall
-pkgver=0.2.2
+pkgver=0.3.0
 pkgrel=1
 pkgdesc="Keyboard-first file manager: Miller columns, dual pane, instant search, compare tool and Vim keys"
 arch=('x86_64')
@@ -48,7 +48,7 @@ conflicts=("$_pkgname")
 options=('!strip' '!debug')
 source=("$url/releases/download/v$pkgver/Gall_${pkgver}_amd64.deb"
         "LICENSE-$pkgver::https://raw.githubusercontent.com/GaMa87/gall/v$pkgver/LICENSE")
-sha256sums=('b970073cfd5f275b6cc3ec96d699240f0e488876b2ecda701a8163d3cf949ebd'
+sha256sums=('a5ef443c26dbb6754c7a0000ab6463bf3aeaa53f7de10fcfe61a15285d27d61b'
             '565441b185f6bf183284cc87c34d43e2084b04d2c94275536b60d2e93eca3ba3')
 
 package() {
