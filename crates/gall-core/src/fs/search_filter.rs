@@ -76,6 +76,17 @@ impl CountBudget {
             max_duration: Duration::from_millis(350),
         }
     }
+
+    /// Deterministic budget for unit tests verifying filter/count logic rather than
+    /// wall-clock deadline expiry under parallel CI load.
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Self {
+        Self {
+            max_matches: 100,
+            max_entries: 25_000,
+            max_duration: Duration::from_secs(30),
+        }
+    }
 }
 
 /// Why an entry is hidden by search filters.
@@ -112,7 +123,7 @@ pub struct FilterMatcher {
     root: PathBuf,
     config: FilterConfig,
     overrides: Option<Override>,
-    global_gitignore: Option<Gitignore>,
+    global_gitignore: Option<Arc<Gitignore>>,
     root_rules: Arc<DirRules>,
     /// Cache from directory path -> `(rules, is_hidden_dir)` for directories under `root`.
     dir_cache: RwLock<HashMap<PathBuf, Arc<CachedDir>>>,
@@ -124,15 +135,26 @@ struct CachedDir {
     hidden: bool,
 }
 
+fn load_global_gitignore(config: &FilterConfig) -> Option<Arc<Gitignore>> {
+    if !config.respect_gitignore {
+        return None;
+    }
+    let (gi, _err) = Gitignore::global();
+    (!gi.is_empty()).then(|| Arc::new(gi))
+}
+
 impl FilterMatcher {
     pub fn new(root: &Path, config: FilterConfig) -> Self {
+        let global_gitignore = load_global_gitignore(&config);
+        Self::new_with_global(root, config, global_gitignore)
+    }
+
+    fn new_with_global(
+        root: &Path,
+        config: FilterConfig,
+        global_gitignore: Option<Arc<Gitignore>>,
+    ) -> Self {
         let overrides = build_exclude_override(root, &config.exclude);
-        let global_gitignore = if config.respect_gitignore {
-            let (gi, _err) = Gitignore::global();
-            (!gi.is_empty()).then_some(gi)
-        } else {
-            None
-        };
         let root_rules = build_ancestor_rules(root, &config);
         let mut cache = HashMap::new();
         cache.insert(
@@ -489,8 +511,10 @@ pub fn walk_hidden_matches(
     if budget.max_matches == 0 || budget.max_entries == 0 || cancel.load(Ordering::Relaxed) {
         return HiddenCount::default();
     }
-    let started = Instant::now();
     let remote = super::index::remote_mounts();
+    let global_gitignore = load_global_gitignore(config);
+    let matcher = FilterMatcher::new_with_global(root, config.clone(), global_gitignore);
+    let started = Instant::now();
     let mut state = WalkState {
         started,
         budget,
@@ -502,6 +526,7 @@ pub fn walk_hidden_matches(
         root,
         false,
         config,
+        &matcher,
         user_exclude,
         &remote,
         &[],
@@ -527,15 +552,8 @@ pub fn walk_hidden_matches_multi(
     if budget.max_matches == 0 || budget.max_entries == 0 || cancel.load(Ordering::Relaxed) {
         return HiddenCount::default();
     }
-    let started = Instant::now();
     let remote = super::index::remote_mounts();
-    let mut state = WalkState {
-        started,
-        budget,
-        matches: 0,
-        visited: 0,
-        budget_hit: false,
-    };
+    let global_gitignore = load_global_gitignore(config);
 
     // Build ordered (dir, containing_root) targets: priority folders inside any root
     // first, then remaining roots.
@@ -559,14 +577,29 @@ pub fn walk_hidden_matches_multi(
         targets.push((r.clone(), None));
     }
 
+    // Reuse one FilterMatcher per root across priority checks and walks instead of
+    // re-parsing global gitignore and ancestor rules for each target.
+    let mut root_matchers: HashMap<PathBuf, FilterMatcher> = HashMap::new();
+    let started = Instant::now();
+    let mut state = WalkState {
+        started,
+        budget,
+        matches: 0,
+        visited: 0,
+        budget_hit: false,
+    };
+
     let mut scanned: Vec<PathBuf> = Vec::new();
     for (dir, containing_root) in targets {
         if cancel.load(Ordering::Relaxed) || state.budget_hit {
             break;
         }
-        let initial_hidden = containing_root
-            .as_deref()
-            .is_some_and(|r| FilterMatcher::new(r, config.clone()).is_path_hidden(&dir, true));
+        let initial_hidden = containing_root.as_ref().is_some_and(|r| {
+            let m = root_matchers.entry(r.clone()).or_insert_with(|| {
+                FilterMatcher::new_with_global(r, config.clone(), global_gitignore.clone())
+            });
+            m.is_path_hidden(&dir, true)
+        });
         if initial_hidden {
             if let Some(name) = dir.file_name().map(|n| n.to_string_lossy()) {
                 match on_hidden(&dir, &name, true) {
@@ -585,10 +618,14 @@ pub fn walk_hidden_matches_multi(
                 }
             }
         }
+        let matcher = root_matchers.entry(dir.clone()).or_insert_with(|| {
+            FilterMatcher::new_with_global(&dir, config.clone(), global_gitignore.clone())
+        });
         walk_one_root(
             &dir,
             initial_hidden,
             config,
+            matcher,
             None,
             &remote,
             &scanned,
@@ -625,6 +662,7 @@ fn walk_one_root(
     root: &Path,
     initial_hidden: bool,
     config: &FilterConfig,
+    matcher: &FilterMatcher,
     user_exclude: Option<&Override>,
     remote: &HashSet<PathBuf>,
     skip_dirs: &[PathBuf],
@@ -632,8 +670,6 @@ fn walk_one_root(
     state: &mut WalkState,
     on_hidden: &mut impl FnMut(&Path, &str, bool) -> ProbeMatch,
 ) {
-    let matcher = FilterMatcher::new(root, config.clone());
-
     // Tier 1: visible directories (to discover hidden files and hidden subdirs) and
     // directories hidden by .gallignore / .ignore / .gitignore.
     let mut tier1: VecDeque<(PathBuf, Arc<DirRules>, bool)> = VecDeque::new();
@@ -656,7 +692,7 @@ fn walk_one_root(
             break;
         }
         if state.visited >= state.budget.max_entries
-            || state.started.elapsed() >= state.budget.max_duration
+            || (state.visited > 0 && state.started.elapsed() >= state.budget.max_duration)
         {
             state.budget_hit = true;
             break;
@@ -675,7 +711,7 @@ fn walk_one_root(
         };
 
         for item in rd {
-            if state.visited & 63 == 0 {
+            if state.visited > 0 && state.visited & 63 == 0 {
                 if cancel.load(Ordering::Relaxed) {
                     return;
                 }

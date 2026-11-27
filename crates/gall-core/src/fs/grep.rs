@@ -702,7 +702,7 @@ mod tests {
             p,
             "only_hidden_token",
             &base_opts,
-            CountBudget::grep_default(),
+            CountBudget::for_tests(),
             &cancel,
         )
         .unwrap();
@@ -723,7 +723,7 @@ mod tests {
             p,
             "only_hidden_token",
             &rs_only,
-            CountBudget::grep_default(),
+            CountBudget::for_tests(),
             &cancel,
         )
         .unwrap();
@@ -742,7 +742,7 @@ mod tests {
             p,
             "shared_token",
             &base_opts,
-            CountBudget::grep_default(),
+            CountBudget::for_tests(),
             &cancel,
         )
         .unwrap();
@@ -759,7 +759,7 @@ mod tests {
             p,
             "absent_token_xyz",
             &base_opts,
-            CountBudget::grep_default(),
+            CountBudget::for_tests(),
             &cancel,
         )
         .unwrap();

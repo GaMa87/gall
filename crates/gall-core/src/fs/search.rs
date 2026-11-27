@@ -589,7 +589,7 @@ mod tests {
             p,
             "secret_only*",
             &filter,
-            CountBudget::name_default(),
+            CountBudget::for_tests(),
             &cancel,
         );
         assert_eq!(
@@ -614,7 +614,7 @@ mod tests {
             |e| vis.push(e.name),
         );
         assert_eq!(vis, ["report.ts"]);
-        let hc = count_hidden(p, "report*", &filter, CountBudget::name_default(), &cancel);
+        let hc = count_hidden(p, "report*", &filter, CountBudget::for_tests(), &cancel);
         assert_eq!(
             hc,
             HiddenCount {
@@ -628,7 +628,7 @@ mod tests {
             p,
             "no_such_name",
             &filter,
-            CountBudget::name_default(),
+            CountBudget::for_tests(),
             &cancel,
         );
         assert_eq!(

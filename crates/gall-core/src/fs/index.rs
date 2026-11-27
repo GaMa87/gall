@@ -1523,13 +1523,7 @@ mod tests {
         assert_eq!(normal.query("widget", None, 20).total, 1);
 
         // Zero visible + 2 hidden.
-        let hc = count_hidden(
-            p,
-            "only_secret",
-            &filter,
-            CountBudget::name_default(),
-            &cancel,
-        );
+        let hc = count_hidden(p, "only_secret", &filter, CountBudget::for_tests(), &cancel);
         assert_eq!(
             hc,
             HiddenCount {
@@ -1539,7 +1533,7 @@ mod tests {
         );
 
         // Some visible (1) + 1 hidden.
-        let hc = count_hidden(p, "widget", &filter, CountBudget::name_default(), &cancel);
+        let hc = count_hidden(p, "widget", &filter, CountBudget::for_tests(), &cancel);
         assert_eq!(
             hc,
             HiddenCount {
@@ -1553,7 +1547,7 @@ mod tests {
             p,
             "definitely_missing_xyz",
             &filter,
-            CountBudget::name_default(),
+            CountBudget::for_tests(),
             &cancel,
         );
         assert_eq!(
@@ -1594,7 +1588,7 @@ mod tests {
             &[p.join("gen")],
             "widget",
             &filter,
-            CountBudget::name_default(),
+            CountBudget::for_tests(),
             &cancel,
         );
         assert_eq!(
@@ -1659,13 +1653,7 @@ mod tests {
         let cancel = AtomicBool::new(false);
 
         // Ancestor folder name ("search-hidden-proj") must NOT inflate the count to 100+.
-        let hc = count_hidden(
-            &proj,
-            "hidden",
-            &filter,
-            CountBudget::name_default(),
-            &cancel,
-        );
+        let hc = count_hidden(&proj, "hidden", &filter, CountBudget::for_tests(), &cancel);
         assert_eq!(
             hc,
             HiddenCount {
@@ -1676,13 +1664,7 @@ mod tests {
 
         // Scattered path letters ("report" across "target/debug/deps/crate_..._out") must
         // NOT inflate the count to 100+.
-        let hc = count_hidden(
-            &proj,
-            "report",
-            &filter,
-            CountBudget::name_default(),
-            &cancel,
-        );
+        let hc = count_hidden(&proj, "report", &filter, CountBudget::for_tests(), &cancel);
         assert_eq!(
             hc,
             HiddenCount {
@@ -1696,7 +1678,7 @@ mod tests {
             &proj,
             "gen/hidden",
             &filter,
-            CountBudget::name_default(),
+            CountBudget::for_tests(),
             &cancel,
         );
         assert_eq!(
