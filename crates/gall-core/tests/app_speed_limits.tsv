@@ -10,16 +10,16 @@ linux	Quick Open: two words	0.590
 linux	build the file index (115 000 entries)	11.247
 linux	compare a tree of 60 000 files with a profile folder, many folders (hidden files not shown)	10.911
 linux	compare two folders of 5 000 files (content)	3.482
-linux	compare two folders of 5 000 files (content, read again)	1.931
+linux	compare two folders of 5 000 files (content, read again)	2.344
 linux	compare two folders of 5 000 files (filtered)	0.322
 linux	compare two folders of 5 000 files (sizes and times)	0.757
-linux	compress a folder of 5 000 files to a tar.gz	1.362
+linux	compress a folder of 5 000 files to a tar.gz	1.579
 linux	compress a folder of 5 000 files to a zip	3.093
-linux	diff two files of 40 000 lines	2.684
-linux	diff two files of 40 000 lines by tokens (structural)	1.775
+linux	diff two files of 40 000 lines	3.235
+linux	diff two files of 40 000 lines by tokens (structural)	3.643
 linux	extract a zip of 5 000 files	4.517
 linux	find names: *.md in 60 000 files	2.272
-linux	find names: file01234*	1.367
+linux	find names: file01234*	2.167
 linux	highlight 40 000 lines	77.175
 linux	list AppData/Local (3 000 folders)	0.201
 linux	list a 7z archive of 5 000 files	0.179
@@ -29,7 +29,7 @@ linux	list a zip archive of 50 000 entries	3.855
 linux	list one application folder	0.007
 linux	list the same, folders only (tree column)	1.787
 linux	list the same, hidden not shown	3.595
-linux	open an early file inside a tar.gz archive of 20 000 files	1.044
+linux	open an early file inside a tar.gz archive of 20 000 files	1.629
 linux	open one file inside a 7z archive of 5 000 files	0.186
 linux	open one file inside a zip archive of 50 000 entries	2.330
 linux	rename 100 tagged files among 100 000 tags	0.168
