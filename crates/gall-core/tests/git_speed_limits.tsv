@@ -13,12 +13,12 @@ linux	commit details	0.01
 linux	commit diff	0.11
 linux	commit the staged files	2.35
 linux	commits for the diff picker	0.10
-linux	commits of the staged changes	2.08
+linux	commits of the staged changes	2.14
 linux	conflict forecast of a branch	0.25
 linux	content of a file in a commit	0.12
 linux	create a branch	2.15
-linux	create a worktree in the preset folder	11.33
-linux	create a worktree with linked folders	13.40
+linux	create a worktree in the preset folder	14.15
+linux	create a worktree with linked folders	16.24
 linux	delete a branch	2.27
 linux	discard selected lines	7.15
 linux	fetch (nothing new, local remote)	2.77
@@ -52,10 +52,10 @@ linux	scrub 20 revisions of a file	0.83
 linux	search: abbreviated hash	0.17
 linux	search: author in the whole history	0.51
 linux	search: file in the whole history	62.79
-linux	search: message in the whole history	0.45
+linux	search: message in the whole history	0.46
 linux	selectable patch of a changed file	1.87
 linux	stage a file	2.13
-linux	stage selected lines	3.35
+linux	stage selected lines	3.67
 linux	stash a staged file	5.63
 linux	stashes with files	0.41
 linux	state of a worktree	1.96
@@ -74,177 +74,177 @@ linux	submodule: working changes	0.67
 linux	the same with the notes of a commit	3.08
 linux	undo a cherry-pick	2.81
 linux	undo a created worktree	13.50
-linux	undo a worktree with linked folders	14.61
+linux	undo a worktree with linked folders	16.11
 linux	unstage a file	2.62
 linux	untrusted repository check	0.01
 linux	working changes	2.37
 linux	worktrees for the switcher	0.01
 linux	worktrees to clean up	0.43
 linux	worktrees, submodules, bisect	2.62
-macos	an image of a commit	0.07
-macos	blame	0.29
+macos	an image of a commit	0.13
+macos	blame	0.48
 macos	branches that remember changes	0.07
-macos	checkout another branch	3.63
-macos	cherry-pick 3 commits	2.72
-macos	cherry-pick a commit	2.05
-macos	commit as a patch	0.09
+macos	checkout another branch	5.85
+macos	cherry-pick 3 commits	4.47
+macos	cherry-pick a commit	3.56
+macos	commit as a patch	0.15
 macos	commit details	0.01
-macos	commit diff	0.08
+macos	commit diff	0.14
 macos	commit the staged files	2.55
-macos	commits for the diff picker	0.08
-macos	commits of the staged changes	2.05
-macos	conflict forecast of a branch	0.23
-macos	content of a file in a commit	0.15
+macos	commits for the diff picker	0.18
+macos	commits of the staged changes	2.53
+macos	conflict forecast of a branch	0.58
+macos	content of a file in a commit	0.22
 macos	create a branch	1.54
-macos	create a worktree in the preset folder	19.48
-macos	create a worktree with linked folders	22.67
+macos	create a worktree in the preset folder	23.04
+macos	create a worktree with linked folders	26.30
 macos	delete a branch	2.12
-macos	discard selected lines	6.14
-macos	fetch (nothing new, local remote)	2.01
+macos	discard selected lines	7.33
+macos	fetch (nothing new, local remote)	2.50
 macos	git root of a folder	0.01
-macos	graph view with the reflog	1.62
-macos	graph view, 200 commits	1.58
-macos	graph view, 2000 commits	1.61
-macos	history of a file	0.22
-macos	history of three lines	0.59
-macos	history query	1.35
-macos	interactive rebase: conflict check of 10 commits	0.10
-macos	interactive rebase: messages of 10 commits	0.09
-macos	interactive rebase: plan of 10 commits	1.60
+macos	graph view with the reflog	2.01
+macos	graph view, 200 commits	2.59
+macos	graph view, 2000 commits	2.06
+macos	history of a file	0.37
+macos	history of three lines	0.71
+macos	history query	2.27
+macos	interactive rebase: conflict check of 10 commits	0.12
+macos	interactive rebase: messages of 10 commits	0.11
+macos	interactive rebase: plan of 10 commits	1.74
 macos	linked worktree: graph view	1.39
-macos	linked worktree: status badges	1.37
-macos	linked worktree: working changes	1.20
+macos	linked worktree: status badges	1.81
+macos	linked worktree: working changes	3.65
 macos	list .cache/pkg001/lib1	0.01
 macos	list node_modules (500 folders)	0.02
 macos	list the root	0.01
 macos	location of a new worktree (live preview)	0.01
 macos	merge a branch	2.62
-macos	nested submodule: working changes	0.25
+macos	nested submodule: working changes	0.31
 macos	operation journal	0.01
-macos	patch of a changed file	1.30
-macos	patch of one file of a commit	0.08
-macos	push one commit (local remote)	2.16
-macos	rebase 3 commits onto a branch	3.07
+macos	patch of a changed file	1.40
+macos	patch of one file of a commit	0.14
+macos	push one commit (local remote)	2.59
+macos	rebase 3 commits onto a branch	3.15
 macos	reflog as a list	0.06
-macos	repository snapshot	1.52
-macos	scrub 20 revisions of a file	0.42
-macos	search: abbreviated hash	0.18
-macos	search: author in the whole history	0.39
-macos	search: file in the whole history	23.47
-macos	search: message in the whole history	0.41
-macos	selectable patch of a changed file	1.46
-macos	stage a file	1.46
-macos	stage selected lines	3.08
-macos	stash a staged file	4.26
-macos	stashes with files	0.21
-macos	state of a worktree	1.37
-macos	status badges: .cache (hidden, ignored)	0.16
-macos	status badges: node_modules (ignored)	0.15
-macos	status badges: node_modules/pkg001	0.16
+macos	repository snapshot	1.84
+macos	scrub 20 revisions of a file	0.61
+macos	search: abbreviated hash	0.27
+macos	search: author in the whole history	0.55
+macos	search: file in the whole history	38.70
+macos	search: message in the whole history	0.99
+macos	selectable patch of a changed file	1.64
+macos	stage a file	2.05
+macos	stage selected lines	3.42
+macos	stash a staged file	4.40
+macos	stashes with files	0.43
+macos	state of a worktree	2.19
+macos	status badges: .cache (hidden, ignored)	0.45
+macos	status badges: node_modules (ignored)	0.43
+macos	status badges: node_modules/pkg001	0.27
 macos	status badges: root	1.42
-macos	status badges: src/mod001	0.17
-macos	status badges: untracked/d1	0.16
-macos	status badges: vendor (folder of submodules)	0.16
-macos	status badges: vendor/big (a submodule)	0.72
-macos	status badges: vendor/big/src/mod001	0.12
-macos	submodule tree (3 submodules, one nested)	0.29
-macos	submodule: graph view	0.76
-macos	submodule: working changes	0.75
-macos	the same with the notes of a commit	1.59
+macos	status badges: src/mod001	0.36
+macos	status badges: untracked/d1	0.21
+macos	status badges: vendor (folder of submodules)	0.25
+macos	status badges: vendor/big (a submodule)	0.91
+macos	status badges: vendor/big/src/mod001	0.20
+macos	submodule tree (3 submodules, one nested)	0.40
+macos	submodule: graph view	0.97
+macos	submodule: working changes	0.83
+macos	the same with the notes of a commit	1.94
 macos	undo a cherry-pick	1.97
-macos	undo a created worktree	21.77
+macos	undo a created worktree	25.89
 macos	undo a worktree with linked folders	22.26
-macos	unstage a file	1.64
+macos	unstage a file	2.11
 macos	untrusted repository check	0.01
 macos	working changes	1.35
 macos	worktrees for the switcher	0.01
 macos	worktrees to clean up	0.36
-macos	worktrees, submodules, bisect	1.60
-windows	an image of a commit	0.56
+macos	worktrees, submodules, bisect	2.14
+windows	an image of a commit	0.60
 windows	blame	2.15
 windows	branches that remember changes	0.83
-windows	checkout another branch	6.16
+windows	checkout another branch	10.68
 windows	cherry-pick 3 commits	7.66
-windows	cherry-pick a commit	5.17
+windows	cherry-pick a commit	5.29
 windows	commit as a patch	0.70
 windows	commit details	0.01
 windows	commit diff	0.66
-windows	commit the staged files	3.62
+windows	commit the staged files	5.82
 windows	commits for the diff picker	0.68
-windows	commits of the staged changes	4.22
+windows	commits of the staged changes	6.37
 windows	conflict forecast of a branch	1.19
 windows	content of a file in a commit	1.27
-windows	create a branch	2.69
-windows	create a worktree in the preset folder	37.42
-windows	create a worktree with linked folders	38.12
+windows	create a branch	3.21
+windows	create a worktree in the preset folder	128.54
+windows	create a worktree with linked folders	164.31
 windows	delete a branch	5.35
-windows	discard selected lines	14.77
-windows	fetch (nothing new, local remote)	4.55
+windows	discard selected lines	37.92
+windows	fetch (nothing new, local remote)	5.88
 windows	git root of a folder	0.01
-windows	graph view with the reflog	3.68
-windows	graph view, 200 commits	2.61
-windows	graph view, 2000 commits	2.89
+windows	graph view with the reflog	5.82
+windows	graph view, 200 commits	4.59
+windows	graph view, 2000 commits	5.20
 windows	history of a file	1.57
-windows	history of three lines	2.32
-windows	history query	2.19
+windows	history of three lines	2.56
+windows	history query	2.80
 windows	interactive rebase: conflict check of 10 commits	0.78
 windows	interactive rebase: messages of 10 commits	0.65
-windows	interactive rebase: plan of 10 commits	2.19
-windows	linked worktree: graph view	3.23
-windows	linked worktree: status badges	1.74
-windows	linked worktree: working changes	1.40
+windows	interactive rebase: plan of 10 commits	3.69
+windows	linked worktree: graph view	4.95
+windows	linked worktree: status badges	1.88
+windows	linked worktree: working changes	2.21
 windows	list .cache/pkg001/lib1	0.01
 windows	list node_modules (500 folders)	0.01
 windows	list the root	0.01
 windows	location of a new worktree (live preview)	0.01
-windows	merge a branch	10.19
-windows	nested submodule: working changes	1.05
+windows	merge a branch	11.34
+windows	nested submodule: working changes	1.32
 windows	operation journal	0.01
-windows	patch of a changed file	2.16
+windows	patch of a changed file	2.66
 windows	patch of one file of a commit	0.70
-windows	push one commit (local remote)	6.42
+windows	push one commit (local remote)	7.92
 windows	rebase 3 commits onto a branch	10.69
 windows	reflog as a list	0.21
-windows	repository snapshot	2.85
-windows	search: abbreviated hash	0.93
-windows	search: author in the whole history	1.05
-windows	search: file in the whole history	32.63
-windows	search: message in the whole history	1.09
-windows	selectable patch of a changed file	2.48
-windows	stage a file	2.76
-windows	stage selected lines	5.07
-windows	stash a staged file	14.52
-windows	stashes with files	0.96
-windows	state of a worktree	1.41
+windows	repository snapshot	3.59
+windows	search: abbreviated hash	1.12
+windows	search: author in the whole history	2.14
+windows	search: file in the whole history	53.19
+windows	search: message in the whole history	2.20
+windows	selectable patch of a changed file	3.74
+windows	stage a file	4.38
+windows	stage selected lines	7.49
+windows	stash a staged file	16.19
+windows	stashes with files	1.07
+windows	state of a worktree	2.04
 windows	status badges: .cache (hidden, ignored)	1.04
 windows	status badges: node_modules (ignored)	1.01
-windows	status badges: node_modules/pkg001	0.85
-windows	status badges: root	1.43
-windows	status badges: src/mod001	0.85
+windows	status badges: node_modules/pkg001	1.01
+windows	status badges: root	2.07
+windows	status badges: src/mod001	0.86
 windows	status badges: untracked/d1	0.99
-windows	status badges: vendor (folder of submodules)	1.00
-windows	status badges: vendor/big (a submodule)	0.96
+windows	status badges: vendor (folder of submodules)	1.03
+windows	status badges: vendor/big (a submodule)	1.69
 windows	status badges: vendor/big/src/mod001	0.78
 windows	submodule tree (3 submodules, one nested)	2.52
-windows	submodule: graph view	1.59
-windows	submodule: working changes	1.47
-windows	the same with the notes of a commit	3.22
-windows	undo a cherry-pick	11.22
-windows	undo a created worktree	54.60
-windows	undo a worktree with linked folders	52.59
-windows	unstage a file	2.55
+windows	submodule: graph view	2.82
+windows	submodule: working changes	1.71
+windows	the same with the notes of a commit	4.67
+windows	undo a cherry-pick	12.26
+windows	undo a created worktree	93.20
+windows	undo a worktree with linked folders	81.26
+windows	unstage a file	4.07
 windows	untrusted repository check	0.01
-windows	working changes	1.71
+windows	working changes	3.34
 windows	worktrees for the switcher	0.02
-windows	worktrees to clean up	1.71
-windows	worktrees, submodules, bisect	2.76
+windows	worktrees to clean up	1.81
+windows	worktrees, submodules, bisect	4.75
 windows-wsl	an image of a commit	1.50
 windows-wsl	blame	4.49
 windows-wsl	branches that remember changes	0.22
 windows-wsl	checkout another branch	3.48
 windows-wsl	cherry-pick 3 commits	4.88
 windows-wsl	cherry-pick a commit	2.91
-windows-wsl	commit as a patch	1.52
+windows-wsl	commit as a patch	1.95
 windows-wsl	commit details	0.03
 windows-wsl	commit diff	1.66
 windows-wsl	commit the staged files	2.92
@@ -253,22 +253,22 @@ windows-wsl	commits of the staged changes	4.17
 windows-wsl	conflict forecast of a branch	1.56
 windows-wsl	content of a file in a commit	2.95
 windows-wsl	create a branch	2.30
-windows-wsl	create a worktree in the preset folder	5.56
-windows-wsl	create a worktree with linked folders	8.72
+windows-wsl	create a worktree in the preset folder	12.83
+windows-wsl	create a worktree with linked folders	15.60
 windows-wsl	delete a branch	3.05
 windows-wsl	discard selected lines	7.26
 windows-wsl	fetch (nothing new, local remote)	4.41
 windows-wsl	git root of a folder	0.07
 windows-wsl	graph view with the reflog	2.22
-windows-wsl	graph view, 200 commits	2.28
-windows-wsl	graph view, 2000 commits	2.30
+windows-wsl	graph view, 200 commits	3.62
+windows-wsl	graph view, 2000 commits	4.30
 windows-wsl	history of a file	3.40
 windows-wsl	history of three lines	3.11
-windows-wsl	history query	1.22
+windows-wsl	history query	1.31
 windows-wsl	interactive rebase: conflict check of 10 commits	5.15
 windows-wsl	interactive rebase: messages of 10 commits	0.39
 windows-wsl	interactive rebase: plan of 10 commits	2.29
-windows-wsl	linked worktree: graph view	2.30
+windows-wsl	linked worktree: graph view	2.56
 windows-wsl	linked worktree: status badges	1.30
 windows-wsl	linked worktree: working changes	1.56
 windows-wsl	list .cache/pkg001/lib1	0.03
@@ -283,15 +283,15 @@ windows-wsl	patch of one file of a commit	1.42
 windows-wsl	push one commit (local remote)	3.67
 windows-wsl	rebase 3 commits onto a branch	4.62
 windows-wsl	reflog as a list	22.45
-windows-wsl	repository snapshot	2.46
+windows-wsl	repository snapshot	2.69
 windows-wsl	search: abbreviated hash	1.56
-windows-wsl	search: author in the whole history	0.94
+windows-wsl	search: author in the whole history	1.14
 windows-wsl	search: file in the whole history	28.84
-windows-wsl	search: message in the whole history	0.87
-windows-wsl	selectable patch of a changed file	2.15
-windows-wsl	stage a file	2.03
+windows-wsl	search: message in the whole history	1.07
+windows-wsl	selectable patch of a changed file	2.53
+windows-wsl	stage a file	2.08
 windows-wsl	stage selected lines	4.42
-windows-wsl	stash a staged file	4.09
+windows-wsl	stash a staged file	6.95
 windows-wsl	stashes with files	0.37
 windows-wsl	state of a worktree	1.05
 windows-wsl	status badges: .cache (hidden, ignored)	0.53
@@ -303,16 +303,16 @@ windows-wsl	status badges: untracked/d1	0.53
 windows-wsl	status badges: vendor (folder of submodules)	0.53
 windows-wsl	status badges: vendor/big (a submodule)	0.79
 windows-wsl	status badges: vendor/big/src/mod001	0.52
-windows-wsl	submodule tree (3 submodules, one nested)	1.36
+windows-wsl	submodule tree (3 submodules, one nested)	2.35
 windows-wsl	submodule: graph view	1.53
 windows-wsl	submodule: working changes	0.87
-windows-wsl	the same with the notes of a commit	2.95
+windows-wsl	the same with the notes of a commit	7.31
 windows-wsl	undo a cherry-pick	3.32
-windows-wsl	undo a created worktree	5.74
-windows-wsl	undo a worktree with linked folders	10.12
+windows-wsl	undo a created worktree	7.20
+windows-wsl	undo a worktree with linked folders	11.91
 windows-wsl	unstage a file	2.09
 windows-wsl	untrusted repository check	0.01
-windows-wsl	working changes	1.67
+windows-wsl	working changes	1.76
 windows-wsl	worktrees for the switcher	0.59
 windows-wsl	worktrees to clean up	1.03
-windows-wsl	worktrees, submodules, bisect	2.95
+windows-wsl	worktrees, submodules, bisect	5.00

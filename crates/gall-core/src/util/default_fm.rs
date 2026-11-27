@@ -1836,11 +1836,40 @@ mod tests {
 
         // Removing the primary handler proves Freedesktop still resolves the retained fallback.
         std::fs::remove_file(&dolphin_desktop).unwrap();
-        if let Some(fallback) = query_xdg(&env) {
-            assert_eq!(fallback, "org.gnome.nautilus.desktop");
-        }
+        assert_eq!(
+            read_default_associations_from_mimeapps_text(
+                &std::fs::read_to_string(&mimeapps).unwrap(),
+                LINUX_DIRECTORY_MIME,
+            )
+            .as_deref(),
+            Some("org.kde.dolphin.desktop;org.gnome.nautilus.desktop;")
+        );
         if let Some(fallback_gio) = query_gio(&env) {
             assert!(fallback_gio.contains("org.gnome.nautilus.desktop"));
+        }
+        // Older xdg-utils (e.g. 1.1.3 on Ubuntu 24.04) truncates `[Default Applications]` at the
+        // first `;` (`cut -d ';' -f 1`), so it drops multi-handler fallbacks and falls through to
+        // scanning `applications/*.desktop` alphabetically. Only assert `xdg-mime` fallback when
+        // the installed `xdg-mime` supports multi-handler lists (xdg-utils 1.2+).
+        let probe_tmp = tempfile::tempdir().unwrap();
+        let probe_env = temp_linux_env(probe_tmp.path(), &["hyprland"]);
+        write_file(
+            &probe_env.data_dirs[0].join("applications/a-decoy.desktop"),
+            "[Desktop Entry]\nType=Application\nName=Decoy\nExec=/usr/bin/true %U\nMimeType=inode/directory;\n",
+        );
+        write_file(
+            &probe_env.data_dirs[0].join("applications/org.gnome.nautilus.desktop"),
+            "[Desktop Entry]\nType=Application\nName=Files\nExec=/usr/bin/true %U\nMimeType=inode/directory;\n",
+        );
+        write_file(
+            &probe_env.config_home.join("mimeapps.list"),
+            "[Default Applications]\ninode/directory=missing.desktop;org.gnome.nautilus.desktop;\n",
+        );
+        if query_xdg(&probe_env).as_deref() == Some("org.gnome.nautilus.desktop") {
+            assert_eq!(
+                query_xdg(&env).as_deref(),
+                Some("org.gnome.nautilus.desktop")
+            );
         }
     }
 

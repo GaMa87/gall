@@ -189,19 +189,35 @@ pub fn tandem_mirror_path(
     dst_root: &str,
     target: &str,
 ) -> Option<(String, Option<(String, String)>)> {
-    use std::path::Path;
+    use std::path::{Component, Path};
 
     let src = Path::new(src_root);
     let dst = Path::new(dst_root);
     let tgt = Path::new(target);
 
     if let Ok(rel) = tgt.strip_prefix(src) {
-        let mirrored = if rel.as_os_str().is_empty() {
-            dst.to_path_buf()
+        if rel.as_os_str().is_empty() {
+            return Some((dst_root.to_string(), None));
+        }
+        // Preserve `dst_root`'s own separator style so POSIX paths stay `/` on Windows and
+        // native Windows `C:\...` roots stay `\` without mixing separators.
+        let sep = if dst_root.contains('\\') && !dst_root.contains('/') {
+            '\\'
+        } else if dst_root.contains('/') {
+            '/'
         } else {
-            dst.join(rel)
+            std::path::MAIN_SEPARATOR
         };
-        return Some((mirrored.to_string_lossy().into_owned(), None));
+        let mut out = dst_root.to_string();
+        for comp in rel.components() {
+            if let Component::Normal(seg) = comp {
+                if !out.ends_with('/') && !out.ends_with('\\') {
+                    out.push(sep);
+                }
+                out.push_str(&seg.to_string_lossy());
+            }
+        }
+        return Some((out, None));
     }
 
     if let Ok(up_rel) = src.strip_prefix(tgt) {
@@ -1545,6 +1561,15 @@ mod tests {
         // Tandem relative walk down, across siblings, and back/forward.
         s.navigate(0, "/repo-a/src/ui");
         assert_eq!(s.active_tab(1).path, "/repo-b/src/ui");
+        // Verify separator style stays consistent for both POSIX roots and backslash roots.
+        assert_eq!(
+            tandem_mirror_path("/repo-a", "/repo-b", "/repo-a/src/ui"),
+            Some(("/repo-b/src/ui".to_string(), None))
+        );
+        assert_eq!(
+            tandem_mirror_path("/", "/mirror", "/src/ui"),
+            Some(("/mirror/src/ui".to_string(), None))
+        );
         s.navigate(0, "/repo-a/tests");
         assert_eq!(s.active_tab(1).path, "/repo-b/tests");
         assert!(s.back(0));
