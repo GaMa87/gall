@@ -6,7 +6,7 @@
 #
 # Bump: set pkgver (pkgrel=1), run `updpkgsums && makepkg --printsrcinfo > .SRCINFO`.
 pkgname=gall
-pkgver=0.3.0
+pkgver=0.3.1
 pkgrel=1
 pkgdesc="Keyboard-first file manager: Miller columns, dual pane, instant search, compare tool and Vim keys"
 arch=('x86_64' 'aarch64')
@@ -38,7 +38,7 @@ provides=("$pkgname")
 conflicts=("$pkgname-bin")
 options=('!lto')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('254169f2bf0f6cd649da86a9f96c86f1bf615fc80475c8fc65935f821c5b6f42')
+sha256sums=('19dffcf12558614b585a3340714213c643103d7ea9eb8c028f2e0c9be69ec988')
 
 prepare() {
   cd "$pkgname-$pkgver"

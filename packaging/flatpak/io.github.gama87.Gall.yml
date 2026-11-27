@@ -68,11 +68,11 @@ modules:
       - install -Dm644 THIRD-PARTY-NOTICES.md /app/share/licenses/io.github.gama87.Gall/THIRD-PARTY-NOTICES.md
 
     sources:
-      # The tagged release (commit of v0.3.0); point it at the release being submitted.
+      # The tagged release (commit of v0.3.1); point it at the release being submitted.
       - type: git
         url: https://github.com/GaMa87/gall.git
-        tag: v0.3.0
-        commit: ed147b2aed1209506d60b78afbe5b3a9b0483da6
+        tag: v0.3.1
+        commit: f216ba0c2ca523b8008728adcb4655417dad4560
       # Generated, not committed (see packaging/README.md, "Flathub"):
       - cargo-sources.json
       - node-sources.json

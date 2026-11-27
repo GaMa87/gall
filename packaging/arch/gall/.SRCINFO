@@ -1,6 +1,6 @@
 pkgbase = gall
 	pkgdesc = Keyboard-first file manager: Miller columns, dual pane, instant search, compare tool and Vim keys
-	pkgver = 0.3.0
+	pkgver = 0.3.1
 	pkgrel = 1
 	url = https://github.com/GaMa87/gall
 	arch = x86_64
@@ -36,7 +36,7 @@ pkgbase = gall
 	provides = gall
 	conflicts = gall-bin
 	options = !lto
-	source = gall-0.3.0.tar.gz::https://github.com/GaMa87/gall/archive/refs/tags/v0.3.0.tar.gz
-	sha256sums = 254169f2bf0f6cd649da86a9f96c86f1bf615fc80475c8fc65935f821c5b6f42
+	source = gall-0.3.1.tar.gz::https://github.com/GaMa87/gall/archive/refs/tags/v0.3.1.tar.gz
+	sha256sums = 19dffcf12558614b585a3340714213c643103d7ea9eb8c028f2e0c9be69ec988
 
 pkgname = gall
