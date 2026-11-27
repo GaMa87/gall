@@ -1,0 +1,15 @@
+.wt-dot { flex: none; display: inline-block; width: 9px; height: 9px; border-radius: 50%; }
+.wt-badges { flex: none; display: inline-flex; gap: 6px; font-size: 11px; font-variant-numeric: tabular-nums; color: var(--readable-fg-dim, var(--fg-dim)); }
+.wt-badges em { font-style: normal; }
+.wt-badges .ok { color: var(--readable-ok, var(--ok, #58a978)); }
+.wt-badges .dirty { color: var(--readable-warn, var(--warn, #d9a441)); }
+.wt-badges .bad { color: var(--readable-danger, var(--danger, #e16e6e)); font-weight: 700; }
+.wt-badges.dim { opacity: .6; }
+.wt-switcher, .wt-cleanup { max-height: min(560px, 84vh); }
+.wt-switcher .gp-label small, .wt-cleanup .gp-label small { color: var(--readable-fg-dim, var(--fg-dim)); font-size: 11px; }
+.wt-cleanup:focus { outline: none; }
+.wt-title { flex: none; display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; border-bottom: 1px solid var(--border-soft); }
+.wt-foot { flex: none; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 14px; border-top: 1px solid var(--border-soft); font-size: 12px; }
+.wt-error { flex: none; margin: 0; padding: 8px 14px; color: var(--readable-danger, var(--danger, #e16e6e)); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 120px; overflow: auto; }
+.fp-worktree { display: inline-flex; align-items: center; gap: 6px; min-width: 0; max-width: 16em; padding: 1px 8px; border: 1px solid var(--border); border-radius: 999px; color: var(--readable-fg-dim, var(--fg-dim)); font-size: 11px; cursor: default; }
+.fp-worktree span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

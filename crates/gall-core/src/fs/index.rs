@@ -7,6 +7,10 @@
 //! queries keep using the previous snapshot.
 
 use super::fuzzy::{Query, Scratch};
+use super::search_filter::{
+    walk_hidden_matches, walk_hidden_matches_multi, CountBudget, FilterConfig, FilterMatcher,
+    HiddenCount, ProbeMatch,
+};
 use serde::Serialize;
 use std::collections::BinaryHeap;
 use std::path::{Path, PathBuf};
@@ -20,6 +24,12 @@ pub struct IndexOptions {
     pub respect_gitignore: bool,
     /// Glob patterns (gitignore syntax) that are never indexed.
     pub exclude: Vec<String>,
+    /// Index everything: no `.gallignore`, no `.gitignore`, no `exclude`, no cache
+    /// folders skipped; entries that normal filters would skip are flagged `hidden`.
+    pub everything: bool,
+    /// Optional subtrees inside `roots` to walk first (e.g. current folder, home)
+    /// so `everything` scans index user folders before hitting `max_entries`.
+    pub priority_roots: Vec<PathBuf>,
     /// Hard cap on indexed entries, to bound memory.
     pub max_entries: usize,
 }
@@ -30,6 +40,8 @@ impl Default for IndexOptions {
             include_hidden: false,
             respect_gitignore: true,
             exclude: default_excludes(),
+            everything: false,
+            priority_roots: vec![],
             max_entries: 3_000_000,
         }
     }
@@ -251,6 +263,8 @@ struct Entry {
     /// Byte offset of the file name inside the path.
     name: u16,
     is_dir: bool,
+    /// Normally hidden by search filters (set only in `everything` scans).
+    hidden: bool,
 }
 
 #[derive(Default)]
@@ -260,12 +274,17 @@ struct Snapshot {
     roots: Vec<PathBuf>,
     built_at: Option<SystemTime>,
     build_ms: u64,
+    restricted_dirs: usize,
 }
 
 impl Snapshot {
     fn path(&self, e: &Entry) -> &str {
         &self.arena[e.start as usize..(e.start + e.len) as usize]
     }
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -277,6 +296,10 @@ pub struct IndexStatus {
     /// Unix epoch milliseconds of the last completed build.
     pub built_at: Option<i64>,
     pub build_ms: u64,
+    /// macOS: TCC-protected folders (such as `~/Library` subfolders) skipped due to
+    /// missing Full Disk Access during the last index build.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub restricted_dirs: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -288,6 +311,9 @@ pub struct IndexHit {
     pub score: i32,
     /// Highlighted positions as UTF-16 offsets into `path` (for JavaScript).
     pub positions: Vec<u32>,
+    /// True when normal search filters would have hidden this item (shown under `Alt+I`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -306,6 +332,8 @@ pub struct IndexResult {
 pub struct FileIndex {
     snap: RwLock<Arc<Snapshot>>,
     building: AtomicBool,
+    /// A build was requested and has not started yet (see [`FileIndex::request_rebuild`]).
+    requested: AtomicBool,
     pending_roots: Mutex<Vec<PathBuf>>,
     /// Paths under these prefixes rank higher (e.g. the home folder).
     preferred: RwLock<Vec<String>>,
@@ -325,6 +353,7 @@ impl FileIndex {
         FileIndex {
             snap: RwLock::new(Arc::new(Snapshot::default())),
             building: AtomicBool::new(false),
+            requested: AtomicBool::new(false),
             pending_roots: Mutex::new(vec![]),
             preferred: RwLock::new(vec![]),
         }
@@ -353,14 +382,37 @@ impl FileIndex {
                 .iter()
                 .map(|r| r.to_string_lossy().into_owned())
                 .collect(),
-            building: self.building.load(Ordering::Relaxed),
+            // A requested build counts as running from the request on: a caller that polls
+            // `building` right after asking for a refresh must not see the gap before the
+            // build thread starts, or the one between a cancelled build and its rerun.
+            building: self.building.load(Ordering::Acquire)
+                || self.requested.load(Ordering::Acquire),
             built_at: s.built_at.and_then(|t| super::entry::to_millis(Ok(t))),
             build_ms: s.build_ms,
+            restricted_dirs: s.restricted_dirs,
         }
     }
 
+    /// A build is running right now.
     pub fn is_building(&self) -> bool {
-        self.building.load(Ordering::Relaxed)
+        self.building.load(Ordering::Acquire)
+    }
+
+    /// Records that a build must start (or restart) with what exists now. Call it before
+    /// looking at [`FileIndex::is_building`] and before spawning the build thread:
+    /// `status().building` is true from here until a build that began afterwards ends.
+    pub fn request_rebuild(&self) {
+        self.requested.store(true, Ordering::SeqCst);
+    }
+
+    /// Withdraws a request whose build thread could not be started.
+    pub fn withdraw_request(&self) {
+        self.requested.store(false, Ordering::SeqCst);
+    }
+
+    /// A request arrived that no build has taken over yet: a running build began before it.
+    pub fn rebuild_requested(&self) -> bool {
+        self.requested.load(Ordering::SeqCst)
     }
 
     /// Age of the current snapshot, or `None` if never built.
@@ -391,7 +443,17 @@ impl FileIndex {
         if self.building.swap(true, Ordering::AcqRel) {
             return false;
         }
-        let roots = normalize_roots(roots);
+        // The build takes over every request made so far: it walks the disk after this point.
+        // `building` is already true, so `status()` never shows a gap.
+        self.requested.store(false, Ordering::SeqCst);
+        // A root the user chose on a network share (NFS, SMB, sshfs) is indexed like any other root; only
+        // GVFS paths (FUSE views that stat every entry over the network) are never walked.
+        let filtered_roots: Vec<PathBuf> = roots
+            .iter()
+            .filter(|r| !super::gvfs::is_gvfs_path(r))
+            .cloned()
+            .collect();
+        let roots = normalize_roots(&filtered_roots);
         *self.pending_roots.lock().unwrap() = roots.clone();
         let t0 = Instant::now();
         let mut snap = build(&roots, opts, cancel);
@@ -434,6 +496,7 @@ impl FileIndex {
             roots: old.roots.clone(),
             built_at: old.built_at,
             build_ms: old.build_ms,
+            restricted_dirs: old.restricted_dirs,
         };
         for e in &old.entries {
             let s = old.path(e);
@@ -514,6 +577,7 @@ impl FileIndex {
             };
         }
 
+        let scope_chars = scope.as_ref().map_or(0, |s| s.chars().count());
         let threads = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)
@@ -537,12 +601,25 @@ impl FileIndex {
                                 continue;
                             }
                             let p = snap.path(e);
-                            if let Some(s) = scope {
-                                if !p.starts_with(s) {
+                            let (target, name_start, pos_shift) = if let Some(s) = scope {
+                                let Some(rel) = p.strip_prefix(s) else {
                                     continue;
+                                };
+                                (rel, (e.name as usize).saturating_sub(s.len()), scope_chars)
+                            } else {
+                                (p, e.name as usize, 0)
+                            };
+                            let matched = if e.hidden {
+                                q.score_name_focused(target, name_start, &mut scratch)
+                            } else {
+                                q.score(target, name_start, &mut scratch)
+                            };
+                            if let Some(mut m) = matched {
+                                if pos_shift > 0 {
+                                    for pos in &mut m.positions {
+                                        *pos += pos_shift;
+                                    }
                                 }
-                            }
-                            if let Some(m) = q.score(p, e.name as usize, &mut scratch) {
                                 total += 1;
                                 let boost = if preferred.iter().any(|d| p.starts_with(d.as_str())) {
                                     BONUS_PREFERRED
@@ -587,6 +664,7 @@ impl FileIndex {
                     is_dir: e.is_dir,
                     score: r.score,
                     positions: utf16_positions(path, &r.positions),
+                    hidden: e.hidden,
                 }
             })
             .collect();
@@ -606,6 +684,9 @@ impl FileIndex {
 /// network mount below a root, which the index never walks into: Quick Open scans those
 /// itself. A WSL folder listed as an indexed folder is covered like any other root.
 pub fn index_covers(roots: &[PathBuf], path: &Path) -> bool {
+    if super::gvfs::is_slow_or_gvfs_mount(path) {
+        return false;
+    }
     let remote = remote_mounts();
     roots.iter().any(|r| {
         path.starts_with(r)
@@ -668,7 +749,11 @@ fn utf16_positions(path: &str, char_pos: &[usize]) -> Vec<u32> {
 }
 
 fn normalize_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
-    let mut r: Vec<PathBuf> = roots.iter().filter(|p| p.is_dir()).cloned().collect();
+    let mut r: Vec<PathBuf> = roots
+        .iter()
+        .filter(|p| !super::gvfs::is_gvfs_path(p) && p.is_dir())
+        .cloned()
+        .collect();
     r.sort();
     r.dedup();
     let all = r.clone();
@@ -676,28 +761,171 @@ fn normalize_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
     r
 }
 
+/// Counts entries hidden by `filter` under `root` that match Quick Open's fuzzy
+/// `query`, within `budget`. Returns zero when `query` is empty or cancelled.
+pub fn count_hidden(
+    root: &Path,
+    query: &str,
+    filter: &FilterConfig,
+    budget: CountBudget,
+    cancel: &AtomicBool,
+) -> HiddenCount {
+    if super::gvfs::is_gvfs_path(root) {
+        return HiddenCount::default();
+    }
+    let q = Query::parse(query);
+    if q.is_empty() {
+        return HiddenCount::default();
+    }
+    let mut prefix = root.to_string_lossy().into_owned();
+    if !prefix.ends_with('/') && !prefix.ends_with('\\') {
+        prefix.push(std::path::MAIN_SEPARATOR);
+    }
+    let mut scratch = Scratch::default();
+    walk_hidden_matches(root, filter, None, budget, cancel, |path, _name, is_dir| {
+        if q.dirs_only() && !is_dir {
+            return ProbeMatch::NoMatch;
+        }
+        let s = path.to_string_lossy();
+        let rel = s.strip_prefix(prefix.as_str()).unwrap_or(&s);
+        let name_start = rel.rfind(['/', '\\']).map(|i| i + 1).unwrap_or(0);
+        if q.score_name_focused(rel, name_start, &mut scratch)
+            .is_some()
+        {
+            ProbeMatch::Matched
+        } else {
+            ProbeMatch::NoMatch
+        }
+    })
+}
+
+/// Counts entries hidden by `filter` across multiple `roots` (for Quick Open
+/// "everywhere"), probing `priority` folders first without double-counting.
+pub fn count_hidden_roots(
+    roots: &[PathBuf],
+    priority: &[PathBuf],
+    query: &str,
+    filter: &FilterConfig,
+    budget: CountBudget,
+    cancel: &AtomicBool,
+) -> HiddenCount {
+    let filtered_roots: Vec<PathBuf> = roots
+        .iter()
+        .filter(|r| !super::gvfs::is_gvfs_path(r))
+        .cloned()
+        .collect();
+    if filtered_roots.is_empty() {
+        return HiddenCount::default();
+    }
+    let filtered_priority: Vec<PathBuf> = priority
+        .iter()
+        .filter(|r| !super::gvfs::is_gvfs_path(r))
+        .cloned()
+        .collect();
+    let q = Query::parse(query);
+    if q.is_empty() {
+        return HiddenCount::default();
+    }
+    let mut scratch = Scratch::default();
+    walk_hidden_matches_multi(
+        &filtered_roots,
+        &filtered_priority,
+        filter,
+        budget,
+        cancel,
+        |path, _name, is_dir| {
+            if q.dirs_only() && !is_dir {
+                return ProbeMatch::NoMatch;
+            }
+            let s = path.to_string_lossy();
+            let name_start = s.rfind(['/', '\\']).map(|i| i + 1).unwrap_or(0);
+            if q.score_name_focused(&s, name_start, &mut scratch).is_some() {
+                ProbeMatch::Matched
+            } else {
+                ProbeMatch::NoMatch
+            }
+        },
+    )
+}
+
 fn build(roots: &[PathBuf], opts: &IndexOptions, cancel: &AtomicBool) -> Snapshot {
     let mut snap = Snapshot {
         roots: roots.to_vec(),
         ..Default::default()
     };
-    for root in roots {
-        let collected: Mutex<Vec<(String, bool)>> = Mutex::new(Vec::new());
+    // Build ordered (walk_dir, filter_root) pairs: priority folders inside `roots`
+    // first so `everything` scans over `/` index user folders before `max_entries`.
+    let mut plan: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for p in &opts.priority_roots {
+        if super::gvfs::is_gvfs_path(p) || !p.is_dir() {
+            continue;
+        }
+        let Some(containing) = roots.iter().find(|r| p.starts_with(r)) else {
+            continue;
+        };
+        if plan.iter().any(|(d, _)| p.starts_with(d)) {
+            continue;
+        }
+        plan.push((p.clone(), containing.clone()));
+    }
+    for r in roots {
+        if super::gvfs::is_gvfs_path(r) || !r.is_dir() || plan.iter().any(|(d, _)| r == d) {
+            continue;
+        }
+        plan.push((r.clone(), r.clone()));
+    }
+
+    let mut walked_prefixes: Vec<PathBuf> = Vec::new();
+    let restricted_dirs = std::sync::atomic::AtomicUsize::new(0);
+    #[cfg(target_os = "macos")]
+    let macos_home = dirs::home_dir();
+    for (root, filter_root) in plan {
+        let collected: Mutex<Vec<(String, bool, bool)>> = Mutex::new(Vec::new());
         let count = std::sync::atomic::AtomicUsize::new(snap.entries.len());
         let remote = remote_mounts();
-        let mut wb = ignore::WalkBuilder::new(root);
+        let gvfs_roots = super::gvfs::gvfs_mount_roots();
+        let skip_already: std::collections::HashSet<PathBuf> =
+            walked_prefixes.iter().cloned().collect();
+        let use_git = !opts.everything && opts.respect_gitignore;
+        let everything = opts.everything;
+        let filter_matcher = opts.everything.then(|| {
+            FilterMatcher::new(
+                &filter_root,
+                FilterConfig {
+                    include_hidden: opts.include_hidden,
+                    respect_gitignore: opts.respect_gitignore,
+                    exclude: opts.exclude.clone(),
+                    use_gallignore: true,
+                },
+            )
+        });
+        // If this priority folder is strictly inside its containing root, include the
+        // folder entry itself once so searching for its own name finds it too.
+        if root != filter_root {
+            let hidden = filter_matcher
+                .as_ref()
+                .is_some_and(|m| m.is_path_hidden(&root, true));
+            collected
+                .lock()
+                .unwrap()
+                .push((root.to_string_lossy().into_owned(), true, hidden));
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+        let mut wb = ignore::WalkBuilder::new(&root);
         wb.hidden(!opts.include_hidden)
-            .git_ignore(opts.respect_gitignore)
-            .git_global(opts.respect_gitignore)
-            .git_exclude(opts.respect_gitignore)
-            .ignore(opts.respect_gitignore)
-            .parents(opts.respect_gitignore)
+            .git_ignore(use_git)
+            .git_global(use_git)
+            .git_exclude(use_git)
+            .ignore(use_git)
+            .parents(use_git)
             .require_git(true)
             .follow_links(false)
             .filter_entry(move |e| {
                 !is_system_skip(e.path())
                     && (e.depth() == 0 || !remote.contains(e.path()))
-                    && !super::ignorefile::skip_cache(e)
+                    && (e.depth() == 0 || !gvfs_roots.iter().any(|g| e.path() == g.as_path()))
+                    && (e.depth() == 0 || !skip_already.contains(e.path()))
+                    && (everything || !super::ignorefile::skip_cache(e))
             })
             .threads(
                 std::thread::available_parallelism()
@@ -705,9 +933,9 @@ fn build(roots: &[PathBuf], opts: &IndexOptions, cancel: &AtomicBool) -> Snapsho
                     .unwrap_or(4)
                     .min(8),
             );
-        super::ignorefile::configure(&mut wb, true);
-        if !opts.exclude.is_empty() {
-            let mut ob = ignore::overrides::OverrideBuilder::new(root);
+        super::ignorefile::configure(&mut wb, !opts.everything);
+        if !opts.everything && !opts.exclude.is_empty() {
+            let mut ob = ignore::overrides::OverrideBuilder::new(&root);
             for g in &opts.exclude {
                 let _ = ob.add(&format!("!{g}"));
             }
@@ -718,6 +946,10 @@ fn build(roots: &[PathBuf], opts: &IndexOptions, cancel: &AtomicBool) -> Snapsho
         wb.build_parallel().run(|| {
             let collected = &collected;
             let count = &count;
+            let restricted_dirs = &restricted_dirs;
+            #[cfg(target_os = "macos")]
+            let macos_home = &macos_home;
+            let filter_matcher = &filter_matcher;
             let mut local = Flush {
                 items: Vec::with_capacity(4096),
                 into: collected,
@@ -729,16 +961,31 @@ fn build(roots: &[PathBuf], opts: &IndexOptions, cancel: &AtomicBool) -> Snapsho
                 {
                     return WalkState::Quit;
                 }
-                if let Ok(d) = res {
-                    if d.depth() > 0 {
-                        let is_dir = d.file_type().is_some_and(|t| t.is_dir());
-                        local
-                            .items
-                            .push((d.path().to_string_lossy().into_owned(), is_dir));
-                        if local.items.len() >= 4096 {
-                            count.fetch_add(local.items.len(), Ordering::Relaxed);
-                            local.flush();
+                match res {
+                    Ok(d) => {
+                        if d.depth() > 0 {
+                            let is_dir = d.file_type().is_some_and(|t| t.is_dir());
+                            let hidden = filter_matcher
+                                .as_ref()
+                                .is_some_and(|m| m.is_path_hidden(d.path(), is_dir));
+                            local.items.push((
+                                d.path().to_string_lossy().into_owned(),
+                                is_dir,
+                                hidden,
+                            ));
+                            if local.items.len() >= 4096 {
+                                count.fetch_add(local.items.len(), Ordering::Relaxed);
+                                local.flush();
+                            }
                         }
+                    }
+                    Err(err) => {
+                        #[cfg(target_os = "macos")]
+                        if is_permission_denied_tcc(&err, macos_home.as_deref()) {
+                            restricted_dirs.fetch_add(1, Ordering::Relaxed);
+                        }
+                        #[cfg(not(target_os = "macos"))]
+                        let _ = (&err, restricted_dirs);
                     }
                 }
                 WalkState::Continue
@@ -748,18 +995,57 @@ fn build(roots: &[PathBuf], opts: &IndexOptions, cancel: &AtomicBool) -> Snapsho
         // which happens before `run` returns.
         let items = collected.into_inner().unwrap();
         push_items(&mut snap, items, opts.max_entries);
-        if cancel.load(Ordering::Relaxed) {
+        walked_prefixes.push(root);
+        if cancel.load(Ordering::Relaxed) || snap.entries.len() >= opts.max_entries {
             break;
         }
     }
+    snap.restricted_dirs = restricted_dirs.load(Ordering::Relaxed);
     snap.built_at = Some(SystemTime::now());
     snap
 }
 
+/// True when `path` lies inside a macOS TCC / Full Disk Access protected folder under
+/// `home` (such as `~/Library` or `~/.Trash`).
+pub fn is_tcc_protected_path(path: &Path, home: Option<&Path>) -> bool {
+    let Some(home) = home else { return false };
+    let Ok(rel) = path.strip_prefix(home) else {
+        return false;
+    };
+    let Some(first) = rel.components().next() else {
+        return false;
+    };
+    matches!(
+        first.as_os_str().to_str(),
+        Some("Library" | ".Trash" | "Desktop" | "Documents" | "Downloads")
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn is_permission_denied_tcc(err: &ignore::Error, home: Option<&Path>) -> bool {
+    let Some(io_err) = err.io_error() else {
+        return false;
+    };
+    if io_err.kind() != std::io::ErrorKind::PermissionDenied {
+        return false;
+    }
+    fn extract_path(err: &ignore::Error) -> Option<&Path> {
+        match err {
+            ignore::Error::WithPath { path, .. } => Some(path.as_path()),
+            ignore::Error::WithDepth { err, .. } => extract_path(err),
+            ignore::Error::WithLineNumber { err, .. } => extract_path(err),
+            ignore::Error::Loop { child, .. } => Some(child.as_path()),
+            ignore::Error::Partial(list) => list.iter().find_map(extract_path),
+            _ => None,
+        }
+    }
+    extract_path(err).is_some_and(|p| is_tcc_protected_path(p, home))
+}
+
 /// Per-thread buffer that moves its items into the shared list on drop.
 struct Flush<'a> {
-    items: Vec<(String, bool)>,
-    into: &'a Mutex<Vec<(String, bool)>>,
+    items: Vec<(String, bool, bool)>,
+    into: &'a Mutex<Vec<(String, bool, bool)>>,
 }
 
 impl Flush<'_> {
@@ -776,8 +1062,8 @@ impl Drop for Flush<'_> {
     }
 }
 
-fn push_items(snap: &mut Snapshot, items: Vec<(String, bool)>, max: usize) {
-    for (p, is_dir) in items {
+fn push_items(snap: &mut Snapshot, items: Vec<(String, bool, bool)>, max: usize) {
+    for (p, is_dir, hidden) in items {
         if snap.entries.len() >= max {
             break;
         }
@@ -792,6 +1078,7 @@ fn push_items(snap: &mut Snapshot, items: Vec<(String, bool)>, max: usize) {
             len: p.len() as u32,
             name: name.min(u16::MAX as usize) as u16,
             is_dir,
+            hidden,
         });
     }
 }
@@ -835,6 +1122,34 @@ mod tests {
             std::fs::write(f, "").unwrap();
         }
         d
+    }
+
+    #[test]
+    fn requested_build_counts_as_building_until_a_later_build_ends() {
+        let d = tree();
+        let idx = FileIndex::new();
+        let opts = IndexOptions::default();
+        let roots = [d.path().to_path_buf()];
+        assert!(!idx.status().building);
+        // Right after the request, before any thread runs: a poller must not see "done".
+        idx.request_rebuild();
+        assert!(idx.status().building && !idx.is_building());
+        assert!(idx.rebuild(&roots, &opts, &AtomicBool::new(false)));
+        assert!(!idx.status().building, "the build took over the request");
+        assert!(!idx.rebuild_requested());
+        // A request that arrives while a build runs outlives it: that build began earlier.
+        idx.request_rebuild();
+        std::fs::write(d.path().join("late.txt"), "x").unwrap();
+        assert!(idx.status().building);
+        assert!(idx.rebuild(&roots, &opts, &AtomicBool::new(false)));
+        assert!(idx
+            .query("late.txt", None, 5)
+            .hits
+            .iter()
+            .any(|h| h.name == "late.txt"));
+        idx.request_rebuild();
+        idx.withdraw_request();
+        assert!(!idx.status().building);
     }
 
     #[test]
@@ -988,5 +1303,327 @@ mod tests {
     #[test]
     fn utf16_offsets() {
         assert_eq!(utf16_positions("a😀b", &[0, 2]), vec![0, 3]);
+    }
+
+    #[test]
+    fn hidden_count_and_everything_index_marking() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path();
+        for dir in [".git", "src", "gen", "dist", "node_modules/pkg"] {
+            std::fs::create_dir_all(p.join(dir)).unwrap();
+        }
+        std::fs::write(p.join("src/widget.rs"), "").unwrap();
+        std::fs::write(p.join("gen/widget_gen.rs"), "").unwrap();
+        std::fs::write(p.join("dist/only_secret.js"), "").unwrap();
+        std::fs::write(p.join("node_modules/pkg/only_secret_dep.js"), "").unwrap();
+        std::fs::write(p.join(".gitignore"), "dist/\n").unwrap();
+        std::fs::write(p.join(".gallignore"), "/gen/\n").unwrap();
+
+        let filter = FilterConfig {
+            include_hidden: false,
+            respect_gitignore: true,
+            exclude: vec!["node_modules".into()],
+            use_gallignore: true,
+        };
+        let cancel = AtomicBool::new(false);
+
+        // Normal index excludes hidden files.
+        let normal = FileIndex::new();
+        normal.rebuild(
+            &[p.to_path_buf()],
+            &IndexOptions {
+                exclude: vec!["node_modules".into()],
+                ..Default::default()
+            },
+            &cancel,
+        );
+        assert_eq!(normal.query("only_secret", None, 20).total, 0);
+        assert_eq!(normal.query("widget", None, 20).total, 1);
+
+        // Zero visible + 2 hidden.
+        let hc = count_hidden(
+            p,
+            "only_secret",
+            &filter,
+            CountBudget::name_default(),
+            &cancel,
+        );
+        assert_eq!(
+            hc,
+            HiddenCount {
+                count: 2,
+                capped: false
+            }
+        );
+
+        // Some visible (1) + 1 hidden.
+        let hc = count_hidden(p, "widget", &filter, CountBudget::name_default(), &cancel);
+        assert_eq!(
+            hc,
+            HiddenCount {
+                count: 1,
+                capped: false
+            }
+        );
+
+        // Nothing hidden matches.
+        let hc = count_hidden(
+            p,
+            "definitely_missing_xyz",
+            &filter,
+            CountBudget::name_default(),
+            &cancel,
+        );
+        assert_eq!(
+            hc,
+            HiddenCount {
+                count: 0,
+                capped: false
+            }
+        );
+
+        // Everything index includes all and flags only normally-hidden entries.
+        let everything = FileIndex::new();
+        everything.rebuild(
+            &[p.to_path_buf()],
+            &IndexOptions {
+                exclude: vec!["node_modules".into()],
+                everything: true,
+                ..Default::default()
+            },
+            &cancel,
+        );
+        let res = everything.query("widget", None, 20);
+        let mut tagged: Vec<(String, bool)> =
+            res.hits.into_iter().map(|h| (h.name, h.hidden)).collect();
+        tagged.sort();
+        assert_eq!(
+            tagged,
+            vec![
+                ("widget.rs".to_string(), false),
+                ("widget_gen.rs".to_string(), true),
+            ]
+        );
+
+        // Multi-root / everywhere with a priority folder inside the root: no duplicates,
+        // and priority folder inside an ignored dir still counts its files as hidden.
+        let hc_multi = count_hidden_roots(
+            &[p.to_path_buf()],
+            &[p.join("gen")],
+            "widget",
+            &filter,
+            CountBudget::name_default(),
+            &cancel,
+        );
+        assert_eq!(
+            hc_multi,
+            HiddenCount {
+                count: 1,
+                capped: false
+            }
+        );
+
+        let everything_prio = FileIndex::new();
+        everything_prio.rebuild(
+            &[p.to_path_buf()],
+            &IndexOptions {
+                exclude: vec!["node_modules".into()],
+                everything: true,
+                priority_roots: vec![p.join("gen")],
+                ..Default::default()
+            },
+            &cancel,
+        );
+        let mut prio_tagged: Vec<(String, bool)> = everything_prio
+            .query("widget", None, 20)
+            .hits
+            .into_iter()
+            .map(|h| (h.name, h.hidden))
+            .collect();
+        prio_tagged.sort();
+        assert_eq!(
+            prio_tagged,
+            vec![
+                ("widget.rs".to_string(), false),
+                ("widget_gen.rs".to_string(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn hidden_count_ignores_ancestor_path_and_scattered_target_noise() {
+        let d = tempfile::tempdir().unwrap();
+        let proj = d.path().join("search-hidden-proj");
+        std::fs::create_dir_all(proj.join("target/debug/deps")).unwrap();
+        std::fs::create_dir_all(proj.join("gen")).unwrap();
+        std::fs::write(proj.join(".gallignore"), "/gen/\n").unwrap();
+        for i in 0..150 {
+            std::fs::write(
+                proj.join(format!("target/debug/deps/crate_{i:03}_out.rlib")),
+                "",
+            )
+            .unwrap();
+        }
+        for name in ["hidden_a.txt", "hidden_b.txt", "hidden_c.txt"] {
+            std::fs::write(proj.join("gen").join(name), "").unwrap();
+        }
+
+        let filter = FilterConfig {
+            include_hidden: false,
+            respect_gitignore: false,
+            exclude: vec!["target".into()],
+            use_gallignore: true,
+        };
+        let cancel = AtomicBool::new(false);
+
+        // Ancestor folder name ("search-hidden-proj") must NOT inflate the count to 100+.
+        let hc = count_hidden(
+            &proj,
+            "hidden",
+            &filter,
+            CountBudget::name_default(),
+            &cancel,
+        );
+        assert_eq!(
+            hc,
+            HiddenCount {
+                count: 3,
+                capped: false
+            }
+        );
+
+        // Scattered path letters ("report" across "target/debug/deps/crate_..._out") must
+        // NOT inflate the count to 100+.
+        let hc = count_hidden(
+            &proj,
+            "report",
+            &filter,
+            CountBudget::name_default(),
+            &cancel,
+        );
+        assert_eq!(
+            hc,
+            HiddenCount {
+                count: 0,
+                capped: false
+            }
+        );
+
+        // Explicit path query with `/` still matches hidden folder paths.
+        let hc = count_hidden(
+            &proj,
+            "gen/hidden",
+            &filter,
+            CountBudget::name_default(),
+            &cancel,
+        );
+        assert_eq!(
+            hc,
+            HiddenCount {
+                count: 3,
+                capped: false
+            }
+        );
+
+        // Alt+I (everything) agrees 1-to-1 with the hidden count (3 matches, not 153).
+        let everything = FileIndex::new();
+        everything.rebuild(
+            std::slice::from_ref(&proj),
+            &IndexOptions {
+                exclude: vec!["target".into()],
+                everything: true,
+                ..Default::default()
+            },
+            &cancel,
+        );
+        let res = everything.query("hidden", Some(&proj), 200);
+        assert_eq!(res.total, 3);
+        assert!(res.hits.iter().all(|h| h.hidden));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gvfs_paths_are_not_covered_or_rebuilt() {
+        let gvfs = Path::new("/run/user/1000/gvfs/mtp:host=Pixel");
+        assert!(!index_covers(&[PathBuf::from("/")], gvfs));
+        assert!(!index_covers(&[gvfs.to_path_buf()], gvfs));
+
+        let idx = FileIndex::new();
+        let cancel = AtomicBool::new(false);
+        assert!(idx.rebuild(&[gvfs.to_path_buf()], &IndexOptions::default(), &cancel));
+        assert_eq!(idx.status().entries, 0);
+        assert!(idx.status().built_at.is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn priority_roots_inside_gvfs_mount_are_not_walked() {
+        struct XdgRuntimeGuard(Option<std::ffi::OsString>);
+        impl Drop for XdgRuntimeGuard {
+            fn drop(&mut self) {
+                if let Some(prev) = self.0.take() {
+                    std::env::set_var("XDG_RUNTIME_DIR", prev);
+                } else {
+                    std::env::remove_var("XDG_RUNTIME_DIR");
+                }
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let gvfs_sub = tmp
+            .path()
+            .join("gvfs")
+            .join("smb-share:server=nas,share=media");
+        std::fs::create_dir_all(&gvfs_sub).unwrap();
+        std::fs::write(gvfs_sub.join("gvfs_secret_file.txt"), b"remote").unwrap();
+        std::fs::write(tmp.path().join("local_visible_file.txt"), b"local").unwrap();
+
+        let _guard = XdgRuntimeGuard(std::env::var_os("XDG_RUNTIME_DIR"));
+        std::env::set_var("XDG_RUNTIME_DIR", tmp.path());
+
+        assert!(super::super::gvfs::is_slow_or_gvfs_mount(&gvfs_sub));
+        assert!(!index_covers(
+            std::slice::from_ref(&tmp.path().to_path_buf()),
+            &gvfs_sub
+        ));
+
+        let idx = FileIndex::new();
+        let cancel = AtomicBool::new(false);
+        assert!(idx.rebuild(
+            &[tmp.path().to_path_buf()],
+            &IndexOptions {
+                priority_roots: vec![gvfs_sub],
+                ..Default::default()
+            },
+            &cancel,
+        ));
+        assert_eq!(idx.query("gvfs_secret_file", None, 10).total, 0);
+        assert_eq!(idx.query("local_visible_file", None, 10).total, 1);
+    }
+
+    #[test]
+    fn tcc_protected_path_classification() {
+        let home = Path::new("/Users/alice");
+        assert!(is_tcc_protected_path(
+            Path::new("/Users/alice/Library/Mail"),
+            Some(home)
+        ));
+        assert!(is_tcc_protected_path(
+            Path::new("/Users/alice/.Trash"),
+            Some(home)
+        ));
+        assert!(is_tcc_protected_path(
+            Path::new("/Users/alice/Documents/secret"),
+            Some(home)
+        ));
+        assert!(!is_tcc_protected_path(
+            Path::new("/Users/alice/Projects/app"),
+            Some(home)
+        ));
+        assert!(!is_tcc_protected_path(Path::new("/tmp/foo"), Some(home)));
+        assert!(!is_tcc_protected_path(
+            Path::new("/Users/alice/Library"),
+            None
+        ));
     }
 }

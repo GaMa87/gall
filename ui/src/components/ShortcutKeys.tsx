@@ -1,4 +1,5 @@
 import { Fragment } from "react";
+import { platformLabel } from "../core/keymap";
 
 export type KeySequence = readonly string[];
 
@@ -6,6 +7,11 @@ const KEY_NAMES: Record<string, string> = {
   ArrowUp: "↑", ArrowDown: "↓", ArrowLeft: "←", ArrowRight: "→",
   PageUp: "PgUp", PageDown: "PgDn", Escape: "Esc",
 };
+
+/** The text of one key cap: arrows as arrows, Ctrl and Alt as Cmd and Option on macOS. */
+export function keyCap(key: string, mac?: boolean): string {
+  return platformLabel(KEY_NAMES[key] ?? key, mac);
+}
 
 function chordKeys(chord: string): string[] {
   const keys: string[] = [];
@@ -27,7 +33,8 @@ export function vimSteps(tokens: readonly string[], leader = "Ctrl"): string[] {
 export function ShortcutKeys({ alternatives }: { alternatives: readonly KeySequence[] }) {
   const description = alternatives.map((steps) => steps.map((step) => {
     const keys = chordKeys(step);
-    return keys.length > 1 ? `${keys.join(" and ")} together` : keys[0];
+    const names = keys.map((k) => keyCap(k));
+    return keys.length > 1 ? `${names.join(" and ")} together` : names[0];
   }).join(", then ")).join(", or ");
   return (
     <span className="key-bindings" role="img" aria-label={description} title={description}>
@@ -42,7 +49,7 @@ export function ShortcutKeys({ alternatives }: { alternatives: readonly KeySeque
                   {chordKeys(step).map((key, part) => (
                     <Fragment key={part}>
                       {part > 0 && <span className="key-plus">+</span>}
-                      <kbd>{KEY_NAMES[key] ?? key}</kbd>
+                      <kbd>{keyCap(key)}</kbd>
                     </Fragment>
                   ))}
                 </span>

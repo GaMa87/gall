@@ -49,6 +49,15 @@ impl CoreError {
     }
 }
 
+impl From<gall_compare::Error> for CoreError {
+    fn from(e: gall_compare::Error) -> Self {
+        match e {
+            gall_compare::Error::Cancelled => CoreError::Cancelled,
+            gall_compare::Error::Other(reason) => CoreError::Other(reason),
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, CoreError>;
 
 /// Extension trait to attach an operation name and path to `io::Result`.

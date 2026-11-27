@@ -8,10 +8,16 @@ linux	Quick Open: no match	0.247
 linux	Quick Open: one letter	0.570
 linux	Quick Open: two words	0.590
 linux	build the file index (115 000 entries)	11.247
+linux	compare a tree of 60 000 files with a profile folder, many folders (hidden files not shown)	10.911
 linux	compare two folders of 5 000 files (content)	3.482
+linux	compare two folders of 5 000 files (content, read again)	1.729
+linux	compare two folders of 5 000 files (filtered)	0.296
 linux	compare two folders of 5 000 files (sizes and times)	0.757
+linux	compress a folder of 5 000 files to a tar.gz	1.362
+linux	compress a folder of 5 000 files to a zip	2.632
 linux	diff two files of 40 000 lines	2.684
 linux	diff two files of 40 000 lines by tokens (structural)	1.775
+linux	extract a zip of 5 000 files	2.304
 linux	find names: *.md in 60 000 files	2.272
 linux	find names: file01234*	1.367
 linux	highlight 40 000 lines	77.175
@@ -32,5 +38,82 @@ linux	search content: a rare word	11.168
 linux	search content: a regex	9.610
 linux	search content: no match	9.269
 linux	size of a folder of 60 000 files	2.727
+linux	sort 100 000 entries by date	1.224
+linux	sort 100 000 entries by date, grouped by type	1.110
 linux	tag 1 000 files	0.053
 linux	tags of a folder among 100 000 tags	0.030
+macos	Quick Open: file01234	0.063
+macos	Quick Open: no match	0.068
+macos	Quick Open: one letter	0.192
+macos	Quick Open: two words	0.183
+macos	build the file index (115 000 entries)	4.177
+macos	compare a tree of 60 000 files with a profile folder, many folders (hidden files not shown)	7.203
+macos	compare two folders of 5 000 files (content)	0.747
+macos	compare two folders of 5 000 files (content, read again)	2.995
+macos	compare two folders of 5 000 files (filtered)	0.274
+macos	compare two folders of 5 000 files (sizes and times)	0.342
+macos	compress a folder of 5 000 files to a tar.gz	1.405
+macos	compress a folder of 5 000 files to a zip	2.163
+macos	diff two files of 40 000 lines	0.746
+macos	diff two files of 40 000 lines by tokens (structural)	0.984
+macos	extract a zip of 5 000 files	7.228
+macos	find names: *.md in 60 000 files	0.957
+macos	find names: file01234*	0.721
+macos	highlight 40 000 lines	11.889
+macos	list AppData/Local (3 000 folders)	0.123
+macos	list a 7z archive of 5 000 files	0.059
+macos	list a folder of 46 500 entries, hidden shown	1.883
+macos	list a tar.gz archive of 20 000 files	0.637
+macos	list a zip archive of 50 000 entries	0.582
+macos	list one application folder	0.001
+macos	list the same, folders only (tree column)	0.652
+macos	list the same, hidden not shown	1.863
+macos	open an early file inside a tar.gz archive of 20 000 files	0.395
+macos	open one file inside a 7z archive of 5 000 files	0.085
+macos	open one file inside a zip archive of 50 000 entries	0.678
+macos	rename 100 tagged files among 100 000 tags	0.125
+macos	search content: a common word	0.972
+macos	search content: a rare word	18.262
+macos	search content: a regex	13.866
+macos	search content: no match	12.981
+macos	size of a folder of 60 000 files	2.894
+macos	sort 100 000 entries by date	0.237
+macos	sort 100 000 entries by date, grouped by type	0.271
+macos	tag 1 000 files	0.012
+macos	tags of a folder among 100 000 tags	0.006
+windows	Quick Open: file01234	0.310
+windows	Quick Open: no match	0.226
+windows	Quick Open: one letter	0.772
+windows	Quick Open: two words	0.920
+windows	build the file index (115 000 entries)	20.343
+windows	compare two folders of 5 000 files (content)	26.292
+windows	compare two folders of 5 000 files (sizes and times)	7.854
+windows	compress a folder of 5 000 files to a tar.gz	12.719
+windows	compress a folder of 5 000 files to a zip	15.525
+windows	diff two files of 40 000 lines	3.448
+windows	diff two files of 40 000 lines by tokens (structural)	4.004
+windows	extract a zip of 5 000 files	182.102
+windows	find names: *.md in 60 000 files	6.101
+windows	find names: file01234*	2.003
+windows	highlight 40 000 lines	38.395
+windows	list AppData/Local (3 000 folders)	0.274
+windows	list a 7z archive of 5 000 files	0.170
+windows	list a folder of 46 500 entries, hidden shown	2.436
+windows	list a tar.gz archive of 20 000 files	1.583
+windows	list a zip archive of 50 000 entries	2.860
+windows	list one application folder	0.004
+windows	list the same, folders only (tree column)	1.020
+windows	list the same, hidden not shown	3.112
+windows	open an early file inside a tar.gz archive of 20 000 files	2.521
+windows	open one file inside a 7z archive of 5 000 files	0.687
+windows	open one file inside a zip archive of 50 000 entries	7.780
+windows	rename 100 tagged files among 100 000 tags	0.789
+windows	search content: a common word	4.482
+windows	search content: a rare word	53.964
+windows	search content: a regex	49.240
+windows	search content: no match	45.403
+windows	size of a folder of 60 000 files	2.475
+windows	sort 100 000 entries by date	2.359
+windows	sort 100 000 entries by date, grouped by type	3.155
+windows	tag 1 000 files	0.087
+windows	tags of a folder among 100 000 tags	0.031

@@ -2,14 +2,16 @@
 // the right entry on each row. Filter by status, open file diffs, copy single
 // rows, or preview and run a sync (update / mirror, either way) that is one
 // undoable operation.
+import { activeFilterCount, formOf, parseFilters, type FilterForm } from "../core/dirFilters";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { tt } from "../i18n";
 import { api } from "../api/ipc";
 import type { DirCmpOptions, DirCmpResult, DirItem, DirMeta } from "../api/types";
 import { formatDate, formatSize } from "../core/format";
-import { joinRel } from "../core/path";
-import { describePlan, planSync, visibleRows, type Direction, type SyncMode, type SyncPlan } from "../core/syncPlan";
+import { describePlan, planSync, sidePath, syncBlocked, visibleRows, type Direction, type SyncMode, type SyncPlan } from "../core/syncPlan";
 import * as A from "../state/actions";
 import { refreshAll } from "../state/controllers";
+import { finishCompareWait, useCompareWaitClose } from "../state/launch";
 import { useStore } from "../state/store";
 import { FileIcon, Icon } from "./Icon";
 
@@ -19,47 +21,80 @@ const OPTS_KEY = "dircmp:opts";
 // Last result per pair, so coming back from a file diff is instant.
 const cache = new Map<string, { res: DirCmpResult; collapsed: Set<string>; filter: Filter }>();
 
+/** Saved options, tolerating a damaged or older entry: every field is checked, nothing odd reaches the core. */
 function loadOpts(): DirCmpOptions {
+  const base: DirCmpOptions = { content: false, hidden: false, respectGitignore: false };
   try {
-    return { content: false, hidden: false, respectGitignore: false, ...JSON.parse(localStorage.getItem(OPTS_KEY) ?? "{}") };
+    const saved = JSON.parse(localStorage.getItem(OPTS_KEY) ?? "{}") as Record<string, unknown>;
+    const flag = (v: unknown) => v === true;
+    const globs = (v: unknown) => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : []);
+    const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+    return { content: flag(saved.content), hidden: flag(saved.hidden), respectGitignore: flag(saved.respectGitignore), include: globs(saved.include), exclude: globs(saved.exclude), minSize: num(saved.minSize), maxSize: num(saved.maxSize), modifiedAfter: num(saved.modifiedAfter), modifiedBefore: num(saved.modifiedBefore) };
   } catch {
-    return { content: false, hidden: false, respectGitignore: false };
+    return base;
   }
 }
 
 const STATUS_GLYPH: Record<DirItem["status"], string> = { same: "=", different: "≠", leftOnly: "◧", rightOnly: "◨" };
 const STATUS_TEXT: Record<DirItem["status"], string> = { same: "identical", different: "differs", leftOnly: "only on the left", rightOnly: "only on the right" };
-const REASON: Record<string, string> = { content: "content differs", size: "size differs", date: "modified at a different time", type: "file on one side, folder on the other" };
+const REASON: Record<string, string> = { content: "content differs", size: "size differs", date: "modified at a different time", type: "file on one side, folder on the other", unreadable: "could not be read, so its bytes were not compared" };
 
-export function DirCompare({ left: l0, right: r0 }: { left: string; right: string }) {
+/** How long a shown sync plan stays valid (ten minutes). */
+const MAX_PLAN_AGE_MS = 10 * 60 * 1000;
+
+export function DirCompare({ left: l0, right: r0, wait }: { left: string; right: string; wait?: boolean }) {
   const fontSize = useStore((s) => s.settings?.fontSize ?? 13);
   const [sides, setSides] = useState<[string, string]>([l0, r0]);
   const key = `${sides[0]}\u0000${sides[1]}`;
   const cached = cache.get(key);
   const [opts, setOpts] = useState<DirCmpOptions>(loadOpts);
   const [res, setRes] = useState<DirCmpResult | null>(cached?.res ?? null);
-  const [loading, setLoading] = useState(!cached);
+  const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   const [filter, setFilter] = useState<Filter>(cached?.filter ?? "diff");
   const [query, setQuery] = useState("");
   const [collapsed, setCollapsed] = useState<Set<string>>(cached?.collapsed ?? new Set());
   const [sel, setSel] = useState<Set<string>>(new Set());
   const [cursor, setCursor] = useState(0);
+  // The filters are typed in a form and applied together (Enter or the button): a scan per keystroke would be wasteful.
+  const [showFilters, setShowFilters] = useState(false);
+  const [form, setForm] = useState<FilterForm>(() => formOf(loadOpts()));
+  const [formError, setFormError] = useState("");
+  // Bumped by the `f` key: the form is shown and its first field takes the focus once it is in the page.
+  const [focusFilters, setFocusFilters] = useState(0);
+  useEffect(() => { if (focusFilters) (rootRef.current?.querySelector(".dc-filters input") as HTMLInputElement | null)?.focus(); }, [focusFilters]);
+  const applyFilters = () => {
+    // Not while a sync runs: a new scan would end it half way.
+    if (busy) return;
+    const parsed = parseFilters(form);
+    if (!parsed.ok) { setFormError(tt(parsed.error)); return; }
+    setFormError("");
+    setOpts((o) => ({ ...o, ...parsed.fields }));
+  };
+  const clearFilters = () => { setForm(formOf({})); setFormError(""); setOpts((o) => ({ ...o, include: [], exclude: [], minSize: null, maxSize: null, modifiedAfter: null, modifiedBefore: null })); };
   const [plan, setPlan] = useState<SyncPlan | null>(null);
   const [busy, setBusy] = useState(false);
+  // Set before the first await: a second Enter in the same tick still sees the old `busy`.
+  const running = useRef(false);
   const [scrollTop, setScrollTop] = useState(0);
   const [viewH, setViewH] = useState(600);
   const listRef = useRef<HTMLDivElement>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const rowH = Math.round(fontSize * 1.9);
 
+  const request = useRef(0);
+  const activeScan = useRef<DirCmpResult | null>(null);
   const run = useCallback((keepView = false) => {
+    const id = ++request.current;
+    activeScan.current = null;
+    setPlan(null);
     setLoading(true);
     setErr(null);
     api.dircmpCompare(sides[0], sides[1], opts)
       .then((r) => {
+        if (request.current !== id) return;
+        activeScan.current = r;
         setRes(r);
-        setPlan(null);
         setSel(new Set());
         if (!keepView) {
           // Identical folders start collapsed; folders with differences open.
@@ -67,27 +102,27 @@ export function DirCompare({ left: l0, right: r0 }: { left: string; right: strin
           setCursor(0);
         }
       })
-      .catch((e) => setErr(String(e)))
-      .finally(() => setLoading(false));
+      .catch((e) => { if (request.current === id) setErr(String(e)); })
+      .finally(() => { if (request.current === id) setLoading(false); });
   }, [sides, opts]);
-  // First open: reuse the cached result if any. Later: swapped sides = fresh view,
-  // changed options = compare again and keep the view.
+  // Cached rows are for browsing while a fresh scan runs. Keep the view on option changes.
   const mounted = useRef(false);
   const prevSides = useRef(sides);
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!mounted.current) {
       mounted.current = true;
-      if (!cached) run();
+      run(!!cached);
       return;
     }
     const swapped = prevSides.current !== sides;
     prevSides.current = sides;
+    if (swapped) setRes(null);
     run(!swapped);
   }, [run]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => { localStorage.setItem(OPTS_KEY, JSON.stringify(opts)); }, [opts]);
-  useEffect(() => { if (res) cache.set(key, { res, collapsed, filter }); }, [res, collapsed, filter, key]);
+  useEffect(() => { if (res && res === activeScan.current) cache.set(key, { res, collapsed, filter }); }, [res, collapsed, filter, key]);
   useEffect(() => { rootRef.current?.focus(); }, []);
-  useEffect(() => () => { api.dircmpCancel().catch(() => {}); }, []);
+  useEffect(() => () => { ++request.current; activeScan.current = null; api.dircmpCancel().catch(() => {}); }, []);
 
   const items = res?.items ?? [];
   const rows = useMemo(() => {
@@ -134,37 +169,81 @@ export function DirCompare({ left: l0, right: r0 }: { left: string; right: strin
     });
 
   const openItem = (it: DirItem) => {
+    if (!res) return;
     if (it.isDir) return toggleDir(it.rel);
     if (!it.left || !it.right) return A.notify(`${it.name} exists only on the ${it.left ? "left" : "right"}`, "info");
-    A.openOverlay({ type: "diff", a: { kind: "file", path: joinRel(sides[0], it.rel) }, b: { kind: "file", path: joinRel(sides[1], it.rel) }, back: { type: "dircmp", left: sides[0], right: sides[1] } });
+    A.openOverlay({ type: "diff", a: { kind: "file", path: sidePath(res.left, it, "left") }, b: { kind: "file", path: sidePath(res.right, it, "right") }, wait,
+      back: { type: "dircmp", left: sides[0], right: sides[1], wait } });
   };
 
+  // A plan is a picture of the folders at one moment: one shown for a long time is dropped and the folders are read again.
+  const plannedAt = useRef(0);
   const execute = async (p: SyncPlan) => {
+    if (!res || res !== activeScan.current) return;
+    if (Date.now() - plannedAt.current > MAX_PLAN_AGE_MS) {
+      setPlan(null);
+      A.notify(tt("This plan is out of date. The folders are compared again; check the plan and apply it."), "warn");
+      run(true);
+      return;
+    }
+    const blocked = syncBlocked(p.mode, res);
+    if (blocked) return A.notify(tt(blocked), "warn");
     if (!p.ops.length) return A.notify("Nothing to sync", "info");
+    // A second run would cancel the first one midway (one cancel flag for the dialog).
+    if (running.current) return;
+    const scanRequest = request.current;
+    running.current = true;
     setBusy(true);
     try {
-      const r = await api.syncApply(p.ops);
-      A.notify(`Synced: ${r.copied} copied${r.replaced ? ` (${r.replaced} replaced, old versions in trash)` : ""}${r.trashed ? `, ${r.trashed} moved to trash` : ""}`, "success", { label: "Undo", run: () => A.undo() });
+      const r = await api.syncApply(p.ops, p.checks);
+      A.notify(`Synced: ${r.copied} copied${r.replaced ? ` (${r.replaced} replaced, old versions in trash)` : ""}${r.trashed ? `, ${r.trashed} moved to trash` : ""}`, "success", A.undoAction(r.undoId));
       A.refreshUndo();
       refreshAll();
       A.invalidateAllFolderSizes();
-      run(true);
+      if (request.current === scanRequest) run(true);
     } catch (e) {
       A.fail(e);
       A.invalidateAllFolderSizes(); // part of the plan may be applied
-      run(true);
+      if (request.current === scanRequest) run(true);
     } finally {
+      running.current = false;
       setBusy(false);
     }
   };
-  const preview = (dir: Direction, mode: SyncMode) => {
-    const p = planSync(items, sides[0], sides[1], dir, mode, mode === "selected" ? (sel.size ? sel : new Set([rows[cursor]?.rel].filter(Boolean) as string[])) : undefined);
-    if (!p.ops.length) return A.notify(mode === "update" ? "Nothing newer or missing on that side" : "Nothing to copy", "info");
+  /** The folders a plan copies or trashes as a whole get the fingerprint of everything below them (hidden files
+   *  included), so a file that appears there after the preview stops the write instead of being copied or trashed. */
+  const withTrees = async (p: SyncPlan): Promise<SyncPlan | null> => {
+    const folders = p.checks.filter((c) => c.dir);
+    const files = p.checks.filter((c) => !c.dir && c.stamp);
+    if (!folders.length && !files.length) return p;
+    try {
+      const [trees, exact] = await Promise.all([
+        folders.length ? api.syncTreeFingerprints(folders.map((c) => c.path)) : Promise.resolve([] as string[]),
+        files.length ? api.syncFileFingerprints(files.map((c) => c.path)) : Promise.resolve([] as (string | null)[]),
+      ]);
+      const treeOf = new Map(folders.map((c, i) => [c.path, trees[i]] as const));
+      const exactOf = new Map(files.map((c, i) => [c.path, exact[i]] as const));
+      return { ...p, checks: p.checks.map((c) => (c.dir ? { ...c, tree: treeOf.get(c.path) } : exactOf.get(c.path) ? { ...c, exact: exactOf.get(c.path) ?? undefined } : c)) };
+    } catch (e) { A.fail(e); return null; }
+  };
+  const preview = async (dir: Direction, mode: SyncMode, only?: Set<string>) => {
+    if (!res || res !== activeScan.current) return;
+    const blocked = syncBlocked(mode, res);
+    if (blocked) return A.notify(tt(blocked), "warn");
+    const planned = planSync(res, res.left, res.right, dir, mode, mode === "selected" ? (only ?? (sel.size ? sel : new Set([rows[cursor]?.rel].filter(Boolean) as string[]))) : undefined);
+    if (!planned.ops.length) return A.notify(mode === "update" ? "Nothing newer or missing on that side" : "Nothing to copy", "info");
+    const scan = res;
+    const p = await withTrees(planned);
+    // The scan may have been replaced while the folders were looked at.
+    if (!p || scan !== activeScan.current) return;
+    plannedAt.current = Date.now();
     // A single row copied by hand runs straight away (it is undoable); bigger syncs preview first.
     if (mode === "selected" && p.ops.length <= 1 && p.trashes === 0) return execute(p);
     setPlan(p);
   };
-  const syncMenu = (e: React.MouseEvent) => A.showMenu(e.clientX, e.clientY, [
+  const bulkBlocked = res && syncBlocked("update", res);
+  const selectedBlocked = !res || loading || !!err || busy || !!syncBlocked("selected", res);
+  const syncMenu = (e: React.MouseEvent) => A.showMenuFor(e, [
     { label: "Update right  (copy missing + newer →)", run: () => preview("toRight", "update") },
     { label: "Update left  (← copy missing + newer)", run: () => preview("toLeft", "update") },
     { separator: true },
@@ -172,7 +251,16 @@ export function DirCompare({ left: l0, right: r0 }: { left: string; right: strin
     { label: "Mirror to left  (left = right, extras to trash)", run: () => preview("toLeft", "mirror") },
   ]);
 
-  const close = () => (plan ? setPlan(null) : A.openOverlay(null));
+  const leave = () => {
+    if (wait) {
+      if (!running.current) void finishCompareWait(err ? "error" : res ? "accepted" : "cancelled", undefined, err ?? undefined);
+    } else A.openOverlay(null);
+  };
+  const close = () => (plan ? setPlan(null) : leave());
+  useCompareWaitClose(wait, leave);
+  useEffect(() => {
+    if (wait && err) void finishCompareWait("error", undefined, err);
+  }, [wait, err]);
   const onKey = (e: React.KeyboardEvent) => {
     e.stopPropagation();
     if ((e.target as HTMLElement).tagName === "INPUT") {
@@ -181,6 +269,10 @@ export function DirCompare({ left: l0, right: r0 }: { left: string; right: strin
     }
     const it = rows[cursor];
     const k = e.key;
+    if (running.current && ["s", "r", "c", "."].includes(k)) {
+      e.preventDefault();
+      return;
+    }
     if (k === "Escape" || k === "q") close();
     else if (k === "j" || k === "ArrowDown") moveCursor(cursor + 1);
     else if (k === "k" || k === "ArrowUp") moveCursor(cursor - 1);
@@ -200,7 +292,10 @@ export function DirCompare({ left: l0, right: r0 }: { left: string; right: strin
     else if (k === "s") setSides(([a, b]) => [b, a]);
     else if (k === "r") run(true);
     else if (k === "c") setOpts((o) => ({ ...o, content: !o.content }));
+    else if (k === "C" && opts.content) setOpts((o) => ({ ...o, fresh: !o.fresh }));
     else if (k === ".") setOpts((o) => ({ ...o, hidden: !o.hidden }));
+    else if (k === "f" && !busy) { setShowFilters(true); setFocusFilters((n) => n + 1); }
+    else if (k === "F" && !busy) clearFilters();
     else if (k === "/") { e.preventDefault(); (rootRef.current?.querySelector(".dc-search") as HTMLInputElement | null)?.focus(); return; }
     else if (k === "a") setFilter((f) => (f === "all" ? "diff" : "all"));
     else return;
@@ -217,7 +312,7 @@ export function DirCompare({ left: l0, right: r0 }: { left: string; right: strin
     return (
       <div className={`dc-side ${side}`} style={{ paddingLeft: side === "l" ? 8 + it.depth * 16 : 8 }}>
         {it.isDir ? (
-          <button className="dc-twisty" title="Expand or collapse folder" onClick={(e) => { e.stopPropagation(); toggleDir(it.rel); }}>
+          <button className="dc-twisty" title={tt("Expand or collapse folder")} onClick={(e) => { e.stopPropagation(); toggleDir(it.rel); }}>
             <Icon name={collapsed.has(it.rel) ? "chevronRight" : "chevronDown"} size={12} />
           </button>
         ) : <span className="dc-twisty" />}
@@ -234,14 +329,14 @@ export function DirCompare({ left: l0, right: r0 }: { left: string; right: strin
   const actionGlyph = (a?: string) => (a === "copyRight" ? "→" : a === "copyLeft" ? "←" : a === "trashLeft" || a === "trashRight" ? "🗑" : "");
 
   return (
-    <div className="backdrop glass center" onMouseDown={() => A.openOverlay(null)}>
+    <div className="backdrop glass center" onMouseDown={leave}>
       <div className="dircmp" ref={rootRef} tabIndex={-1} onKeyDown={onKey} onMouseDown={(e) => e.stopPropagation()}>
         <header className="dc-head">
           <div className="dc-paths">
             <div className="dc-path l" title={sides[0]}><Icon name="folder" size={15} /><span>{"‎" + sides[0] + "‎"}</span></div>
-            <button className="icon-btn" title="Swap sides (s)" onClick={() => setSides(([a, b]) => [b, a])}><Icon name="compare" size={15} /></button>
+            <button className="icon-btn" disabled={busy} title={tt("Swap sides (s)")} onClick={() => setSides(([a, b]) => [b, a])}><Icon name="compare" size={15} /></button>
             <div className="dc-path r" title={sides[1]}><Icon name="folder" size={15} /><span>{"‎" + sides[1] + "‎"}</span></div>
-            <button className="icon-btn" title="Close (Esc)" onClick={() => A.openOverlay(null)}><Icon name="close" size={15} /></button>
+            <button className="icon-btn" title={tt("Close (Esc)")} onClick={leave}><Icon name="close" size={15} /></button>
           </div>
           <div className="dc-bar">
             <div className="dc-chips">
@@ -252,34 +347,51 @@ export function DirCompare({ left: l0, right: r0 }: { left: string; right: strin
               {chip("same", "= Same", c?.same)}
               {chip("all", "All")}
             </div>
-            <input className="dc-search" value={query} placeholder="Filter paths… (/)" spellCheck={false} onChange={(e) => setQuery(e.target.value)} />
+            <input className="dc-search" value={query} placeholder={tt("Filter paths… (/)")} spellCheck={false} onChange={(e) => setQuery(e.target.value)} />
             <div className="dv-toggles">
-              <button className={`tgl ${opts.content ? "on" : ""}`} title="Compare file contents, not just size and date (c)" onClick={() => setOpts((o) => ({ ...o, content: !o.content }))}>{"{ }"}</button>
-              <button className={`tgl ${opts.hidden ? "on" : ""}`} title="Include hidden files (.)" onClick={() => setOpts((o) => ({ ...o, hidden: !o.hidden }))}>.*</button>
-              <button className={`tgl ${opts.respectGitignore ? "on" : ""}`} title="Skip files ignored by .gitignore" onClick={() => setOpts((o) => ({ ...o, respectGitignore: !o.respectGitignore }))}>git</button>
+              <button className={`tgl ${opts.content ? "on" : ""}`} disabled={busy} title={tt("Compare file contents, not just size and date (c)")} onClick={() => setOpts((o) => ({ ...o, content: !o.content }))}>{"{ }"}</button>
+              {opts.content && <button className={`tgl ${opts.fresh ? "on" : ""}`} disabled={busy} aria-pressed={!!opts.fresh} title={tt("Read every file again, ignoring remembered results (C)")} onClick={() => setOpts((o) => ({ ...o, fresh: !o.fresh }))}>↻</button>}
+              <button className={`tgl ${opts.hidden ? "on" : ""}`} disabled={busy} title={tt("Include hidden files (.)")} onClick={() => setOpts((o) => ({ ...o, hidden: !o.hidden }))}>.*</button>
+              <button className={`tgl ${showFilters || activeFilterCount(opts) > 0 ? "on" : ""}`} disabled={busy} aria-expanded={showFilters} title={tt("Filters: include and exclude patterns, sizes, dates (f, Shift+F clears)")} onClick={() => setShowFilters((v) => !v)}>▽{activeFilterCount(opts) > 0 ? ` ${activeFilterCount(opts)}` : ""}</button>
+              <button className={`tgl ${opts.respectGitignore ? "on" : ""}`} disabled={busy} title={tt("Skip files ignored by .gitignore")} onClick={() => setOpts((o) => ({ ...o, respectGitignore: !o.respectGitignore }))}>git</button>
             </div>
             <span className="spacer" />
-            <button className="dc-btn" disabled={!res || busy} title="Copy the selected rows (or the row under the cursor) to the right (>)" onClick={() => preview("toRight", "selected")}>Copy →</button>
-            <button className="dc-btn" disabled={!res || busy} title="Copy the selected rows to the left (<)" onClick={() => preview("toLeft", "selected")}>← Copy</button>
-            <button className="dc-btn primary" disabled={!res || busy} onClick={syncMenu}>Sync <Icon name="chevronDown" size={12} /></button>
-            <button className="icon-btn" title="Compare again (r)" onClick={() => run(true)}><Icon name="refresh" size={15} /></button>
+            <button className="dc-btn" disabled={selectedBlocked} title={tt("Copy the selected rows (or the row under the cursor) to the right (>)")} onClick={() => preview("toRight", "selected")}>Copy →</button>
+            <button className="dc-btn" disabled={selectedBlocked} title={tt("Copy the selected rows to the left (<)")} onClick={() => preview("toLeft", "selected")}>← Copy</button>
+            <button className="dc-btn primary" disabled={loading || !!err || busy || !res || !!bulkBlocked} title={bulkBlocked ? tt(bulkBlocked) : undefined} onClick={syncMenu}>{tt("Sync")} <Icon name="chevronDown" size={12} /></button>
+            <button className="icon-btn" disabled={busy} title={tt("Compare again (r)")} onClick={() => run(true)}><Icon name="refresh" size={15} /></button>
           </div>
+          {showFilters && (
+            <div className="dc-filters" role="group" aria-label={tt("Filters")} onKeyDown={(e) => { e.stopPropagation(); if (e.key === "Enter" && (e.target as HTMLElement).tagName === "INPUT") { e.preventDefault(); applyFilters(); } if (e.key === "Escape") { e.preventDefault(); setShowFilters(false); rootRef.current?.focus(); } }}>
+              <label>{tt("Only")}<input disabled={busy} value={form.include} placeholder="*.rs, src/**" spellCheck={false} onChange={(e) => setForm({ ...form, include: e.target.value })} /></label>
+              <label>{tt("Leave out")}<input disabled={busy} value={form.exclude} placeholder="*.log, node_modules/" spellCheck={false} onChange={(e) => setForm({ ...form, exclude: e.target.value })} /></label>
+              <label>{tt("Size from")}<input disabled={busy} value={form.minSize} placeholder="10k" spellCheck={false} onChange={(e) => setForm({ ...form, minSize: e.target.value })} /></label>
+              <label>{tt("to")}<input disabled={busy} value={form.maxSize} placeholder="2 MB" spellCheck={false} onChange={(e) => setForm({ ...form, maxSize: e.target.value })} /></label>
+              <label>{tt("Modified from")}<input disabled={busy} value={form.after} placeholder="2025-01-31" spellCheck={false} onChange={(e) => setForm({ ...form, after: e.target.value })} /></label>
+              <label>{tt("until")}<input disabled={busy} value={form.before} placeholder="2025-12-31" spellCheck={false} onChange={(e) => setForm({ ...form, before: e.target.value })} /></label>
+              <button className="dc-btn primary" disabled={busy} onClick={applyFilters}>{tt("Apply")}</button>
+              <button className="dc-btn" disabled={busy} onClick={clearFilters}>{tt("Clear")}</button>
+              {formError && <span className="dc-filter-error" role="alert">{formError}</span>}
+              <span className="dc-filter-note">{tt("Left out on one side is left out on both. A folder that holds left-out files is never copied or trashed as a whole.")}</span>
+            </div>
+          )}
         </header>
 
         {plan && (
           <div className="dc-plan">
             <Icon name="compare" size={16} />
             <span><b>{plan.mode === "mirror" ? "Mirror" : plan.mode === "update" ? "Update" : "Copy"}</b> {describePlan(plan)} · {formatSize(plan.bytes)}</span>
-            <small>Replaced files and removed items go to the trash; the whole sync is one Undo.</small>
+            <small>{tt("Replaced files and removed items go to the trash; the whole sync is one Undo.")}</small>
             <span className="spacer" />
-            <button className="dc-btn" onClick={() => setPlan(null)}>Cancel</button>
+            <button className="dc-btn" onClick={() => setPlan(null)}>{tt("Cancel")}</button>
             <button className="dc-btn primary" disabled={busy} onClick={() => execute(plan).then(() => setPlan(null))}>{busy ? "Syncing…" : "Run (Enter)"}</button>
           </div>
         )}
         {err && <div className="dv-msg err"><Icon name="close" size={16} /> {err}</div>}
-        {loading && <div className="dc-loading">Comparing folders…</div>}
-        {res?.truncated && <div className="dv-msg">Stopped after {(300000).toLocaleString()} entries per side; narrow the comparison to a subfolder.</div>}
-        {res && !loading && rows.length === 0 && (
+        {loading && <div className="dc-loading">{tt("Comparing folders…")}</div>}
+        {res?.incompleteReasons.length ? <div className="dv-msg">{tt("The folder scan is incomplete. Sync is unavailable.")}</div> : null}
+        {res?.truncated && <div className="dv-msg">Stopped after {(300000).toLocaleString()} entries per side, so the list is incomplete and Sync is off; compare a subfolder instead.</div>}
+        {res && !loading && !err && !bulkBlocked && rows.length === 0 && (
           <div className="dv-msg same"><Icon name="check" size={16} /> {filter === "diff" ? `No differences (${c?.same ?? 0} identical files${opts.content ? ", contents compared" : ", by size and date"})` : "Nothing to show for this filter"}</div>
         )}
 
@@ -301,9 +413,9 @@ export function DirCompare({ left: l0, right: r0 }: { left: string; right: strin
                   <div className="dc-mid" title={`${STATUS_TEXT[it.status]}${it.reason ? ` · ${REASON[it.reason]}` : ""}${it.newer ? ` · ${it.newer} is newer` : ""}`}>
                     {act ? <span className={`dc-act ${act}`}>{actionGlyph(act)}</span> : (
                       <>
-                        <button className="dc-copy l" title="Copy to the left" onClick={(e) => { e.stopPropagation(); setCursor(i); setSel(new Set([it.rel])); execute(planSync(items, sides[0], sides[1], "toLeft", "selected", new Set([it.rel]))); }} disabled={it.status === "same" || it.status === "leftOnly"}>‹</button>
+                        <button className="dc-copy l" title={tt("Copy to the left")} onClick={(e) => { e.stopPropagation(); setCursor(i); setSel(new Set([it.rel])); void preview("toLeft", "selected", new Set([it.rel])); }} disabled={selectedBlocked || it.status === "same" || it.status === "leftOnly"}>‹</button>
                         <span className="dc-glyph">{it.newer === "left" && it.status === "different" ? "◂" : ""}{STATUS_GLYPH[it.status]}{it.newer === "right" && it.status === "different" ? "▸" : ""}</span>
-                        <button className="dc-copy r" title="Copy to the right" onClick={(e) => { e.stopPropagation(); setCursor(i); setSel(new Set([it.rel])); execute(planSync(items, sides[0], sides[1], "toRight", "selected", new Set([it.rel]))); }} disabled={it.status === "same" || it.status === "rightOnly"}>›</button>
+                        <button className="dc-copy r" title={tt("Copy to the right")} onClick={(e) => { e.stopPropagation(); setCursor(i); setSel(new Set([it.rel])); void preview("toRight", "selected", new Set([it.rel])); }} disabled={selectedBlocked || it.status === "same" || it.status === "rightOnly"}>›</button>
                       </>
                     )}
                   </div>
@@ -314,12 +426,13 @@ export function DirCompare({ left: l0, right: r0 }: { left: string; right: strin
           </div>
         </div>
         <footer className="dv-foot">
-          <span><kbd>Enter</kbd> open diff / folder</span>
-          <span><kbd>n</kbd>/<kbd>N</kbd> next/prev difference</span>
-          <span><kbd>Space</kbd> select</span>
-          <span><kbd>&gt;</kbd>/<kbd>&lt;</kbd> copy right/left</span>
+          <span><kbd>Enter</kbd> {tt("open diff / folder")}</span>
+          <span><kbd>n</kbd>/<kbd>N</kbd> {tt("next/prev difference")}</span>
+          <span><kbd>{tt("Space")}</kbd> select</span>
+          <span><kbd>&gt;</kbd>/<kbd>&lt;</kbd> {tt("copy right/left")}</span>
           <span><kbd>c</kbd> contents</span>
           <span><kbd>a</kbd> all/diff</span>
+          <span><kbd>f</kbd> filters</span>
           <span><kbd>Esc</kbd> close</span>
           {res && <span className="spacer" />}
           {res && <span>{res.items.length.toLocaleString()} entries · {res.elapsedMs} ms</span>}

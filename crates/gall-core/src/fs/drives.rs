@@ -138,7 +138,11 @@ pub fn list_drives() -> Vec<Drive> {
         });
     }
     #[cfg(target_os = "linux")]
-    for v in fuse_vaults() {
+    for v in fuse_vaults()
+        .into_iter()
+        .chain(iso_media())
+        .chain(super::gvfs::gvfs_drives())
+    {
         if seen.insert(v.mount.clone()) {
             out.push(v);
         }
@@ -326,6 +330,57 @@ fn fold_home(mut out: Vec<Drive>, home: &str) -> Vec<Drive> {
     out
 }
 
+/// Mounts of `iso9660` under the desktop's removable-media folders, from
+/// `/proc/self/mounts` text: `(device, mount point)`. sysinfo drops every iso9660 mount
+/// as "optical media", which also hides an installer USB stick or a mounted ISO image.
+#[cfg(any(target_os = "linux", test))]
+fn parse_iso_mounts(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|line| {
+            let mut f = line.split(' ');
+            let (dev, mount, fs) = (f.next()?, f.next()?, f.next()?);
+            let mount = mount
+                .replace("\\040", " ")
+                .replace("\\011", "\t")
+                .replace("\\134", "\\");
+            let user_media = mount.starts_with("/run/media/") || mount.starts_with("/media/");
+            (fs == "iso9660" && user_media).then(|| (dev.to_string(), mount))
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn iso_media() -> Vec<Drive> {
+    let Ok(text) = std::fs::read_to_string("/proc/self/mounts") else {
+        return Vec::new();
+    };
+    parse_iso_mounts(&text)
+        .into_iter()
+        .map(|(device, mount)| {
+            let (total, available) = statvfs(&mount).unwrap_or((0, 0));
+            let name = mount.rsplit('/').next().unwrap_or(&mount).to_string();
+            Drive {
+                short: name,
+                label: String::new(),
+                mount,
+                fs: "iso9660".into(),
+                total,
+                available,
+                removable: true,
+                lockable: false,
+                space_shown_by: String::new(),
+                device,
+            }
+        })
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+fn iso_media() -> Vec<Drive> {
+    Vec::new()
+}
+
 /// FUSE filesystems that are system plumbing, not user storage.
 #[cfg(target_os = "linux")]
 const SYSTEM_FUSE: &[&str] = &[
@@ -413,6 +468,19 @@ pub fn eject(mount: &str) -> crate::Result<()> {
         }
         crate::CoreError::Other(in_use_message(&who))
     })
+}
+
+/// Unmounts the drive at `mount` and then powers its whole device off, so it can be unplugged.
+/// Only Linux unmounts without powering off ([`eject`]); elsewhere ejecting already does both.
+/// When the power-off is refused (another volume of the drive is still mounted) the drive stays
+/// unmounted, listed under "Not mounted", and the error says why.
+pub fn eject_and_power_off(mount: &str) -> crate::Result<()> {
+    let device = super::volumes::device_of_mount(mount);
+    eject(mount)?;
+    match device {
+        Some(d) => super::volumes::power_off_volume(&d),
+        None => Ok(()),
+    }
 }
 
 /// "eject failed: the drive is in use by OneCommander; close its files …".
@@ -562,17 +630,28 @@ fn parse_lsof(out: &str, me: u32) -> Vec<String> {
     names
 }
 
+/// Linux tools to try, in order. They only unmount: `gio mount -e` would also power the
+/// device off, and it would vanish from the "Not mounted" list with no way to mount it again.
+#[allow(dead_code)]
+fn linux_unmount_attempts(mount: &str) -> Vec<Vec<&str>> {
+    vec![
+        vec!["gio", "mount", "-u", mount],
+        vec!["udisksctl", "unmount", "-p", mount],
+        vec!["umount", mount],
+    ]
+}
+
 fn eject_inner(mount: &str) -> crate::Result<()> {
     use std::process::Command;
     #[cfg(windows)]
     return eject_windows(mount);
+    #[cfg(target_os = "linux")]
+    if super::gvfs::is_gvfs_mount_path(mount) {
+        return super::gvfs::eject_gvfs(mount);
+    }
     #[allow(unreachable_code)]
     let attempts: Vec<Vec<&str>> = if cfg!(target_os = "linux") {
-        vec![
-            vec!["gio", "mount", "-e", mount],
-            vec!["udisksctl", "unmount", "-p", mount],
-            vec!["umount", mount],
-        ]
+        linux_unmount_attempts(mount)
     } else if cfg!(target_os = "macos") {
         vec![vec!["diskutil", "eject", mount]]
     } else {
@@ -1232,6 +1311,9 @@ fn eject_by_lock(mount: &str) -> crate::Result<()> {
 fn is_mounted(mount: &str) -> bool {
     #[cfg(target_os = "linux")]
     {
+        if super::gvfs::is_gvfs_mount_path(mount) {
+            return Path::new(mount).exists();
+        }
         match std::fs::read_to_string("/proc/self/mounts") {
             Ok(t) => mount_points(&t).iter().any(|m| m == mount),
             Err(_) => true,
@@ -1323,8 +1405,9 @@ fn fstab_mounts() -> Vec<std::path::PathBuf> {
 /// letter, a folder under /run/media/<user>, /media, /mnt or /Volumes, an fstab mount
 /// point): those folders come back with the drive. History drops the gone ones.
 pub fn folder_gone(path: &Path) -> bool {
-    // Looking into a stopped WSL distribution would start it.
-    if !super::wsl::may_touch(path) {
+    // Looking into a stopped WSL distribution would start it; disconnected GVFS or
+    // slow remote mounts should stay in history rather than probing/pruning them.
+    if !super::wsl::may_touch(path) || super::gvfs::is_slow_or_gvfs_mount(path) {
         return false;
     }
     // Only a clear "not found": no permission or a network error is not "deleted".
@@ -1359,6 +1442,36 @@ pub fn folder_gone(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn iso9660_usb_stick_under_run_media_is_listed() {
+        let mounts = "/dev/nvme0n1p2 / btrfs rw 0 0\n\
+            /dev/sdb1 /run/media/matej/OMARCHY_202611 iso9660 ro,nosuid 0 0\n\
+            /dev/sdc1 /run/media/matej/My\\040Disc iso9660 ro 0 0\n\
+            /dev/loop0 /mnt/image iso9660 ro 0 0\n\
+            /dev/sda1 /run/media/matej/GaMa87 ntfs3 rw 0 0\n";
+        assert_eq!(
+            parse_iso_mounts(mounts),
+            [
+                (
+                    "/dev/sdb1".to_string(),
+                    "/run/media/matej/OMARCHY_202611".to_string()
+                ),
+                (
+                    "/dev/sdc1".to_string(),
+                    "/run/media/matej/My Disc".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_unmount_never_powers_the_device_off() {
+        let attempts = linux_unmount_attempts("/run/media/a/USB");
+        assert!(attempts.iter().all(|c| !c.contains(&"-e")));
+        assert_eq!(attempts[0], ["gio", "mount", "-u", "/run/media/a/USB"]);
+    }
 
     #[cfg(unix)]
     #[test]
@@ -1613,5 +1726,13 @@ mod tests {
     #[test]
     fn listing_does_not_panic() {
         let _ = list_drives();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gvfs_paths_are_never_treated_as_deleted() {
+        assert!(!folder_gone(Path::new(
+            "/run/user/1000/gvfs/smb-share:server=nas,share=media/docs"
+        )));
     }
 }

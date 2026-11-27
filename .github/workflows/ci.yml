@@ -130,6 +130,9 @@ jobs:
             ui/package-lock.json
       # tauri::generate_context! needs the built frontend.
       - run: npm ci --prefix ui && npm --prefix ui run build
+      # The UI unit tests too: they cover platform code (Cmd/Option labels, NFC/NFD names) that only
+      # macOS shows.
+      - run: npm --prefix ui test
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       # Builds the real .app (debug, unsigned) so Info.plist, icons and bundle settings

@@ -244,6 +244,156 @@ pub fn mount_volume(id: &str) -> Result<String> {
     }
 }
 
+/// The whole disk to power off for the volume `id` (pure, for tests): the top of its parent chain.
+/// Refuses while another partition of that disk (or something unlocked from it) is still mounted,
+/// because the system would only answer "target is busy".
+pub fn power_off_target(devs: &[BlockDev], id: &str) -> std::result::Result<String, String> {
+    let start = devs
+        .iter()
+        .find(|d| d.path == id)
+        .ok_or_else(|| format!("{id} is not connected any more"))?;
+    let mut disk = start;
+    while let Some(parent) = disk
+        .pkname
+        .as_deref()
+        .and_then(|p| devs.iter().find(|x| x.kname == p))
+    {
+        disk = parent;
+    }
+    // Everything below the disk: children, and theirs.
+    let mut below = vec![disk.kname.as_str()];
+    let mut i = 0;
+    while i < below.len() {
+        let parent = below[i];
+        below.extend(
+            devs.iter()
+                .filter(|d| d.pkname.as_deref() == Some(parent))
+                .map(|d| d.kname.as_str()),
+        );
+        i += 1;
+    }
+    let busy = devs
+        .iter()
+        .filter(|d| below.contains(&d.kname.as_str()))
+        .any(|d| d.mountpoint.as_deref().is_some_and(|m| !m.is_empty()));
+    if busy {
+        return Err(
+            "Another volume of this drive is still mounted: unmount or eject it first".into(),
+        );
+    }
+    Ok(disk.path.clone())
+}
+
+/// The device mounted at `mount` in an `lsblk` listing (pure, for tests).
+pub fn device_in(devs: &[BlockDev], mount: &str) -> Option<String> {
+    // "/run/media/a/X/" and "/run/media/a/X" are the same mount; "/" stays "/", "" matches nothing.
+    fn norm(m: &str) -> Option<&str> {
+        if m.is_empty() {
+            return None;
+        }
+        Some(if m.trim_matches('/').is_empty() {
+            "/"
+        } else {
+            m.trim_end_matches('/')
+        })
+    }
+    let want = norm(mount)?;
+    devs.iter()
+        .find(|d| d.mountpoint.as_deref().and_then(norm) == Some(want))
+        .map(|d| d.path.clone())
+}
+
+/// The block device mounted at `mount` (Linux), `None` for anything else (gvfs, network).
+pub fn device_of_mount(mount: &str) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        device_in(&lsblk(), mount)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = mount;
+        None
+    }
+}
+
+/// Powers a removable drive off (`udisksctl power-off`) so it can be unplugged: the volume `id`
+/// is one of its partitions, or the disk itself. It disappears from the lists afterwards.
+pub fn power_off_volume(id: &str) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let disk = power_off_target(&lsblk(), id).map_err(CoreError::Other)?;
+        udisksctl(&["power-off", "-b", &disk], None)
+            .map(|_| ())
+            .map_err(|e| CoreError::Other(friendly(&e)))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = id;
+        Err(CoreError::Other(
+            "powering a drive off is not supported here".into(),
+        ))
+    }
+}
+
+/// First `name` on `PATH` (`which`).
+#[cfg(target_os = "linux")]
+fn find_program(name: &str) -> Option<std::path::PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|d| d.join(name))
+        .find(|p| p.is_file())
+}
+
+/// Clears the "dirty" flag of an NTFS volume (`ntfsfix -d`, as root through polkit) and
+/// mounts it. The kernel driver refuses a dirty volume ("volume is dirty and "force" flag
+/// is not set"), which is what a Windows crash, a forced power-off or Fast Startup leaves
+/// behind. Only NTFS volumes are touched; `ntfsfix` comes from `ntfsprogs` (Arch since 2026.9; `ntfs-3g` elsewhere).
+pub fn repair_mount_volume(id: &str) -> Result<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let is_ntfs = lsblk().iter().any(|d| {
+            d.path == id
+                && d.fstype
+                    .as_deref()
+                    .is_some_and(|f| f.eq_ignore_ascii_case("ntfs"))
+        });
+        if !is_ntfs {
+            return Err(CoreError::Other(format!("{id} is not an NTFS volume")));
+        }
+        let ntfsfix = find_program("ntfsfix").ok_or_else(|| {
+            CoreError::Other(
+                "ntfsfix not found: install the ntfsprogs package (ntfs-3g on older distributions)"
+                    .into(),
+            )
+        })?;
+        let o = std::process::Command::new("pkexec")
+            .arg(ntfsfix)
+            .args(["-d", id])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| CoreError::Other(format!("pkexec: {e} (install polkit)")))?;
+        if !o.status.success() {
+            // pkexec: 126 = dismissed or not authorized, 127 = authentication failed.
+            if matches!(o.status.code(), Some(126 | 127)) {
+                return Err(CoreError::Other(
+                    "Not authorized to repair this volume".into(),
+                ));
+            }
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            return Err(CoreError::Other(format!("ntfsfix failed: {}", text.trim())));
+        }
+        mount_volume(id)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = id;
+        Err(CoreError::Other("repairing is not supported here".into()))
+    }
+}
+
 /// Unlocks an encrypted device with `passphrase`, mounts it and returns where.
 /// Windows: shows the system BitLocker dialog instead (the passphrase is unused).
 pub fn unlock_volume(id: &str, passphrase: &str) -> Result<Option<String>> {
@@ -511,6 +661,68 @@ mod tests {
                 ("/dev/sda1", "Matej", false, true),
                 ("/dev/sdb", "sdb", true, true)
             ]
+        );
+    }
+
+    #[test]
+    fn partition_stays_listed_after_unmount() {
+        // Mounted: not listed. The same partition after `unmount` (no mountpoint): listed.
+        let row = |mp: &str| {
+            format!(
+                r#"{{"blockdevices":[{{"path":"/dev/sdd1","kname":"sdd1","pkname":"sdd","type":"part","fstype":"exfat","label":"USB","parttype":null,"size":1000,"mountpoint":{mp},"rm":true,"hotplug":true}}]}}"#
+            )
+        };
+        assert!(unmounted_from(&parse(&row(r#""/run/media/a/USB""#))).is_empty());
+        let v = unmounted_from(&parse(&row("null")));
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].id, "/dev/sdd1");
+    }
+
+    #[test]
+    fn power_off_goes_to_the_whole_disk() {
+        let devs = parse(SAMPLE);
+        assert_eq!(
+            power_off_target(&devs, "/dev/sda1").as_deref(),
+            Ok("/dev/sda")
+        );
+        assert_eq!(
+            power_off_target(&devs, "/dev/sda").as_deref(),
+            Ok("/dev/sda")
+        );
+        // A locked partition whose mapped device is mounted keeps the disk busy.
+        assert!(power_off_target(&devs, "/dev/sdc1").is_err());
+        assert!(power_off_target(&devs, "/dev/gone")
+            .unwrap_err()
+            .contains("not connected"));
+    }
+
+    #[test]
+    fn finds_the_device_of_a_mount() {
+        let devs = parse(SAMPLE);
+        assert_eq!(
+            device_in(&devs, "/run/media/a/Backup/").as_deref(),
+            Some("/dev/mapper/luks-1")
+        );
+        assert_eq!(device_in(&devs, "/"), Some("/dev/mapper/root".to_string()));
+        assert_eq!(device_in(&devs, "/run/media/a/none"), None);
+        assert_eq!(device_in(&devs, ""), None);
+    }
+
+    #[test]
+    fn power_off_waits_for_other_mounted_partitions() {
+        let two = r#"{"blockdevices":[
+          {"path":"/dev/sde","kname":"sde","pkname":null,"type":"disk","size":1,"mountpoint":null,"rm":true,"hotplug":true},
+          {"path":"/dev/sde1","kname":"sde1","pkname":"sde","type":"part","fstype":"vfat","size":1,"mountpoint":"/run/media/a/ONE","rm":true,"hotplug":true},
+          {"path":"/dev/sde2","kname":"sde2","pkname":"sde","type":"part","fstype":"ext4","size":1,"mountpoint":null,"rm":true,"hotplug":true}
+        ]}"#;
+        let devs = parse(two);
+        assert!(power_off_target(&devs, "/dev/sde2")
+            .unwrap_err()
+            .contains("still mounted"));
+        let none = two.replace("\"/run/media/a/ONE\"", "null");
+        assert_eq!(
+            power_off_target(&parse(&none), "/dev/sde2").as_deref(),
+            Ok("/dev/sde")
         );
     }
 

@@ -34,24 +34,34 @@ impl JsonStore {
         self.path.with_file_name(format!("{stem}.backup.json"))
     }
 
-    fn read<T: DeserializeOwned>(p: &Path) -> Option<T> {
-        let s = std::fs::read_to_string(p).ok()?;
-        match serde_json::from_str(&s) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                log::error!("corrupt json {}: {e}", p.display());
-                None
-            }
-        }
+    fn read<T: DeserializeOwned>(p: &Path) -> std::result::Result<Option<T>, serde_json::Error> {
+        let Ok(contents) = std::fs::read(p) else {
+            return Ok(None);
+        };
+        serde_json::from_slice(&contents)
+            .map(Some)
+            .inspect_err(|e| {
+                log::info!("corrupt json {}: {e}", p.display());
+            })
     }
 
     pub fn load<T: DeserializeOwned + Default>(&self) -> (T, LoadedFrom) {
-        if let Some(v) = Self::read(&self.path) {
+        let primary = Self::read(&self.path);
+        if let Ok(Some(v)) = primary {
             return (v, LoadedFrom::Primary);
         }
-        if let Some(v) = Self::read(&self.backup_path()) {
-            log::warn!("restored {} from backup", self.path.display());
+        let name = self
+            .path
+            .file_name()
+            .unwrap_or(self.path.as_os_str())
+            .to_string_lossy();
+        let backup = Self::read(&self.backup_path());
+        if let Ok(Some(v)) = backup {
+            log::warn!("Restored “{name}” from backup.");
             return (v, LoadedFrom::Backup);
+        }
+        if primary.is_err() || backup.is_err() {
+            log::warn!("Could not read “{name}”. Using defaults.");
         }
         (T::default(), LoadedFrom::Default)
     }
@@ -68,7 +78,7 @@ impl JsonStore {
             f.sync_all().ctx("sync", &tmp)?;
         }
         // Keep the last known-good version as backup (only if it parses).
-        if Self::read::<serde_json::Value>(&self.path).is_some() {
+        if matches!(Self::read::<serde_json::Value>(&self.path), Ok(Some(_))) {
             let _ = std::fs::copy(&self.path, self.backup_path());
         }
         std::fs::rename(&tmp, &self.path).ctx("replace", &self.path)?;
@@ -98,5 +108,39 @@ mod tests {
         let (v, from): (BTreeMap<String, i32>, _) = s.load();
         assert_eq!(from, LoadedFrom::Backup);
         assert_eq!(v["a"], 1);
+    }
+
+    #[test]
+    fn session_store_migrates_legacy_and_recovers_backup() {
+        use crate::nav::{Session, StoredSession};
+
+        let d = tempfile::tempdir().unwrap();
+        let store = JsonStore::new(d.path().join("session.json"));
+        let mut legacy = Session::new("/left", "/right");
+        legacy.navigate(0, "/left/sub");
+        store.save(&legacy).unwrap();
+
+        let (loaded, from): (Option<StoredSession>, _) = store.load();
+        assert_eq!(from, LoadedFrom::Primary);
+        let mut ws = loaded.unwrap().into_store("/home");
+        assert_eq!(ws.workspaces.len(), 1);
+        assert_eq!(ws.active_session().active_tab(0).path, "/left/sub");
+
+        ws.create("/two-l", "/two-r", Some("Docs".into()), None, true);
+        store.save(&ws).unwrap();
+
+        // Corrupt primary: recovers previous valid file from backup.
+        std::fs::write(store.path(), "{ broken").unwrap();
+        let (recovered, from): (Option<StoredSession>, _) = store.load();
+        assert_eq!(from, LoadedFrom::Backup);
+        assert_eq!(
+            recovered
+                .unwrap()
+                .into_store("/home")
+                .active_session()
+                .active_tab(0)
+                .path,
+            "/left/sub"
+        );
     }
 }

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { api } from "../api/ipc";
 import { RECORD_SECONDS, recordGall } from "../core/reportMedia";
 import { Icon } from "./Icon";
+import { tt } from "../i18n";
 
 type Capture = { mode: "screenshot" | "video"; finish: (blob?: Blob, error?: string) => void };
 type CaptureSession = Capture & { cancelled: boolean; control?: { stop: (discard?: boolean) => void } };
@@ -85,15 +86,15 @@ export function ReportCapture() {
     return () => window.removeEventListener("keydown", key, true);
   }, [capture, finishing]);
   if (!capture) return null;
-  return <aside className="report-capture" aria-label="Gall capture controls" onKeyDown={(e) => {
+  return <aside className="report-capture" aria-label={tt("Gall capture controls")} onKeyDown={(e) => {
     e.stopPropagation();
     if (e.key === "Escape") { e.preventDefault(); cancel(); }
   }}>
     <span className={recording ? "report-record-dot" : "report-capture-icon"}><Icon name={capture.mode === "video" ? "video" : "image"} size={18} /></span>
-    <div role="status"><strong>{finishing ? "Preparing clip..." : recording ? `Recording Gall · ${elapsed}s / ${RECORD_SECONDS}s` : countdown ? `${capture.mode === "video" ? "Recording" : "Screenshot"} in ${countdown}...` : "Preparing capture..."}</strong>
-      <small>{capture.mode === "video" ? "Gall only · no audio · stays local" : "Arrange Gall to show the problem"}</small>
-      <small>Ctrl/Cmd+Shift+Enter: stop · Ctrl/Cmd+Shift+Backspace: cancel</small></div>
-    {recording && <button className="btn primary" disabled={finishing} onClick={stop}>Stop recording</button>}
-    <button className="btn" onClick={cancel}>Cancel capture</button>
+    <div role="status"><strong>{finishing ? tt("Preparing clip...") : recording ? tt("Recording Gall · {elapsed}s / {RECORD_SECONDS}s", { elapsed, RECORD_SECONDS }) : countdown ? tt(capture.mode === "video" ? "Recording in {countdown}..." : "Screenshot in {countdown}...", { countdown }) : tt("Preparing capture...")}</strong>
+      <small>{capture.mode === "video" ? tt("Gall only · no audio · stays local") : tt("Arrange Gall to show the problem")}</small>
+      <small>{tt("Ctrl/Cmd+Shift+Enter: stop · Ctrl/Cmd+Shift+Backspace: cancel")}</small></div>
+    {recording && <button className="btn primary" disabled={finishing} onClick={stop}>{tt("Stop recording")}</button>}
+    <button className="btn" onClick={cancel}>{tt("Cancel capture")}</button>
   </aside>;
 }

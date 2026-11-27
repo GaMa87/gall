@@ -1,4 +1,7 @@
 import { useEffect, useRef, useState } from "react";
+import { dropdownBox, type DropdownBox } from "../core/anchor";
+import { HoverGuard } from "../core/hover";
+import { tt } from "../i18n";
 import "./RepoPicker.css";
 
 export type RepoPickerEntry = { label: string; path: string; state: string; depth: number; name: string };
@@ -24,13 +27,14 @@ type Item = { path: string; name: string; depth: number; mark: MarkKind; hint: s
 export function RepoPicker({ value, mainPath, mainName, entries, disabled, vim, onSelect }: {
   value: string; mainPath: string; mainName: string; entries: RepoPickerEntry[]; disabled?: boolean; vim: boolean; onSelect: (path: string) => void;
 }) {
-  const [open, setOpen] = useState(false), [active, setActive] = useState(0), [box, setBox] = useState<{ left: number; top: number; minWidth: number; maxHeight: number } | null>(null);
+  const [open, setOpen] = useState(false), [active, setActive] = useState(0), [box, setBox] = useState<DropdownBox | null>(null);
   const button = useRef<HTMLButtonElement>(null), list = useRef<HTMLDivElement>(null);
+  const hover = useRef(new HoverGuard(false));
   const items: Item[] = [
-    { path: mainPath, name: mainName, depth: 0, mark: "main", hint: "main", title: mainName, disabled: false },
+    { path: mainPath, name: mainName, depth: 0, mark: "main", hint: tt("main"), title: mainName, disabled: false },
     ...entries.map((entry): Item => ({
       path: entry.path, name: entry.name, depth: entry.depth + 1, mark: entry.depth ? "nested" : "submodule", title: entry.label,
-      hint: entry.state === "notInitialized" ? "not initialized" : entry.state === "unsupportedPath" ? "unsupported path" : "",
+      hint: entry.state === "notInitialized" ? tt("not initialized") : entry.state === "unsupportedPath" ? tt("unsupported path") : "",
       disabled: entry.state === "notInitialized" || entry.state === "unsupportedPath",
     })),
   ];
@@ -38,8 +42,8 @@ export function RepoPicker({ value, mainPath, mainName, entries, disabled, vim, 
   const enabled = (from: number, step: number) => { for (let i = from; i >= 0 && i < items.length; i += step) if (!items[i].disabled) return i; return -1; };
   const show = () => {
     const rect = button.current?.getBoundingClientRect(); if (!rect || disabled) return;
-    const below = window.innerHeight - rect.bottom - 12;
-    setBox({ left: rect.left, top: rect.bottom + 4, minWidth: Math.max(rect.width, 240), maxHeight: Math.max(160, below) });
+    setBox(dropdownBox(rect, { minWidth: 240, maxHeight: window.innerHeight, gap: 4 }, window.innerWidth, window.innerHeight));
+    hover.current.reset();
     setActive(Math.max(0, items.findIndex((item) => item.path === value))); setOpen(true);
   };
   const close = () => setOpen(false);
@@ -66,16 +70,16 @@ export function RepoPicker({ value, mainPath, mainName, entries, disabled, vim, 
   };
   return (
     <>
-      <button ref={button} type="button" className={`rp-button${open ? " open" : ""}`} aria-label="Repository" aria-haspopup="listbox" aria-expanded={open} title="Main repository or submodule"
+      <button ref={button} type="button" className={`rp-button${open ? " open" : ""}`} aria-label={tt("Repository")} aria-haspopup="listbox" aria-expanded={open} title={tt("Main repository or submodule")}
         disabled={disabled} onClick={() => (open ? close() : show())} onKeyDown={onKeyDown}>
-        <Mark kind={current.mark} depth={0} /><span className="rp-name">{current.name}</span>{current.depth === 0 && <span className="rp-badge">main</span>}<span className="rp-caret" aria-hidden>▾</span>
+        <Mark kind={current.mark} depth={0} /><span className="rp-name">{current.name}</span>{current.depth === 0 && <span className="rp-badge">{tt("main")}</span>}<span className="rp-caret" aria-hidden>▾</span>
       </button>
       {open && box && (
-        <div ref={list} className="rp-menu" role="listbox" aria-label="Repository" style={box}>
+        <div ref={list} className="rp-menu" role="listbox" aria-label={tt("Repository")} style={{ ...box, width: undefined, minWidth: box.width, maxWidth: window.innerWidth - box.left - 8 }}>
           {items.map((item, index) => (
             <div key={item.path} role="option" aria-selected={item.path === value} aria-disabled={item.disabled} title={item.title}
               className={`rp-item${index === active ? " kb" : ""}${item.path === value ? " current" : ""}${item.disabled ? " disabled" : ""}`}
-              onMouseEnter={() => { if (!item.disabled) setActive(index); }} onClick={() => choose(item)}>
+              onMouseEnter={(e) => { if (hover.current.moved(e) && !item.disabled) setActive(index); }} onMouseMove={(e) => { if (hover.current.moved(e) && !item.disabled) setActive(index); }} onClick={() => choose(item)}>
               {Array.from({ length: Math.max(0, item.depth) }, (_, level) => <span key={level} className={`rp-guide${level === item.depth - 1 ? " last" : ""}`} />)}
               <Mark kind={item.mark} depth={item.depth} />
               <span className="rp-name">{item.name}</span>

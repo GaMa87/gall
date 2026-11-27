@@ -1,10 +1,8 @@
 import type { gitSelftest } from "./selftest";
-import { getCurrentWindow } from "@tauri-apps/api/window";
-import { LogicalSize } from "@tauri-apps/api/dpi";
 
 /** Focused real-WebView coverage; native option computed styles cannot prove popup colours. */
 export async function runThemedSelectSelfTest(t: typeof gitSelftest) {
-  const { $, $$, mouse, click, key, until, sleep, shot, log, updateSettings, getState } = t;
+  const { $, $$, mouse, click, key, until, sleep, shot, setWindowSize, log, updateSettings, getState } = t;
   const A = await import("./state/actions");
   const press = async (value: string, select: HTMLSelectElement) => { key(value, {}, select); await sleep(60); };
   const popup = () => $(".themed-select-menu[role=listbox]");
@@ -35,8 +33,7 @@ export async function runThemedSelectSelfTest(t: typeof gitSelftest) {
     log(!!$("[role=option][aria-selected=true]", menu), `${name}: current choice is marked`);
   };
   try {
-    await getCurrentWindow().unmaximize();
-    await getCurrentWindow().setSize(new LogicalSize(1100, 800));
+    await setWindowSize(1100, 800);
     await updateSettings({ indexRoots: [], animations: false });
     A.openOverlay({ type: "settings", section: "appearance" });
     await until(() => $(".theme-pick select"));
@@ -121,7 +118,7 @@ export async function runThemedSelectSelfTest(t: typeof gitSelftest) {
     log(!!await until(popup), "F4 opens the themed popup instead of a native window");
     await press("F4", select);
     log(!popup(), "F4 toggles the popup closed");
-    await getCurrentWindow().setSize(new LogicalSize(720, 600));
+    await setWindowSize(720, 600);
     select = $(".theme-pick select") as HTMLSelectElement;
     menu = await open(select);
     assertPalette(menu, "narrow window");

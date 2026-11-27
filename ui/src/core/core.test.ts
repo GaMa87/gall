@@ -265,3 +265,16 @@ describe("windowsMode", () => {
     expect(windowsMode(0x410, true)).toBe("l----");
   });
 });
+
+describe("formatSize language", () => {
+  it("follows the language's decimal separator", async () => {
+    const { formatSize } = await import("./format");
+    const { applyLanguage } = await import("../i18n");
+    await applyLanguage("en", null, ["en-US"]);
+    expect(formatSize(1536)).toBe("1.50 KB");
+    expect(formatSize(1023.6 * 1024 * 1024)).toBe("1024 MB");
+    await applyLanguage("sl", { code: "sl", formatLocale: "sl-SI", direction: "ltr" });
+    expect(formatSize(1536)).toBe("1,50 KB");
+    await applyLanguage("en", null, ["en-US"]);
+  });
+});

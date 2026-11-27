@@ -206,13 +206,35 @@ impl Query {
     /// Scores `path`, whose file name starts at byte `name_start`.
     /// Returns `None` when any term fails.
     pub fn score(&self, path: &str, name_start: usize, s: &mut Scratch) -> Option<Match> {
+        self.score_inner(path, name_start, true, s)
+    }
+
+    /// Like [`score`], but plain terms (without `/`) only match the file name rather than
+    /// falling back to scattered subsequences across ancestor folders. Terms containing `/`
+    /// still match the full path, and `!` exclusions still inspect the full path.
+    pub fn score_name_focused(
+        &self,
+        path: &str,
+        name_start: usize,
+        s: &mut Scratch,
+    ) -> Option<Match> {
+        self.score_inner(path, name_start, false, s)
+    }
+
+    fn score_inner(
+        &self,
+        path: &str,
+        name_start: usize,
+        allow_path_fallback: bool,
+        s: &mut Scratch,
+    ) -> Option<Match> {
         // A decomposed (NFD) name, as macOS volumes and some archives give, is matched
         // composed; positions then count the composed characters.
         if !path.is_ascii() {
             let composed = crate::util::unicode::nfc(path);
             if composed != path {
                 let start = crate::util::unicode::nfc(&path[..name_start.min(path.len())]).len();
-                return self.score(&composed, start, s);
+                return self.score_inner(&composed, start, allow_path_fallback, s);
             }
         }
         if !self.prefilter(path) {
@@ -246,6 +268,7 @@ impl Query {
                     if t.case_sensitive { fc } else { fl },
                     name_off,
                     name,
+                    allow_path_fallback,
                 )
             } else {
                 t.eval(
@@ -253,6 +276,7 @@ impl Query {
                     if t.case_sensitive { &s.chars } else { &s.lower },
                     name_off,
                     name,
+                    allow_path_fallback,
                 )
             };
             match (r, t.inverse) {
@@ -381,7 +405,14 @@ impl Term {
 
     /// `hay`: the path as the pattern is matched against it (lower-cased and accent-folded
     /// as the term asks); `chars`: the path as written, for word-boundary bonuses.
-    fn eval(&self, chars: &[char], hay: &[char], name_off: usize, name: &str) -> Option<Match> {
+    fn eval(
+        &self,
+        chars: &[char],
+        hay: &[char],
+        name_off: usize,
+        name: &str,
+        allow_path_fallback: bool,
+    ) -> Option<Match> {
         match &self.kind {
             Kind::Ext(list) => list.contains(&extension_of(name)).then(|| Match {
                 score: 0,
@@ -404,6 +435,9 @@ impl Term {
                         m.score += BONUS_NAME;
                         return Some(m);
                     }
+                    if !allow_path_fallback && !self.inverse {
+                        return None;
+                    }
                 }
                 let mut m = fuzzy(chars, hay, 0, &self.pat)?;
                 if !self.path {
@@ -415,6 +449,9 @@ impl Term {
                 if !self.path {
                     if let Some(i) = find(&hay[name_off..], &self.pat) {
                         return Some(self.literal(chars, name_off + i, BONUS_NAME));
+                    }
+                    if !allow_path_fallback && !self.inverse {
+                        return None;
                     }
                 }
                 find(hay, &self.pat).map(|i| self.literal(chars, i, 0))

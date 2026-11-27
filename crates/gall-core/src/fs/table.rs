@@ -447,10 +447,12 @@ fn diff_sheet(name: &str, l: Option<&Sheet>, r: Option<&Sheet>, o: &TableDiffOpt
     let ld: Vec<Vec<String>> = ls.rows.iter().skip(skip).cloned().collect();
     let rd: Vec<Vec<String>> = rs.rows.iter().skip(skip).cloned().collect();
 
-    // Columns: left order, then right-only columns; matched by trimmed, case-insensitive name.
+    // Columns: left order, then right-only columns; matched by trimmed, case-insensitive name. A header that
+    // occurs more than once is matched occurrence by occurrence (the second `a` of the right with the second `a`
+    // of the left), so repeated headers compare cell by cell and only a surplus repeat is an added or removed column.
     let key_of = |s: &str| s.trim().to_lowercase();
     let mut columns: Vec<Column> = Vec::new();
-    let mut by_name: HashMap<String, usize> = HashMap::new();
+    let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, n) in lh.iter().enumerate() {
         let k = key_of(n);
         let label = if n.trim().is_empty() {
@@ -458,8 +460,8 @@ fn diff_sheet(name: &str, l: Option<&Sheet>, r: Option<&Sheet>, o: &TableDiffOpt
         } else {
             n.clone()
         };
-        if !k.is_empty() && !by_name.contains_key(&k) {
-            by_name.insert(k, columns.len());
+        if !k.is_empty() {
+            by_name.entry(k).or_default().push(columns.len());
         }
         columns.push(Column {
             name: label,
@@ -467,10 +469,19 @@ fn diff_sheet(name: &str, l: Option<&Sheet>, r: Option<&Sheet>, o: &TableDiffOpt
             right: None,
         });
     }
+    let mut seen_on_right: HashMap<String, usize> = HashMap::new();
     for (j, n) in rh.iter().enumerate() {
         let k = key_of(n);
+        let occurrence = if k.is_empty() {
+            0
+        } else {
+            let count = seen_on_right.entry(k.clone()).or_insert(0);
+            *count += 1;
+            *count - 1
+        };
         match by_name
             .get(&k)
+            .and_then(|found| found.get(occurrence))
             .copied()
             .filter(|_| !k.is_empty())
             .or_else(|| {
@@ -539,9 +550,18 @@ fn diff_sheet(name: &str, l: Option<&Sheet>, r: Option<&Sheet>, o: &TableDiffOpt
         let kv = |rows: &[Vec<String>], i: usize, c: usize| {
             norm(rows[i].get(c).map(|s| s.trim()).unwrap_or(""), o)
         };
-        let rmap: HashMap<String, usize> = (0..rd.len()).map(|i| (kv(&rd, i, kr), i)).collect();
+        // Rows with the same key are matched occurrence by occurrence (the first left row of a key with the first
+        // right row of it, and so on); a surplus on either side is added or removed. A map that kept only the last
+        // row of a key would pair every left row of it with that one row and leave the others unmatched.
+        let mut rmap: HashMap<String, std::collections::VecDeque<usize>> = HashMap::new();
+        for i in 0..rd.len() {
+            rmap.entry(kv(&rd, i, kr)).or_default().push_back(i);
+        }
         let lmatch: Vec<Option<usize>> = (0..ld.len())
-            .map(|li| rmap.get(&kv(&ld, li, kl)).copied())
+            .map(|li| {
+                rmap.get_mut(&kv(&ld, li, kl))
+                    .and_then(|rows| rows.pop_front())
+            })
             .collect();
         let mut right_matched = vec![false; rd.len()];
         for ri in lmatch.iter().flatten() {
@@ -779,6 +799,91 @@ mod tests {
     }
 
     #[test]
+    fn repeated_headers_are_matched_occurrence_by_occurrence_and_the_result_is_deterministic() {
+        let t = tempfile::tempdir().unwrap();
+        let a = write(t.path(), "a.csv", "a,a,b\n1,2,3\n");
+        let b = write(t.path(), "b.csv", "a,a,b\n1,9,3\n");
+        let o = TableDiffOptions::default();
+        let r = compare_tables(&a, &b, &o).unwrap();
+        let s = &r.sheets[0];
+        let cols = |s: &SheetDiff| {
+            s.columns
+                .iter()
+                .map(|c| (c.name.clone(), c.left, c.right))
+                .collect::<Vec<_>>()
+        };
+        // Each `a` pairs with the `a` in the same place: the change is a changed cell of the second one.
+        assert_eq!(
+            cols(s),
+            [
+                ("a".into(), Some(0), Some(0)),
+                ("a".into(), Some(1), Some(1)),
+                ("b".into(), Some(2), Some(2))
+            ]
+        );
+        assert_eq!(s.counts.changed, 1);
+        assert_eq!(s.rows[0].cells, vec![1]);
+        // A surplus repeat on the right is one added column, after the matched ones.
+        let c = write(t.path(), "c.csv", "a,a,a,b\n1,2,7,3\n");
+        let r = compare_tables(&a, &c, &o).unwrap();
+        assert_eq!(
+            cols(&r.sheets[0]),
+            [
+                ("a".into(), Some(0), Some(0)),
+                ("a".into(), Some(1), Some(1)),
+                ("b".into(), Some(2), Some(3)),
+                ("a".into(), None, Some(2))
+            ]
+        );
+        // And on the left, one removed column.
+        let r = compare_tables(&c, &a, &o).unwrap();
+        assert_eq!(
+            cols(&r.sheets[0]),
+            [
+                ("a".into(), Some(0), Some(0)),
+                ("a".into(), Some(1), Some(1)),
+                ("a".into(), Some(2), None),
+                ("b".into(), Some(3), Some(2))
+            ]
+        );
+        // The same inputs give the same columns every time.
+        for _ in 0..3 {
+            assert_eq!(
+                cols(&compare_tables(&a, &c, &o).unwrap().sheets[0]),
+                cols(&compare_tables(&a, &c, &o).unwrap().sheets[0])
+            );
+        }
+        // Names that differ only in case or padding are the same header; empty headers keep their letters.
+        let d = write(t.path(), "d.csv", " A ,A,B\n1,2,3\n");
+        let r = compare_tables(&a, &d, &o).unwrap();
+        assert_eq!(r.sheets[0].counts.same, 1);
+    }
+
+    #[test]
+    fn added_and_removed_columns_are_one_sided_and_never_a_row_change() {
+        let t = tempfile::tempdir().unwrap();
+        let a = write(t.path(), "a.csv", "id,keep,gone\n1,x,y\n2,x,y\n");
+        let b = write(t.path(), "b.csv", "id,new,keep\n1,n,x\n2,n,x\n");
+        let r = compare_tables(&a, &b, &TableDiffOptions::default()).unwrap();
+        let s = &r.sheets[0];
+        let sides: Vec<_> = s
+            .columns
+            .iter()
+            .map(|c| (c.name.as_str(), c.left.is_some(), c.right.is_some()))
+            .collect();
+        assert_eq!(
+            sides,
+            [
+                ("id", true, true),
+                ("keep", true, true),
+                ("gone", true, false),
+                ("new", false, true)
+            ]
+        );
+        assert_eq!((s.counts.same, s.counts.changed), (2, 0));
+    }
+
+    #[test]
     fn positional_when_no_key() {
         let t = tempfile::tempdir().unwrap();
         let a = write(t.path(), "a.csv", "x,y\n1,1\n1,1\n2,2\n");
@@ -824,5 +929,175 @@ mod tests {
         assert_eq!(col_letter(25), "Z");
         assert_eq!(col_letter(26), "AA");
         assert_eq!(col_letter(701), "ZZ");
+    }
+
+    /// A minimal `.xlsx` with one sheet of text cells (inline strings), enough for the table reader.
+    fn xlsx(dir: &Path, name: &str, rows: &[&[&str]]) -> std::path::PathBuf {
+        use std::io::Write;
+        let path = dir.join(name);
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        let mut put = |file: &str, body: String| {
+            zip.start_file(file, options).unwrap();
+            zip.write_all(body.as_bytes()).unwrap();
+        };
+        put("[Content_Types].xml", r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#.into());
+        put("_rels/.rels", r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#.into());
+        put("xl/workbook.xml", r#"<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>"#.into());
+        put("xl/_rels/workbook.xml.rels", r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#.into());
+        let mut sheet = String::from(
+            r#"<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>"#,
+        );
+        for (r, row) in rows.iter().enumerate() {
+            sheet.push_str(&format!("<row r=\"{}\">", r + 1));
+            for (c, cell) in row.iter().enumerate() {
+                sheet.push_str(&format!(
+                    "<c r=\"{}{}\" t=\"inlineStr\"><is><t>{}</t></is></c>",
+                    col_letter(c),
+                    r + 1,
+                    cell
+                ));
+            }
+            sheet.push_str("</row>");
+        }
+        sheet.push_str("</sheetData></worksheet>");
+        put("xl/worksheets/sheet1.xml", sheet);
+        zip.finish().unwrap();
+        path
+    }
+
+    fn counts(r: &TableDiffResult) -> (usize, usize, usize, usize) {
+        let c = &r.sheets[0].counts;
+        (c.same, c.added, c.removed, c.changed)
+    }
+
+    #[test]
+    fn row_insertions_and_deletions_by_key_in_csv_tsv_and_excel() {
+        let t = tempfile::tempdir().unwrap();
+        let o = TableDiffOptions::default();
+        // The same story in three formats: row 2 deleted, row 9 inserted in the middle, row 3 changed.
+        let csv = |name: &str, rows: &str| write(t.path(), name, rows);
+        let (a, b) = (
+            csv("a.csv", "id,v\n1,a\n2,b\n3,c\n4,d\n"),
+            csv("b.csv", "id,v\n1,a\n9,new\n3,changed\n4,d\n"),
+        );
+        assert_eq!(counts(&compare_tables(&a, &b, &o).unwrap()), (2, 1, 1, 1));
+        let (a, b) = (
+            csv("a.tsv", "id\tv\n1\ta\n2\tb\n3\tc\n4\td\n"),
+            csv("b.tsv", "id\tv\n1\ta\n9\tnew\n3\tchanged\n4\td\n"),
+        );
+        assert_eq!(counts(&compare_tables(&a, &b, &o).unwrap()), (2, 1, 1, 1));
+        let left: &[&[&str]] = &[
+            &["id", "v"],
+            &["1", "a"],
+            &["2", "b"],
+            &["3", "c"],
+            &["4", "d"],
+        ];
+        let right: &[&[&str]] = &[
+            &["id", "v"],
+            &["1", "a"],
+            &["9", "new"],
+            &["3", "changed"],
+            &["4", "d"],
+        ];
+        let (a, b) = (
+            xlsx(t.path(), "a.xlsx", left),
+            xlsx(t.path(), "b.xlsx", right),
+        );
+        assert_eq!(counts(&compare_tables(&a, &b, &o).unwrap()), (2, 1, 1, 1));
+    }
+
+    #[test]
+    fn column_insertions_and_deletions_are_columns_not_row_changes_in_every_format() {
+        let t = tempfile::tempdir().unwrap();
+        let o = TableDiffOptions::default();
+        // A column inserted in the middle and another removed at the end: the rows are still the same rows.
+        let (a, b) = (
+            write(t.path(), "a.csv", "id,x,y\n1,p,q\n2,r,s\n"),
+            write(t.path(), "b.csv", "id,new,x\n1,N1,p\n2,N2,r\n"),
+        );
+        let r = compare_tables(&a, &b, &o).unwrap();
+        assert_eq!(counts(&r), (2, 0, 0, 0));
+        let cols: Vec<_> = r.sheets[0]
+            .columns
+            .iter()
+            .map(|c| (c.name.as_str(), c.left.is_some(), c.right.is_some()))
+            .collect();
+        assert_eq!(
+            cols,
+            [
+                ("id", true, true),
+                ("x", true, true),
+                ("y", true, false),
+                ("new", false, true)
+            ]
+        );
+        let left: &[&[&str]] = &[&["id", "x", "y"], &["1", "p", "q"], &["2", "r", "s"]];
+        let right: &[&[&str]] = &[&["id", "new", "x"], &["1", "N1", "p"], &["2", "N2", "r"]];
+        let r = compare_tables(
+            &xlsx(t.path(), "a.xlsx", left),
+            &xlsx(t.path(), "b.xlsx", right),
+            &o,
+        )
+        .unwrap();
+        assert_eq!(counts(&r), (2, 0, 0, 0));
+    }
+
+    #[test]
+    fn duplicate_keys_are_matched_in_order_and_an_extra_duplicate_is_one_added_row() {
+        let t = tempfile::tempdir().unwrap();
+        let o = TableDiffOptions {
+            key: Some("id".into()),
+            ..Default::default()
+        };
+        let a = write(t.path(), "a.csv", "id,v\n1,a\n1,b\n2,c\n");
+        let b = write(t.path(), "b.csv", "id,v\n1,a\n1,b\n1,extra\n2,c\n");
+        let r = compare_tables(&a, &b, &o).unwrap();
+        assert_eq!(r.sheets[0].key.as_deref(), Some("id"));
+        // The first two rows of key 1 pair in order; the third is the surplus.
+        assert_eq!(counts(&r), (3, 1, 0, 0));
+        // Compared again, the answer is the same (nothing depends on a hash order).
+        let again = compare_tables(&a, &b, &o).unwrap();
+        let shape = |r: &TableDiffResult| {
+            r.sheets[0]
+                .rows
+                .iter()
+                .map(|x| (x.status, x.left, x.right))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shape(&r), shape(&again));
+    }
+
+    #[test]
+    fn without_a_key_column_the_rows_are_matched_by_position_and_the_result_is_deterministic() {
+        let t = tempfile::tempdir().unwrap();
+        // Every column has repeated values, so none can be a key: rows pair by position.
+        let a = write(t.path(), "a.csv", "x,y\n1,a\n1,a\n2,b\n2,b\n");
+        let b = write(t.path(), "b.csv", "x,y\n1,a\n2,b\n2,b\n2,b\n");
+        let o = TableDiffOptions::default();
+        let r = compare_tables(&a, &b, &o).unwrap();
+        assert_eq!(r.sheets[0].key, None);
+        assert!(r.sheets[0].key_candidates.is_empty());
+        // Without a key the rows are matched by a line diff of whole rows: the second (1,a) is removed and a third
+        // (2,b) is added, the rest is the same.
+        assert_eq!(counts(&r), (3, 1, 1, 0));
+        let again = compare_tables(&a, &b, &o).unwrap();
+        let shape = |r: &TableDiffResult| {
+            r.sheets[0]
+                .rows
+                .iter()
+                .map(|x| (x.status, x.left, x.right, x.cells.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shape(&r), shape(&again));
+        // A row inserted in the middle is one added row: the diff of whole rows follows the rest.
+        let c = write(t.path(), "c.csv", "x,y\n1,a\n9,z\n1,a\n2,b\n2,b\n");
+        let r = compare_tables(&a, &c, &o).unwrap();
+        assert_eq!(
+            counts(&r).1,
+            1,
+            "the surplus row at the end is the added one"
+        );
     }
 }

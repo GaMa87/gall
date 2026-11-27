@@ -4,6 +4,7 @@
 // The leader key (Space by default) opens a which-key menu of grouped
 // commands. Sequences are resolved here as pure data so they are testable;
 // App.tsx feeds key tokens in and runs the resulting action.
+import { ACTION_KEYS } from "./actionsKeys";
 import { altGrChar, buildKeymap, IS_MAC, normalizeChord, optionChar, type Action, type Keymap } from "./keymap";
 
 export interface KeyNode {
@@ -12,6 +13,8 @@ export interface KeyNode {
   children?: Map<string, KeyNode>;
   /** The next key names a folder mark (m{letter}, '{letter} …) instead of a child. */
   mark?: MarkOp;
+  /** The next key picks one of the actions.d actions that fit the selection (see `keyActions`). */
+  actions?: boolean;
 }
 
 type Spec = [keys: string, label: string, action?: Action];
@@ -49,6 +52,7 @@ export const NORMAL_KEYS: Spec[] = [
   ["g", "+go"],
   ["gg", "First item", "cursorTop"],
   ["gr", "Git graph / switch revision", "gitGraph"],
+  ["gw", "Switch worktree", "worktrees"],
   ["gh", "Home folder", "goHome"],
   ["g/", "File system root", "goRoot"],
   ["gp", "Edit path", "editPath"],
@@ -71,12 +75,16 @@ export const NORMAL_KEYS: Spec[] = [
   ["d", "+cut"],
   ["dd", "Cut", "cut"],
   ["dD", "Delete permanently", "deletePermanent"],
-  ["z", "+zip (archives)"],
+  ["z", "+zip, groups"],
   ["zx", "Extract here", "extractHere"],
   ["zf", "Extract to own folder", "extractToFolder"],
   ["zo", "Extract to other browser", "extractToOther"],
   ["zz", "Compress to .zip", "compressZip"],
   ["zc", "Compress: name and format…", "compressAs"],
+  // Vim's fold keys; zc and zo are archives here.
+  ["za", "Collapse / expand the group", "groupToggle"],
+  ["zM", "Collapse all groups", "groupCollapseAll"],
+  ["zR", "Expand all groups", "groupExpandAll"],
   ["N", "New note", "newNote"],
   ["gs", "Show in system file manager", "reveal"],
   ["gv", "Next view", "viewNext"],
@@ -116,6 +124,7 @@ export const NORMAL_KEYS: Spec[] = [
   ["Ctrl+w l", "Right browser", "focusRight"],
   // Ctrl+U (swap) is vim's half page up; Ctrl+w x is vim's own "exchange windows".
   ["Ctrl+w x", "Swap folders of the two browsers", "swapBrowsers"],
+  ["Ctrl+w n", "New window (this folder)", "newWindow"],
   [",", "+sort"],
   [",n", "Name ↑", "sortName"],
   [",N", "Name ↓", "sortNameDesc"],
@@ -127,10 +136,14 @@ export const NORMAL_KEYS: Spec[] = [
   [",E", "Type ↓", "sortExtDesc"],
   [",c", "Created ↑", "sortCreated"],
   [",C", "Created ↓", "sortCreatedDesc"],
+  [",g", "Next grouping", "groupNext"],
+  [",G", "Next order of the groups", "groupOrderNext"],
   ["=", "+compare"],
   ["==", "Compare selection / other panel", "compare"],
-  ["=h", "Compare with Git HEAD", "compareGitHead"],
-  ["=g", "Compare with a Git commit", "compareGitCommit"],
+  ["=h", "Compare file with Git HEAD (my changes)", "compareGitHead"],
+  ["=l", "Show the last Git change to this file", "compareGitLastChange"],
+  ["=g", "Compare with Git commit", "compareGitCommit"],
+  ["=r", "Open file history", "gitFileHistory"],
   ["=c", "Compare with clipboard", "compareClipboard"],
   ["=f", "Compare panel folders", "compareFolders"],
   ["+", "+windows"],
@@ -176,6 +189,8 @@ export const LEADER_KEYS: Spec[] = [
   ["ac", "Compress: name and format…", "compressAs"],
   ["fc", "Settings", "settings"],
   ["ft", "Terminal here", "terminal"],
+  // The entries of this group come from the actions.d folder and depend on the selection: see `leaderNode`.
+  ["x", "+custom actions"],
   ["s", "+search"],
   ["sg", "Grep this folder", "grepFolder"],
   ["sG", "Grep whole system", "grepRoot"],
@@ -187,13 +202,19 @@ export const LEADER_KEYS: Spec[] = [
   ["dd", "Compare selection / other panel", "compare"],
   ["dc", "Compare with clipboard", "compareClipboard"],
   ["wr", "Git graph / switch revision", "gitGraph"],
+  ["wt", "Switch worktree", "worktrees"],
   ["dg", "Compare with Git HEAD", "compareGitHead"],
   ["dh", "Compare with a Git commit", "compareGitCommit"],
+  ["dl", "Show the last Git change to this file", "compareGitLastChange"],
+  ["dr", "Open file history", "gitFileHistory"],
   ["df", "Compare panel folders", "compareFolders"],
   ["b", "+buffers (tabs)"],
   ["bd", "Close tab", "closeTab"],
   ["bb", "Previous tab", "prevTab"],
   ["bp", "Pin / unpin folder", "togglePin"],
+  ["bi", "Import favorites…", "favoritesImport"],
+  ["bm", "Merge three files…", "mergeFiles"],
+  ["ba", "Apply a patch…", "applyPatch"],
   ["t", "+tabs"],
   ["tn", "New tab", "newTab"],
   ["tc", "Close tab", "closeTab"],
@@ -201,14 +222,29 @@ export const LEADER_KEYS: Spec[] = [
   ["tl", "Next tab", "nextTab"],
   ["th", "Previous tab", "prevTab"],
   ["tp", "Tab from clipboard path", "tabFromClipboard"],
+  ["p", "+pairs"],
+  ["pp", "Pair / unpair active tabs", "pairToggle"],
+  ["pm", "Cycle pair mode (Linked / Tandem / Flow)", "pairCycleMode"],
+  ["ps", "Send selection across Flow bridge", "pairFlowSend"],
+  ["pf", "Reverse Flow direction", "pairFlowFlip"],
+  ["pg", "Open & pair ghost tab suggestion", "gravityAccept"],
+  ["px", "Dismiss ghost tab suggestion", "gravityDismiss"],
   ["w", "+windows"],
   ["ww", "Other browser", "focusOther"],
   ["wh", "Left browser", "focusLeft"],
   ["wl", "Right browser", "focusRight"],
   ["wn", "Next layout", "layoutNext"],
+  ["wN", "New window (this folder)", "newWindow"],
   ["wd", "Details pane", "togglePreviewPane"],
   ["ws", "Swap folders", "swapBrowsers"],
   ["wc", "Columns / breadcrumbs", "toggleColumns"],
+  ["W", "+workspaces"],
+  ["Wn", "New workspace", "workspaceNew"],
+  ["Wc", "Close workspace", "workspaceClose"],
+  ["Wr", "Rename workspace", "workspaceRename"],
+  ["Wl", "Next workspace", "workspaceNext"],
+  ["Wh", "Previous workspace", "workspacePrev"],
+  ...([1, 2, 3, 4, 5, 6, 7, 8, 9] as const).map((n): Spec => [`W${n}`, `Workspace ${n}`, `workspace${n}`]),
   ["c", "+copy"],
   ["cp", "Copy path", "copyPath"],
   ["cf", "Copy folder path", "copyFolderPath"],
@@ -222,13 +258,20 @@ export const LEADER_KEYS: Spec[] = [
   ["gf", "Forward", "forward"],
   ["u", "+ui"],
   ["uh", "Hidden files", "toggleHidden"],
+  ["uH", "Hidden files (both browsers)", "toggleHiddenAll"],
   ["un", "Long names", "longNames"],
   ["uv", "Next view", "viewNext"],
   ["uf", "Folders on top", "toggleFoldersOnTop"],
+  ["ug", "Collapse / expand the group", "groupToggle"],
+  ["uM", "Collapse all groups", "groupCollapseAll"],
+  ["uR", "Expand all groups", "groupExpandAll"],
   ["ur", "Reload theme", "reloadTheme"],
   ["us", "Settings", "settings"],
   ...NORMAL_KEYS.filter(([keys]) => keys.startsWith(",")),
 ];
+
+/** The leader key of the group that lists the actions.d actions for the selection. */
+export const CUSTOM_ACTIONS_KEY = "x";
 
 /** Internal token for a tap of the Ctrl key (used as a leader). */
 export const CTRL_TAP = "CtrlTap";
@@ -359,6 +402,7 @@ export function buildLeaderTree(leader: string): KeyNode {
 function leaderNode(leader: string): KeyNode {
   const n = build(LEADER_KEYS, leader).children!.get(leader)!;
   n.label = "+leader";
+  n.children!.get(CUSTOM_ACTIONS_KEY)!.actions = true;
   return n;
 }
 
@@ -371,11 +415,17 @@ export type Resolved =
   | { kind: "action"; action: Action }
   | { kind: "pending"; node: KeyNode }
   | { kind: "mark"; op: MarkOp; key: string }
+  /** `key` is the key typed after the custom-actions group (see `keyActions`). */
+  | { kind: "customAction"; key: string }
   | { kind: "none" };
 
 export function resolve(tree: KeyNode, seq: string[]): Resolved {
   let n: KeyNode | undefined = tree;
   for (let i = 0; i < seq.length; i++) {
+    if (n.actions) {
+      // The key after the custom-actions group picks an action and ends the sequence.
+      return i === seq.length - 1 && ACTION_KEYS.includes(seq[i]) && seq[i].length === 1 ? { kind: "customAction", key: seq[i] } : { kind: "none" };
+    }
     if (n.mark) {
       // The key after a mark key is the mark's name and ends the sequence.
       const key = i === seq.length - 1 ? markKey(n.mark, seq[i]) : null;
@@ -384,7 +434,7 @@ export function resolve(tree: KeyNode, seq: string[]): Resolved {
     n = n.children?.get(seq[i]);
     if (!n) return { kind: "none" };
   }
-  if (n.children?.size || n.mark) return { kind: "pending", node: n };
+  if (n.children?.size || n.mark || n.actions) return { kind: "pending", node: n };
   if (n.action) return { kind: "action", action: n.action };
   return { kind: "none" };
 }

@@ -1,7 +1,9 @@
 // Executes keyboard / palette / leader-menu actions against the active browser.
 import { api } from "../api/ipc";
 import type { Action } from "../core/keymap";
+import { archiveOf } from "../core/archive";
 import { ancestors } from "../core/path";
+import { isPatchFile } from "../core/patchImport";
 import * as A from "./actions";
 import { controller, refreshAll } from "./controllers";
 import { getState, setState } from "./store";
@@ -26,22 +28,28 @@ export function run(a: Action) {
     case "copyFolderPath": A.copyPaths([], path); break;
     case "togglePin": A.togglePin(path); break;
     case "compare": A.compareSelection(b); break;
-    case "gitGraph":
-      // Outside a repository there is nothing to show: warn instead of opening an empty window.
-      void api.gitRoot(path).catch(() => null).then((root) => {
-        if (root) A.openOverlay({ type: "gitGraph", path });
-        else void A.trustGitFolder(path).then((refused) => { if (!refused) A.notify("This folder is not inside a Git repository", "warn"); });
-      });
-      break;
+    case "gitGraph": void A.openGitWorkspace(path); break;
+    case "worktrees": void A.openWorktrees(path); break;
     case "compareFolders": A.comparePanelFolders(b); break;
+    case "mergeFiles": A.mergeSelection(b); break;
+    case "applyPatch": {
+      // With a patch file focused the dialog opens on it.
+      const f = archiveOf(path) ? null : controller(b)?.focused();
+      A.openOverlay({ type: "applyPatch", root: A.activePath(b), file: f && isPatchFile(f) ? f.path : undefined });
+      break;
+    }
+    case "favoritesImport": A.openOverlay({ type: "favoritesImport" }); break;
+    case "gitFileHistory":
     case "compareClipboard":
     case "compareGitCommit":
+    case "compareGitLastChange":
     case "compareGitHead": {
       const f = controller(b)?.focused();
       if (!f || f.isDir) { A.notify("Focus a file first", "warn"); break; }
       if (a === "compareClipboard") A.compareWithClipboard(f.path);
-      else if (a === "compareGitCommit") A.openOverlay({ type: "gitCommits", path: f.path });
-      else A.compareWithGitHead(f.path);
+      else if (a === "gitFileHistory" || a === "compareGitCommit") {
+        A.openOverlay({ type: "gitCommits", path: f.path, onlyFile: a === "gitFileHistory" });
+      } else A.compareGitFile(f.path, a === "compareGitLastChange" ? "lastChange" : "head");
       break;
     }
     case "longNames": setState((s) => ({ longNames: !s.longNames })); break;
@@ -60,6 +68,22 @@ export function run(a: Action) {
       if (idx < br.tabs.length) A.sessionCmd({ op: "activate", b, idx });
       break;
     }
+    case "workspace1": case "workspace2": case "workspace3": case "workspace4": case "workspace5":
+    case "workspace6": case "workspace7": case "workspace8": case "workspace9": {
+      A.switchWorkspace(Number(a.slice(9)) - 1);
+      break;
+    }
+    case "workspaceNew": A.createWorkspace(); break;
+    case "workspaceNext": A.cycleWorkspace(1); break;
+    case "workspacePrev": A.cycleWorkspace(-1); break;
+    case "workspaceClose": A.closeWorkspace(getState().activeWorkspace); break;
+    case "workspaceRename": void A.promptRenameWorkspace(getState().activeWorkspace); break;
+    case "pairToggle": A.toggleActivePair(); break;
+    case "pairCycleMode": A.cycleActivePairMode(); break;
+    case "pairFlowSend": void A.sendAcrossFlow(); break;
+    case "pairFlowFlip": A.flipActiveFlowDirection(); break;
+    case "gravityAccept": void A.acceptGravityGhost(); break;
+    case "gravityDismiss": void A.dismissGravityGhost(); break;
     case "focusLeft":
     case "focusRight": {
       const t = a === "focusLeft" ? 0 : 1;
@@ -77,12 +101,22 @@ export function run(a: Action) {
     case "paste": A.paste(b); break;
     case "pasteAsLinks": A.pasteAsLinks(b); break;
     case "refresh": refreshAll(); A.refreshDrives(); A.invalidateAllFolderSizes(); break;
-    case "toggleHidden": A.updateSettings({ showHidden: !getState().settings!.showHidden }); break;
+    case "toggleHidden": A.toggleHidden(b); break;
+    case "toggleHiddenAll": A.toggleHiddenAll(); break;
     case "toggleColumns": A.toggleColumns(b); break;
-    case "toggleSidebar": setState((s) => ({ sidebarVisible: !s.sidebarVisible })); break;
+    case "toggleSidebar": A.toggleSidebar(); break;
+    case "newWindow": api.newWindow({ paths: [path] }).catch(A.fail); break;
     case "togglePreviewPane": A.toggleDetails(b); break;
     case "swapBrowsers": A.swapBrowsers(); break;
-    case "notifications": setState((s) => ({ showNotificationLog: !s.showNotificationLog })); break;
+    case "notifications": {
+      const showNotificationLog = !getState().showNotificationLog;
+      setState({ showNotificationLog });
+      if (showNotificationLog) {
+        const actions = document.querySelectorAll<HTMLButtonElement>(".toasts .toast:not(.task) > button:first-of-type");
+        actions[actions.length - 1]?.focus();
+      }
+      break;
+    }
     case "search": A.openOverlay({ type: "search", root: path }); break;
     case "quickOpen": A.openOverlay({ type: "quickOpen" }); break;
     case "commandPalette": A.openOverlay({ type: "quickOpen", initial: ">" }); break;

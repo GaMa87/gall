@@ -53,19 +53,31 @@
     "license": "MIT",
     "licenseFile": "../LICENSE",
     "longDescription": "Gall is a fast, keyboard-first file manager with Miller columns, two side-by-side browsers and tabs. It finds any file on the computer as you type, searches text inside files, compares text, spreadsheets, images and folders, and has Vim keys, previews, Git status and undo for every file operation.",
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "installerHooks": "../packaging/windows/compare-hooks.nsh"
+      }
+    },
     "linux": {
       "deb": {
         "depends": [],
         "desktopTemplate": "../packaging/linux/gall.desktop",
         "files": {
-          "/usr/share/metainfo/org.gall.app.metainfo.xml": "../packaging/linux/org.gall.app.metainfo.xml"
+          "/usr/share/metainfo/org.gall.app.metainfo.xml": "../packaging/linux/org.gall.app.metainfo.xml",
+          "/usr/share/icons/hicolor/scalable/apps/gall.svg": "../assets/icon.svg",
+          "/usr/share/dbus-1/services/org.gall.app.FileManager1.service": "../packaging/linux/org.gall.app.FileManager1.service",
+          "/usr/share/gall/actions.d/50-omarchy.json": "../packaging/linux/omarchy-actions.json"
         }
       },
       "rpm": {
         "depends": [],
         "desktopTemplate": "../packaging/linux/gall.desktop",
         "files": {
-          "/usr/share/metainfo/org.gall.app.metainfo.xml": "../packaging/linux/org.gall.app.metainfo.xml"
+          "/usr/share/metainfo/org.gall.app.metainfo.xml": "../packaging/linux/org.gall.app.metainfo.xml",
+          "/usr/share/icons/hicolor/scalable/apps/gall.svg": "../assets/icon.svg",
+          "/usr/share/dbus-1/services/org.gall.app.FileManager1.service": "../packaging/linux/org.gall.app.FileManager1.service",
+          "/usr/share/gall/actions.d/50-omarchy.json": "../packaging/linux/omarchy-actions.json"
         }
       }
     }
@@ -75,7 +87,10 @@
       "endpoints": [
         "https://github.com/GaMa87/gall/releases/latest/download/latest.json"
       ],
-      "pubkey": ""
+      "pubkey": "",
+      "windows": {
+        "installMode": "quiet"
+      }
     }
   }
 }

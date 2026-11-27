@@ -58,6 +58,11 @@ impl ArchiveFormat {
     }
 }
 
+/// The last extensions of the names `detect` recognises.
+pub(crate) const EXTENSIONS: &[&str] = &[
+    "tgz", "txz", "tbz2", "tbz", "tzst", "tar", "zip", "7z", "gz", "xz", "bz2", "zst",
+];
+
 /// Recognises an archive by its file name. Returns the format and the name without
 /// the archive extension (`photos.tar.gz` → `photos`).
 pub fn detect(path: &Path) -> Option<(ArchiveFormat, String)> {
@@ -261,6 +266,10 @@ pub fn source_bytes(sources: &[PathBuf]) -> u64 {
 
 // ───────────────────────────── compress ─────────────────────────────
 
+/// Size of the buffer between an archive writer and its file: writers emit many small pieces
+/// (headers, deflate blocks), and each unbuffered piece is a system call.
+const WRITE_BUFFER: usize = 256 * 1024;
+
 /// Packs `sources` into a new archive at `target` (a unique name is chosen if it
 /// exists). Returns the path written.
 pub fn compress(
@@ -318,7 +327,10 @@ fn write_zip(
     tick: &mut Tick,
 ) -> Result<()> {
     use zip::write::SimpleFileOptions;
-    let mut w = zip::ZipWriter::new(fs::File::create(tmp).ctx("create", tmp)?);
+    let mut w = zip::ZipWriter::new(io::BufWriter::with_capacity(
+        WRITE_BUFFER,
+        fs::File::create(tmp).ctx("create", tmp)?,
+    ));
     for (path, name, meta) in entries {
         if cancel.load(Ordering::Relaxed) {
             return Err(CoreError::Cancelled);
@@ -346,7 +358,8 @@ fn write_zip(
             check(io::copy(&mut r, &mut w), cancel, "zip")?;
         }
     }
-    check(w.finish(), cancel, "zip")?;
+    let mut out = check(w.finish(), cancel, "zip")?;
+    check(io::Write::flush(&mut out), cancel, "zip")?;
     Ok(())
 }
 
@@ -357,7 +370,7 @@ fn write_tar_gz(
     tick: &mut Tick,
 ) -> Result<()> {
     let gz = flate2::write::GzEncoder::new(
-        fs::File::create(tmp).ctx("create", tmp)?,
+        io::BufWriter::with_capacity(WRITE_BUFFER, fs::File::create(tmp).ctx("create", tmp)?),
         flate2::Compression::default(),
     );
     let mut b = tar::Builder::new(gz);
@@ -376,7 +389,8 @@ fn write_tar_gz(
         }
     }
     let gz = check(b.into_inner(), cancel, "tar")?;
-    check(gz.finish(), cancel, "gzip")?;
+    let mut out = check(gz.finish(), cancel, "gzip")?;
+    check(io::Write::flush(&mut out), cancel, "gzip")?;
     Ok(())
 }
 
@@ -527,6 +541,8 @@ fn read_tar<R: Read>(r: R, stage: &Path, cancel: &AtomicBool) -> Result<()> {
 
 fn read_zip<R: Read + Seek>(r: R, stage: &Path, cancel: &AtomicBool, archive: &Path) -> Result<()> {
     let mut z = check(zip::ZipArchive::new(r), cancel, "zip")?;
+    // Entries of a folder come one after another: create it once, not once per file.
+    let mut made_dir = PathBuf::new();
     for i in 0..z.len() {
         // Encrypted entries use the password typed while browsing the archive.
         let mut f = super::archive_view::zip_entry(&mut z, i, archive)?;
@@ -538,8 +554,9 @@ fn read_zip<R: Read + Seek>(r: R, stage: &Path, cancel: &AtomicBool, archive: &P
             fs::create_dir_all(&out).ctx("create", &out)?;
             continue;
         }
-        if let Some(p) = out.parent() {
+        if let Some(p) = out.parent().filter(|p| *p != made_dir) {
             fs::create_dir_all(p).ctx("create", p)?;
+            made_dir = p.to_path_buf();
         }
         if f.is_symlink() {
             let mut target = String::new();
@@ -730,6 +747,96 @@ mod tests {
                     .all(|e| !e.file_name().to_string_lossy().starts_with(".gall-")),
                 "no staging left"
             );
+        }
+    }
+
+    /// Every path below `dir` (relative, sorted) with the bytes of each file.
+    fn snapshot(dir: &Path) -> Vec<(String, Option<Vec<u8>>)> {
+        fn walk(root: &Path, at: &Path, out: &mut Vec<(String, Option<Vec<u8>>)>) {
+            for e in fs::read_dir(at).unwrap().flatten() {
+                let rel = e
+                    .path()
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if e.path().is_dir() {
+                    out.push((rel, None));
+                    walk(root, &e.path(), out);
+                } else {
+                    out.push((rel, Some(fs::read(e.path()).unwrap())));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, dir, &mut out);
+        out.sort();
+        out
+    }
+
+    /// The writers are buffered and extraction creates a folder once for its entries: a payload that
+    /// is bigger than the write buffer, an empty file, and many entries in a few folders must come
+    /// back byte for byte, with the empty folders.
+    #[test]
+    fn buffered_writers_keep_every_byte() {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut noise = |n: usize| -> Vec<u8> {
+            (0..n)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state >> 24) as u8
+                })
+                .collect()
+        };
+        for fmt in [ArchiveFormat::Zip, ArchiveFormat::TarGz] {
+            let t = tempfile::tempdir().unwrap();
+            let src = t.path().join("data");
+            for d in ["a", "a/deep/er", "b", "empty/nested"] {
+                fs::create_dir_all(src.join(d)).unwrap();
+            }
+            // Incompressible: the archive itself is far larger than WRITE_BUFFER.
+            fs::write(src.join("a/big.bin"), noise(WRITE_BUFFER * 2 + 12_345)).unwrap();
+            fs::write(src.join("b/exact.bin"), noise(WRITE_BUFFER)).unwrap();
+            fs::write(src.join("zero.txt"), b"").unwrap();
+            for i in 0..300 {
+                fs::write(
+                    src.join(format!("a/deep/er/f{i:03}.txt")),
+                    format!("file {i}\n").repeat(i % 7 + 1),
+                )
+                .unwrap();
+                fs::write(src.join(format!("b/g{i:03}.dat")), noise(i * 13 % 900)).unwrap();
+            }
+            let out = t.path().join("out");
+            fs::create_dir(&out).unwrap();
+            let ar = compress(
+                std::slice::from_ref(&src),
+                &out.join(format!("data.{}", fmt.extension())),
+                fmt,
+                &AtomicBool::new(false),
+                &mut |_| {},
+            )
+            .unwrap();
+            assert!(
+                fs::metadata(&ar).unwrap().len() > WRITE_BUFFER as u64 * 2,
+                "{fmt:?}"
+            );
+            let placed = extract(
+                &ar,
+                &out,
+                ExtractMode::Smart,
+                &AtomicBool::new(false),
+                &mut |_| {},
+            )
+            .unwrap();
+            assert_eq!(placed, vec![out.join("data")], "{fmt:?}");
+            let (want, got) = (snapshot(&src), snapshot(&placed[0]));
+            assert_eq!(want.len(), got.len(), "{fmt:?}: same paths");
+            for (w, g) in want.iter().zip(&got) {
+                assert_eq!(w.0, g.0, "{fmt:?}");
+                assert!(w.1 == g.1, "{fmt:?}: {} differs", w.0);
+            }
         }
     }
 

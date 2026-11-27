@@ -1,11 +1,13 @@
 // Tips & tricks (Settings › About, and one at a time in the About window). Keys are shown
 // as they are now: vim keys when those are on, the user's own chords when rebound.
 import { useState, type ReactNode } from "react";
+import { tt } from "../i18n";
 import { ACTION_LABELS, type Action } from "../core/keymap";
 import * as A from "../state/actions";
 import { useKeyLabels } from "../state/keyLabels";
 import { useStore } from "../state/store";
 import { Icon } from "./Icon";
+import { platformLabel } from "../core/keymap";
 
 /** Renders an action's keys, or its name where it has none in the current mode. */
 type K = (a: Action) => ReactNode;
@@ -19,16 +21,16 @@ const TIP_GROUPS: { title: string; icon: string; tips: Tip[] }[] = [
   {
     title: "Getting around", icon: "forward", tips: [
       { title: "Go to any file", body: (k) => <>{k("quickOpen")} searches the open folder and below; <kbd>Tab</kbd> switches to everywhere in the index. Unindexed folders are read on demand. Inside archives, only index search is available. End the query with <code>/</code> to list only folders; <code>ext:md</code>, <code>^start</code>, <code>end$</code>, <code>'exact</code> and <code>!skip</code> narrow it down.</> },
-      { title: "Find text in files", body: (k) => <>{k("grepFolder")} searches inside the files of this folder, {k("grepRoot")} the whole system. <kbd>Tab</kbd> switches between the folder, Home and the drive; <kbd>Alt+C</kbd>, <kbd>Alt+W</kbd> and <kbd>Alt+R</kbd> toggle case, whole word and regex.</> },
+      { title: "Find text in files", body: (k) => <>{k("grepFolder")} searches inside the files of this folder, {k("grepRoot")} the whole system. <kbd>Tab</kbd> switches between the folder, Home and the drive; <kbd>{platformLabel("Alt+C")}</kbd>, <kbd>{platformLabel("Alt+W")}</kbd> and <kbd>{platformLabel("Alt+R")}</kbd> toggle case, whole word and regex.</> },
       { title: "Folder marks", body: () => <>With Vim keys on, <kbd>m</kbd> and a letter marks the current folder; <kbd>'</kbd> and the letter goes back to it, <kbd>`</kbd> and the letter also selects the item you were on. <kbd>''</kbd> returns to where you jumped from. Marks are kept between sessions.</> },
       { title: "Hide search noise", body: () => <>Right-click › Hide from search adds an item to <code>.gallignore</code>; Show in search again brings it back. Rules also apply to subfolders, find in files and name search, without changing Git's rules.</> },
-      { title: "Find ignored files", body: () => <><kbd>Alt+I</kbd> includes ignored files in find in files and the name search. In Quick Open it opens the name search in the current folder, including ignored files (not available inside archives).</> },
+      { title: "Find ignored files", body: () => <><kbd>{platformLabel("Alt+I")}</kbd> includes ignored files in find in files and the name search. In Quick Open it opens the name search in the current folder, including ignored files (not available inside archives).</> },
       { title: "Browse WSL on Windows", body: (k) => <>Open a distribution from Drives › Not mounted to start it. {k("terminal")} opens its Linux shell here. Delete uses its Linux trash where available; Gall's Trash window only shows the Windows Recycle Bin. Stop terminates every program in the distribution.</> },
       { title: "Type to filter", body: () => <>Start typing in a folder to filter it (with vim keys on, press <kbd>/</kbd> first). <kbd>Esc</kbd> clears the filter.</> },
       { title: "Every action by name", body: (k) => <>{k("commandPalette")} opens the command palette: search any action and see its keys.</> },
       { title: "A menu instead of shortcuts", body: (_k, leader) => leader ? <>Press <kbd>{leader}</kbd> (the leader key) for a menu of grouped actions; each letter leads one level deeper.</> : <>Set a leader key in Settings › Keyboard for a menu of grouped actions instead of shortcuts.</> },
       { title: "Type a path", body: (k) => <>{k("editPath")} turns the folder path into a text field; <code>~</code> and <code>$VARIABLES</code> work. It suggests favourites, tabs, history and a path on the clipboard, and <kbd>Tab</kbd> completes. Right-click it to copy the path in another format.</> },
-      { title: "Recent files", body: (k) => <>{k("quickOpen")} with an empty query lists recent files and folders. <kbd>Ctrl+Enter</kbd> selects a result in its folder, <kbd>Shift+Enter</kbd> opens it in the other browser.</> },
+      { title: "Recent files", body: (k) => <>{k("quickOpen")} with an empty query lists recent files and folders. <kbd>{platformLabel("Ctrl+Enter")}</kbd> selects a result in its folder, <kbd>Shift+Enter</kbd> opens it in the other browser.</> },
       { title: "q closes windows", body: () => <><kbd>q</kbd> closes Quick Open, compare views, the preview and other windows like <kbd>Esc</kbd>, in every profile (not dialogs or notes, and not while typing).</> },
     ],
   },
@@ -41,22 +43,22 @@ const TIP_GROUPS: { title: string; icon: string; tips: Tip[] }[] = [
       { title: "Title bar panel controls", body: () => <>The layout buttons in the title bar switch layouts. Above the divider, ‹ and › hide one browser and ⇄ swaps their folders; right-click there to show or hide each browser's details pane.</> },
       { title: "Pin a folder", body: (k) => <>{k("togglePin")} (or the star in the folder header) pins the current folder in the sidebar. With two browsers, hover a favourite to open it in the left or right one.</> },
       { title: "Favourites groups", body: () => <>Organise favourites in groups: the New group button at the bottom of the sidebar, + on a group adds the current folder, drop a folder on a group title, drag to reorder, give items an alias. Middle-click any sidebar item to open it in a background tab.</> },
-      { title: "Tabs", body: (k) => <>{k("newTab")} opens a tab and {k("reopenTab")} brings back a closed one. Middle-click closes a tab; <kbd>Alt</kbd>+middle-click moves it to the other browser.</> },
+      { title: "Tabs", body: (k) => <>{k("newTab")} opens a tab and {k("reopenTab")} brings back a closed one. Middle-click closes a tab; <kbd>{platformLabel("Alt")}</kbd>+middle-click moves it to the other browser.</> },
     ],
   },
   {
     title: "Files", icon: "copy", tips: [
-      { title: "Drag with a modifier", body: () => <>While dragging, hold <kbd>Ctrl</kbd> to copy, <kbd>Shift</kbd> to move or <kbd>Alt</kbd> to create a link.</> },
+      { title: "Drag with a modifier", body: () => <>While dragging, hold <kbd>{platformLabel("Ctrl")}</kbd> to copy, <kbd>Shift</kbd> to move or <kbd>{platformLabel("Alt")}</kbd> to create a link.</> },
       { title: "Undo almost anything", body: (k) => <>{k("undo")} undoes copies, moves, renames (also batch renames), folder merges, deletes to the trash and extractions.</> },
       { title: "Rename many at once", body: (k) => <>Select several items and press {k("rename")}: a name template with counter and date, find & replace (also regex), case changes or edit all names as text. The preview flags clashes; one undo reverts it all.</> },
       { title: "Merge folders", body: () => <>When a copied or moved folder already exists, Merge puts both together; then choose for files in both: keep both, replace, replace older or skip.</> },
       { title: "Folder sizes", body: (k) => <>{k("folderSizes")} counts the selected folders, or all folders here, and shows the totals in the Size column. Calculate automatically in the Folder sizes menu keeps them up to date.</> },
-      { title: "Hold Ctrl in menus", body: () => <>Hold <kbd>Ctrl</kbd> while a context menu is open to see the alternative items: Edit with…, Terminal here with…, and extract and move the archive to the trash.</> },
-      { title: "Faster dialogs", body: (k) => <>In {k("newFolder")}, <kbd>Ctrl+Enter</kbd> creates and opens the folder and <kbd>Shift+Enter</kbd> moves the selection into it. While renaming, <kbd>F2</kbd> again selects the name, the extension or everything.</> },
+      { title: "Hold Ctrl in menus", body: () => <>Hold <kbd>{platformLabel("Ctrl")}</kbd> while a context menu is open to see the alternative items: Edit with…, Terminal here with…, and extract and move the archive to the trash.</> },
+      { title: "Faster dialogs", body: (k) => <>In {k("newFolder")}, <kbd>{platformLabel("Ctrl+Enter")}</kbd> creates and opens the folder and <kbd>Shift+Enter</kbd> moves the selection into it. While renaming, <kbd>F2</kbd> again selects the name, the extension or everything.</> },
       { title: "Trash window", body: () => <>Click Trash in the sidebar to restore items, show their original folder, delete for good or empty the trash. Dropping files on Trash moves them there.</> },
       { title: "Folder colours and header", body: () => <>Right-click › Folder colour, or the ⋯ menu in the folder header, colours a folder. The header's undo button undoes the last operation in that folder.</> },
       { title: "Notes", body: (k) => <>{k("newNote")} creates a <code>.2do</code> note with a done checkbox, right next to your files.</> },
-      { title: "Always open with…", body: (k) => <>{k("openWith")} lists programs for the file. Pick one and press <kbd>Ctrl ↵</kbd> to always use it for that type; <kbd>Tab</kbd> narrows the rule to the project, the folder or only this file.</> },
+      { title: "Always open with…", body: (k) => <>{k("openWith")} lists programs for the file. Pick one and press <kbd>{platformLabel("Ctrl ↵")}</kbd> to always use it for that type; <kbd>Tab</kbd> narrows the rule to the project, the folder or only this file.</> },
       { title: "New from a template", body: (k) => <>{k("newFile")} creates a file from your templates; "Create file template" in the context menu adds any file to them.</> },
       { title: "Colour tags", body: (k) => <>{k("tag")} tags the selection with a colour; {k("search")} finds files by tag.</> },
     ],
@@ -66,13 +68,13 @@ const TIP_GROUPS: { title: string; icon: string; tips: Tip[] }[] = [
       { title: "Peek inside", body: (k) => <>{k("preview")} previews the file: Markdown is rendered, source code coloured, video and PDF played and paged, STL 3D models turned with the mouse.</> },
       { title: "Compare two files", body: (k) => <>Select two files and press {k("compare")}; the context menu also compares with the clipboard, with Git HEAD or with any commit ({k("compareGitCommit")}).</> },
       { title: "Sync two folders", body: (k) => <>{k("compareFolders")} compares the folders of both browsers and copies what differs: <kbd>&gt;</kbd> / <kbd>&lt;</kbd> copy the selection, <kbd>c</kbd> compares contents.</> },
-      { title: "Keys in compare views", body: () => <><kbd>n</kbd> / <kbd>N</kbd> jump between changes, <kbd>u</kbd> switches split and unified, <kbd>Alt+→</kbd> / <kbd>Alt+←</kbd> copy a change across and <kbd>Ctrl+S</kbd> saves. Binary files open in a hex compare; three or more files give a similarity matrix.</> },
+      { title: "Keys in compare views", body: () => <><kbd>n</kbd> / <kbd>N</kbd> jump between changes, <kbd>u</kbd> switches split and unified, <kbd>{platformLabel("Alt+→")}</kbd> / <kbd>{platformLabel("Alt+←")}</kbd> copy a change across and <kbd>{platformLabel("Ctrl+S")}</kbd> saves. Binary files open in a hex compare; three or more files give a similarity matrix.</> },
     ],
   },
   {
     title: "Archives", icon: "archive", tips: [
       { title: "Archives are folders", body: (k) => <>{k("open")} on a zip, 7z or tar opens it like a folder: preview, copy and open what is inside. Encrypted ones ask for the password.</> },
-      { title: "Extract and clean up", body: () => <>Hold <kbd>Ctrl</kbd> in the context menu: the extract items also move the archive to the trash. One undo brings it back.</> },
+      { title: "Extract and clean up", body: () => <>Hold <kbd>{platformLabel("Ctrl")}</kbd> in the context menu: the extract items also move the archive to the trash. One undo brings it back.</> },
     ],
   },
   {
@@ -101,7 +103,7 @@ function useTipKeys(): { k: K; leader: string } {
   const leaderSetting = s?.vimKeys ? s.leaderKey || "Space" : s?.leaderKeyBasic ?? "Ctrl Ctrl";
   const k: K = (a) => {
     const label = keys.action(a);
-    return label ? <kbd>{label}</kbd> : <em>{ACTION_LABELS[a]}</em>;
+    return label ? <kbd>{label}</kbd> : <em>{tt(ACTION_LABELS[a])}</em>;
   };
   return { k, leader: leaderSetting };
 }

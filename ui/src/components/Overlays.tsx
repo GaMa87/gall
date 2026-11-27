@@ -1,25 +1,33 @@
+import { PatchImport } from "./PatchImport";
+import { StandaloneMerge } from "./StandaloneMerge";
 import { BugReport } from "./BugReport";
 // Modal overlays, context menu, notifications and task progress.
 import { createPortal } from "react-dom";
 import { DiffView } from "./DiffView";
 import { GitGraph } from "./GitGraph";
+import { WorktreeCleanup, WorktreeSwitcher } from "./GitWorktrees";
 import { DirCompare } from "./DirCompare";
 import { SimilarityMatrix } from "./SimilarityMatrix";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api/ipc";
 import type { FileEntry, Template } from "../api/types";
 import { formatEta } from "../core/eta";
+import { contrastingText } from "../core/omarchyTheme";
+import { placeSurface, submenuAnchor, type Anchor } from "../core/anchor";
 import { formatDateTime, formatSize } from "../core/format";
+import { HoverGuard } from "../core/hover";
 import { primaryMod } from "../core/keymap";
 import { basename, parent, sepOf } from "../core/path";
 import * as A from "../state/actions";
 import { controller } from "../state/controllers";
 import { bumpNonce } from "../state/hooks";
 import { useKeyLabels } from "../state/keyLabels";
+import { tt } from "../i18n";
 import { AboutInfo } from "./AboutInfo";
 import { BatchRename } from "./BatchRename";
 import { FolderLink } from "./FolderLink";
 import { Welcome } from "./Welcome";
+import { FavoritesImportDialog } from "./FavoritesImport";
 import { getState, setState, useStore, type DialogSpec, type MenuItem, type NoteKind, type Overlay } from "../state/store";
 import { FileIcon, Icon, TAG_COLORS } from "./Icon";
 import { Preview, usePreviewInfo } from "./Preview";
@@ -30,6 +38,7 @@ import { FindInFiles } from "./FindInFiles";
 import { KeyHelp } from "./WhichKey";
 import { SettingsDialog } from "./Settings";
 import { OpenWith } from "./OpenWith";
+import { platformLabel } from "../core/keymap";
 
 /** Ref that focuses an element once when it appears. A function written inline in the
  *  JSX is new on every render, so React would call it again and pull the focus back to
@@ -60,8 +69,8 @@ function useCtrlHeld() {
   return held;
 }
 
-function MenuList({ items, x, y, onClose, depth = 0, active = true, onBack, startKb = -1 }: {
-  items: MenuItem[]; x: number; y: number; onClose: () => void; depth?: number;
+function MenuList({ items, anchor, onClose, depth = 0, active = true, onBack, startKb = -1 }: {
+  items: MenuItem[]; anchor: Anchor; onClose: () => void; depth?: number;
   /** This menu takes the keys (the root, or a submenu opened with the keyboard). */
   active?: boolean;
   /** Leaves a submenu opened with the keyboard (Left / h / Esc). */
@@ -72,18 +81,29 @@ function MenuList({ items, x, y, onClose, depth = 0, active = true, onBack, star
   const ctrlHeld = useCtrlHeld();
   // Print the keys that do it in the current mode (vim keys / rebound chords).
   const keys = useKeyLabels();
-  const [pos, setPos] = useState({ x, y });
+  const [pos, setPos] = useState({ x: anchor.x, y: anchor.y });
   const [open, setOpen] = useState<number | null>(null);
   const [kb, setKb] = useState(startKb);
-  const [subPos, setSubPos] = useState({ x: 0, y: 0 });
+  const [subPos, setSubPos] = useState<Anchor>({ x: 0, y: 0 });
   // A submenu opened with the keyboard takes the keys until it is left.
   const [subKb, setSubKb] = useState(false);
+  // Opened with a key (a menu that keeps its item visible, a submenu that takes the keys): a mouse at rest chooses nothing.
+  const hoverGuard = useRef<HoverGuard | null>(null);
+  const guard = (hoverGuard.current ??= new HoverGuard(depth ? !active : !anchor.avoid));
+  const hover = (e: React.MouseEvent<HTMLElement>, i: number) => {
+    if (!guard.moved(e)) return;
+    const submenu = !!items[i].submenu;
+    if (kb === i && open === (submenu ? i : null) && !subKb) return;
+    setKb(i);
+    if (submenu) {
+      setSubPos(submenuAnchor(e.currentTarget));
+      setOpen(i);
+    } else setOpen(null);
+    setSubKb(false);
+  };
   const openSub = (i: number, byKeys: boolean) => {
     const el = ref.current?.children[i] as HTMLElement | undefined;
-    if (el) {
-      const r = el.getBoundingClientRect();
-      setSubPos({ x: r.right - 2, y: r.top - 4 });
-    }
+    if (el) setSubPos(submenuAnchor(el));
     setOpen(i);
     setSubKb(byKeys);
   };
@@ -94,15 +114,15 @@ function MenuList({ items, x, y, onClose, depth = 0, active = true, onBack, star
     // Layout size, not getBoundingClientRect: the opening animation scales the menu down,
     // which made it measure smaller and stick out of the window by a few pixels. Again
     // when its content changes size (items that load later).
-    const place = () => setPos({
-      x: Math.max(4, Math.min(x, window.innerWidth - el.offsetWidth - 4)),
-      y: Math.max(4, Math.min(y, window.innerHeight - el.offsetHeight - 4)),
-    });
+    const place = () => setPos(placeSurface(anchor, el.offsetWidth, el.offsetHeight, window.innerWidth, window.innerHeight));
     place();
     const ro = new ResizeObserver(place);
     ro.observe(el);
     return () => ro.disconnect();
-  }, [x, y]);
+  }, [anchor]);
+
+  // In a low window the menu scrolls: keep the item the keys are on visible.
+  useLayoutEffect(() => { if (kb >= 0) ref.current?.children[kb]?.scrollIntoView({ block: "nearest" }); }, [kb]);
 
   useEffect(() => {
     if (!active || subKb) return;
@@ -134,7 +154,7 @@ function MenuList({ items, x, y, onClose, depth = 0, active = true, onBack, star
   }, [items, kb, depth, onClose, active, subKb, onBack]);
 
   return (
-    <div className="menu" ref={ref} style={{ left: pos.x, top: pos.y }} onMouseDown={(e) => e.stopPropagation()} onContextMenu={(e) => e.preventDefault()}>
+    <div className="menu" ref={ref} style={{ left: pos.x, top: pos.y }} onScroll={() => { if (!subKb) setOpen(null); }} onMouseDown={(e) => e.stopPropagation()} onContextMenu={(e) => e.preventDefault()}>
       {items.map((it, i) =>
         it.separator ? (
           <div key={i} className="sep" />
@@ -142,33 +162,26 @@ function MenuList({ items, x, y, onClose, depth = 0, active = true, onBack, star
           <div
             key={i}
             className={`mi ${it.disabled ? "disabled" : ""} ${it.danger ? "danger" : ""} ${kb === i ? "kb" : ""}`}
-            onMouseEnter={(e) => {
-              setKb(i);
-              if (it.submenu) {
-                const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-                setSubPos({ x: r.right - 2, y: r.top - 4 });
-                setOpen(i);
-              } else setOpen(null);
-              setSubKb(false);
-            }}
-            title={it.ctrl ? `Hold Ctrl: ${it.ctrl.label}` : undefined}
+            onMouseEnter={(e) => hover(e, i)}
+            onMouseMove={(e) => hover(e, i)}
+            title={it.ctrl ? tt("Hold Ctrl: {label}", { label: it.ctrl.label }) : undefined}
             onClick={(e) => {
-              if (it.disabled || it.submenu) return;
+              if (it.disabled || (it.submenu && !it.run)) return;
               onClose();
               (e.ctrlKey && it.ctrl ? it.ctrl.run : it.run)?.();
             }}
           >
             <span style={{ width: 16, display: "inline-flex" }}>{it.swatch ? <span className={`swatch ${it.checked ? "on" : ""}`} style={{ background: it.swatch }} /> : it.checked ? <Icon name="check" size={14} /> : it.icon ? <Icon name={it.icon} size={14} /> : null}</span>
-            <span className="lbl">{ctrlHeld && it.ctrl ? it.ctrl.label : it.label}</span>
+            <span className="lbl">{tt((ctrlHeld && it.ctrl ? it.ctrl.label : it.label) ?? "")}</span>
             {(() => {
-              const sc = it.action ? keys.action(it.action) : it.shortcut ? keys.chord(it.shortcut) : it.accel ?? null;
+              const sc = it.action ? keys.action(it.action) : it.keyCap ? it.keyCap : it.shortcut ? keys.chord(it.shortcut) : it.accel ?? null;
               return sc && <span className="sc">{sc}</span>;
             })()}
             {it.submenu && <Icon name="chevronRight" size={12} />}
             {/* Portal: .menu has backdrop-filter, which would make a nested position:fixed
                 submenu position itself relative to the parent menu instead of the window. */}
             {it.submenu && open === i && createPortal(
-              <MenuList items={it.submenu} x={subPos.x} y={subPos.y} onClose={onClose} depth={depth + 1}
+              <MenuList items={it.submenu} anchor={subPos} onClose={onClose} depth={depth + 1}
                 active={subKb} onBack={() => { setSubKb(false); setOpen(null); }}
                 startKb={subKb ? it.submenu.findIndex((s) => !s.separator && !s.disabled) : -1} />,
               document.body)}
@@ -194,7 +207,7 @@ export function ContextMenu() {
     };
   }, [menu]);
   if (!menu) return null;
-  return <MenuList items={menu.items} x={menu.x} y={menu.y} onClose={() => setState({ menu: null })} />;
+  return <MenuList items={menu.items} anchor={menu} onClose={() => setState({ menu: null })} />;
 }
 
 // ───────── generic dialog ─────────
@@ -275,15 +288,15 @@ function Dialog({ d }: { d: DialogSpec }) {
           }
         }}
         tabIndex={-1} ref={d.input ? undefined : focusOnMount}>
-        <h3>{d.title}</h3>
+        <h3>{tt(d.title)}</h3>
         <div className="body">
-          {d.message && <p>{d.message}</p>}
-          {d.input && (d.input.multiline ? <><textarea ref={(element) => { inputRef.current = element; }} className="dialog-multiline" aria-label={d.title} value={value} placeholder={d.input.placeholder} onChange={(e) => setValue(e.target.value)} spellCheck={false} /><small>Ctrl+Enter saves · Escape cancels</small></> : <input ref={(element) => { inputRef.current = element; }} type={d.input.password ? "password" : "text"} autoComplete="off" value={value} placeholder={d.input.placeholder} onChange={(e) => setValue(e.target.value)} spellCheck={false} />)}
+          {d.message && <p>{tt(d.message)}</p>}
+          {d.input && (d.input.multiline ? <><textarea ref={(element) => { inputRef.current = element; }} className="dialog-multiline" aria-label={tt(d.title)} value={value} placeholder={d.input.placeholder} onChange={(e) => setValue(e.target.value)} spellCheck={false} /><small>{tt("Ctrl+Enter saves · Escape cancels")}</small></> : <input ref={(element) => { inputRef.current = element; }} type={d.input.password ? "password" : "text"} autoComplete="off" value={value} placeholder={d.input.placeholder} onChange={(e) => setValue(e.target.value)} spellCheck={false} />)}
         </div>
         <div className="buttons" ref={buttonsRef}>
           {d.buttons.map((b) => (
             <button key={b.id} data-id={b.id} className={`btn ${b.primary ? "primary" : ""} ${b.danger ? "danger" : ""}`} onClick={() => finish(b.id)}>
-              {b.key && !d.input ? <AccelLabel label={b.label} k={b.key} /> : b.label}{b.hint && <small>{b.hint}</small>}
+              {b.key && !d.input ? <AccelLabel label={tt(b.label)} k={b.key} /> : tt(b.label)}{b.hint && <small>{tt(b.hint)}</small>}
             </button>
           ))}
         </div>
@@ -358,7 +371,7 @@ function PathEdit({ b }: { b: number }) {
             onChange={(e) => { setValue(e.target.value); setSel(-1); }}
             onContextMenu={(e) => {
               e.preventDefault();
-              A.showMenu(e.clientX, e.clientY, (
+              A.showMenuFor(e, (
                 [["native", "Copy path"], ["nativeQuoted", "Copy path in quotes"], ["escaped", "Copy with escaped backslashes"], ["forward", "Copy with forward slashes"], ["forwardQuoted", "Copy with forward slashes, quoted"], ["uri", "Copy as file:// URI"], ["linux", "Copy as Linux path (WSL)"]] as const
               ).filter(([f]) => f !== "linux" || getState().info?.platform === "windows").map(([f, l]) => ({ label: l, run: () => api.pathFormat(current, f).then((t) => api.clipSetText(t)).then(() => A.notify("Path copied")).catch(A.fail) })));
             }}
@@ -429,7 +442,7 @@ function Templates({ dir, b }: { dir: string; b: number }) {
           if (e.key === "Escape") A.openOverlay(null);
           if (e.key === "Enter") { e.preventDefault(); create(primaryMod(e)); }
         }}>
-        <h3>New file</h3>
+        <h3>{tt("New file")}</h3>
         <div className="body">
           <div ref={listRef} tabIndex={0} className="suggest" style={{ maxHeight: 260, marginTop: 0, outline: "none" }}
             onKeyDown={(e) => {
@@ -444,14 +457,14 @@ function Templates({ dir, b }: { dir: string; b: number }) {
               </div>
             ))}
           </div>
-          <p style={{ margin: "10px 0 4px" }}>File name</p>
+          <p style={{ margin: "10px 0 4px" }}>{tt("File name")}</p>
           <input ref={nameRef} type="text" value={name} onChange={(e) => setName(e.target.value)} spellCheck={false} />
         </div>
         <div className="buttons">
-          <FolderLink path={info?.templatesDir ?? ""} label="Templates folder" />
+          <FolderLink path={info?.templatesDir ?? ""} label={tt("Templates folder")} />
           <span style={{ flex: 1 }} />
-          <button className="btn" onClick={() => create(true)}>Create & open<small>Ctrl+Enter</small></button>
-          <button className="btn primary" onClick={() => create(false)}>Create</button>
+          <button className="btn" onClick={() => create(true)}>{tt("Create & open")}<small>{platformLabel("Ctrl+Enter")}</small></button>
+          <button className="btn primary" onClick={() => create(false)}>{tt("Create")}</button>
         </div>
       </div>
     </div>
@@ -514,11 +527,11 @@ function NoteEditor({ dir, path, text, overlay }: {
           <textarea autoFocus rows={8} value={value} onChange={(e) => {
             valueRef.current = e.target.value;
             setValue(e.target.value);
-          }} placeholder="First line becomes the file name…" />
+          }} placeholder={tt("First line becomes the file name…")} />
         </div>
         <div className="buttons">
-          <button className="btn" onClick={() => A.openOverlay(null)}>Cancel</button>
-          <button className="btn primary" disabled={saving} onClick={() => void save()}>{saving ? "Saving…" : "Save"}<small>Ctrl+Enter</small></button>
+          <button className="btn" onClick={() => A.openOverlay(null)}>{tt("Cancel")}</button>
+          <button className="btn primary" disabled={saving} onClick={() => void save()}>{saving ? "Saving…" : "Save"}<small>{platformLabel("Ctrl+Enter")}</small></button>
         </div>
       </div>
     </div>
@@ -543,10 +556,10 @@ function TagPopup({ paths }: { paths: string[] }) {
         }}>
         <h3>Colour tag ({paths.length} item{paths.length > 1 ? "s" : ""})</h3>
         <div className="body">
-          <p>Press a number key or click a colour. 0 removes the tag.</p>
+          <p>{tt("Press a number key or click a colour. 0 removes the tag.")}</p>
           <div className="tags">
             {TAG_COLORS.map((c, i) => (
-              <button key={i} style={{ background: c || "var(--bg-3)", color: c ? "#fff" : "var(--fg)" }} title={i === 0 ? "No colour tag" : `Colour tag ${i}`} onClick={() => apply(i)}>{i}</button>
+              <button key={i} style={{ background: c || "var(--bg-3)", color: c ? contrastingText(c) : "var(--fg)" }} title={i === 0 ? "No colour tag" : `Colour tag ${i}`} onClick={() => apply(i)}>{i}</button>
             ))}
           </div>
         </div>
@@ -574,25 +587,25 @@ function Properties({ entry }: { entry: FileEntry }) {
         <div className="body props">
           <table>
             <tbody>
-              <tr><td>Location</td><td>{parent(entry.path)}</td></tr>
-              <tr><td>Type</td><td>{entry.isDir ? "Folder" : entry.ext ? `${entry.ext.toUpperCase()} file` : "File"}{entry.isSymlink ? " (symbolic link)" : ""}</td></tr>
-              {!entry.isDir && <tr><td>Size</td><td>{formatSize(entry.size)} ({entry.size.toLocaleString()} bytes)</td></tr>}
+              <tr><td>{tt("Location")}</td><td>{parent(entry.path)}</td></tr>
+              <tr><td>{tt("Type")}</td><td>{entry.isDir ? "Folder" : entry.ext ? `${entry.ext.toUpperCase()} file` : "File"}{entry.isSymlink ? " (symbolic link)" : ""}</td></tr>
+              {!entry.isDir && <tr><td>{tt("Size")}</td><td>{formatSize(entry.size)} ({entry.size.toLocaleString()} bytes)</td></tr>}
               {entry.isDir && (
-                <tr><td>Size</td><td title={A.folderSizeTitle(total)}>
+                <tr><td>{tt("Size")}</td><td title={A.folderSizeTitle(total)}>
                   {A.folderSizeDetails(total)}
                 </td></tr>
               )}
-              {entry.isDir && info?.folderItems != null && <tr><td>Contents</td><td>{A.items(info.folderItems)} directly inside</td></tr>}
-              {info?.width && <tr><td>Dimensions</td><td>{info.width} × {info.height}</td></tr>}
-              <tr><td>Created</td><td>{formatDateTime(entry.created)}</td></tr>
-              <tr><td>Modified</td><td>{formatDateTime(entry.modified)}</td></tr>
-              <tr><td>Attributes</td><td>{[entry.readonly && "read-only", entry.isHidden && "hidden"].filter(Boolean).join(", ") || "—"}</td></tr>
+              {entry.isDir && info?.folderItems != null && <tr><td>{tt("Contents")}</td><td>{A.items(info.folderItems)} directly inside</td></tr>}
+              {info?.width && <tr><td>{tt("Dimensions")}</td><td>{info.width} × {info.height}</td></tr>}
+              <tr><td>{tt("Created")}</td><td>{formatDateTime(entry.created)}</td></tr>
+              <tr><td>{tt("Modified")}</td><td>{formatDateTime(entry.modified)}</td></tr>
+              <tr><td>{tt("Attributes")}</td><td>{[entry.readonly && "read-only", entry.isHidden && "hidden"].filter(Boolean).join(", ") || "—"}</td></tr>
             </tbody>
           </table>
         </div>
         <div className="buttons">
-          <button className="btn" onClick={() => A.copyPaths([entry], entry.path)}>Copy path</button>
-          <button className="btn primary" onClick={() => A.openOverlay(null)}>Close</button>
+          <button className="btn" onClick={() => A.copyPaths([entry], entry.path)}>{tt("Copy path")}</button>
+          <button className="btn primary" onClick={() => A.openOverlay(null)}>{tt("Close")}</button>
         </div>
       </div>
     </div>
@@ -690,8 +703,8 @@ function PreviewWindow({ b }: { b: number }) {
           <FileIcon entry={entry} />
           <span className="t">{entry.name}</span>
           <span style={{ color: "var(--fg-dim)" }}>{entry.isDir ? "" : formatSize(entry.size)}</span>
-          <button className="icon-btn" title="Open" onClick={() => api.openPath(entry.path).catch(A.fail)}><Icon name="forward" /></button>
-          <button className="icon-btn" title="Close (Esc)" onClick={() => A.openOverlay(null)}><Icon name="close" /></button>
+          <button className="icon-btn" title={tt("Open")} onClick={() => api.openPath(entry.path).catch(A.fail)}><Icon name="forward" /></button>
+          <button className="icon-btn" title={tt("Close (Esc)")} onClick={() => A.openOverlay(null)}><Icon name="close" /></button>
         </div>
         <div className="pb"><Preview entry={entry} info={info} big /></div>
         <PreviewHints kind={info?.kind ?? null} vim={vim} />
@@ -728,7 +741,7 @@ function About() {
     <div className="backdrop center" onMouseDown={() => A.openOverlay(null)}>
       <div className="modal about-win" onMouseDown={(e) => e.stopPropagation()} tabIndex={-1} ref={focusOnMount}
         onKeyDown={(e) => { e.stopPropagation(); if (e.key === "Escape") A.openOverlay(null); }}>
-        <button className="icon-btn about-close" title="Close (Esc)" onClick={() => A.openOverlay(null)}><Icon name="close" size={14} /></button>
+        <button className="icon-btn about-close" title={tt("Close (Esc)")} onClick={() => A.openOverlay(null)}><Icon name="close" size={14} /></button>
         <div className="body">
           <AboutInfo />
         </div>
@@ -777,7 +790,7 @@ const dialogOnTop = () => getState().overlay?.type === "dialog";
 function OverlayWindow({ o }: { o: Overlay }) {
   switch (o.type) {
     case "dialog": return null;
-    case "bugReport": return <BugReport previous={o.previous} resume={o.resume} />;
+    case "bugReport": return <BugReport previous={o.previous} resume={o.resume} triggerError={o.triggerError} />;
     case "pathEdit": return <PathEdit b={o.b} />;
     case "templates": return <Templates dir={o.dir} b={o.b} />;
     case "note": return <NoteEditor dir={o.dir} path={o.path} text={o.text} overlay={o} />;
@@ -790,14 +803,18 @@ function OverlayWindow({ o }: { o: Overlay }) {
     case "quickOpen": return <QuickOpen initial={o.initial} />;
     case "grep": return <FindInFiles root={o.root} scope={o.scope} />;
     case "keys": return <KeyHelp />;
-    case "gitGraph": return <GitGraph path={o.path} />;
-    case "gitCommits": return <GitGraph path={o.path} compareFile={o.path} />;
+    case "gitGraph": return <GitGraph key={o.focusFile} path={o.path} focusFile={o.focusFile} compare={o.compare} show={o.show} />;
+    case "worktrees": return o.cleanup ? <WorktreeCleanup path={o.path} /> : <WorktreeSwitcher path={o.path} />;
+    case "gitCommits": return <GitGraph key={JSON.stringify([o.path, !!o.onlyFile])} path={o.path} compareFile={o.path} startScoped={o.onlyFile} />;
     case "settings": return <SettingsDialog section={o.section} />;
     case "about": return <About />;
     case "welcome": return <Welcome />;
+    case "favoritesImport": return <FavoritesImportDialog />;
     // Keyed by its sources: DiffView keeps them in state, so a new pair needs a fresh instance.
-    case "diff": return <DiffView key={JSON.stringify([o.a, o.b])} a={o.a} b={o.b} back={o.back} />;
-    case "dircmp": return <DirCompare left={o.left} right={o.right} />;
+    case "diff": return <DiffView key={JSON.stringify([o.a, o.b, o.wait])} a={o.a} b={o.b} back={o.back} wait={o.wait} />;
+    case "dircmp": return <DirCompare left={o.left} right={o.right} wait={o.wait} />;
+    case "applyPatch": return <PatchImport root={o.root} text={o.text} file={o.file} back={o.back} />;
+    case "standaloneMerge": return <StandaloneMerge key={JSON.stringify([o.base, o.left, o.right, o.waitOutput])} base={o.base} left={o.left} right={o.right} waitOutput={o.waitOutput} />;
     case "matrix": return <SimilarityMatrix paths={o.paths} />;
     case "openWith": return <OpenWith paths={o.paths} mode={o.mode} />;
   }
@@ -812,9 +829,25 @@ export function Notifications() {
   const log = useStore((s) => s.notificationLog);
   const showLog = useStore((s) => s.showNotificationLog);
   const tasks = useStore((s) => s.tasks);
+  const stack = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const el = stack.current;
+    if (el) A.holdNotes(el.matches(":hover") || el.contains(document.activeElement));
+  }, [notes, tasks]);
+  const dismissToast = (id: number, element: HTMLElement) => {
+    const hadFocus = element.contains(document.activeElement);
+    A.dismiss(id);
+    if (hadFocus && !getState().overlay) controller(A.activeBrowser())?.focus();
+  };
   return (
     <>
-      <div className="toasts" onMouseEnter={() => A.holdNotes(true)} onMouseLeave={() => A.holdNotes(false)}>
+      <div
+        ref={stack} className="toasts"
+        onMouseEnter={() => A.holdNotes(true)}
+        onMouseLeave={(e) => A.holdNotes(e.currentTarget.contains(document.activeElement))}
+        onFocus={() => A.holdNotes(true)}
+        onBlur={(e) => A.holdNotes(e.currentTarget.contains(e.relatedTarget) || e.currentTarget.matches(":hover"))}
+      >
         {/* Running file operations sit with the notifications, styled the same, above them. */}
         {Object.values(tasks).map((t) => {
           const pct = t.totalBytes ? (t.doneBytes / t.totalBytes) * 100 : t.totalItems ? (t.doneItems / t.totalItems) * 100 : 0;
@@ -822,9 +855,9 @@ export function Notifications() {
             <div key={t.id} className="toast task">
               <div className="line">
                 <b>{{ copy: "Copying", move: "Moving", delete: "Deleting", compress: "Compressing", extract: "Extracting", duplicate: "Duplicating" }[t.kind]}</b>
-                <span className="eta" title="Estimated time left">{t.eta === null ? "estimating…" : `${formatEta(t.eta)} left`}</span>
+                <span className="eta" title={tt("Estimated time left")}>{t.eta === null ? "estimating…" : `${formatEta(t.eta)} left`}</span>
                 <span className="pct">{Math.floor(pct)}%</span>
-                <button className="icon-btn" title="Cancel" onClick={() => api.cancelTask(t.id)}><Icon name="close" size={12} /></button>
+                <button className="icon-btn" title={tt("Cancel")} onClick={() => api.cancelTask(t.id)}><Icon name="close" size={12} /></button>
               </div>
               <div className="bar"><div style={{ width: `${pct}%` }} /></div>
               <div className="line dim">
@@ -835,20 +868,25 @@ export function Notifications() {
           );
         })}
         {notes.map((n) => (
-          <div key={n.id} className={`toast ${n.kind}`} role={n.kind === "error" ? "alert" : "status"} onClick={() => A.dismiss(n.id)}>
+          <div key={n.id} className={`toast ${n.kind} ${n.more?.length ? "many" : ""}`} role={n.kind === "error" ? "alert" : "status"} onClick={(e) => dismissToast(n.id, e.currentTarget)}>
             <span className="ti"><Icon name={NOTE_ICON[n.kind]} size={n.kind === "error" ? 18 : 16} /></span>
-            <span className="t">{n.text}</span>
-            {n.action && <button onClick={(e) => { e.stopPropagation(); n.action!.run(); A.dismiss(n.id); }}>{n.action.label}</button>}
-            {n.kind === "error" && !n.expected && <button onClick={(e) => { e.stopPropagation(); A.openOverlay({ type: "bugReport" }); }}>Report a bug</button>}
-            {n.kind === "error" && <span className="tx" title="Dismiss"><Icon name="close" size={12} /></span>}
+            <div className="t">{tt(n.text)}{n.details !== undefined && (
+              <details className="toast-details" onClick={(e) => e.stopPropagation()}>
+                <summary>{tt("Technical details")}</summary>
+                <pre>{n.details}</pre>
+              </details>
+            )}</div>
+            {n.action && [n.action, ...n.more ?? []].map((action) => <button key={action.label} onClick={(e) => { e.stopPropagation(); action.run(); dismissToast(n.id, e.currentTarget); }}>{tt(action.label)}</button>)}
+            {n.reportError !== undefined && <button onClick={(e) => { e.stopPropagation(); A.openOverlay({ type: "bugReport", triggerError: n.reportError }); A.dismiss(n.id); }}>{tt("Report a bug")}</button>}
+            {n.kind === "error" && <button className="tx" title={tt("Dismiss")} aria-label={tt("Dismiss notification")}><Icon name="close" size={12} /></button>}
           </div>
         ))}
       </div>
       {showLog && (
         <div className="notif-log" onMouseDown={(e) => e.stopPropagation()}>
           {log.length ? log.map((n) => (
-            <div key={n.id} className="n"><small>{new Date(n.at).toLocaleTimeString()}</small>{n.text}</div>
-          )) : <div className="n">No notifications yet</div>}
+            <div key={n.id} className="n"><small>{new Date(n.at).toLocaleTimeString()}</small>{tt(n.text)}</div>
+          )) : <div className="n">{tt("No notifications yet")}</div>}
         </div>
       )}
     </>

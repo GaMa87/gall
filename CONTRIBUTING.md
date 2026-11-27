@@ -17,21 +17,27 @@ npm install && npm install --prefix ui
 npm run dev
 ```
 
+To run the latest checkout as your everyday Gall on Linux or Omarchy, `./scripts/build-omarchy.sh` builds
+the release binary with the bundled UI and installs it to `~/.local/bin/gall` (`--no-install` only builds,
+`--dest <file>` installs elsewhere).
+
 ## Before opening a PR
 
 ```sh
 npm run lint              # cargo fmt --check, clippy -D warnings, TypeScript
 npm test                  # Rust + UI unit tests
-./scripts/selftest.sh     # UI changes: end-to-end self-test (KDE, needs a display)
+./scripts/selftest.sh     # UI changes: end-to-end self-test (Linux desktop or headless compositor)
 cargo test -p gall-core --release --test undo_fuzz -- --ignored   # file operation or undo changes
 ```
 
 Run only the updater integration scenarios with `./scripts/selftest.sh --updates` after
-building the bundled debug application. This exercises the real Settings UI, backend
-installation eligibility and public update endpoint, and writes a report and screenshots
-to the temporary path printed by the runner. It never installs an update. Available-update
-and signed-installation coverage depends on publishing a configured signed release; a
-missing manifest is tested as an actual endpoint error.
+building the bundled debug application. This starts a local loopback signed update
+server with a disposable test keypair and exercises the real Settings UI and backend end
+to end: an initial 503 endpoint error (with collapsible technical details), automatic
+background download, Minisign verification, binary probe (`--gall-update-probe`), staged
+restart into a verified user-space overlay, post-restart notification and `active.json`
+verification, Settings path display, **Revert** availability, keyboard toggle checks, and
+screenshots written to the temporary folder printed by the runner.
 
 Run `./scripts/selftest.sh --git-rebase-submodules [binary]` for the focused ordinary-rebase
 regression with an initialized submodule, recursive Git configuration, preserved submodule
@@ -94,17 +100,21 @@ Use tags such as `v0.2.0` for stable releases and `v0.2.0-beta.1` for prerelease
 Manual workflow runs without `dry_run` must select an existing version tag. The workflow keeps the
 release as a draft; after every platform build and the checksum job succeeds,
 inspect its assets, add meaningful release notes and publish it. Verify that
-`latest.json` contains Windows x86_64, Linux x86_64 and both macOS architectures,
-with signatures and download URLs for the published version. Prereleases are not
-served through the application's stable `releases/latest` endpoint.
+`latest.json` contains all 8 platform targets (`windows-x86_64`, `linux-x86_64`,
+`darwin-aarch64`, `darwin-x86_64`, plus `windows-x86_64-bin`, `linux-x86_64-bin`,
+`darwin-aarch64-app`, and `darwin-x86_64-app`), with signatures and download URLs
+for the published version. Prereleases are not served through the application's stable
+`releases/latest` endpoint.
 
-Existing users must install the first updater-enabled version manually. Test the
-next signed stable version from an older installed version: check both startup
-notification and **Settings → Updates → Check for updates**, confirm installation,
-and verify the new version and preserved settings after restart. Also check no
-update, unavailable network, failed download, invalid signature and active file
-operation cases. Never publish test releases as the latest stable release for
-ordinary users. Windows portable ZIPs and system packages use manual upgrades;
+Existing users on `<= 0.2.2` must install the first hybrid-updater release manually. Test
+the next signed stable version from an older installed version: check both startup
+notification and **Settings → Updates → Check for updates**, confirm automatic download
+and restart (in place for writable installs, and user-space overlay for system-managed
+installs), and verify the new version, path cards, **Revert** action, and preserved
+settings after restart. Also check no update, unavailable network, failed download,
+invalid signature, and active file or Git operation cases. Never publish test releases as
+the latest stable release for ordinary users. Portable ZIPs and system packages (`.rpm`,
+`.deb`, `.msi`, Scoop) update in-app, while Flatpak and Snap update through their store;
 see [packaging](packaging/README.md).
 
 Updater signatures are separate from Windows code signing and Apple signing or
@@ -139,12 +149,22 @@ activation with Explorer and Vim keys. It creates disposable PDF and shortcut
 fixtures in an isolated portable installation and prints the report/screenshot
 directory. A graphical desktop and WebView2 are required.
 
+Run `./scripts/selftest.sh --notifications [binary]` after building the bundled
+debug application. It checks empty and successful Undo with Vim and Explorer
+keys, invalid names, skipped transfers, recovery from a settings backup and
+which failures reach the bug reporter. The runner uses disposable files and saves
+screenshots to the reported output directory.
+
 Run focused keyboard and tab scenarios with `./scripts/selftest.sh --keyboard` after
 building the bundled debug application. This checks basic/Vim help, standard typing,
 Commander-style shortcuts, pinning and tab middle-click through the real UI and backend.
 It uses isolated disposable folders, exercises move/trash undo, and captures wide/narrow
-help and pin/tab states. It requires KDE Spectacle for screenshots, but not the full
-runner's image/archive fixture tools.
+help and pin/tab states. On Linux, screenshots are captured directly from Gall's WebKitGTK
+webview (no KDE Spectacle required; override with `GALL_SELFTEST_CAPTURE=webview|spectacle|grim`),
+and `./scripts/selftest.sh` automatically selects a private headless compositor when available
+(`kwin_wayland`, `labwc`, `weston`, `sway`, or `Xvfb`) or falls back to the active desktop
+(auto-floating test windows on Hyprland/Omarchy; override with `GALL_GUI_BACKEND=...` or
+`GALL_SELFTEST_REAL=1`). It does not require the full runner's image/archive fixture tools.
 
 Run `./scripts/selftest.sh --key-help` for help-only layout and notation scenarios:
 all three profiles, dark/light themes, wide/narrow windows, filtered and empty searches,
@@ -153,8 +173,8 @@ and the next-key picker. This mode does not perform file operations.
 Run `./scripts/selftest.sh --key-profiles` for welcome/settings profile selection,
 persisted profile and custom-shortcut settings, Explorer function keys, Commander
 preview/edit/copy/move/new-folder/trash with copy/move/trash undo, and Vim navigation
-and pinning. Like `--keyboard`, it uses disposable data and requires Spectacle for
-screenshots. To verify a second process reloads the selection, launch the same isolated
+and pinning. Like `--keyboard`, it uses disposable data and works on both KDE and
+non-KDE Linux desktops (including Hyprland/Omarchy). To verify a second process reloads the selection, launch the same isolated
 binary/configuration with `GALL_SELFTEST=key-profiles-reload` after this scenario;
 it expects the Commander profile and custom F9 pin shortcut left by the first process.
 

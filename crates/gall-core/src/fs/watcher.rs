@@ -63,6 +63,9 @@ impl FolderWatcher {
     }
 
     pub fn watch(&self, dir: &Path) -> Result<()> {
+        if super::gvfs::is_slow_or_gvfs_mount(dir) {
+            return Ok(());
+        }
         let mut st = self.inner.lock().unwrap();
         if let Some(n) = st.early_unwatch.get_mut(dir) {
             // Already unwatched: this watch is over before it started.
@@ -129,7 +132,11 @@ impl FolderWatcher {
                     st.watched.remove(dir);
                 }
             }
-            None => *st.early_unwatch.entry(dir.to_path_buf()).or_default() += 1,
+            None => {
+                if !super::gvfs::is_slow_or_gvfs_mount(dir) {
+                    *st.early_unwatch.entry(dir.to_path_buf()).or_default() += 1;
+                }
+            }
         }
     }
 
@@ -383,5 +390,16 @@ mod tests {
         std::fs::create_dir(&later).unwrap();
         w.watch(&later).unwrap();
         assert_eq!(w.watched(), vec![later.clone()]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gvfs_paths_skip_watching_without_leaking_early_unwatch() {
+        let w = quiet();
+        let gvfs = Path::new("/run/user/1000/gvfs/smb-share:server=nas,share=media");
+        w.watch(gvfs).unwrap();
+        assert!(w.watched().is_empty());
+        w.unwatch(gvfs);
+        assert!(w.inner.lock().unwrap().early_unwatch.is_empty());
     }
 }

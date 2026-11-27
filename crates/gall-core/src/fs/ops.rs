@@ -278,6 +278,40 @@ impl UndoRecord {
         }
     }
 
+    fn affected_paths(&self, out: &mut Vec<PathBuf>) {
+        match self {
+            UndoRecord::Created { paths } | UndoRecord::Trashed { paths, .. } => {
+                out.extend(paths.iter().cloned());
+            }
+            UndoRecord::RemovedDirs { dirs } => out.extend(dirs.iter().cloned()),
+            UndoRecord::Moved { pairs } => {
+                for (from, to) in pairs {
+                    out.push(from.clone());
+                    out.push(to.clone());
+                }
+            }
+            UndoRecord::Batch { records, dirs, .. } => {
+                for r in records {
+                    r.affected_paths(out);
+                }
+                out.extend(dirs.iter().cloned());
+            }
+        }
+    }
+
+    /// True when two operations touch the same path or an ancestor/descendant pair,
+    /// meaning reversing the older one out of order could corrupt or miss newer changes.
+    fn overlaps(&self, other: &UndoRecord) -> bool {
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        self.affected_paths(&mut a);
+        other.affected_paths(&mut b);
+        a.iter().any(|pa| {
+            b.iter()
+                .any(|pb| same_path_ci(pa, pb) || starts_with_ci(pa, pb) || starts_with_ci(pb, pa))
+        })
+    }
+
     /// What the operation did, for "Undo: …" tooltips: `add “a.txt”`, `rename “a” to “b”`.
     pub fn describe(&self) -> String {
         match self {
@@ -355,9 +389,23 @@ fn what(paths: &[PathBuf]) -> String {
     }
 }
 
-#[derive(Default)]
+struct UndoEntry {
+    id: u64,
+    record: UndoRecord,
+}
+
 pub struct UndoJournal {
-    stack: Mutex<Vec<UndoRecord>>,
+    next_id: AtomicU64,
+    stack: Mutex<Vec<UndoEntry>>,
+}
+
+impl Default for UndoJournal {
+    fn default() -> Self {
+        Self {
+            next_id: AtomicU64::new(1),
+            stack: Mutex::new(Vec::new()),
+        }
+    }
 }
 
 const UNDO_LIMIT: usize = 100;
@@ -445,12 +493,14 @@ fn revert_moved(
 }
 
 impl UndoJournal {
-    pub fn push(&self, r: UndoRecord) {
+    pub fn push(&self, r: UndoRecord) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let mut s = self.stack.lock().unwrap();
-        s.push(r);
+        s.push(UndoEntry { id, record: r });
         if s.len() > UNDO_LIMIT {
             s.remove(0);
         }
+        id
     }
 
     /// Number of steps that can be undone.
@@ -462,8 +512,22 @@ impl UndoJournal {
         self.len() == 0
     }
 
+    /// Stable ID of the most recently recorded step, if any.
+    pub fn latest_id(&self) -> Option<u64> {
+        self.stack.lock().unwrap().last().map(|e| e.id)
+    }
+
+    /// True while the entry with `id` is still present in the journal.
+    pub fn has_id(&self, id: u64) -> bool {
+        self.stack.lock().unwrap().iter().any(|e| e.id == id)
+    }
+
     pub fn peek_description(&self) -> Option<String> {
-        self.stack.lock().unwrap().last().map(|r| r.describe())
+        self.stack
+            .lock()
+            .unwrap()
+            .last()
+            .map(|e| e.record.describe())
     }
 
     /// Description of the most recent operation that touched `dir` (per-panel undo).
@@ -473,8 +537,8 @@ impl UndoJournal {
             .unwrap()
             .iter()
             .rev()
-            .find(|r| r.touches(dir))
-            .map(|r| r.describe())
+            .find(|e| e.record.touches(dir))
+            .map(|e| e.record.describe())
     }
 
     /// Reverts the most recent operation. Returns its description. When the undo fails,
@@ -499,16 +563,23 @@ impl UndoJournal {
             bool,
         ) -> std::result::Result<String, (CoreError, Option<UndoRecord>)>,
     ) -> Result<String> {
-        let (at, rec) = {
+        let (at, entry) = {
             let mut s = self.stack.lock().unwrap();
             let at = s.len().checked_sub(1).ok_or(CoreError::NothingToUndo)?;
             (at, s.pop().expect("stack length checked"))
         };
-        revert(rec, permanent).map_err(|(e, left)| {
+        let entry_id = entry.id;
+        revert(entry.record, permanent).map_err(|(e, left)| {
             if let Some(r) = left {
                 let mut s = self.stack.lock().unwrap();
                 let at = at.min(s.len());
-                s.insert(at, r);
+                s.insert(
+                    at,
+                    UndoEntry {
+                        id: entry_id,
+                        record: r,
+                    },
+                );
                 if s.len() > UNDO_LIMIT {
                     s.remove(0);
                 }
@@ -525,19 +596,83 @@ impl UndoJournal {
 
     /// [`undo_in`](Self::undo_in); `permanent` as in [`undo_with`](Self::undo_with).
     pub fn undo_in_with(&self, dir: &Path, permanent: bool) -> Result<String> {
-        let (i, rec) = {
+        let (i, entry) = {
             let mut s = self.stack.lock().unwrap();
             let i = s
                 .iter()
-                .rposition(|r| r.touches(dir))
+                .rposition(|e| e.record.touches(dir))
                 .ok_or(CoreError::NothingToUndo)?;
             (i, s.remove(i))
         };
-        Self::revert(rec, permanent).map_err(|(e, left)| {
+        let entry_id = entry.id;
+        Self::revert(entry.record, permanent).map_err(|(e, left)| {
             if let Some(r) = left {
                 let mut s = self.stack.lock().unwrap();
                 let at = i.min(s.len());
-                s.insert(at, r);
+                s.insert(
+                    at,
+                    UndoEntry {
+                        id: entry_id,
+                        record: r,
+                    },
+                );
+            }
+            e
+        })
+    }
+
+    /// Reverts the specific operation identified by `id` (used by notification Undo buttons).
+    /// Returns [`CoreError::NothingToUndo`] when `id` is no longer in the journal, and refuses
+    /// without changing files when a newer journal entry overlaps the same paths.
+    pub fn undo_by_id(&self, id: u64) -> Result<String> {
+        self.undo_by_id_with(id, false)
+    }
+
+    /// [`undo_by_id`](Self::undo_by_id); `permanent` as in [`undo_with`](Self::undo_with).
+    pub fn undo_by_id_with(&self, id: u64, permanent: bool) -> Result<String> {
+        self.undo_by_id_with_reverter(id, permanent, Self::revert)
+    }
+
+    fn undo_by_id_with_reverter(
+        &self,
+        id: u64,
+        permanent: bool,
+        revert: impl FnOnce(
+            UndoRecord,
+            bool,
+        ) -> std::result::Result<String, (CoreError, Option<UndoRecord>)>,
+    ) -> Result<String> {
+        let (i, entry) = {
+            let mut s = self.stack.lock().unwrap();
+            let i = s
+                .iter()
+                .position(|e| e.id == id)
+                .ok_or(CoreError::NothingToUndo)?;
+            if s[i + 1..]
+                .iter()
+                .any(|newer| newer.record.overlaps(&s[i].record))
+            {
+                return Err(CoreError::Other(
+                    "A newer operation changed the same files. Undo that first.".into(),
+                ));
+            }
+            (i, s.remove(i))
+        };
+        let entry_id = entry.id;
+        revert(entry.record, permanent).map_err(|(e, left)| {
+            if let Some(r) = left {
+                let mut s = self.stack.lock().unwrap();
+                let at = i.min(s.len());
+                s.insert(
+                    at,
+                    UndoEntry {
+                        id: entry_id,
+                        record: r,
+                    },
+                );
+                if s.len() > UNDO_LIMIT {
+                    s.remove(0);
+                }
             }
             e
         })
@@ -822,6 +957,45 @@ fn pick_trashed<T>(
     best.into_values().map(|(_, i)| i).collect()
 }
 
+/// `trash::os_limited::list`, tried again when it panics. On freedesktop systems the crate reads
+/// every `.trashinfo` file and *panics* on one that another process or thread is writing at that
+/// moment (a half-written file has no `key=value` line). That passes at once, so listing is
+/// retried a few times instead of taking the worker thread down.
+#[cfg(any(
+    target_os = "windows",
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+))]
+pub(crate) fn list_trash_items() -> Result<Vec<trash::TrashItem>> {
+    #[cfg(all(
+        test,
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    ))]
+    if let Some(items) = test_support::list_isolated_trash() {
+        return items;
+    }
+    const ATTEMPTS: u64 = 5;
+    for attempt in 1..=ATTEMPTS {
+        match std::panic::catch_unwind(|| with_trash(trash::os_limited::list)) {
+            Ok(result) => return result,
+            Err(_) if attempt < ATTEMPTS => {
+                std::thread::sleep(std::time::Duration::from_millis(25 * attempt));
+            }
+            Err(_) => break,
+        }
+    }
+    Err(CoreError::Trash(
+        "the trash could not be read (a file in it kept changing)".into(),
+    ))
+}
+
 /// The trash's items, with their real names. On Windows the `trash` crate takes an
 /// item's name from the shell's display name, which has no extension when Explorer hides
 /// known extensions (the default): `a.txt` was listed, matched and restored as `a`. The
@@ -837,7 +1011,7 @@ fn pick_trashed<T>(
 ))]
 pub(crate) fn list_trash() -> Result<Vec<trash::TrashItem>> {
     #[allow(unused_mut)]
-    let mut items = with_trash(trash::os_limited::list)?;
+    let mut items = list_trash_items()?;
     #[cfg(windows)]
     for item in &mut items {
         if let Some(name) = recycle_bin_original_path(&item.id)
@@ -993,12 +1167,12 @@ fn on_network_drive(p: &Path) -> bool {
 }
 
 /// Moves `paths` to the trash (see [`with_trash`]).
-/// Items sent to the trash so far (tests: see `tests::TestDir`).
-#[cfg(test)]
+/// Items sent to the trash so far (Windows tests: see `tests::TestDir`).
+#[cfg(all(test, windows))]
 static TRASHED: AtomicU64 = AtomicU64::new(0);
 
 fn trash_paths(paths: &[PathBuf]) -> Result<()> {
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     TRASHED.fetch_add(1, Ordering::Relaxed);
     // Inside WSL: the distribution's own trash (Windows has no Recycle Bin there and
     // would delete for good when asked to recycle).
@@ -1023,6 +1197,16 @@ fn trash_paths(paths: &[PathBuf]) -> Result<()> {
         )));
     }
     let _released = release(paths.iter().map(PathBuf::as_path));
+    #[cfg(all(
+        test,
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    ))]
+    if let Some(res) = test_support::trash_into_isolated(paths) {
+        return res;
+    }
     #[cfg(target_os = "macos")]
     return super::mactrash::trash(paths);
     #[cfg(not(target_os = "macos"))]
@@ -1277,6 +1461,14 @@ pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
 /// in the order given. Items may swap names or change only the case of a letter. When
 /// one rename fails, the others are reverted.
 pub fn batch_rename(items: &[(PathBuf, String)], journal: &UndoJournal) -> Result<Vec<PathBuf>> {
+    batch_rename_recorded(items, journal).map(|(out, _)| out)
+}
+
+/// [`batch_rename`], also returning the stable undo record ID when anything changed.
+pub fn batch_rename_recorded(
+    items: &[(PathBuf, String)],
+    journal: &UndoJournal,
+) -> Result<(Vec<PathBuf>, Option<u64>)> {
     let mut out = Vec::with_capacity(items.len());
     let mut pairs = Vec::new();
     for (path, name) in items {
@@ -1317,24 +1509,33 @@ pub fn batch_rename(items: &[(PathBuf, String)], journal: &UndoJournal) -> Resul
         }
     }
     if pairs.is_empty() {
-        return Ok(out);
+        return Ok((out, None));
     }
     rename_many(&pairs)?;
-    journal.push(UndoRecord::Moved { pairs });
-    Ok(out)
+    let id = journal.push(UndoRecord::Moved { pairs });
+    Ok((out, Some(id)))
 }
 
 pub fn create_dir(parent: &Path, name: &str, journal: &UndoJournal) -> Result<PathBuf> {
+    create_dir_recorded(parent, name, journal).map(|(p, _)| p)
+}
+
+/// [`create_dir`], also returning the stable undo record ID.
+pub fn create_dir_recorded(
+    parent: &Path,
+    name: &str,
+    journal: &UndoJournal,
+) -> Result<(PathBuf, u64)> {
     validate_name(name)?;
     let p = parent.join(name);
     if exists_no_follow(&p) {
         return Err(CoreError::AlreadyExists(p));
     }
     fs::create_dir(&p).ctx("create folder", &p)?;
-    journal.push(UndoRecord::Created {
+    let id = journal.push(UndoRecord::Created {
         paths: vec![p.clone()],
     });
-    Ok(p)
+    Ok((p, id))
 }
 
 /// Creates a new file, either empty, with `contents`, or cloned from a template.
@@ -1345,6 +1546,17 @@ pub fn create_file(
     contents: Option<&[u8]>,
     journal: &UndoJournal,
 ) -> Result<PathBuf> {
+    create_file_recorded(parent, name, template, contents, journal).map(|(p, _)| p)
+}
+
+/// [`create_file`], also returning the stable undo record ID.
+pub fn create_file_recorded(
+    parent: &Path,
+    name: &str,
+    template: Option<&Path>,
+    contents: Option<&[u8]>,
+    journal: &UndoJournal,
+) -> Result<(PathBuf, u64)> {
     validate_name(name)?;
     let p = parent.join(name);
     let mut f = fs::OpenOptions::new()
@@ -1373,10 +1585,10 @@ pub fn create_file(
         let _ = fs::remove_file(&p);
         return Err(e);
     }
-    journal.push(UndoRecord::Created {
+    let id = journal.push(UndoRecord::Created {
         paths: vec![p.clone()],
     });
-    Ok(p)
+    Ok((p, id))
 }
 
 /// Moves items to the system trash / Recycle Bin.
@@ -1391,6 +1603,160 @@ pub enum SyncOp {
     Trash { path: PathBuf },
 }
 
+/// What a file looked like when a comparison was made: its size and modification time (whole seconds).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Stamp {
+    pub size: u64,
+    pub mtime: i64,
+}
+
+/// A path of a sync plan as the comparison saw it, checked again right before anything is written. `stamp: None` means
+/// that the path did not exist.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncCheck {
+    pub path: PathBuf,
+    #[serde(default)]
+    pub stamp: Option<Stamp>,
+    /// The path must still be a folder (a whole-tree copy or trash of it is planned); `stamp` is then not used.
+    #[serde(default)]
+    pub dir: bool,
+    /// For a folder that is copied or trashed as a whole: the fingerprint of everything below it when the plan was
+    /// shown (see [`tree_fingerprint`]); a folder that holds other entries by the time of the write is refused.
+    #[serde(default)]
+    pub tree: Option<String>,
+    /// For a file: its size and modification time to the nanosecond when the plan was shown (see
+    /// [`file_fingerprint`]); the seconds of `stamp` miss a rewrite of equal size within the same second.
+    #[serde(default)]
+    pub exact: Option<String>,
+}
+
+/// The size and the modification time to the nanosecond of a file (not followed if it is a link), or `None` when
+/// there is no such file. Two states of one file that differ by a rewrite have different fingerprints even within a
+/// second, wherever the file system keeps finer times.
+pub fn file_fingerprint(path: &Path) -> Option<String> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    let nanos = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos());
+    Some(format!("{}:{nanos}", meta.len()))
+}
+
+/// Most entries a fingerprint walk looks at; a bigger tree cannot be checked and a whole-tree operation on it is
+/// refused instead of being run unchecked.
+pub const MAX_TREE_ENTRIES: u64 = 2_000_000;
+
+/// A fingerprint of everything below `root`: every entry (hidden and ignored ones too, links not followed) with its
+/// relative path, size and modification time to the nanosecond, combined without regard to the order of the walk.
+/// A file added, removed, renamed or rewritten below it changes the fingerprint.
+pub fn tree_fingerprint(root: &Path) -> Result<String> {
+    use std::hash::{Hash, Hasher};
+    let mut sum: u64 = 0;
+    let mut entries: u64 = 0;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).ctx("read", &dir)? {
+            let entry = entry.ctx("read", &dir)?;
+            let path = entry.path();
+            let meta = std::fs::symlink_metadata(&path).ctx("read", &path)?;
+            entries += 1;
+            if entries > MAX_TREE_ENTRIES {
+                return Err(CoreError::Other(format!(
+                    "{} holds more than {MAX_TREE_ENTRIES} entries and cannot be checked as a whole",
+                    root.display()
+                )));
+            }
+            let nanos = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos());
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            path.strip_prefix(root).unwrap_or(&path).hash(&mut h);
+            (meta.len(), nanos, meta.is_dir(), meta.is_symlink()).hash(&mut h);
+            sum = sum.wrapping_add(h.finish());
+            if meta.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    Ok(format!("{entries}:{sum:016x}"))
+}
+
+/// Whole seconds since the epoch of the modification time (negative before it), as the folder comparison counts them.
+pub fn mtime_secs(m: &std::fs::Metadata) -> Option<i64> {
+    let time = m.modified().ok()?;
+    Some(match time.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(before) => -(before.duration().as_secs() as i64),
+    })
+}
+
+/// Checks every path of a plan against what the comparison saw. The first path that differs ends the check with its
+/// name, and nothing has been touched yet.
+pub fn verify_sync(checks: &[SyncCheck]) -> Result<()> {
+    use std::io::ErrorKind;
+    for check in checks {
+        let shown = check.path.display();
+        let refuse = |what: &str| {
+            Err(CoreError::Other(format!(
+                "{shown} {what}; compare again before syncing"
+            )))
+        };
+        let now = match std::fs::symlink_metadata(&check.path) {
+            Ok(m) => Some(m),
+            Err(e) if e.kind() == ErrorKind::NotFound => None,
+            // Only "not there" is absence: a path that cannot be looked at cannot be checked, so it is not written.
+            Err(_) => return refuse("cannot be checked"),
+        };
+        match (check.dir, &check.stamp, now) {
+            // A folder that is to be copied or trashed as a whole must still be a folder.
+            (true, _, Some(m)) => {
+                if !m.is_dir() {
+                    return refuse("is no longer a folder");
+                }
+                if let Some(expected) = &check.tree {
+                    match tree_fingerprint(&check.path) {
+                        Ok(now) if &now == expected => {}
+                        Ok(_) => return refuse("holds other entries than when it was compared"),
+                        Err(_) => return refuse("cannot be checked as a whole"),
+                    }
+                }
+            }
+            (true, _, None) | (false, Some(_), None) => {
+                return refuse("is gone since the comparison")
+            }
+            (false, None, Some(_)) => return refuse("appeared after the comparison"),
+            (false, None, None) => {}
+            (false, Some(stamp), Some(m)) => {
+                if !m.is_file() || m.len() != stamp.size || mtime_secs(&m) != Some(stamp.mtime) {
+                    return refuse("changed after the comparison");
+                }
+                // Finer than the seconds of the comparison: the state when the plan was shown.
+                if let Some(exact) = &check.exact {
+                    if file_fingerprint(&check.path).as_deref() != Some(exact.as_str()) {
+                        return refuse("changed after the plan was shown");
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// [`apply_sync`] after [`verify_sync`]: a plan whose files changed since the preview is refused as a whole.
+pub fn apply_sync_checked(
+    ops: &[SyncOp],
+    checks: &[SyncCheck],
+    journal: &UndoJournal,
+    cancel: &AtomicBool,
+) -> Result<SyncReport> {
+    verify_sync(checks)?;
+    apply_sync(ops, journal, cancel)
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncReport {
@@ -1398,6 +1764,8 @@ pub struct SyncReport {
     pub replaced: usize,
     pub trashed: usize,
     pub bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub undo_id: Option<u64>,
 }
 
 /// Applies a folder sync as one undoable operation. Stops at the first error;
@@ -1476,11 +1844,11 @@ pub fn apply_sync(
         records.push(UndoRecord::Created { paths: created });
     }
     if !records.is_empty() {
-        journal.push(UndoRecord::Batch {
+        rep.undo_id = Some(journal.push(UndoRecord::Batch {
             label: format!("sync of {}", items(rep.copied + rep.trashed)),
             records,
             dirs: Vec::new(),
-        });
+        }));
     }
     result.map(|_| rep)
 }
@@ -1493,8 +1861,69 @@ pub fn apply_sync(
 /// its place (one undo step). A symlink is followed: the file it points to is saved and
 /// the link stays. Where no trash is available (a network share, a read-only trash), the
 /// new file replaces the old one atomically, without undo.
+/// Size and modification time of a file, as one text; changes when the file is written.
+pub fn file_revision(path: &Path) -> Option<String> {
+    let meta = fs::metadata(path).ok()?;
+    file_revision_of(&meta)
+}
+
+/// Captures a revision from the open file rather than looking up its path again.
+pub fn file_revision_of(meta: &fs::Metadata) -> Option<String> {
+    let nanos = meta
+        .modified()
+        .ok()?
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some(format!("{}-{nanos}", meta.len()))
+}
+
+/// `save_text` for a file that was read at `expected` (see [`file_revision`]): when it changed on
+/// disk since, nothing is written, so an edit made against an old copy cannot overwrite newer work.
+/// An empty or missing `expected` saves without the check, as for a new file.
+pub fn save_text_checked(
+    path: &Path,
+    text: &str,
+    expected: Option<&str>,
+    journal: &UndoJournal,
+) -> Result<bool> {
+    save_text_recorded(path, text, expected, false, journal).map(|(u, _)| u)
+}
+
 pub fn save_text(path: &Path, text: &str, journal: &UndoJournal) -> Result<bool> {
-    let real = if exists_no_follow(path) {
+    save_text_recorded(path, text, None, false, journal).map(|(u, _)| u)
+}
+
+/// Publishes a new result only if the selected name is still free.
+pub fn save_new_text(path: &Path, text: &str, journal: &UndoJournal) -> Result<bool> {
+    save_text_recorded(path, text, None, true, journal).map(|(u, _)| u)
+}
+
+/// Saves text and returns `(undoable, undo_id)`.
+pub fn save_text_recorded(
+    path: &Path,
+    text: &str,
+    expected: Option<&str>,
+    expect_missing: bool,
+    journal: &UndoJournal,
+) -> Result<(bool, Option<u64>)> {
+    save_text_inner(
+        path,
+        text,
+        expected.filter(|want| !want.is_empty()),
+        expect_missing,
+        journal,
+    )
+}
+
+fn save_text_inner(
+    path: &Path,
+    text: &str,
+    expected: Option<&str>,
+    expect_missing: bool,
+    journal: &UndoJournal,
+) -> Result<(bool, Option<u64>)> {
+    let real = if !expect_missing && exists_no_follow(path) {
         fs::canonicalize(path).ctx("resolve", path)?
     } else {
         path.to_path_buf()
@@ -1503,36 +1932,55 @@ pub fn save_text(path: &Path, text: &str, journal: &UndoJournal) -> Result<bool>
         .parent()
         .ok_or_else(|| CoreError::NotFound(real.clone()))?;
     let tmp = dir.join(format!(
-        ".{}.gall-save-{}",
-        file_name(&real)?,
-        std::process::id()
+        ".gall-save-{}-{}",
+        std::process::id(),
+        RENAME_TEMP_ID.fetch_add(1, Ordering::Relaxed)
     ));
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .ctx("save", &tmp)?;
     let guard = DeleteOnDrop(Some(tmp.clone()));
     {
-        let mut f = fs::File::create(&tmp).ctx("save", &tmp)?;
-        f.write_all(text.as_bytes()).ctx("save", &tmp)?;
-        f.sync_all().ctx("save", &tmp)?;
+        let mut file = file;
+        file.write_all(text.as_bytes()).ctx("save", &tmp)?;
+        file.sync_all().ctx("save", &tmp)?;
     }
-    if let Ok(m) = fs::metadata(&real) {
-        let _ = fs::set_permissions(&tmp, m.permissions());
-    }
-    let mut records = Vec::new();
-    let mut undoable = true;
-    if exists_no_follow(&real) {
-        match trash_timed(std::slice::from_ref(&real)) {
-            Ok((at, until)) => records.push(UndoRecord::Trashed {
-                paths: vec![real.clone()],
-                at,
-                until,
-            }),
-            Err(e) => {
-                log::warn!("saving {} without undo: {e}", real.display());
-                undoable = false;
-            }
+    if let Some(want) = expected {
+        if file_revision(&real).as_deref() != Some(want) {
+            return Err(CoreError::Other(format!(
+                "{} changed on disk since it was compared. Reload the comparison before saving; your edits are still in the window",
+                path.display()
+            )));
         }
     }
-    // Over the old file when it could not be trashed: rename replaces atomically.
-    let res = fs::rename(&tmp, &real).ctx("save", &real);
+
+    let mut records = Vec::new();
+    let mut undoable = true;
+    let res = if expect_missing {
+        rename_noreplace(&tmp, &real)
+    } else {
+        if let Ok(m) = fs::metadata(&real) {
+            let _ = fs::set_permissions(&tmp, m.permissions());
+        }
+        if exists_no_follow(&real) {
+            match trash_timed(std::slice::from_ref(&real)) {
+                Ok((at, until)) => records.push(UndoRecord::Trashed {
+                    paths: vec![real.clone()],
+                    at,
+                    until,
+                }),
+                Err(e) => {
+                    log::info!("saving {} without undo: {e}", real.display());
+                    undoable = false;
+                }
+            }
+        }
+        // Over the old file when it could not be trashed: rename replaces atomically.
+        fs::rename(&tmp, &real)
+    }
+    .ctx("save", &real);
     if res.is_ok() {
         guard.disarm();
         records.push(UndoRecord::Created {
@@ -1540,19 +1988,27 @@ pub fn save_text(path: &Path, text: &str, journal: &UndoJournal) -> Result<bool>
         });
     }
     // Recorded even when the rename failed: undo then brings the old version back.
-    if undoable && !records.is_empty() {
-        journal.push(UndoRecord::Batch {
+    let undo_id = if undoable && !records.is_empty() {
+        Some(journal.push(UndoRecord::Batch {
             label: format!("save {}", quoted(&real)),
             records,
             dirs: Vec::new(),
-        });
-    }
-    res.map(|()| undoable)
+        }))
+    } else {
+        None
+    };
+    res.map(|()| (undoable, undo_id))
 }
 
 pub fn trash_items(paths: &[PathBuf], journal: &UndoJournal) -> Result<()> {
+    trash_items_recorded(paths, journal).0
+}
+
+/// Moves items to the system trash and returns `(result, undo_id)`. On partial failure,
+/// `undo_id` still identifies the items that reached the trash.
+pub fn trash_items_recorded(paths: &[PathBuf], journal: &UndoJournal) -> (Result<()>, Option<u64>) {
     if paths.is_empty() {
-        return Ok(());
+        return (Ok(()), None);
     }
     let at = chrono::Utc::now().timestamp_millis();
     let existed: Vec<&PathBuf> = paths.iter().filter(|p| exists_no_follow(p)).collect();
@@ -1566,14 +2022,16 @@ pub fn trash_items(paths: &[PathBuf], journal: &UndoJournal) -> Result<()> {
             .cloned()
             .collect(),
     };
-    if !gone.is_empty() {
-        journal.push(UndoRecord::Trashed {
+    let undo_id = if !gone.is_empty() {
+        Some(journal.push(UndoRecord::Trashed {
             paths: gone,
             at,
             until: chrono::Utc::now().timestamp_millis(),
-        });
-    }
-    res
+        }))
+    } else {
+        None
+    };
+    (res, undo_id)
 }
 
 /// Creates a symbolic link to `target` inside `dest_dir`. (O-20)
@@ -1692,15 +2150,24 @@ pub enum TaskEvent {
         name: Option<String>,
         /// Name of the destination folder (copy/move).
         to: Option<String>,
+        /// Stable undo journal record produced by this task, if undoable.
+        #[serde(rename = "undoId", skip_serializing_if = "Option::is_none")]
+        undo_id: Option<u64>,
     },
     Failed {
         id: u64,
         kind: TaskKind,
         error: String,
+        /// Stable undo journal record for any partial work completed before failure.
+        #[serde(rename = "undoId", skip_serializing_if = "Option::is_none")]
+        undo_id: Option<u64>,
     },
     Cancelled {
         id: u64,
         kind: TaskKind,
+        /// Stable undo journal record for any partial work completed before cancellation.
+        #[serde(rename = "undoId", skip_serializing_if = "Option::is_none")]
+        undo_id: Option<u64>,
     },
 }
 
@@ -1828,6 +2295,13 @@ fn copy_file(
     tick: &mut Tick,
     durable: bool,
 ) -> Result<()> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(CoreError::Cancelled);
+    }
+    #[cfg(target_os = "macos")]
+    if clone_apfs(src, dst, cancel, tick, durable)? {
+        return Ok(());
+    }
     let mut r = fs::File::open(src).ctx("open", src)?;
     let meta = r.metadata().ctx("stat", src)?;
     // Never truncate an existing file: a replaced one went to the trash before.
@@ -1844,7 +2318,9 @@ fn copy_file(
     let tmp_guard = DeleteOnDrop(Some(dst.to_path_buf()));
     #[cfg(target_os = "linux")]
     let in_kernel = copy_in_kernel(&r, &w, src, cancel, tick)?;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    let in_kernel = copy_in_kernel_macos(&r, &w, src, cancel, tick)?;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let in_kernel = false;
     if !in_kernel {
         let mut buf = vec![0u8; CHUNK];
@@ -1873,6 +2349,164 @@ fn copy_file(
     tmp_guard.disarm();
     tick(0);
     Ok(())
+}
+
+/// macOS: attempts an atomic copy-on-write APFS clone via `clonefile(2)`.
+/// Instant and zero extra disk blocks on the same APFS volume while preserving data,
+/// mode, timestamps, and extended attributes. Returns `Ok(false)` when cloning is not
+/// supported (cross-volume `EXDEV`, non-APFS filesystem `ENOTSUP`, etc.) so the caller
+/// falls back to `fcopyfile` / chunked copy. Fails immediately on `EEXIST` so an
+/// existing destination is never overwritten.
+#[cfg(target_os = "macos")]
+fn clone_apfs(
+    src: &Path,
+    dst: &Path,
+    cancel: &AtomicBool,
+    tick: &mut Tick,
+    durable: bool,
+) -> Result<bool> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    if cancel.load(Ordering::Relaxed) {
+        return Err(CoreError::Cancelled);
+    }
+    // Verify the source is readable before cloning (preserves error semantics for
+    // unreadable mode-0000 files where `clonefile` might succeed for the owner).
+    let src_file = fs::File::open(src).ctx("open", src)?;
+    let meta = src_file.metadata().ctx("stat", src)?;
+    drop(src_file);
+
+    let Ok(src_c) = CString::new(src.as_os_str().as_bytes()) else {
+        return Ok(false);
+    };
+    let Ok(dst_c) = CString::new(dst.as_os_str().as_bytes()) else {
+        return Ok(false);
+    };
+
+    // SAFETY: NUL-terminated path pointers; `flags = 0` follows symlinks on `src`
+    // (matching `File::open`) and atomically fails with `EEXIST` if `dst` exists.
+    let rc = unsafe { libc::clonefile(src_c.as_ptr(), dst_c.as_ptr(), 0) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EEXIST) {
+            return Err(CoreError::io("create", dst, err));
+        }
+        // Any other failure (EXDEV across volumes, ENOTSUP/EOPNOTSUPP on FAT/ExFAT/SMB/HFS+,
+        // EINVAL, EPERM, EACCES, ENOSYS, ELOOP) safely falls back to descriptor copy.
+        return Ok(false);
+    }
+
+    let tmp_guard = DeleteOnDrop(Some(dst.to_path_buf()));
+    if durable {
+        let f = fs::File::open(dst).ctx("sync", dst)?;
+        f.sync_all().ctx("sync", dst)?;
+    }
+    tmp_guard.disarm();
+    tick(meta.len());
+    tick(0);
+    Ok(true)
+}
+
+/// macOS cross-volume / non-APFS fallback: copies data via `fcopyfile(3)` with a
+/// progress and cancellation callback. Returns `Ok(false)` before writing if `fcopyfile`
+/// is unsupported so the caller falls back to the chunked read/write loop.
+#[cfg(target_os = "macos")]
+fn copy_in_kernel_macos(
+    r: &fs::File,
+    w: &fs::File,
+    src: &Path,
+    cancel: &AtomicBool,
+    tick: &mut Tick,
+) -> Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    struct Ctx<'a, 'b> {
+        cancel: &'a AtomicBool,
+        tick: &'a mut Tick<'b>,
+        last_copied: i64,
+        cancelled: bool,
+    }
+
+    extern "C" fn status_cb(
+        what: libc::c_int,
+        stage: libc::c_int,
+        state: libc::copyfile_state_t,
+        _src: *const libc::c_char,
+        _dst: *const libc::c_char,
+        ctx_ptr: *mut libc::c_void,
+    ) -> libc::c_int {
+        if ctx_ptr.is_null() {
+            return libc::COPYFILE_CONTINUE;
+        }
+        // SAFETY: `ctx_ptr` points to our stack-allocated `Ctx` for the duration of `fcopyfile`.
+        let ctx = unsafe { &mut *(ctx_ptr as *mut Ctx<'_, '_>) };
+        if ctx.cancel.load(Ordering::Relaxed) {
+            ctx.cancelled = true;
+            return libc::COPYFILE_QUIT;
+        }
+        if what == libc::COPYFILE_COPY_DATA && stage == libc::COPYFILE_PROGRESS {
+            let mut copied: libc::off_t = 0;
+            // SAFETY: `state` is valid during the callback; `COPYFILE_STATE_COPIED` writes `off_t`.
+            let rc = unsafe {
+                libc::copyfile_state_get(
+                    state,
+                    libc::COPYFILE_STATE_COPIED as u32,
+                    (&mut copied as *mut libc::off_t).cast(),
+                )
+            };
+            if rc == 0 && copied > ctx.last_copied {
+                let delta = (copied - ctx.last_copied) as u64;
+                ctx.last_copied = copied;
+                (ctx.tick)(delta);
+            }
+        }
+        libc::COPYFILE_CONTINUE
+    }
+
+    // SAFETY: allocates an opaque `copyfile_state_t` freed unconditionally below.
+    let state = unsafe { libc::copyfile_state_alloc() };
+    if state.is_null() {
+        return Ok(false);
+    }
+    let mut ctx = Ctx {
+        cancel,
+        tick,
+        last_copied: 0,
+        cancelled: false,
+    };
+    let cb: libc::copyfile_callback_t = Some(status_cb);
+    let rc = unsafe {
+        libc::copyfile_state_set(
+            state,
+            libc::COPYFILE_STATE_STATUS_CB as u32,
+            cb.map_or(std::ptr::null(), |f| f as *const libc::c_void),
+        );
+        libc::copyfile_state_set(
+            state,
+            libc::COPYFILE_STATE_STATUS_CTX as u32,
+            (&mut ctx as *mut Ctx<'_, '_>).cast(),
+        );
+        let rc = libc::fcopyfile(r.as_raw_fd(), w.as_raw_fd(), state, libc::COPYFILE_DATA);
+        libc::copyfile_state_free(state);
+        rc
+    };
+    if ctx.cancelled || cancel.load(Ordering::Relaxed) {
+        return Err(CoreError::Cancelled);
+    }
+    if rc == 0 {
+        return Ok(true);
+    }
+    let err = std::io::Error::last_os_error();
+    if ctx.last_copied == 0
+        && matches!(
+            err.raw_os_error(),
+            Some(libc::ENOTSUP | libc::EOPNOTSUPP | libc::EINVAL | libc::ENOSYS)
+        )
+    {
+        return Ok(false);
+    }
+    Err(CoreError::io("copy", src, err))
 }
 
 /// Linux: copies with `copy_file_range`, in chunks so progress and cancel keep working.
@@ -1948,6 +2582,12 @@ impl Drop for DeleteOnDrop {
             let _ = fs::remove_file(p);
         }
     }
+}
+
+/// Copies one file or link as a file operation does (shared blocks where the file system
+/// can, times and permissions kept, an existing destination refused), without undo.
+pub(super) fn copy_item(src: &Path, dst: &Path, cancel: &AtomicBool) -> Result<()> {
+    copy_tree(src, dst, cancel, &mut |_| {})
 }
 
 fn copy_tree(src: &Path, dst: &Path, cancel: &AtomicBool, tick: &mut Tick) -> Result<()> {
@@ -2523,8 +3163,7 @@ impl Transfer<'_> {
                 return Ok(false);
             }
             if self.merge && !same_place && real_dir(src) && real_dir(&target) {
-                self.merge_into(src, &target, out, tick)?;
-                return Ok(true);
+                return self.merge_into(src, &target, out, tick);
             }
             let policy = match self.conflict {
                 ConflictPolicy::OverwriteOlder if newer(src, &target) => ConflictPolicy::Overwrite,
@@ -2618,21 +3257,27 @@ impl Transfer<'_> {
         target: &Path,
         out: &mut Placed,
         tick: &mut Tick,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        let merge_index = out.merged.len();
         out.merged.push(target.to_path_buf());
         let mut children: Vec<PathBuf> = fs::read_dir(src)
             .ctx("list", src)?
             .map(|e| e.map(|e| e.path()).ctx("list", src))
             .collect::<Result<_>>()?;
         children.sort();
+        let mut changed = false;
         for child in &children {
-            self.place(child, target, out, tick)?;
+            changed |= self.place(child, target, out, tick)?;
         }
         tick(0); // the folder itself, as counted by `measure`
         if self.kind == TaskKind::Move && fs::remove_dir(src).is_ok() {
+            changed = true;
             out.emptied.push(src.to_path_buf());
         }
-        Ok(())
+        if !changed {
+            out.merged.truncate(merge_index);
+        }
+        Ok(changed)
     }
 }
 
@@ -2834,7 +3479,8 @@ impl TaskManager {
                     .dest
                     .as_deref()
                     .and_then(|d| file_name(d).or_else(|| Some(d.display().to_string())));
-                let ev = match me.run_named(&handle, req) {
+                let (outcome, undo_id) = me.run_named(&handle, req);
+                let ev = match outcome {
                     Ok((items, skipped, output)) => TaskEvent::Done {
                         id,
                         kind,
@@ -2842,12 +3488,14 @@ impl TaskManager {
                         skipped,
                         name: output.or(name.take()),
                         to,
+                        undo_id,
                     },
-                    Err(CoreError::Cancelled) => TaskEvent::Cancelled { id, kind },
+                    Err(CoreError::Cancelled) => TaskEvent::Cancelled { id, kind, undo_id },
                     Err(e) => TaskEvent::Failed {
                         id,
                         kind,
                         error: e.to_string(),
+                        undo_id,
                     },
                 };
                 me.running.lock().unwrap().retain(|h| h.id != id);
@@ -2859,18 +3507,23 @@ impl TaskManager {
 
     /// Runs a task on the calling thread: (items done, items skipped).
     pub fn run(&self, handle: &TaskHandle, req: TaskRequest) -> Result<(u64, u64)> {
-        self.run_named(handle, req).map(|(d, s, _)| (d, s))
+        self.run_named(handle, req).0.map(|(d, s, _)| (d, s))
     }
 
     /// Like [`run`](Self::run), plus the name of the single item created
-    /// (the archive, or the extracted folder), for the "done" message.
+    /// (the archive, or the extracted folder), and the stable undo record ID if any.
+    #[allow(clippy::type_complexity)]
     fn run_named(
         &self,
         handle: &TaskHandle,
         req: TaskRequest,
-    ) -> Result<(u64, u64, Option<String>)> {
+    ) -> (Result<(u64, u64, Option<String>)>, Option<u64>) {
         // Names inside WSL that Windows cannot hold or address: refused before anything.
-        super::wsl::check_task(req.kind, &req.sources, req.dest.as_deref(), &handle.cancel)?;
+        if let Err(err) =
+            super::wsl::check_task(req.kind, &req.sources, req.dest.as_deref(), &handle.cancel)
+        {
+            return (Err(err), None);
+        }
         let totals = match req.kind {
             TaskKind::Compress => Totals {
                 bytes: super::archive::source_bytes(&req.sources),
@@ -3024,11 +3677,13 @@ impl TaskManager {
             }
             _ => None,
         };
-        // Record whatever completed, even on failure/cancel, so it can be undone.
+        // Record whatever completed, even on failure/cancel, as one atomic undo step so a
+        // notification can target this exact task by its stable record ID.
+        let mut step_records: Vec<UndoRecord> = Vec::new();
         if !trashed.is_empty() {
             // Extract and trash: one undo restores the archives and removes what was unpacked.
             let label = format!("extract and delete {}", what(&trashed));
-            self.journal.push(UndoRecord::Batch {
+            step_records.push(UndoRecord::Batch {
                 label,
                 dirs: Vec::new(),
                 records: vec![
@@ -3055,7 +3710,7 @@ impl TaskManager {
         if !replaced.is_empty() || !merged.is_empty() {
             // One undo step: the copies are removed (or moved back), then the replaced
             // items come back from the trash.
-            self.journal.push(transfer_batch(
+            step_records.push(transfer_batch(
                 req.kind,
                 &req.sources,
                 created,
@@ -3066,13 +3721,33 @@ impl TaskManager {
             ));
         } else {
             if !created.is_empty() {
-                self.journal.push(UndoRecord::Created { paths: created });
+                step_records.push(UndoRecord::Created { paths: created });
             }
             if !moved.is_empty() {
-                self.journal.push(UndoRecord::Moved { pairs: moved });
+                step_records.push(UndoRecord::Moved { pairs: moved });
             }
         }
-        result.map(|_| (done_top, skipped, output))
+        let undo_id = match step_records.len() {
+            0 => None,
+            1 => Some(
+                self.journal
+                    .push(step_records.pop().expect("single record")),
+            ),
+            _ => Some(self.journal.push(UndoRecord::Batch {
+                label: format!(
+                    "{} {}",
+                    if req.kind == TaskKind::Move {
+                        "move"
+                    } else {
+                        "copy"
+                    },
+                    what(&req.sources)
+                ),
+                records: step_records,
+                dirs: Vec::new(),
+            })),
+        };
+        (result.map(|_| (done_top, skipped, output)), undo_id)
     }
 }
 
@@ -3099,13 +3774,24 @@ pub fn epoch_secs(t: SystemTime) -> i64 {
 /// Test helpers shared by the crate's tests.
 #[cfg(test)]
 pub(crate) mod test_support {
+    #[cfg_attr(target_os = "macos", allow(unused_imports))]
     use super::*;
 
-    /// A test's temporary folder. Replace, delete and undo use the real trash: when the
-    /// test ends, what went there from this folder is purged as well (it piled up in the
-    /// developer's Recycle Bin / ~/.local/share/Trash with every `cargo test`).
+    /// A test's temporary folder. On freedesktop Unix, unit tests run against a per-test
+    /// isolated trash directory inside a disposable tempdir so parallel tests and chroots
+    /// never touch or race on the user's real trash (integration tests such as `undo_fuzz`
+    /// and production builds are unaffected). On Windows, items sent to the Recycle Bin
+    /// from this folder are purged on drop.
     pub(crate) struct TestDir {
         dir: tempfile::TempDir,
+        #[cfg(all(
+            unix,
+            not(target_os = "macos"),
+            not(target_os = "ios"),
+            not(target_os = "android")
+        ))]
+        _trash: isolated_trash::Guard,
+        #[cfg(windows)]
         trashed_before: u64,
     }
 
@@ -3116,6 +3802,7 @@ pub(crate) mod test_support {
         }
     }
 
+    #[cfg(windows)]
     impl Drop for TestDir {
         fn drop(&mut self) {
             if TRASHED.load(Ordering::Relaxed) != self.trashed_before {
@@ -3126,20 +3813,358 @@ pub(crate) mod test_support {
 
     pub(crate) fn test_dir() -> TestDir {
         TestDir {
+            #[cfg(windows)]
             trashed_before: TRASHED.load(Ordering::Relaxed),
+            #[cfg(all(
+                unix,
+                not(target_os = "macos"),
+                not(target_os = "ios"),
+                not(target_os = "android")
+            ))]
+            _trash: isolated_trash::Guard::enter(),
             dir: tempfile::tempdir().unwrap(),
         }
     }
 
-    #[cfg(any(
-        windows,
-        all(
-            unix,
-            not(target_os = "macos"),
-            not(target_os = "ios"),
-            not(target_os = "android")
-        )
+    #[cfg(all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
     ))]
+    pub(super) fn trash_into_isolated(paths: &[PathBuf]) -> Option<Result<()>> {
+        isolated_trash::trash_paths(paths)
+    }
+
+    #[cfg(all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    ))]
+    pub(super) fn list_isolated_trash() -> Option<Result<Vec<trash::TrashItem>>> {
+        isolated_trash::list()
+    }
+
+    #[cfg(all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    ))]
+    pub(super) fn isolated_trash_root() -> Option<PathBuf> {
+        isolated_trash::current_root()
+    }
+
+    #[cfg(all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    ))]
+    mod isolated_trash {
+        use super::*;
+        use std::cell::{OnceCell, RefCell};
+        use std::ffi::{OsStr, OsString};
+        use std::io::Write;
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        use std::path::Component;
+        use std::rc::Rc;
+
+        thread_local! {
+            static STACK: RefCell<Vec<Rc<OnceCell<tempfile::TempDir>>>> = const { RefCell::new(Vec::new()) };
+        }
+
+        pub(super) struct Guard {
+            slot: Rc<OnceCell<tempfile::TempDir>>,
+        }
+
+        impl Guard {
+            pub(super) fn enter() -> Self {
+                let slot = Rc::new(OnceCell::new());
+                STACK.with(|s| s.borrow_mut().push(Rc::clone(&slot)));
+                Self { slot }
+            }
+        }
+
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = STACK.try_with(|s| {
+                    let mut stack = s.borrow_mut();
+                    if let Some(idx) = stack.iter().rposition(|x| Rc::ptr_eq(x, &self.slot)) {
+                        stack.remove(idx);
+                    }
+                });
+            }
+        }
+
+        fn current() -> Option<Rc<OnceCell<tempfile::TempDir>>> {
+            STACK.with(|s| s.borrow().last().cloned())
+        }
+
+        pub(super) fn current_root() -> Option<PathBuf> {
+            current().and_then(|slot| slot.get().map(|d| d.path().to_path_buf()))
+        }
+
+        fn encode_uri_path(path: &Path) -> String {
+            let mut out = String::new();
+            for component in path.components() {
+                match component {
+                    Component::RootDir => out.push('/'),
+                    Component::Normal(part) => {
+                        if !out.is_empty() && !out.ends_with('/') {
+                            out.push('/');
+                        }
+                        for &b in part.as_bytes() {
+                            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+                                out.push(b as char);
+                            } else {
+                                use std::fmt::Write as _;
+                                let _ = write!(out, "%{b:02X}");
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            out
+        }
+
+        fn hex_nibble(b: u8) -> Option<u8> {
+            match b {
+                b'0'..=b'9' => Some(b - b'0'),
+                b'a'..=b'f' => Some(b - b'a' + 10),
+                b'A'..=b'F' => Some(b - b'A' + 10),
+                _ => None,
+            }
+        }
+
+        fn decode_uri_path(raw: &str) -> PathBuf {
+            let bytes = raw.as_bytes();
+            let mut decoded = Vec::with_capacity(bytes.len());
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == b'%' && i + 2 < bytes.len() {
+                    if let (Some(hi), Some(lo)) =
+                        (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2]))
+                    {
+                        decoded.push((hi << 4) | lo);
+                        i += 3;
+                        continue;
+                    }
+                }
+                decoded.push(bytes[i]);
+                i += 1;
+            }
+            PathBuf::from(OsString::from_vec(decoded))
+        }
+
+        fn canonicalize_parent_keep_leaf(path: &Path) -> Result<PathBuf> {
+            if path.as_os_str().is_empty() {
+                return Err(CoreError::Trash("empty path".into()));
+            }
+            let target = if path.is_relative() {
+                std::env::current_dir()
+                    .map_err(|e| CoreError::Trash(e.to_string()))?
+                    .join(path)
+            } else {
+                path.to_path_buf()
+            };
+            let parent = target
+                .parent()
+                .ok_or_else(|| CoreError::Trash("cannot trash root directory".into()))?;
+            let name = target
+                .file_name()
+                .ok_or_else(|| CoreError::Trash("cannot trash path without file name".into()))?;
+            let canonical_parent = fs::canonicalize(parent)
+                .map_err(|e| CoreError::Trash(format!("{}: {e}", parent.display())))?;
+            Ok(canonical_parent.join(name))
+        }
+
+        fn move_into_trash(src: &Path, dst: &Path) -> std::io::Result<()> {
+            match fs::rename(src, dst) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+                    let meta = fs::symlink_metadata(src)?;
+                    if meta.file_type().is_symlink() {
+                        let target = fs::read_link(src)?;
+                        std::os::unix::fs::symlink(target, dst)?;
+                        fs::remove_file(src)
+                    } else if meta.is_dir() {
+                        copy_dir_all_for_trash(src, dst)?;
+                        fs::remove_dir_all(src)
+                    } else {
+                        fs::copy(src, dst)?;
+                        fs::remove_file(src)
+                    }
+                }
+                Err(e) => Err(e),
+            }
+        }
+
+        fn copy_dir_all_for_trash(src: &Path, dst: &Path) -> std::io::Result<()> {
+            fs::create_dir_all(dst)?;
+            for entry in fs::read_dir(src)? {
+                let entry = entry?;
+                let src_path = entry.path();
+                let dst_path = dst.join(entry.file_name());
+                let ft = entry.file_type()?;
+                if ft.is_dir() {
+                    copy_dir_all_for_trash(&src_path, &dst_path)?;
+                } else if ft.is_symlink() {
+                    std::os::unix::fs::symlink(fs::read_link(&src_path)?, &dst_path)?;
+                } else {
+                    fs::copy(&src_path, &dst_path)?;
+                }
+            }
+            Ok(())
+        }
+
+        pub(super) fn trash_paths(paths: &[PathBuf]) -> Option<Result<()>> {
+            let slot = current()?;
+            Some(trash_paths_in(&slot, paths))
+        }
+
+        fn trash_paths_in(slot: &OnceCell<tempfile::TempDir>, paths: &[PathBuf]) -> Result<()> {
+            let full_paths: Vec<PathBuf> = paths
+                .iter()
+                .map(|p| {
+                    let full = canonicalize_parent_keep_leaf(p)?;
+                    fs::symlink_metadata(&full)
+                        .map_err(|e| CoreError::Trash(format!("{}: {e}", full.display())))?;
+                    Ok(full)
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            let root = slot
+                .get_or_init(|| tempfile::tempdir().expect("isolated test trash tempdir"))
+                .path();
+            let files_dir = root.join("files");
+            let info_dir = root.join("info");
+            fs::create_dir_all(&files_dir).map_err(|e| CoreError::Trash(e.to_string()))?;
+            fs::create_dir_all(&info_dir).map_err(|e| CoreError::Trash(e.to_string()))?;
+
+            for full in full_paths {
+                let filename = full
+                    .file_name()
+                    .ok_or_else(|| CoreError::Trash("missing file name".into()))?;
+                let mut suffix = 0usize;
+                loop {
+                    suffix += 1;
+                    let mut in_trash_name = filename.to_os_string();
+                    if suffix > 1 {
+                        in_trash_name.push(format!(".{suffix}"));
+                    }
+                    let mut info_name = in_trash_name.clone();
+                    info_name.push(".trashinfo");
+                    let info_path = info_dir.join(&info_name);
+                    let mut info_file = match fs::OpenOptions::new()
+                        .create_new(true)
+                        .write(true)
+                        .open(&info_path)
+                    {
+                        Ok(f) => f,
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                        Err(e) => return Err(CoreError::Trash(e.to_string())),
+                    };
+                    let now = chrono::Local::now();
+                    let encoded = encode_uri_path(&full);
+                    let write_res = writeln!(info_file, "[Trash Info]")
+                        .and_then(|_| writeln!(info_file, "Path={encoded}"))
+                        .and_then(|_| {
+                            writeln!(
+                                info_file,
+                                "DeletionDate={}",
+                                now.format("%Y-%m-%dT%H:%M:%S")
+                            )
+                        })
+                        .and_then(|_| info_file.flush());
+                    drop(info_file);
+                    if let Err(e) = write_res {
+                        let _ = fs::remove_file(&info_path);
+                        return Err(CoreError::Trash(e.to_string()));
+                    }
+                    let stored_path = files_dir.join(&in_trash_name);
+                    if exists_no_follow(&stored_path) {
+                        let _ = fs::remove_file(&info_path);
+                        continue;
+                    }
+                    if let Err(e) = move_into_trash(&full, &stored_path) {
+                        let _ = fs::remove_file(&info_path);
+                        return Err(CoreError::Trash(e.to_string()));
+                    }
+                    break;
+                }
+            }
+            Ok(())
+        }
+
+        pub(super) fn list() -> Option<Result<Vec<trash::TrashItem>>> {
+            let slot = current()?;
+            let Some(dir) = slot.get() else {
+                return Some(Ok(Vec::new()));
+            };
+            Some(list_in(dir.path()))
+        }
+
+        fn list_in(root: &Path) -> Result<Vec<trash::TrashItem>> {
+            let info_dir = root.join("info");
+            let entries = match fs::read_dir(&info_dir) {
+                Ok(d) => d,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(e) => return Err(CoreError::Trash(e.to_string())),
+            };
+            let mut items = Vec::new();
+            for entry in entries {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                let info_path = entry.path();
+                if info_path.extension() != Some(OsStr::new("trashinfo")) {
+                    continue;
+                }
+                let Ok(content) = fs::read_to_string(&info_path) else {
+                    continue;
+                };
+                let mut name = None;
+                let mut original_parent = None;
+                let mut time_deleted = None;
+                for line in content.lines().skip(1) {
+                    let Some((key, value)) = line.split_once('=') else {
+                        continue;
+                    };
+                    let key = key.trim();
+                    let value = value.trim();
+                    if key == "Path" {
+                        let decoded = decode_uri_path(value);
+                        name = decoded.file_name().map(|n| n.to_os_string());
+                        original_parent = decoded.parent().map(Path::to_path_buf);
+                    } else if key == "DeletionDate" {
+                        if let Ok(naive) =
+                            chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S")
+                        {
+                            use chrono::TimeZone as _;
+                            if let Some(dt) = chrono::Local.from_local_datetime(&naive).earliest() {
+                                time_deleted = Some(dt.timestamp());
+                            }
+                        }
+                    }
+                }
+                if let (Some(name), Some(original_parent)) = (name, original_parent) {
+                    items.push(trash::TrashItem {
+                        id: info_path.into_os_string(),
+                        name,
+                        original_parent,
+                        time_deleted: time_deleted.unwrap_or(-1),
+                    });
+                }
+            }
+            Ok(items)
+        }
+    }
+
+    #[cfg(windows)]
     fn purge_trashed_from(dir: &Path) {
         let Ok(items) = list_trash() else {
             return;
@@ -3152,17 +4177,6 @@ pub(crate) mod test_support {
             let _ = with_trash(move || trash::os_limited::purge_all(mine));
         }
     }
-
-    #[cfg(not(any(
-        windows,
-        all(
-            unix,
-            not(target_os = "macos"),
-            not(target_os = "ios"),
-            not(target_os = "android")
-        )
-    )))]
-    fn purge_trashed_from(_dir: &Path) {}
 }
 
 #[cfg(test)]
@@ -3259,6 +4273,53 @@ mod tests {
             Ok(_) => assert_eq!(std::fs::read_to_string(&p).unwrap(), "old\n"),
             Err(e) => eprintln!("undo not verified (no trash here): {e}"),
         }
+    }
+
+    /// A save made against an old copy of a file is refused and writes nothing; a save made against
+    /// the file as it is, or without a revision, goes through.
+    #[test]
+    fn a_checked_save_is_refused_when_the_file_changed_on_disk() {
+        let t = test_dir();
+        let p = t.path().join("a.txt");
+        fs::write(&p, "one").unwrap();
+        let j = UndoJournal::default();
+        let read = file_revision(&p).unwrap();
+        // Another program writes the file (a different length, so the revision differs at once).
+        fs::write(&p, "changed elsewhere").unwrap();
+        let error = save_text_checked(&p, "my edit", Some(&read), &j)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("changed on disk"), "{error}");
+        assert_eq!(fs::read_to_string(&p).unwrap(), "changed elsewhere");
+        let leftovers = fs::read_dir(t.path()).unwrap().count();
+        assert_eq!(leftovers, 1, "no temporary file left");
+        // Against the file as it is now, the save goes through; a missing or empty revision is not checked.
+        let now = file_revision(&p).unwrap();
+        save_text_checked(&p, "second", Some(&now), &j).unwrap();
+        assert_eq!(fs::read_to_string(&p).unwrap(), "second");
+        save_text_checked(&p, "third", None, &j).unwrap();
+        save_text_checked(&p, "fourth", Some(""), &j).unwrap();
+        assert_eq!(fs::read_to_string(&p).unwrap(), "fourth");
+        // The revision of a missing file is nothing.
+        assert_eq!(file_revision(&t.path().join("missing")), None);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn a_new_text_save_does_not_replace_a_file_created_after_selection() {
+        let t = test_dir();
+        let p = t.path().join("new.txt");
+        let j = UndoJournal::default();
+        assert_eq!(file_revision(&p), None);
+        fs::write(&p, "created elsewhere").unwrap();
+        assert!(save_new_text(&p, "my result", &j).is_err());
+        assert_eq!(fs::read_to_string(&p).unwrap(), "created elsewhere");
+        assert_eq!(j.peek_description(), None);
+        assert_eq!(fs::read_dir(t.path()).unwrap().count(), 1);
+        fs::remove_file(&p).unwrap();
+        assert!(save_new_text(&p, "my result", &j).unwrap());
+        assert_eq!(fs::read_to_string(&p).unwrap(), "my result");
+        assert_eq!(j.peek_description().as_deref(), Some("save “new.txt”"));
     }
 
     /// Saving through a symlink writes the file it points to and keeps the link
@@ -3706,6 +4767,73 @@ mod tests {
         j.undo().unwrap();
         assert_eq!(fs::read_to_string(src.join("a.txt")).unwrap(), "new");
         assert_eq!(fs::read_to_string(dst.join("a.txt")).unwrap(), "old");
+    }
+
+    /// Regression: unit-test trash operations stay isolated per test on freedesktop Unix,
+    /// never touching the real OS trash and remaining reliable under concurrent runs.
+    #[cfg(all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    ))]
+    #[test]
+    fn isolated_test_trash_is_concurrent_and_avoids_os_trash() {
+        let handles: Vec<_> = (0..8)
+            .map(|worker| {
+                std::thread::spawn(move || {
+                    for round in 0..5 {
+                        let d = test_dir();
+                        let src = d.path().join("src");
+                        let dst = d.path().join("dst");
+                        fs::create_dir(&src).unwrap();
+                        fs::create_dir(&dst).unwrap();
+                        let name = format!("100% čebela w{worker} r{round}.txt");
+                        fs::write(src.join(&name), format!("new-{worker}-{round}")).unwrap();
+                        fs::write(dst.join(&name), format!("old-{worker}-{round}")).unwrap();
+
+                        let m = mgr();
+                        let j = m.journal().clone();
+                        run(
+                            &m,
+                            task(
+                                TaskKind::Copy,
+                                &src.join(&name),
+                                &dst,
+                                ConflictPolicy::Overwrite,
+                            ),
+                        )
+                        .unwrap();
+
+                        let root = test_support::isolated_trash_root()
+                            .expect("isolated trash initialized");
+                        let trashed = list_trash().unwrap();
+                        assert_eq!(
+                            trashed.len(),
+                            1,
+                            "worker {worker} round {round} must only see its own trash"
+                        );
+                        assert!(
+                            Path::new(&trashed[0].id).starts_with(&root),
+                            "trashed item {:?} must live inside isolated root {:?}",
+                            trashed[0].id,
+                            root
+                        );
+                        assert_eq!(trashed[0].original_path(), dst.join(&name));
+
+                        j.undo().unwrap();
+                        assert_eq!(
+                            fs::read_to_string(dst.join(&name)).unwrap(),
+                            format!("old-{worker}-{round}")
+                        );
+                        assert!(list_trash().unwrap().is_empty());
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 
     /// A copy that fails half-way leaves nothing behind, and a copy never truncates a
@@ -4495,7 +5623,7 @@ mod tests {
         assert!(matches!(journal.undo(), Err(CoreError::AlreadyExists(_))));
         let stack = journal.stack.lock().unwrap();
         assert!(matches!(
-            stack.last(),
+            stack.last().map(|e| &e.record),
             Some(UndoRecord::Batch { records, .. })
                 if matches!(records.as_slice(), [UndoRecord::Trashed { .. }, UndoRecord::Moved { .. }])
         ));
@@ -5220,5 +6348,204 @@ mod tests {
             )
         };
         assert_eq!(&buf[..n.max(0) as usize], v);
+    }
+
+    #[test]
+    fn undo_by_id_reverses_only_the_targeted_operation_and_preserves_order() {
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("src");
+        let dst = d.path().join("dst");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        let a = src.join("first.txt");
+        let b = src.join("second.txt");
+        fs::write(&a, "one").unwrap();
+        fs::write(&b, "two").unwrap();
+
+        let events = Arc::new(Mutex::new(Vec::<TaskEvent>::new()));
+        let sink = events.clone();
+        let m = TaskManager::new(
+            Arc::new(UndoJournal::default()),
+            Arc::new(move |ev| {
+                sink.lock().unwrap().push(ev);
+            }),
+        );
+
+        let run_copy = |file: &Path| {
+            let h = TaskHandle {
+                id: 1,
+                cancel: AtomicBool::new(false),
+            };
+            let (res, undo_id) = m.run_named(
+                &h,
+                TaskRequest {
+                    kind: TaskKind::Copy,
+                    sources: vec![file.to_path_buf()],
+                    dest: Some(dst.clone()),
+                    conflict: ConflictPolicy::KeepBoth,
+                    archive_name: None,
+                    format: None,
+                    extract_mode: Default::default(),
+                    trash_archive: false,
+                    merge: false,
+                },
+            );
+            res.unwrap();
+            undo_id.expect("copy produces an undo record id")
+        };
+
+        let first_id = run_copy(&a);
+        let second_id = run_copy(&b);
+        assert_ne!(first_id, second_id);
+        assert!(dst.join("first.txt").exists());
+        assert!(dst.join("second.txt").exists());
+
+        // Clicking Undo on the older card removes ONLY first.txt; second.txt stays intact.
+        m.journal().undo_by_id_with(first_id, true).unwrap();
+        assert!(!dst.join("first.txt").exists());
+        assert!(dst.join("second.txt").exists());
+
+        // Clicking the same older card again reports NothingToUndo and leaves second.txt untouched.
+        assert!(matches!(
+            m.journal().undo_by_id_with(first_id, true),
+            Err(CoreError::NothingToUndo)
+        ));
+        assert!(dst.join("second.txt").exists());
+        assert_eq!(m.journal().len(), 1);
+
+        // Global undo still reverses the remaining newer operation in normal LIFO order.
+        m.journal().undo_with(true).unwrap();
+        assert!(!dst.join("second.txt").exists());
+        assert!(m.journal().is_empty());
+    }
+
+    #[test]
+    fn undo_by_id_preserves_identity_on_retry_and_refuses_overlapping_newer_ops() {
+        let d = tempfile::tempdir().unwrap();
+        let f1 = d.path().join("alpha.txt");
+        let f2 = d.path().join("beta.txt");
+        fs::write(&f1, "alpha").unwrap();
+        fs::write(&f2, "beta").unwrap();
+
+        let j = UndoJournal::default();
+        let renamed1 = rename(&f1, "alpha-moved.txt", &j).unwrap();
+        let id1 = j.latest_id().unwrap();
+        let renamed2 = rename(&f2, "beta-moved.txt", &j).unwrap();
+        let id2 = j.latest_id().unwrap();
+
+        // Block id1 by creating a conflicting file at alpha.txt; retry must preserve id1.
+        fs::write(&f1, "blocker").unwrap();
+        assert!(matches!(
+            j.undo_by_id(id1),
+            Err(CoreError::AlreadyExists(_))
+        ));
+        assert!(
+            j.has_id(id1),
+            "failed undo_by_id keeps its stable id for retry"
+        );
+        assert!(
+            renamed2.exists(),
+            "newer unrelated operation stays untouched"
+        );
+
+        // Remove blocker and retry id1 directly.
+        fs::remove_file(&f1).unwrap();
+        j.undo_by_id(id1).unwrap();
+        assert!(f1.exists());
+        assert!(!renamed1.exists());
+        assert!(renamed2.exists());
+
+        // Overlap guard: rename beta-moved.txt again so a newer record overlaps id2.
+        let renamed2b = rename(&renamed2, "beta-final.txt", &j).unwrap();
+        let id3 = j.latest_id().unwrap();
+        let err = j.undo_by_id(id2).unwrap_err();
+        assert!(err.to_string().contains("newer operation"));
+        assert!(renamed2b.exists());
+        assert!(j.has_id(id2) && j.has_id(id3));
+
+        // Undoing the newer overlapping op first unblocks id2.
+        j.undo_by_id(id3).unwrap();
+        j.undo_by_id(id2).unwrap();
+        assert!(f2.exists());
+        assert!(j.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn undo_by_id_retry_after_partial_failure_keeps_same_id() {
+        let d = tempfile::tempdir().unwrap();
+        let a = d.path().join("a.txt");
+        let b = d.path().join("b.txt");
+        fs::write(&a, "a").unwrap();
+        fs::write(&b, "b").unwrap();
+        let j = UndoJournal::default();
+        let id = j.push(UndoRecord::Created {
+            paths: vec![a.clone(), b.clone()],
+        });
+        let other = d.path().join("other.txt");
+        fs::write(&other, "other").unwrap();
+        let other_id = j.push(UndoRecord::Created {
+            paths: vec![other.clone()],
+        });
+
+        let err = j
+            .undo_by_id_with_reverter(id, false, |_, _| {
+                Err((
+                    CoreError::Other("no-trash: simulated".into()),
+                    Some(UndoRecord::Created {
+                        paths: vec![b.clone()],
+                    }),
+                ))
+            })
+            .unwrap_err();
+        assert!(err.to_string().starts_with("no-trash:"));
+        assert!(j.has_id(id));
+        assert!(j.has_id(other_id));
+
+        // Permanent retry targets the same id and removes only its remaining path.
+        j.undo_by_id_with(id, true).unwrap();
+        assert!(!b.exists());
+        assert!(other.exists());
+        assert!(!j.has_id(id));
+        assert!(j.has_id(other_id));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn apfs_clonefile_preserves_data_mode_durable_and_refuses_overwrite() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = test_dir();
+        let src = d.path().join("big.bin");
+        let payload = vec![0xA5u8; 2 * 1024 * 1024];
+        fs::write(&src, &payload).unwrap();
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o444)).unwrap();
+
+        let dst = d.path().join("cloned.bin");
+        let cancel = AtomicBool::new(false);
+        let mut reported = 0u64;
+        let mut tick = |n: u64| reported += n;
+        copy_file(&src, &dst, &cancel, &mut tick, true).unwrap();
+
+        assert_eq!(fs::read(&dst).unwrap(), payload);
+        assert_eq!(reported, payload.len() as u64);
+        assert_eq!(
+            fs::metadata(&dst).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+
+        // Must never overwrite an existing destination.
+        let mut tick2 = |_: u64| {};
+        assert!(copy_file(&src, &dst, &cancel, &mut tick2, false).is_err());
+
+        // Pre-cancelled copy must fail with Cancelled and not create dst.
+        let dst2 = d.path().join("cancelled.bin");
+        let cancelled = AtomicBool::new(true);
+        let err = copy_file(&src, &dst2, &cancelled, &mut tick2, false).unwrap_err();
+        assert!(matches!(err, CoreError::Cancelled));
+        assert!(!dst2.exists());
+
+        // Restore write bit so tempdir cleanup succeeds cleanly.
+        let _ = fs::set_permissions(&src, fs::Permissions::from_mode(0o644));
+        let _ = fs::set_permissions(&dst, fs::Permissions::from_mode(0o644));
     }
 }

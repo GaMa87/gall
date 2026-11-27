@@ -76,28 +76,189 @@ pub fn format_path(path: &str, fmt: PathFormat) -> String {
             crate::fs::wsl::linux_path_for(path).unwrap_or_else(|| path.to_string())
         }
         PathFormat::Uri => {
-            let fwd = path.replace('\\', "/");
-            let encoded: String = fwd
-                .bytes()
-                .map(|b| match b {
-                    b'A'..=b'Z'
-                    | b'a'..=b'z'
-                    | b'0'..=b'9'
-                    | b'-'
-                    | b'_'
-                    | b'.'
-                    | b'~'
-                    | b'/'
-                    | b':' => (b as char).to_string(),
-                    _ => format!("%{b:02X}"),
-                })
-                .collect();
-            if encoded.starts_with('/') {
-                format!("file://{encoded}")
-            } else {
-                format!("file:///{encoded}")
+            let looks_windows = cfg!(windows)
+                || path.starts_with(r"\\")
+                || (path.len() >= 2
+                    && path.as_bytes()[0].is_ascii_alphabetic()
+                    && path.as_bytes()[1] == b':');
+            encode_file_uri_for(path, looks_windows)
+        }
+    }
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn percent_decode_utf8(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push((h << 4) | l);
+                i += 3;
+                continue;
             }
         }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    if out.contains(&0) {
+        return None;
+    }
+    String::from_utf8(out).ok()
+}
+
+fn percent_encode_uri_bytes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' | b':' => {
+                out.push(b as char);
+            }
+            _ => {
+                use std::fmt::Write;
+                let _ = write!(out, "%{b:02X}");
+            }
+        }
+    }
+    out
+}
+
+/// Decodes a `file://` URI into a local filesystem `PathBuf`.
+/// Returns `None` if `uri` is not a `file://` URI (case-insensitive scheme),
+/// contains NUL (`%00`) or invalid UTF-8 sequences, or names a non-local host
+/// (on POSIX, anything other than empty or `localhost`).
+pub fn decode_file_uri(uri: &str) -> Option<PathBuf> {
+    decode_file_uri_for(uri, cfg!(windows))
+}
+
+/// Platform-parameterized `file://` URI decoder so POSIX and Windows rules can both be
+/// unit-tested on any host OS.
+pub fn decode_file_uri_for(uri: &str, windows: bool) -> Option<PathBuf> {
+    let rest = uri
+        .get(..7)
+        .filter(|s| s.eq_ignore_ascii_case("file://"))
+        .map(|_| &uri[7..])?;
+    let (host, raw_path, had_leading_slash) = if rest.starts_with('/') {
+        ("", rest, true)
+    } else if let Some((h, p)) = rest.split_once('/') {
+        (h, p, false)
+    } else {
+        return None;
+    };
+
+    let local_host = host.is_empty() || host.eq_ignore_ascii_case("localhost");
+    if !windows {
+        if !local_host {
+            return None;
+        }
+        let decoded = percent_decode_utf8(raw_path)?;
+        let path = if had_leading_slash {
+            decoded
+        } else {
+            format!("/{decoded}")
+        };
+        return Some(PathBuf::from(path));
+    }
+
+    if local_host {
+        let decoded = percent_decode_utf8(raw_path)?;
+        let p = if had_leading_slash {
+            decoded
+        } else {
+            format!("/{decoded}")
+        };
+        if let Some(unc) = p.strip_prefix("//") {
+            return Some(PathBuf::from(format!(r"\\{}", unc.replace('/', "\\"))));
+        }
+        let b = p.as_bytes();
+        if b.len() >= 3
+            && b[0] == b'/'
+            && b[1].is_ascii_alphabetic()
+            && b[2] == b':'
+            && (b.len() == 3 || b[3] == b'/')
+        {
+            let mut drive = p[1..].replace('/', "\\");
+            if b.len() == 3 {
+                drive.push('\\'); // `file:///C:` is the root of C:, not "the current folder of C:"
+            }
+            return Some(PathBuf::from(drive));
+        }
+        return Some(PathBuf::from(p.replace('/', "\\")));
+    }
+
+    let decoded_host = percent_decode_utf8(host)?;
+    let decoded_path = percent_decode_utf8(raw_path)?;
+    let hb = decoded_host.as_bytes();
+    if hb.len() == 2 && hb[0].is_ascii_alphabetic() && hb[1] == b':' {
+        return Some(PathBuf::from(format!(
+            "{decoded_host}\\{}",
+            decoded_path.replace('/', "\\")
+        )));
+    }
+    Some(PathBuf::from(format!(
+        r"\\{decoded_host}\{}",
+        decoded_path.replace('/', "\\")
+    )))
+}
+
+/// Convenience helper for CLI and address-bar inputs: if `input` is a `file://` URI
+/// that decodes to a local path, returns that path string; otherwise returns `input`
+/// unchanged.
+pub fn file_uri_or_raw(input: &str) -> String {
+    decode_file_uri(input)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| input.to_string())
+}
+
+/// Encodes a local path as a canonical `file://` URI (RFC 8089).
+/// Strips Windows verbatim prefixes (`\\?\`, `\\?\UNC\`) before encoding.
+pub fn encode_file_uri(path: &Path) -> String {
+    encode_file_uri_for(&path.to_string_lossy(), cfg!(windows))
+}
+
+/// Platform-parameterized `file://` URI encoder.
+pub fn encode_file_uri_for(path: &str, windows: bool) -> String {
+    let stripped = if windows {
+        if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{rest}")
+        } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+            let b = rest.as_bytes();
+            if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+                rest.to_string()
+            } else {
+                path.to_string()
+            }
+        } else {
+            path.to_string()
+        }
+    } else {
+        path.to_string()
+    };
+    // Only on Windows is a backslash a separator: on POSIX it is a character of the file name.
+    let fwd = if windows {
+        stripped.replace('\\', "/")
+    } else {
+        stripped
+    };
+    if windows {
+        if let Some(unc) = fwd.strip_prefix("//") {
+            return format!("file://{}", percent_encode_uri_bytes(unc));
+        }
+    }
+    let encoded = percent_encode_uri_bytes(&fwd);
+    if encoded.starts_with('/') {
+        format!("file://{encoded}")
+    } else {
+        format!("file:///{encoded}")
     }
 }
 
@@ -247,6 +408,163 @@ mod tests {
         assert_eq!(format_path(p, PathFormat::Escaped), r"C:\\My Docs\\a.txt");
         assert_eq!(format_path(p, PathFormat::Forward), "C:/My Docs/a.txt");
         assert_eq!(format_path("/a b/c", PathFormat::Uri), "file:///a%20b/c");
+        assert_eq!(
+            format_path(r"C:\My Docs\a.txt", PathFormat::Uri),
+            "file:///C:/My%20Docs/a.txt"
+        );
+        assert_eq!(
+            format_path(r"\\server\share\a b.txt", PathFormat::Uri),
+            "file://server/share/a%20b.txt"
+        );
+    }
+
+    #[test]
+    fn backslashes_and_bare_drives_in_file_uris() {
+        // POSIX: a backslash is part of the name and is escaped, not turned into a folder separator.
+        assert_eq!(encode_file_uri_for("/tmp/a\\b", false), "file:///tmp/a%5Cb");
+        assert_eq!(
+            decode_file_uri_for("file:///tmp/a%5Cb", false),
+            Some(PathBuf::from("/tmp/a\\b"))
+        );
+        // Windows: a separator.
+        assert_eq!(
+            encode_file_uri_for(r"C:\Users\a b", true),
+            "file:///C:/Users/a%20b"
+        );
+        // `file:///C:` is the root of the drive.
+        assert_eq!(
+            decode_file_uri_for("file:///C:", true),
+            Some(PathBuf::from("C:\\"))
+        );
+        assert_eq!(
+            decode_file_uri_for("file:///C:/", true),
+            Some(PathBuf::from("C:\\"))
+        );
+        assert_eq!(
+            decode_file_uri_for("file:///C:/x", true),
+            Some(PathBuf::from("C:\\x"))
+        );
+    }
+
+    #[test]
+    fn decode_file_uri_posix_and_validation() {
+        assert_eq!(
+            decode_file_uri_for("file:///home/u/My%20File.txt", false),
+            Some(PathBuf::from("/home/u/My File.txt"))
+        );
+        assert_eq!(
+            decode_file_uri_for("file://localhost/tmp/a%25b", false),
+            Some(PathBuf::from("/tmp/a%b"))
+        );
+        assert_eq!(
+            decode_file_uri_for("FILE://LOCALHOST/tmp/a", false),
+            Some(PathBuf::from("/tmp/a"))
+        );
+        assert_eq!(
+            decode_file_uri_for("file:///home/u/%C4%8Crka.txt", false),
+            Some(PathBuf::from("/home/u/Črka.txt"))
+        );
+        // omarchy-transcode writes unencoded paths in file:// URIs.
+        assert_eq!(
+            decode_file_uri_for("file:///tmp/a b#1?q.jpg", false),
+            Some(PathBuf::from("/tmp/a b#1?q.jpg"))
+        );
+        // Incomplete or invalid % sequences remain literal when valid UTF-8.
+        assert_eq!(
+            decode_file_uri_for("file:///bad%2", false),
+            Some(PathBuf::from("/bad%2"))
+        );
+        assert_eq!(
+            decode_file_uri_for("file:///bad%zz", false),
+            Some(PathBuf::from("/bad%zz"))
+        );
+        // Reject NUL, invalid UTF-8, non-local hosts, localhost boundary tricks, non-file URIs.
+        assert_eq!(decode_file_uri_for("file:///tmp/a%00b", false), None);
+        assert_eq!(decode_file_uri_for("file:///tmp/%FF%FE", false), None);
+        assert_eq!(decode_file_uri_for("file://localhost2/tmp/a", false), None);
+        assert_eq!(decode_file_uri_for("file://remotehost/tmp/a", false), None);
+        assert_eq!(decode_file_uri_for("file://localhost", false), None);
+        assert_eq!(decode_file_uri_for("https://example.com/a", false), None);
+        assert_eq!(decode_file_uri_for("/plain/path", false), None);
+        // Multi-byte UTF-8 straddling byte index 7 must not panic.
+        assert_eq!(decode_file_uri_for("abčdefg", false), None);
+        assert_eq!(
+            decode_file_uri_for("file:///", false),
+            Some(PathBuf::from("/"))
+        );
+        assert_eq!(
+            decode_file_uri_for("file://localhost/", false),
+            Some(PathBuf::from("/"))
+        );
+    }
+
+    #[test]
+    fn decode_file_uri_windows_drive_and_unc() {
+        assert_eq!(
+            decode_file_uri_for("file:///C:/Users/u/My%20File.txt", true),
+            Some(PathBuf::from(r"C:\Users\u\My File.txt"))
+        );
+        assert_eq!(
+            decode_file_uri_for("file:///C%3A/a.txt", true),
+            Some(PathBuf::from(r"C:\a.txt"))
+        );
+        assert_eq!(
+            decode_file_uri_for("file://localhost/D:/x", true),
+            Some(PathBuf::from(r"D:\x"))
+        );
+        assert_eq!(
+            decode_file_uri_for("file://server/share/a%20b.txt", true),
+            Some(PathBuf::from(r"\\server\share\a b.txt"))
+        );
+        assert_eq!(
+            decode_file_uri_for("file:////server/share/x", true),
+            Some(PathBuf::from(r"\\server\share\x"))
+        );
+        // Non-alphabetic drive prefix must not be stripped.
+        assert_eq!(
+            decode_file_uri_for("file:///1:/foo", true),
+            Some(PathBuf::from(r"\1:\foo"))
+        );
+    }
+
+    #[test]
+    fn encode_file_uri_round_trips() {
+        let posix_raw = "/home/u/Črka #1?a%2.txt";
+        let posix_uri = encode_file_uri_for(posix_raw, false);
+        assert_eq!(posix_uri, "file:///home/u/%C4%8Crka%20%231%3Fa%252.txt");
+        assert_eq!(
+            decode_file_uri_for(&posix_uri, false),
+            Some(PathBuf::from(posix_raw))
+        );
+
+        let win_uri = encode_file_uri_for(r"C:\My Docs\a #1.txt", true);
+        assert_eq!(win_uri, "file:///C:/My%20Docs/a%20%231.txt");
+        assert_eq!(
+            decode_file_uri_for(&win_uri, true),
+            Some(PathBuf::from(r"C:\My Docs\a #1.txt"))
+        );
+        assert_eq!(
+            encode_file_uri_for(r"\\?\C:\My Docs\a.txt", true),
+            "file:///C:/My%20Docs/a.txt"
+        );
+
+        let unc_uri = encode_file_uri_for(r"\\my server\share\a b.txt", true);
+        assert_eq!(unc_uri, "file://my%20server/share/a%20b.txt");
+        assert_eq!(
+            decode_file_uri_for(&unc_uri, true),
+            Some(PathBuf::from(r"\\my server\share\a b.txt"))
+        );
+        assert_eq!(
+            encode_file_uri_for(r"\\?\UNC\my server\share\a b.txt", true),
+            unc_uri
+        );
+
+        assert_eq!(file_uri_or_raw("/plain/path"), "/plain/path");
+        #[cfg(not(windows))]
+        assert_eq!(
+            file_uri_or_raw("file:///tmp/hello%20world"),
+            "/tmp/hello world"
+        );
     }
 
     #[test]

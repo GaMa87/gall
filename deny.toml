@@ -24,3 +24,15 @@ unknown-git = "deny"
 # Transitive GTK3 bindings used by Tauri on Linux are flagged "unmaintained";
 # they are outside our control until Tauri moves to GTK4.
 unmaintained = "workspace"
+ignore = [
+  # chrono is flagged "unmaintained" (no vulnerability, no safe upgrade exists). Gall uses it for UTC
+  # timestamps and local-time formatting (Local needs a sound local-offset lookup that `time` does not
+  # offer on multithreaded Unix) and `trash` depends on it too. Revisit when jiff is a drop-in option.
+  { id = "RUSTSEC-2026-0543", reason = "unmaintained chrono: no advisory-listed vulnerability, no replacement with a sound local offset yet" },
+  # cookie 0.18.2 is required by tauri, tauri-runtime and wry (`^0.18`); the only fixed release is the pre-release
+  # 0.19.0-rc.0 (checked 2026-11-24, `cargo update --dry-run` reaches no fixed version). The flaw needs a program that
+  # calls fork() and then adds private (encrypted) cookies in more than one of the resulting processes. Gall never
+  # forks (no fork call in its own code) and never creates a private cookie jar. Remove this entry when Tauri
+  # accepts cookie 0.19 or later.
+  { id = "RUSTSEC-2026-0594", reason = "cookie private-jar nonce repeat after fork(): Gall never forks nor uses private cookies; fixed only in the 0.19 pre-release, which tauri/wry (^0.18) do not accept yet" },
+]

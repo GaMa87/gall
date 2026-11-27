@@ -1,5 +1,5 @@
 //! A validated interactive-rebase plan. Git performs replay and retains resumable conflicts.
-use super::gitgraph::{git, has_content_filters, root};
+use super::gitgraph::{git, root};
 use crate::{CoreError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -7,11 +7,19 @@ use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 const MAX_PLAN: u64 = 8 * 1024 * 1024;
+/// A plan of more commits would not fit into [`MAX_PLAN`].
+const MAX_COMMITS: usize = 50_000;
+/// Without `merge-tree --stdin` every commit of a forecast is a process of its own.
+const MAX_SERIAL: usize = 1_000;
+/// The base of a plan that rewrites from the root commit (git rebase -i --root). It is no commit ID.
+pub const ROOT_BASE: &str = "root";
+/// The longest xec command of a plan.
+const MAX_EXEC: usize = 4096;
 static SERIAL: AtomicU64 = AtomicU64::new(0);
 static STREAMED_REPLAY_SUPPORTED: OnceLock<bool> = OnceLock::new();
 
@@ -33,6 +41,12 @@ pub struct RewritePlan {
 pub struct RewriteCommit {
     pub id: String,
     pub subject: String,
+}
+/// The whole message of a commit, asked for when its editor opens ([`messages`]).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitMessage {
+    pub id: String,
     pub message: String,
 }
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -44,6 +58,8 @@ pub enum RewriteAction {
     Fixup,
     Drop,
     Edit,
+    /// A shell command run after the commits before it; the command is the entry's message and the ID is empty.
+    Exec,
 }
 impl RewriteAction {
     fn name(self) -> &'static str {
@@ -54,12 +70,14 @@ impl RewriteAction {
             Self::Fixup => "fixup",
             Self::Drop => "drop",
             Self::Edit => "edit",
+            Self::Exec => "exec",
         }
     }
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RewriteEntry {
+    #[serde(default)]
     pub id: String,
     pub action: RewriteAction,
     #[serde(default)]
@@ -130,17 +148,18 @@ pub fn plan(path: &Path, base: &str) -> Result<RewritePlan> {
         if id.is_empty() {
             break;
         }
-        let (Some(subject), Some(message)) = (fields.next(), fields.next()) else {
+        let Some(subject) = fields.next() else {
             return Err(fail("Invalid commit metadata"));
         };
         commits.push(RewriteCommit {
             id: id.into(),
             subject: subject.into(),
-            message: message.trim_end_matches('\n').into(),
         });
     }
-    if commits.len() > 1000 {
-        return Err(fail("Select a range of at most 1000 commits"));
+    if commits.len() > MAX_COMMITS {
+        return Err(fail(format!(
+            "Select a range of at most {MAX_COMMITS} commits"
+        )));
     }
     Ok(RewritePlan {
         head: snapshot.head.clone(),
@@ -150,13 +169,56 @@ pub fn plan(path: &Path, base: &str) -> Result<RewritePlan> {
         commits,
     })
 }
-/// The checked base, the commits from it to `head` with their messages (`log` output) and the
+/// The messages of commits, with one process.
+pub fn messages(path: &Path, ids: &[String]) -> Result<Vec<CommitMessage>> {
+    const MAX_IDS: usize = 500;
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    if ids.len() > MAX_IDS {
+        return Err(fail(format!("Ask for at most {MAX_IDS} messages at once")));
+    }
+    if ids
+        .iter()
+        .any(|id| !matches!(id.len(), 40 | 64) || !id.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return Err(fail("Invalid commit ID in the rebase plan"));
+    }
+    let root = root(path)?;
+    let mut args = vec![
+        "log",
+        "--no-show-signature",
+        "--no-walk=unsorted",
+        "--format=%H%x00%B%x00",
+    ];
+    args.extend(ids.iter().map(String::as_str));
+    args.push("--");
+    let listed = git(&root, &args)?;
+    let mut fields = listed.split('\0');
+    let mut found = Vec::new();
+    while let (Some(id), Some(message)) = (fields.next(), fields.next()) {
+        found.push(CommitMessage {
+            id: id.trim_start_matches('\n').into(),
+            message: message.trim_end_matches('\n').into(),
+        });
+    }
+    Ok(found)
+}
+/// The checked base, the commits from it to `head` with their subjects (`log` output) and the
 /// number of merges among them, for [`plan`].
 fn plan_commits(root: &Path, base: &str, head: &str) -> Result<(String, String, usize)> {
-    let base = commit_id(root, base)?;
-    let range = format!("{base}..{head}");
-    // The commits with their messages in one query (it was one `show` per commit, a
-    // thousand processes for the longest plan), next to the count of merges.
+    let base = if base == ROOT_BASE {
+        ROOT_BASE.to_owned()
+    } else {
+        commit_id(root, base)?
+    };
+    let range = if base == ROOT_BASE {
+        head.to_owned()
+    } else {
+        format!("{base}..{head}")
+    };
+    // The commits in one query, next to the count of merges. Messages are asked for when an editor
+    // needs one: for a long plan they are most of the output.
     let (listed, skipped_merges) = std::thread::scope(|scope| {
         let merges = scope.spawn(|| git(root, &["rev-list", "--count", "--merges", &range]));
         let listed = git(
@@ -167,8 +229,8 @@ fn plan_commits(root: &Path, base: &str, head: &str) -> Result<(String, String, 
                 "--reverse",
                 "--topo-order",
                 "--no-merges",
-                "--max-count=1001",
-                "--format=%H%x00%s%x00%B%x00",
+                &format!("--max-count={}", MAX_COMMITS + 1),
+                "--format=%H%x00%s%x00",
                 &range,
             ],
         );
@@ -187,7 +249,7 @@ pub struct ConflictPrediction {
 }
 /// Merges `theirs` into `ours` (commits or trees; `base` is any revision) the way a cherry-pick does. Returns the resulting tree (conflict
 /// markers included when it conflicts) and the conflicted paths, or None when it merged cleanly.
-fn merge_trees(
+pub(super) fn merge_trees(
     root: &Path,
     base: &str,
     ours: &str,
@@ -266,7 +328,13 @@ fn git_supports_streamed_replay(version: &str) -> bool {
 /// process per commit cost 30–40 ms each on Windows. None when this cannot be used (a
 /// repository in WSL, whose Git runs through a shell without input, or a Git that refuses
 /// the input); the caller then merges one commit per process, which also reports the error.
-fn replay_streamed(root: &Path, start: &str, ids: &[String]) -> Option<Vec<ConflictPrediction>> {
+fn replay_streamed(
+    root: &Path,
+    start: &str,
+    ids: &[String],
+    parents: &Parents,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Option<Vec<ConflictPrediction>> {
     use std::io::BufRead;
     if ids.is_empty() {
         return Some(Vec::new());
@@ -310,8 +378,12 @@ fn replay_streamed(root: &Path, start: &str, ids: &[String]) -> Option<Vec<Confl
         };
         let mut current = start.to_owned();
         let mut found = Vec::new();
-        for id in ids {
-            writeln!(input, "{id}^1 -- {current} {id}").ok()?;
+        let total = ids.len() as u64;
+        for (idx, id) in ids.iter().enumerate() {
+            if cancelled() {
+                return None;
+            }
+            writeln!(input, "{} -- {current} {id}", parents.of(id)).ok()?;
             input.flush().ok()?;
             // `<status>NUL<tree>NUL` then the conflicted paths, each with NUL, and a NUL.
             let clean = match field()?.as_str() {
@@ -337,6 +409,13 @@ fn replay_streamed(root: &Path, start: &str, ids: &[String]) -> Option<Vec<Confl
                     files,
                 });
             }
+            super::gitprogress::report_counts(
+                "Checking rebase conflicts",
+                (idx + 1) as u64,
+                Some(total),
+                "commits",
+                Some(id[..8.min(id.len())].to_owned()),
+            );
             current = tree;
         }
         drop(input);
@@ -494,18 +573,76 @@ fn preview_commit(directory: &Path, tree: &str, hash_len: usize) -> Result<Strin
     Ok(id)
 }
 
-fn replay_serial(root: &Path, base: &str, ids: &[String]) -> Result<Vec<ConflictPrediction>> {
+/// What a commit is replayed against: its parent, or the empty tree for a root commit.
+#[derive(Default)]
+struct Parents {
+    roots: BTreeSet<String>,
+    empty: String,
+}
+impl Parents {
+    fn of(&self, id: &str) -> String {
+        if self.roots.contains(id) {
+            self.empty.clone()
+        } else {
+            format!("{id}^1")
+        }
+    }
+}
+/// The ID of the empty tree in the hash algorithm of the repository (Git knows it without storing it).
+fn empty_tree(hash_len: usize) -> String {
+    use sha1::Digest;
+    let object = b"tree 0\0";
+    let bytes: Vec<u8> = if hash_len == 40 {
+        sha1::Sha1::digest(object).to_vec()
+    } else {
+        sha2::Sha256::digest(object).to_vec()
+    };
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+/// `start_tree`: `base` is a tree (the empty one, for a plan from the root), which older Git does not accept as a side of the merge.
+fn replay_serial(
+    root: &Path,
+    base: &str,
+    ids: &[String],
+    parents: &Parents,
+    start_tree: bool,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<Vec<ConflictPrediction>> {
+    if cancelled() {
+        return Err(fail("Cancelled"));
+    }
+    if ids.len() > MAX_SERIAL {
+        return Err(fail(format!(
+            "Checking more than {MAX_SERIAL} commits for conflicts needs a newer Git"
+        )));
+    }
     let mut current = base.to_owned();
     let mut found = Vec::new();
     let mut objects = None;
+    if start_tree {
+        let directory = preview_object_directory(root)?;
+        current = preview_commit(&directory, base, base.len())?;
+        objects = Some(directory);
+    }
+    let total = ids.len() as u64;
     for (index, id) in ids.iter().enumerate() {
-        let (tree, conflict) = merge_trees(root, &format!("{id}^1"), &current, id)?;
+        if cancelled() {
+            return Err(fail("Cancelled"));
+        }
+        let (tree, conflict) = merge_trees(root, &parents.of(id), &current, id)?;
         if let Some(files) = conflict {
             found.push(ConflictPrediction {
                 id: id.clone(),
                 files,
             });
         }
+        super::gitprogress::report_counts(
+            "Checking rebase conflicts",
+            (index + 1) as u64,
+            Some(total),
+            "commits",
+            Some(id[..8.min(id.len())].to_owned()),
+        );
         if index + 1 < ids.len() {
             if objects.is_none() {
                 objects = Some(preview_object_directory(root)?);
@@ -528,24 +665,47 @@ pub fn predict_conflicts(
     path: &Path,
     base: &str,
     entries: &[RewriteEntry],
+    cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<Vec<ConflictPrediction>> {
     let root = root(path)?;
-    if entries.len() > 1000 {
-        return Err(fail("Select a range of at most 1000 commits"));
+    if entries.len() > MAX_COMMITS * 2 {
+        return Err(fail(format!(
+            "Select a range of at most {MAX_COMMITS} commits"
+        )));
     }
     let mut ids = Vec::new();
-    for entry in entries.iter().filter(|e| e.action != RewriteAction::Drop) {
+    for entry in entries
+        .iter()
+        .filter(|e| !matches!(e.action, RewriteAction::Drop | RewriteAction::Exec))
+    {
         if !matches!(entry.id.len(), 40 | 64) || !entry.id.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(fail("Invalid commit ID in the rebase plan"));
         }
         ids.push(entry.id.to_ascii_lowercase());
     }
+    if base == ROOT_BASE {
+        let Some(first) = ids.first() else {
+            return Ok(Vec::new());
+        };
+        let parents = Parents {
+            roots: git(&root, &["rev-list", "--max-parents=0", "HEAD"])?
+                .split_whitespace()
+                .map(str::to_ascii_lowercase)
+                .collect(),
+            empty: empty_tree(first.len()),
+        };
+        if let Some(found) = replay_streamed(&root, &parents.empty, &ids, &parents, cancelled) {
+            return Ok(found);
+        }
+        return replay_serial(&root, &parents.empty, &ids, &parents, true, cancelled);
+    }
+    let parents = Parents::default();
     // The base is checked while the replay runs: it only writes unreferenced trees, and its
     // result is used only when the base is a commit.
     let (base, streamed) = std::thread::scope(|scope| {
         let checked = scope.spawn(|| commit_id(&root, base));
         let streamed = (base.len() == 40 || base.len() == 64)
-            .then(|| replay_streamed(&root, &base.to_ascii_lowercase(), &ids))
+            .then(|| replay_streamed(&root, &base.to_ascii_lowercase(), &ids, &parents, cancelled))
             .flatten();
         (super::gitgraph::joined(checked), streamed)
     });
@@ -553,24 +713,56 @@ pub fn predict_conflicts(
     if let Some(found) = streamed {
         return Ok(found);
     }
-    replay_serial(&root, &base, &ids)
+    replay_serial(&root, &base, &ids, &parents, false, cancelled)
+}
+/// The command of an `exec` line: one line, since a line break would add lines to the plan Git runs.
+fn exec_command(command: &str) -> Result<()> {
+    if command.trim().is_empty() {
+        return Err(fail("An exec line needs a command"));
+    }
+    if command.contains(['\n', '\r', '\0']) {
+        return Err(fail("An exec command must be a single line"));
+    }
+    if command.len() > MAX_EXEC {
+        return Err(fail("An exec command is too long"));
+    }
+    Ok(())
 }
 fn validate_entries(plan: &RewritePlan, entries: &[RewriteEntry]) -> Result<()> {
     let expected: BTreeSet<_> = plan.commits.iter().map(|c| c.id.as_str()).collect();
-    let actual: BTreeSet<_> = entries.iter().map(|c| c.id.as_str()).collect();
-    if entries.is_empty() || entries.len() != expected.len() || actual != expected {
+    let commits: Vec<_> = entries
+        .iter()
+        .filter(|c| c.action != RewriteAction::Exec)
+        .collect();
+    let actual: BTreeSet<_> = commits.iter().map(|c| c.id.as_str()).collect();
+    if commits.is_empty() || commits.len() != expected.len() || actual != expected {
         return Err(fail(
             "The plan must contain every original commit exactly once; use Drop to remove a commit",
         ));
     }
     let mut prior = false;
+    let mut after_exec = false;
     let mut message_size = 0usize;
     for entry in entries {
-        if matches!(entry.action, RewriteAction::Squash | RewriteAction::Fixup) && !prior {
-            return Err(fail("Squash and fixup need a preceding retained commit"));
+        if entry.action == RewriteAction::Exec {
+            exec_command(&entry.message)?;
+            after_exec = true;
+            message_size = message_size.saturating_add(entry.message.len());
+            continue;
+        }
+        if matches!(entry.action, RewriteAction::Squash | RewriteAction::Fixup) {
+            if !prior {
+                return Err(fail("Squash and fixup need a preceding retained commit"));
+            }
+            if after_exec {
+                return Err(fail(
+                    "Move the exec line after the commits that are squashed or fixed up",
+                ));
+            }
         }
         if entry.action != RewriteAction::Drop {
             prior = true;
+            after_exec = false;
         }
         if entry.action == RewriteAction::Reword && entry.message.trim().is_empty() {
             return Err(fail(
@@ -587,7 +779,12 @@ fn validate_entries(plan: &RewritePlan, entries: &[RewriteEntry]) -> Result<()> 
     }
     Ok(())
 }
+#[cfg(test)]
 fn clean_guard(path: &Path) -> Result<()> {
+    guard(path, false).map(|_| ())
+}
+/// Check whether rebase can run and whether to ask Git to autostash tracked edits.
+fn guard(path: &Path, allow_tracked: bool) -> Result<bool> {
     let state = super::gitrepository::snapshot(path)?;
     if state.bisect_active {
         return Err(fail("Finish bisect before rewriting history"));
@@ -597,35 +794,38 @@ fn clean_guard(path: &Path) -> Result<()> {
             "Finish or abort the current Git operation before rewriting history",
         ));
     }
-    if has_content_filters(path) {
-        return Err(fail(
-            "Interactive rebase with content filters requires an external Git client",
-        ));
-    }
     // Submodules are supported: a rebase rewrites the superproject's commits (a submodule is just a
     // recorded commit ID there) and never touches the submodule's own working folder. Edits and
     // untracked files inside a submodule are therefore safe and ignored here, but a changed
     // submodule commit (staged or not) is a local change of this repository like any other.
-    if !git(
+    let changes = git(
         path,
         &[
             "status",
             "--porcelain",
-            "--untracked-files=all",
+            "-z",
+            // Untracked files are no local change for a rebase; `protect_ignored` refuses the
+            // ones it could overwrite.
+            "--untracked-files=no",
             "--ignore-submodules=dirty",
         ],
-    )?
-    .is_empty()
-    {
+    )?;
+    if !changes.is_empty() {
+        if allow_tracked {
+            super::gitrepository::protect_staged_gitlinks(path)?;
+            super::gitrepository::verify_filtered_autostash(path)?;
+            return Ok(true);
+        }
         return Err(fail(
             "Commit or stash local changes before rewriting history (a submodule checked out at a different commit than this repository records counts as one)",
         ));
     }
-    Ok(())
+    super::gitrepository::verify_filtered_autostash(path)?;
+    Ok(false)
 }
 /// After a finished rebase: submodules whose checked-out commit is not the one the rewritten history
 /// records. Gall never changes a submodule's folder, so the user decides when to update it.
-fn submodule_note(path: &Path) -> String {
+pub(super) fn submodule_note(path: &Path) -> String {
     let Ok(status) = git(path, &["submodule", "status"]) else {
         return String::new();
     };
@@ -653,10 +853,32 @@ fn protect_ignored(path: &Path, plan: &RewritePlan) -> Result<()> {
         ));
     }
     let mut touched = BTreeSet::new();
-    for id in std::iter::once(plan.base.as_str()).chain(plan.commits.iter().map(|c| c.id.as_str()))
-    {
-        for file in git(path, &["ls-tree", "-r", "--name-only", "-z", id])?
+    let base = (plan.base != ROOT_BASE).then_some(plan.base.as_str());
+    // Every file the rebase can write is in the base, in the result, or changed by a commit of the
+    // plan. One query for the changes: a tree per commit was a process per commit.
+    let range = match base {
+        Some(base) => format!("{base}..{}", plan.head),
+        None => plan.head.clone(),
+    };
+    let changed = [
+        "log",
+        "--no-show-signature",
+        "--no-renames",
+        "--no-merges",
+        "--format=",
+        "--name-only",
+        "-z",
+        &range,
+        "--",
+    ];
+    let mut lists = vec![git(path, &changed)?];
+    for id in base.into_iter().chain([plan.head.as_str()]) {
+        lists.push(git(path, &["ls-tree", "-r", "--name-only", "-z", id])?);
+    }
+    for list in &lists {
+        for file in list
             .split('\0')
+            .map(|name| name.trim_start_matches('\n'))
             .filter(|s| !s.is_empty())
         {
             if file.contains('\u{fffd}') {
@@ -761,6 +983,10 @@ fn read_plan(path: &Path) -> Result<HelperPlan> {
         ));
     }
     for entry in &plan.entries {
+        if entry.action == RewriteAction::Exec {
+            exec_command(&entry.message)?;
+            continue;
+        }
         if !matches!(entry.id.len(), 40 | 64) || !entry.id.bytes().all(|c| c.is_ascii_hexdigit()) {
             return Err(fail("Invalid saved rebase commit ID"));
         }
@@ -836,6 +1062,10 @@ fn save_plan(path: &Path, plan: &HelperPlan) -> Result<PathBuf> {
     let file = child.join("plan.json");
     let written = (|| {
         let bytes = serde_json::to_vec(plan).map_err(|e| fail(e.to_string()))?;
+        // The helper would refuse to read it in the middle of the rebase.
+        if bytes.len() as u64 > MAX_PLAN {
+            return Err(fail("The rebase plan is too large"));
+        }
         write_new(&file, &bytes)?;
         if replace_pointer {
             std::fs::remove_file(&active).map_err(|e| fail(e.to_string()))?;
@@ -867,43 +1097,50 @@ fn editor_command(executable: &Path, mode: &str, plan: &Path) -> Result<String> 
     ))
 }
 fn run_rebase(path: &Path, args: &[&str], plan: &Path, executable: &Path) -> Result<String> {
-    let sequence = editor_command(executable, "--git-rebase-editor", plan)?;
-    let message = editor_command(executable, "--git-rebase-message", plan)?;
-    let mut cmd = Command::new(super::gitstatus::program());
-    cmd.args([
-        "-c",
-        "core.fsmonitor=false",
-        "-c",
-        if cfg!(windows) {
-            "core.hooksPath=NUL"
-        } else {
-            "core.hooksPath=/dev/null"
-        },
-        "-c",
-        "commit.gpgSign=false",
-        "-c",
-        "rebase.updateRefs=false",
-        "-c",
-        "rebase.autoStash=false",
-        // Never let a user setting make Git recurse into submodule folders during the rebase.
-        "-c",
-        "submodule.recurse=false",
-        "-C",
-    ])
-    .arg(path)
-    .args(args)
-    .stdin(Stdio::null())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .env("GIT_SEQUENCE_EDITOR", sequence)
-    .env("GIT_EDITOR", message)
-    .env("GIT_TERMINAL_PROMPT", "0");
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000);
+    let editor = |mode| {
+        if super::gitexec::place(path).is_none() {
+            return editor_command(executable, mode, plan);
+        }
+        let exe = shell_quote(&crate::nav::path::strip_verbatim(executable.to_path_buf()))?;
+        let plan = shell_quote(&crate::nav::path::strip_verbatim(plan.to_path_buf()))?;
+        // Git appends its editor target as an argument. Translate it without evaluating it.
+        Ok(format!(
+            "gall_editor() {{ exe=$(wslpath -au -- {exe}) && target=$(wslpath -aw -- \"$1\") && exec \"$exe\" {mode} {plan} \"$target\"; }}; gall_editor"
+        ))
+    };
+    let mut cmd = super::gitexec::command(path, super::gitstatus::program());
+    cmd.args(["-c", "core.fsmonitor=false", "-c"])
+        .arg(format!(
+            "core.hooksPath={}",
+            super::gitexec::null_device(path)
+        ))
+        .args([
+            "-c",
+            "commit.gpgSign=false",
+            "-c",
+            "rebase.updateRefs=false",
+            "-c",
+            "rebase.autoStash=false",
+            // Never let a user setting make Git recurse into submodule folders during the rebase.
+            "-c",
+            "submodule.recurse=false",
+            "-C",
+        ])
+        .arg(super::gitexec::dir_arg(path))
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("GIT_SEQUENCE_EDITOR", editor("--git-rebase-editor")?)
+        .env("GIT_EDITOR", editor("--git-rebase-message")?)
+        .env("GIT_TERMINAL_PROMPT", "0");
+    super::gitexec::forward_env(&mut cmd);
+    let out = if let Some(tracker) = super::gitprogress::active() {
+        super::gitprogress::run_streaming_output(&mut cmd, &tracker)
+    } else {
+        cmd.output()
     }
-    let out = cmd.output().map_err(io_context(
+    .map_err(io_context(
         "Could not start git. Make sure Git is installed and available",
     ))?;
     let message = format!(
@@ -942,6 +1179,25 @@ pub fn execute(
     expected: &str,
     editor_executable: &Path,
 ) -> Result<String> {
+    let label = format!("{} commits", entries.len());
+    journaled(path, label, || {
+        execute_now(path, entries, base, expected, editor_executable)
+    })
+}
+
+/// Runs a rewrite as one entry of the operation journal.
+fn journaled(path: &Path, label: String, run: impl FnOnce() -> Result<String>) -> Result<String> {
+    let operation = Some((super::gitjournal::Kind::Rewrite, label));
+    super::gitjournal::around(path, operation, run)
+}
+
+fn execute_now(
+    path: &Path,
+    entries: Vec<RewriteEntry>,
+    base: &str,
+    expected: &str,
+    editor_executable: &Path,
+) -> Result<String> {
     let _busy = super::gitfacts::mutating();
     let root = root(path)?;
     let current = plan(&root, base)?;
@@ -951,7 +1207,7 @@ pub fn execute(
         ));
     }
     validate_entries(&current, &entries)?;
-    clean_guard(&root)?;
+    let autostash = guard(&root, true)?;
     protect_ignored(&root, &current)?;
     let executable = editor_executable.canonicalize().map_err(io_context(
         "Gall cannot find its own program file for the Git editor helper (it may have been updated or moved while running). Restart Gall and try again",
@@ -988,20 +1244,32 @@ pub fn execute(
             "rebase",
             "--interactive",
             "--merge",
-            "--no-autostash",
+            if autostash {
+                "--autostash"
+            } else {
+                "--no-autostash"
+            },
             "--no-update-refs",
             "--no-fork-point",
             "--no-rebase-merges",
             "--keep-empty",
             "--empty=keep",
             "--reapply-cherry-picks",
-            &current.base,
+            // The root plan replays every commit of the history.
+            if current.base == ROOT_BASE {
+                "--root"
+            } else {
+                current.base.as_str()
+            },
         ],
         &saved,
         &executable,
     );
     cleanup(&root, &saved);
     if output.is_ok() && !rebase_in_progress(&directory) {
+        super::gitgraph::retain_detached(&root).map_err(|error| {
+            fail(format!("The rewrite completed, but its detached commit could not be saved for recovery: {error}"))
+        })?;
         super::gitgraph::drop_recovery(&root, &current.head);
         return output.map(|text| format!("{text}{}", submodule_note(&root)));
     }
@@ -1016,8 +1284,252 @@ pub fn reword(
     target: &str,
     message: &str,
     expected: &str,
-    editor_executable: &Path,
+    _editor_executable: &Path,
 ) -> Result<String> {
+    let label = message.trim().lines().next().unwrap_or_default();
+    let label = label.chars().take(100).collect();
+    journaled(path, label, || reword_now(path, target, message, expected))
+}
+
+/// Recreate a commit object with remapped parents without checking out its tree.
+pub(super) fn rewrite_commit_object(
+    root: &Path,
+    id: &str,
+    rewritten: &std::collections::HashMap<String, String>,
+    message: Option<&str>,
+    tree: Option<&str>,
+) -> Result<String> {
+    let (object, truncated) =
+        super::gitinspect::read_git(root, &["cat-file", "commit", id], MAX_PLAN as usize)?;
+    if truncated {
+        return Err(fail("A commit exceeds the history rewrite size limit"));
+    }
+    let Some(separator) = object.windows(2).position(|pair| pair == b"\n\n") else {
+        return Err(fail("Git returned a commit without a message separator"));
+    };
+    let mut updated = Vec::with_capacity(object.len());
+    let mut omit = false;
+    for line in object[..separator].split(|byte| *byte == b'\n') {
+        if !line.starts_with(b" ") {
+            // Signatures and signed merge tags describe the original commit or parents.
+            omit = line.starts_with(b"gpgsig ")
+                || line.starts_with(b"gpgsig-sha256 ")
+                || line.starts_with(b"mergetag ");
+        }
+        if omit {
+            continue;
+        }
+        let parent = line
+            .strip_prefix(b"parent ")
+            .and_then(|id| std::str::from_utf8(id).ok());
+        if let Some(tree) = tree.filter(|_| line.starts_with(b"tree ")) {
+            updated.extend_from_slice(b"tree ");
+            updated.extend_from_slice(tree.as_bytes());
+        } else if let Some(mapped) = parent.and_then(|id| rewritten.get(id)) {
+            updated.extend_from_slice(b"parent ");
+            updated.extend_from_slice(mapped.as_bytes());
+        } else {
+            updated.extend_from_slice(line);
+        }
+        updated.push(b'\n');
+    }
+    updated.push(b'\n');
+    if let Some(message) = message {
+        updated.extend_from_slice(message.trim_end_matches('\n').as_bytes());
+        updated.push(b'\n');
+    } else {
+        updated.extend_from_slice(&object[separator + 2..]);
+    }
+    let mut command = super::gitexec::command(root, super::gitstatus::program());
+    command
+        .arg("-C")
+        .arg(super::gitexec::dir_arg(root))
+        .args(["hash-object", "-w", "-t", "commit", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    super::gitexec::forward_env(&mut command);
+    let mut child = command.spawn().map_err(|e| fail(e.to_string()))?;
+    let written = child
+        .stdin
+        .take()
+        .ok_or_else(|| fail("Git did not open commit input"))?
+        .write_all(&updated);
+    let output = child.wait_with_output().map_err(|e| fail(e.to_string()))?;
+    if !output.status.success() {
+        return Err(fail(
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ));
+    }
+    written.map_err(|e| fail(e.to_string()))?;
+    let new_id = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if new_id.len() != id.len() || !new_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(fail("Git returned an invalid rewritten commit ID"));
+    }
+    Ok(new_id)
+}
+
+fn descendants(root: &Path, head: &str, target: &str) -> Result<Vec<String>> {
+    git(root, &["merge-base", "--is-ancestor", target, head])
+        .map_err(|_| fail("The selected commit is not on the current branch"))?;
+    let range = format!("{target}..{head}");
+    let count = format!("--max-count={MAX_COMMITS}");
+    let (output, truncated) = super::gitinspect::read_git(
+        root,
+        &[
+            "rev-list",
+            "--ancestry-path",
+            "--topo-order",
+            "--reverse",
+            &count,
+            &range,
+        ],
+        MAX_PLAN as usize,
+    )?;
+    let descendants = std::str::from_utf8(&output).map_err(|_| fail("Invalid commit list"))?;
+    if truncated || descendants.lines().count() >= MAX_COMMITS {
+        return Err(fail("Too many descendant commits to rewrite at once"));
+    }
+
+    Ok(descendants.lines().map(str::to_owned).collect())
+}
+
+fn reword_ancestor(
+    root: &Path,
+    head: &str,
+    target: &str,
+    message: &str,
+    expected: &str,
+) -> Result<String> {
+    let descendants = descendants(root, head, target)?;
+    let mut rewritten = std::collections::HashMap::new();
+    for id in std::iter::once(target).chain(descendants.iter().map(String::as_str)) {
+        let new_id = rewrite_commit_object(
+            root,
+            id,
+            &rewritten,
+            (id == target).then_some(message),
+            None,
+        )?;
+        rewritten.insert(id.to_owned(), new_id);
+    }
+    let new_head = rewritten
+        .get(head)
+        .ok_or_else(|| fail("Could not rewrite the current revision"))?;
+    let state = super::gitrepository::snapshot(root)?;
+    if state.token != expected {
+        return Err(fail(
+            "The repository changed. Refresh before rewording this commit",
+        ));
+    }
+    super::gitgraph::retain_commit(root, head, "Gall recovery before rewording history")?;
+    if state.branch.is_none() {
+        super::gitgraph::retain_commit(root, new_head, "Gall reworded detached commit")?;
+    }
+    git(
+        root,
+        &[
+            "update-ref",
+            "-m",
+            "Gall reword commit",
+            "HEAD",
+            new_head,
+            head,
+        ],
+    )?;
+    Ok(format!("Reworded {target}"))
+}
+
+/// Fold the staged delta into the selected commit while keeping the working tree and index.
+pub fn amend_staged(path: &Path, target: &str, expected: &str) -> Result<String> {
+    let label = target.get(..8).unwrap_or(target).to_owned();
+    super::gitjournal::around(path, Some((super::gitjournal::Kind::Amend, label)), || {
+        let _busy = super::gitfacts::mutating();
+        let root = root(path)?;
+        let state = super::gitrepository::snapshot(&root)?;
+        let stale = || fail("The repository changed. Review the staged changes and try again.");
+        if state.token != expected {
+            return Err(stale());
+        }
+        if state.bisect_active || state.operation.is_some() || !state.conflicts.is_empty() {
+            return Err(fail(
+                "Finish or abort the current Git operation before amending a commit.",
+            ));
+        }
+        let head = &state.head;
+        let target = commit_id(&root, target)?;
+        let descendants = descendants(&root, head, &target)?;
+        let write_tree = || git(&root, &["write-tree"]).map(|tree| tree.trim().to_owned());
+        let staged = write_tree()?;
+        if git(&root, &["rev-parse", "HEAD^{tree}"])?.trim() == staged {
+            return Err(fail(
+                "Stage the changes to include in Working Changes first.",
+            ));
+        }
+        let mut rewritten = std::collections::HashMap::new();
+        let staged_commit = if target == *head {
+            None
+        } else {
+            Some(rewrite_commit_object(
+                &root,
+                head,
+                &rewritten,
+                None,
+                Some(&staged),
+            )?)
+        };
+
+        for id in std::iter::once(&target).chain(&descendants) {
+            let tree = if id == head {
+                staged.clone()
+            } else {
+                let source = staged_commit
+                    .as_deref()
+                    .ok_or_else(|| fail("The staged commit is missing"))?;
+                let (tree, conflicts) = merge_trees(&root, head, id, source)?;
+                if let Some(files) = conflicts {
+                    return Err(fail(format!(
+                        "The staged changes conflict with {} at {}. Review the staged paths in Working Changes, or use an interactive rebase edit stop to resolve conflicts.",
+                        &id[..12],
+                        files.join(", ")
+                    )));
+                }
+                tree
+            };
+            let new_id = rewrite_commit_object(&root, id, &rewritten, None, Some(&tree))?;
+            rewritten.insert(id.clone(), new_id);
+        }
+
+        let new_head = rewritten
+            .get(head)
+            .ok_or_else(|| fail("Could not rewrite the current revision"))?;
+        if super::gitrepository::snapshot(&root)?.token != expected || write_tree()? != staged {
+            return Err(stale());
+        }
+        super::gitgraph::retain_commit(
+            &root,
+            head,
+            "Gall recovery before amending staged changes",
+        )?;
+        if state.branch.is_none() {
+            super::gitgraph::retain_commit(&root, new_head, "Gall amended detached commit")?;
+        }
+        git(
+            &root,
+            &[
+                "update-ref",
+                "-m",
+                "Gall amend staged changes",
+                "HEAD",
+                new_head,
+                head,
+            ],
+        )?;
+        Ok(format!("Amended {target}"))
+    })
+}
+
+fn reword_now(path: &Path, target: &str, message: &str, expected: &str) -> Result<String> {
     let _busy = super::gitfacts::mutating();
     if message.trim().is_empty() || message.contains('\0') {
         return Err(fail(
@@ -1055,35 +1567,12 @@ pub fn reword(
         super::gitgraph::drop_recovery(&root, &target);
         return Ok(output);
     }
-    let parents = git(&root, &["show", "-s", "--format=%P", &target])?;
-    let parents: Vec<_> = parents.split_whitespace().collect();
-    if parents.len() != 1 {
+    if snapshot.operation.is_some() || !snapshot.conflicts.is_empty() {
         return Err(fail(
-            "Rewording a root or merge commit requires an external Git client",
+            "Finish or abort the current Git operation before rewording",
         ));
     }
-    let plan = plan(&root, parents[0])?;
-    if !plan.commits.iter().any(|entry| entry.id == target) {
-        return Err(fail("The selected commit is not on the current branch"));
-    }
-    let entries = plan
-        .commits
-        .iter()
-        .map(|entry| RewriteEntry {
-            id: entry.id.clone(),
-            action: if entry.id == target {
-                RewriteAction::Reword
-            } else {
-                RewriteAction::Pick
-            },
-            message: if entry.id == target {
-                message.into()
-            } else {
-                String::new()
-            },
-        })
-        .collect();
-    execute(&root, entries, &plan.base, &plan.token, editor_executable)
+    reword_ancestor(&root, &snapshot.head, &target, message, expected)
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1104,7 +1593,136 @@ pub fn quick_edit(
     expected: &str,
     editor_executable: &Path,
 ) -> Result<String> {
+    let label = target.get(..8).unwrap_or(target).to_owned();
+    journaled(path, label, || {
+        quick_edit_now(path, target, action, expected, editor_executable)
+    })
+}
+
+/// Remove a merge and the commits introduced by it, keeping later merge structure.
+fn drop_merge(root: &Path, target: &str, first_parent: &str, expected: &str) -> Result<String> {
     let _busy = super::gitfacts::mutating();
+    let state = super::gitrepository::snapshot(root)?;
+    if state.token != expected {
+        return Err(fail(
+            "The repository changed. Refresh before editing this commit",
+        ));
+    }
+    replay_first_parent_tail(root, &state, target, first_parent)
+}
+
+fn replay_first_parent_tail(
+    root: &Path,
+    state: &super::gitrepository::Repository,
+    target: &str,
+    onto: &str,
+) -> Result<String> {
+    let line = git(root, &["rev-list", "--first-parent", &state.head])?;
+    if !line.lines().any(|id| id == target) {
+        return Err(fail(
+            "Select a commit on the current branch's first-parent history.",
+        ));
+    }
+    let autostash = guard(root, true)?;
+    super::gitrepository::protect_untracked(root, &[onto], Some(target))?;
+    super::gitgraph::retain_commit(root, &state.head, "Gall recovery before rewriting a merge")?;
+    let output = git(
+        root,
+        &[
+            "-c",
+            "core.editor=true",
+            "-c",
+            "submodule.recurse=false",
+            "rebase",
+            "--merge",
+            "--rebase-merges",
+            "--no-update-refs",
+            "--no-fork-point",
+            "--no-autosquash",
+            "--reapply-cherry-picks",
+            "--empty=keep",
+            if autostash {
+                "--autostash"
+            } else {
+                "--no-autostash"
+            },
+            "--onto",
+            onto,
+            target,
+        ],
+    )?;
+    if state.branch.is_none() {
+        super::gitgraph::retain_detached(root).map_err(|error| {
+            fail(format!("The rewrite completed, but its detached commit could not be saved for recovery: {error}"))
+        })?;
+    }
+    Ok(output)
+}
+
+fn combine_with_merge(
+    root: &Path,
+    state: &super::gitrepository::Repository,
+    target: &str,
+    parent: &str,
+    action: QuickAction,
+) -> Result<String> {
+    let _busy = super::gitfacts::mutating();
+    let tree = git(root, &["rev-parse", &format!("{target}^{{tree}}")])?;
+    let message = if action == QuickAction::Squash {
+        let parent = git(root, &["show", "-s", "--format=%B", parent])?;
+        let child = git(root, &["show", "-s", "--format=%B", target])?;
+        Some(format!(
+            "{}\n\n{}",
+            parent.trim_end_matches('\n'),
+            child.trim_end_matches('\n')
+        ))
+    } else {
+        None
+    };
+    let combined = rewrite_commit_object(
+        root,
+        parent,
+        &std::collections::HashMap::new(),
+        message.as_deref(),
+        Some(tree.trim()),
+    )?;
+    if super::gitrepository::snapshot(root)?.token != state.token {
+        return Err(fail(
+            "The repository changed. Refresh before editing this commit",
+        ));
+    }
+    if state.head != target {
+        return replay_first_parent_tail(root, state, target, &combined);
+    }
+    if state.operation.is_some() || !state.conflicts.is_empty() {
+        return Err(fail(
+            "Finish or abort the current Git operation before rewriting history",
+        ));
+    }
+    super::gitgraph::retain_commit(root, target, "Gall recovery before rewriting a merge")?;
+    if state.branch.is_none() {
+        super::gitgraph::retain_commit(root, &combined, "Gall combined detached merge")?;
+    }
+    git(
+        root,
+        &[
+            "update-ref",
+            "-m",
+            "Gall combine into merge",
+            "HEAD",
+            &combined,
+            target,
+        ],
+    )
+}
+
+fn quick_edit_now(
+    path: &Path,
+    target: &str,
+    action: QuickAction,
+    expected: &str,
+    editor_executable: &Path,
+) -> Result<String> {
     let root = root(path)?;
     let snapshot = super::gitrepository::snapshot(&root)?;
     if snapshot.token != expected {
@@ -1118,26 +1736,40 @@ pub fn quick_edit(
     let target = commit_id(&root, target)?;
     let parents = git(&root, &["show", "-s", "--format=%P", &target])?;
     let parents: Vec<_> = parents.split_whitespace().collect();
-    if parents.len() != 1 {
-        return Err(fail(
-            "Direct history actions require a non-root commit with one parent",
-        ));
-    }
-    let parent = parents[0];
-    let base = if matches!(
-        action,
-        QuickAction::Fixup | QuickAction::Squash | QuickAction::MoveEarlier
-    ) {
-        let grandparents = git(&root, &["show", "-s", "--format=%P", parent])?;
-        let grandparents: Vec<_> = grandparents.split_whitespace().collect();
-        if grandparents.len() != 1 {
-            return Err(fail("The previous commit is a root or merge commit and cannot be rewritten by this action"));
+    let (parent, base) = match parents.as_slice() {
+        [] if matches!(action, QuickAction::Drop | QuickAction::MoveLater) => {
+            (None, ROOT_BASE.to_owned())
         }
-        grandparents[0].to_owned()
-    } else {
-        parent.to_owned()
+        [] => return Err(fail("The first commit has no earlier commit")),
+        [parent] => {
+            let base = if matches!(
+                action,
+                QuickAction::Fixup | QuickAction::Squash | QuickAction::MoveEarlier
+            ) {
+                let grandparents = git(&root, &["show", "-s", "--format=%P", parent])?;
+                let grandparents: Vec<_> = grandparents.split_whitespace().collect();
+                match grandparents.as_slice() {
+                    [] => ROOT_BASE.to_owned(),
+                    [base] => (*base).to_owned(),
+                    _ if matches!(action, QuickAction::Fixup | QuickAction::Squash) => {
+                        return combine_with_merge(&root, &snapshot, &target, parent, action);
+                    }
+                    _ => return Err(fail("The previous commit is a merge. Use Reword to change its message while preserving its parents")),
+                }
+            } else {
+                (*parent).to_owned()
+            };
+            (Some(*parent), base)
+        }
+        [first_parent, ..] if action == QuickAction::Drop => {
+            return drop_merge(&root, &target, first_parent, expected);
+        }
+        _ => return Err(fail("Direct history actions cannot replay a merge commit. Use Reword to change its message or Revert to reverse its changes.")),
     };
     let plan = plan(&root, &base)?;
+    if plan.skipped_merges != 0 {
+        return Err(fail("This action would replay one or more merges as linear history. Open the rebase plan to review the merges first."));
+    }
     let selected = plan
         .commits
         .iter()
@@ -1154,7 +1786,7 @@ pub fn quick_edit(
         .collect();
     match action {
         QuickAction::Fixup | QuickAction::Squash => {
-            if selected == 0 || entries[selected - 1].id != parent {
+            if selected == 0 || Some(entries[selected - 1].id.as_str()) != parent {
                 return Err(fail(
                     "The selected commit has no preceding linear commit to combine with",
                 ));
@@ -1165,7 +1797,12 @@ pub fn quick_edit(
                 RewriteAction::Squash
             };
         }
-        QuickAction::Drop => entries[selected].action = RewriteAction::Drop,
+        QuickAction::Drop => {
+            if base == ROOT_BASE && entries.len() == 1 {
+                return Err(fail("Dropping the only commit would leave no commit for this branch. Amend it to change its contents."));
+            }
+            entries[selected].action = RewriteAction::Drop;
+        }
         QuickAction::MoveEarlier => {
             if selected == 0 {
                 return Err(fail("This commit cannot be moved earlier"));
@@ -1181,7 +1818,7 @@ pub fn quick_edit(
             entries.swap(selected, selected + 1);
         }
     }
-    execute(&root, entries, &base, &plan.token, editor_executable)
+    execute_now(&root, entries, &base, &plan.token, editor_executable)
 }
 
 /// Resume a Gall rebase with the saved message editor after a restart or an edit stop.
@@ -1238,14 +1875,24 @@ pub(super) fn pending_commits(path: &Path) -> Result<Vec<String>> {
                     "The pending Git sequence contains an invalid commit ID",
                 ));
             }
-            let full = git(
-                path,
-                &["rev-parse", "--verify", &format!("{id}^{{commit}}")],
-            )?;
-            ids.push(full.trim().to_owned());
+            ids.push(format!("{id}^{{commit}}"));
         }
     }
-    Ok(ids)
+    // A long sequence is resolved in groups, not with a process for each commit.
+    let mut full = Vec::with_capacity(ids.len());
+    for group in ids.chunks(200) {
+        let mut args = vec!["rev-parse"];
+        args.extend(group.iter().map(String::as_str));
+        let found = git(path, &args)?;
+        let found: Vec<&str> = found.lines().map(str::trim).collect();
+        if found.len() != group.len() {
+            return Err(fail(
+                "The pending Git sequence contains an invalid commit ID",
+            ));
+        }
+        full.extend(found.into_iter().map(str::to_owned));
+    }
+    Ok(full)
 }
 
 pub fn resume(path: &Path, command: &str, editor_executable: &Path) -> Option<Result<String>> {
@@ -1343,7 +1990,13 @@ fn helper(mode: &str, plan_file: &Path, target: &Path) -> Result<()> {
         let todo: String = plan
             .entries
             .iter()
-            .map(|entry| format!("{} {}\n", entry.action.name(), entry.id))
+            .map(|entry| {
+                if entry.action == RewriteAction::Exec {
+                    format!("exec {}\n", entry.message)
+                } else {
+                    format!("{} {}\n", entry.action.name(), entry.id)
+                }
+            })
             .collect();
         return replace_helper_file(target, &todo);
     }
@@ -1549,7 +2202,7 @@ mod tests {
         let ids =
             |list: Vec<ConflictPrediction>| list.into_iter().map(|c| c.id).collect::<Vec<_>>();
         let predict = |entries: &[RewriteEntry]| {
-            ids(super::predict_conflicts(path, base.trim(), entries).unwrap())
+            ids(super::predict_conflicts(path, base.trim(), entries, &|| false).unwrap())
         };
         assert!(predict(&[pick(&a), pick(&b), pick(&c)]).is_empty());
         // `a` creates the file that `b` already changed, so it conflicts on top of `b` too.
@@ -1569,9 +2222,10 @@ mod tests {
             predict(&[pick(&c), entry(&b, RewriteAction::Fixup, ""), pick(&a)]),
             [b.clone(), a.clone()]
         );
-        let found = super::predict_conflicts(path, base.trim(), &[pick(&b), pick(&a)]).unwrap();
+        let found =
+            super::predict_conflicts(path, base.trim(), &[pick(&b), pick(&a)], &|| false).unwrap();
         assert_eq!(found[0].files, ["shared.txt"]);
-        assert!(super::predict_conflicts(path, base.trim(), &[pick("zz")]).is_err());
+        assert!(super::predict_conflicts(path, base.trim(), &[pick("zz")], &|| false).is_err());
         assert_eq!(git(path, &["rev-parse", "HEAD"]).unwrap(), head);
         assert_eq!(git(path, &["status", "--porcelain"]).unwrap(), status);
         assert!(!path.join(".git/rebase-merge").exists());
@@ -1655,10 +2309,25 @@ mod tests {
             let refs = git(path, &["show-ref"]).unwrap();
             let index_path = git_dir(path).unwrap().join("index");
             let index = std::fs::read(&index_path).unwrap();
-            assert!(replay_serial(path, &head, &[a.clone(), b.clone()])
-                .unwrap()
-                .is_empty());
-            let conflicts = replay_serial(path, &head, &[b.clone(), a.clone()]).unwrap();
+            assert!(replay_serial(
+                path,
+                &head,
+                &[a.clone(), b.clone()],
+                &Parents::default(),
+                false,
+                &|| false
+            )
+            .unwrap()
+            .is_empty());
+            let conflicts = replay_serial(
+                path,
+                &head,
+                &[b.clone(), a.clone()],
+                &Parents::default(),
+                false,
+                &|| false,
+            )
+            .unwrap();
             assert_eq!(
                 conflicts.iter().map(|entry| &entry.id).collect::<Vec<_>>(),
                 [&b, &a]
@@ -1707,18 +2376,37 @@ mod tests {
         let index_path = git_dir(path).unwrap().join("index");
         let index = std::fs::read(&index_path).unwrap();
         let status = git(path, &["status", "--porcelain"]).unwrap();
-        assert!(
-            replay_serial(path, &base, &[a.clone(), b.clone(), c.clone()])
-                .unwrap()
-                .is_empty()
-        );
-        let conflicts = replay_serial(path, &base, &[b.clone(), a.clone(), c.clone()]).unwrap();
+        assert!(replay_serial(
+            path,
+            &base,
+            &[a.clone(), b.clone(), c.clone()],
+            &Parents::default(),
+            false,
+            &|| false
+        )
+        .unwrap()
+        .is_empty());
+        let conflicts = replay_serial(
+            path,
+            &base,
+            &[b.clone(), a.clone(), c.clone()],
+            &Parents::default(),
+            false,
+            &|| false,
+        )
+        .unwrap();
         assert_eq!(
             conflicts.iter().map(|entry| &entry.id).collect::<Vec<_>>(),
             [&b, &a]
         );
         assert_eq!(conflicts[0].files, ["shared.txt"]);
-        assert!(replay_serial(path, &base, &[c, a, b]).unwrap().is_empty());
+        assert!(
+            replay_serial(path, &base, &[c, a, b], &Parents::default(), false, &|| {
+                false
+            })
+            .unwrap()
+            .is_empty()
+        );
         assert_eq!(git(path, &["show-ref"]).unwrap(), refs);
         assert_eq!(git(path, &["rev-parse", "HEAD"]).unwrap(), head);
         assert_eq!(git(path, &["status", "--porcelain"]).unwrap(), status);
@@ -1748,7 +2436,7 @@ mod tests {
         // wrappers, so it also works with Git versions that reject raw tree inputs.
         let serial = |ids: &[&String]| {
             let ids = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>();
-            replay_serial(path, &base, &ids)
+            replay_serial(path, &base, &ids, &Parents::default(), false, &|| false)
                 .unwrap()
                 .into_iter()
                 .map(|entry| (entry.id, entry.files))
@@ -1762,7 +2450,9 @@ mod tests {
         ] {
             let ids: Vec<String> = order.iter().map(|id| id.to_string()).collect();
             let compatible = serial(&order);
-            if let Some(streamed) = replay_streamed(path, &base, &ids) {
+            if let Some(streamed) =
+                replay_streamed(path, &base, &ids, &Parents::default(), &|| false)
+            {
                 let streamed = streamed
                     .into_iter()
                     .map(|entry| (entry.id, entry.files))
@@ -1773,7 +2463,7 @@ mod tests {
                     .iter()
                     .map(|id| entry(id, RewriteAction::Pick, ""))
                     .collect::<Vec<_>>();
-                let predicted = predict_conflicts(path, &base, &entries)
+                let predicted = predict_conflicts(path, &base, &entries, &|| false)
                     .unwrap()
                     .into_iter()
                     .map(|entry| (entry.id, entry.files))
@@ -1788,11 +2478,21 @@ mod tests {
         // A commit Git does not know: no answer here, so the caller merges one by one and
         // reports Git's error.
         let unknown = "0".repeat(base.len());
-        assert!(replay_streamed(path, &base, &[a.clone(), unknown.clone()]).is_none());
-        assert!(
-            super::predict_conflicts(path, &base, &[entry(&unknown, RewriteAction::Pick, "")])
-                .is_err()
-        );
+        assert!(replay_streamed(
+            path,
+            &base,
+            &[a.clone(), unknown.clone()],
+            &Parents::default(),
+            &|| false
+        )
+        .is_none());
+        assert!(super::predict_conflicts(
+            path,
+            &base,
+            &[entry(&unknown, RewriteAction::Pick, "")],
+            &|| false
+        )
+        .is_err());
     }
     #[test]
     fn missing_helper_executable_is_explained() {
@@ -1828,7 +2528,28 @@ mod tests {
                 .collect::<Vec<_>>(),
             [a.as_str(), b.as_str()]
         );
-        assert_eq!(plan.commits[0].message, "first");
+        assert_eq!(plan.commits[0].subject, "first");
+        git(
+            path,
+            &["commit", "-q", "--amend", "-m", "second\n\nbody\nmore\n"],
+        )
+        .unwrap();
+        let amended = git(path, &["rev-parse", "HEAD"]).unwrap().trim().to_owned();
+        let asked = messages(path, &[amended.clone(), a.clone()]).unwrap();
+        let found: Vec<_> = asked
+            .iter()
+            .map(|m| (m.id.as_str(), m.message.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (amended.as_str(), "second\n\nbody\nmore"),
+                (a.as_str(), "first")
+            ]
+        );
+        assert!(messages(path, &["HEAD".into()]).is_err());
+        assert!(messages(path, &[]).unwrap().is_empty());
+        git(path, &["reset", "-q", "--hard", &b]).unwrap();
         assert!(validate_entries(
             &plan,
             &[
@@ -1956,6 +2677,28 @@ mod tests {
             &std::env::current_exe().unwrap()
         )
         .is_err());
+    }
+    #[test]
+    fn untracked_files_do_not_block_a_rewrite_unless_it_would_overwrite_them() {
+        let temp = repository();
+        let path = temp.path();
+        let base = git(path, &["rev-parse", "HEAD"]).unwrap();
+        commit(path, "second", "second.txt");
+        // Not in .gitignore and not touched by the plan: allowed, like in Git and lazygit.
+        std::fs::write(path.join("scratch.log"), "local\n").unwrap();
+        std::fs::create_dir(path.join("build")).unwrap();
+        std::fs::write(path.join("build").join("out.bin"), "local\n").unwrap();
+        clean_guard(path).unwrap();
+        let plan = super::plan(path, base.trim()).unwrap();
+        protect_ignored(path, &plan).unwrap();
+        // A tracked change still blocks, and so does an untracked file a commit of the plan writes.
+        std::fs::write(path.join("base.txt"), "edited\n").unwrap();
+        assert!(clean_guard(path).is_err());
+        git(path, &["checkout", "-q", "--", "base.txt"]).unwrap();
+        git(path, &["rm", "-q", "--cached", "second.txt"]).unwrap();
+        git(path, &["commit", "-qm", "untrack second"]).unwrap();
+        let plan = super::plan(path, base.trim()).unwrap();
+        assert!(protect_ignored(path, &plan).is_err());
     }
     #[test]
     fn ignored_collision_guard_includes_intermediate_commit_trees() {
@@ -2183,6 +2926,301 @@ mod tests {
         clean_guard(path).unwrap();
     }
     #[test]
+    fn the_first_commit_can_be_reworded_in_the_app() {
+        let temp = repository();
+        let path = temp.path();
+        let root_id = git(path, &["rev-parse", "HEAD"]).unwrap().trim().to_owned();
+        commit(path, "second", "b.txt");
+        commit(path, "third", "c.txt");
+        // Even with a configured filter, rewording never needs to rewrite this tree.
+        git(path, &["config", "filter.unused.clean", "false"]).unwrap();
+        let tree = git(path, &["rev-parse", "HEAD^{tree}"]).unwrap();
+        std::fs::write(path.join("base.txt"), "local edit\n").unwrap();
+        let token = super::super::gitrepository::snapshot(path).unwrap().token;
+        reword(
+            path,
+            &root_id,
+            "new first message",
+            &token,
+            Path::new("unused"),
+        )
+        .unwrap();
+        let subjects = git(path, &["log", "--reverse", "--format=%s"]).unwrap();
+        assert_eq!(
+            subjects.lines().collect::<Vec<_>>(),
+            ["new first message", "second", "third"]
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.join("base.txt")).unwrap(),
+            "local edit\n"
+        );
+        assert!(git(path, &["cat-file", "-e", &format!("{root_id}^{{commit}}")]).is_ok());
+        assert_eq!(git(path, &["rev-parse", "HEAD^{tree}"]).unwrap(), tree);
+        assert!(!rebase_in_progress(&git_dir(path).unwrap()));
+    }
+
+    #[test]
+    fn rewording_an_older_merge_preserves_its_parents_tree_and_local_changes() {
+        let temp = repository();
+        let path = temp.path();
+        git(path, &["checkout", "-q", "-b", "side"]).unwrap();
+        commit(path, "side", "side.txt");
+        git(path, &["checkout", "-q", "-"]).unwrap();
+        git(
+            path,
+            &["merge", "--no-ff", "-q", "-m", "merge side", "side"],
+        )
+        .unwrap();
+        let merge = git(path, &["rev-parse", "HEAD"]).unwrap().trim().to_owned();
+        commit(path, "after merge", "d.txt");
+        let old_head = git(path, &["rev-parse", "HEAD"]).unwrap();
+        let old_merge_parents = git(path, &["show", "-s", "--format=%P", &merge]).unwrap();
+        let old_tree = git(path, &["rev-parse", "HEAD^{tree}"]).unwrap();
+        std::fs::write(path.join("base.txt"), "staged local\n").unwrap();
+        git(path, &["add", "base.txt"]).unwrap();
+        std::fs::write(path.join("base.txt"), "worktree local\n").unwrap();
+        let token = super::super::gitrepository::snapshot(path).unwrap().token;
+        let unused_helper = Path::new("unused");
+        assert!(reword(path, &merge, "old request", "stale-token", unused_helper).is_err());
+        assert_eq!(git(path, &["rev-parse", "HEAD"]).unwrap(), old_head);
+        reword(
+            path,
+            &merge,
+            "New merge subject\n\nNew body",
+            &token,
+            unused_helper,
+        )
+        .unwrap();
+        assert_eq!(
+            git(path, &["show", "-s", "--format=%P", "HEAD^"]).unwrap(),
+            old_merge_parents
+        );
+        assert_eq!(
+            git(path, &["show", "-s", "--format=%B", "HEAD^"])
+                .unwrap()
+                .trim(),
+            "New merge subject\n\nNew body"
+        );
+        assert_eq!(git(path, &["rev-parse", "HEAD^{tree}"]).unwrap(), old_tree);
+        assert_eq!(git(path, &["show", ":base.txt"]).unwrap(), "staged local\n");
+        assert_eq!(
+            std::fs::read_to_string(path.join("base.txt")).unwrap(),
+            "worktree local\n"
+        );
+        assert!(!rebase_in_progress(&git_dir(path).unwrap()));
+        assert!(git(
+            path,
+            &[
+                "rev-parse",
+                "--verify",
+                &format!("refs/gall/recovery/{}", old_head.trim())
+            ]
+        )
+        .is_ok());
+    }
+    #[test]
+    fn filtered_rebase_accepts_recoverable_edits_and_names_lossy_paths() {
+        let temp = repository();
+        let path = temp.path();
+        git(
+            path,
+            &["config", "filter.preview.clean", "sed 's/ local-only$//'"],
+        )
+        .unwrap();
+        git(path, &["config", "filter.preview.smudge", "cat"]).unwrap();
+        std::fs::write(
+            path.join(".git/info/attributes"),
+            "base.txt filter=preview\n",
+        )
+        .unwrap();
+        assert!(!guard(path, true).unwrap());
+        std::fs::write(path.join("base.txt"), "recoverable edit\n").unwrap();
+        assert!(guard(path, true).unwrap());
+        std::fs::write(path.join("base.txt"), "base local-only\n").unwrap();
+        let error = guard(path, true).unwrap_err().to_string();
+        assert!(error.contains("base.txt"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(path.join("base.txt")).unwrap(),
+            "base local-only\n"
+        );
+    }
+
+    #[test]
+    #[ignore = "Requires GALL_REBASE_HELPER pointing to a bundled Gall application"]
+    fn interactive_rebase_applies_configured_checkout_filters() {
+        let executable =
+            PathBuf::from(std::env::var_os("GALL_REBASE_HELPER").expect("Set GALL_REBASE_HELPER"));
+        let temp = repository();
+        let path = temp.path();
+        std::fs::write(
+            path.join(".gitattributes"),
+            "filtered.txt filter=roundtrip\n",
+        )
+        .unwrap();
+        git(path, &["add", "--", ".gitattributes"]).unwrap();
+        git(path, &["commit", "-qm", "attributes"]).unwrap();
+        let base = git(path, &["rev-parse", "HEAD"]).unwrap();
+        let first = commit(path, "first", "filtered.txt");
+        let second = commit(path, "second", "other.txt");
+        for (key, value) in [
+            ("filter.roundtrip.clean", "sed 's/working/first/g'"),
+            ("filter.roundtrip.smudge", "sed 's/first/working/g'"),
+            ("filter.roundtrip.required", "true"),
+        ] {
+            git(path, &["config", key, value]).unwrap();
+        }
+        std::fs::write(path.join("filtered.txt"), "working\n").unwrap();
+        let plan = plan(path, base.trim()).unwrap();
+        let pick = |id: String| RewriteEntry {
+            id,
+            action: RewriteAction::Pick,
+            message: String::new(),
+        };
+        execute(
+            path,
+            vec![pick(second), pick(first)],
+            &plan.base,
+            &plan.token,
+            &executable,
+        )
+        .unwrap();
+        assert_eq!(
+            git(path, &["show", "HEAD:filtered.txt"]).unwrap(),
+            "first\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.join("filtered.txt")).unwrap(),
+            "working\n"
+        );
+        assert!(!rebase_in_progress(&git_dir(path).unwrap()));
+    }
+
+    #[test]
+    #[ignore = "Requires GALL_REBASE_HELPER pointing to a bundled Gall application"]
+    fn an_interactive_rebase_keeps_a_tracked_local_change_aside_and_puts_it_back() {
+        let executable =
+            PathBuf::from(std::env::var_os("GALL_REBASE_HELPER").expect("Set GALL_REBASE_HELPER"));
+        let temp = repository();
+        let path = temp.path();
+        let base = git(path, &["rev-parse", "HEAD"]).unwrap();
+        commit(path, "first", "a.txt");
+        commit(path, "second", "b.txt");
+        // A tracked change that no commit of the plan touches, staged in the second run.
+        for staged in [false, true] {
+            std::fs::write(path.join("base.txt"), "local edit\n").unwrap();
+            if staged {
+                git(path, &["add", "base.txt"]).unwrap();
+            }
+            // The rebase rewrites the commits, so their IDs are read again each time.
+            let ids = git(
+                path,
+                &["rev-list", "--reverse", &format!("{}..HEAD", base.trim())],
+            )
+            .unwrap();
+            let ids: Vec<&str> = ids.lines().collect();
+            let (one, two) = (ids[1], ids[0]);
+            let plan = super::plan(path, base.trim()).unwrap();
+            execute(
+                path,
+                vec![
+                    entry(one, RewriteAction::Pick, ""),
+                    entry(two, RewriteAction::Pick, ""),
+                ],
+                base.trim(),
+                &plan.token,
+                &executable,
+            )
+            .unwrap_or_else(|e| panic!("staged {staged}: {e}"));
+            assert_eq!(
+                std::fs::read_to_string(path.join("base.txt")).unwrap(),
+                "local edit\n"
+            );
+            assert!(git(path, &["stash", "list"]).unwrap().is_empty());
+            assert!(!is_edit_stop(path) && !rebase_in_progress(&git_dir(path).unwrap()));
+            git(path, &["reset", "-q", "--hard"]).unwrap();
+        }
+    }
+    fn exec(command: &str) -> RewriteEntry {
+        entry("", RewriteAction::Exec, command)
+    }
+    #[test]
+    fn exec_lines_are_single_lines_after_a_commit_and_not_part_of_the_commit_set() {
+        let temp = repository();
+        let path = temp.path();
+        let base = git(path, &["rev-parse", "HEAD"]).unwrap();
+        let first = commit(path, "first", "a.txt");
+        let second = commit(path, "second", "b.txt");
+        let plan = super::plan(path, base.trim()).unwrap();
+        let ok = |entries: Vec<RewriteEntry>| validate_entries(&plan, &entries);
+        assert!(ok(vec![
+            entry(&first, RewriteAction::Pick, ""),
+            exec("cargo test"),
+            entry(&second, RewriteAction::Pick, ""),
+            exec("cargo clippy"),
+        ])
+        .is_ok());
+        // A line break would add plan lines of the caller's choosing, so none is accepted.
+        for bad in ["a\nb", "a\rb", "a\0b", "", "   "] {
+            assert!(ok(vec![
+                entry(&first, RewriteAction::Pick, ""),
+                entry(&second, RewriteAction::Pick, ""),
+                exec(bad)
+            ])
+            .is_err());
+        }
+        // A plan of exec lines only has no commits, and a missing commit is still refused.
+        assert!(ok(vec![exec("true")]).is_err());
+        assert!(ok(vec![entry(&first, RewriteAction::Pick, ""), exec("true")]).is_err());
+        // The combined message of a squash is read from consecutive plan lines: an exec between them breaks the group.
+        assert!(ok(vec![
+            entry(&first, RewriteAction::Pick, ""),
+            exec("true"),
+            entry(&second, RewriteAction::Squash, ""),
+        ])
+        .is_err());
+        assert!(ok(vec![
+            entry(&first, RewriteAction::Pick, ""),
+            entry(&second, RewriteAction::Squash, ""),
+            exec("true"),
+        ])
+        .is_ok());
+    }
+    #[test]
+    fn a_plan_from_the_root_lists_every_commit_and_predicts_with_the_empty_tree() {
+        let temp = repository();
+        let path = temp.path();
+        let first = commit(path, "first", "a.txt");
+        let second = commit(path, "second", "b.txt");
+        let plan = super::plan(path, ROOT_BASE).unwrap();
+        assert_eq!(plan.base, ROOT_BASE);
+        let roots = git(path, &["rev-list", "--max-parents=0", "HEAD"]).unwrap();
+        assert_eq!(
+            plan.commits.first().map(|c| c.id.as_str()),
+            Some(roots.trim())
+        );
+        assert!(
+            plan.commits.iter().any(|c| c.id == first)
+                && plan.commits.iter().any(|c| c.id == second)
+        );
+        let picks: Vec<_> = plan
+            .commits
+            .iter()
+            .map(|c| entry(&c.id, RewriteAction::Pick, ""))
+            .collect();
+        validate_entries(&plan, &picks).unwrap();
+        assert!(predict_conflicts(path, ROOT_BASE, &picks, &|| false)
+            .unwrap()
+            .is_empty());
+        // Applying the later commits without their parents' files replays them against the empty tree and a conflict is not invented.
+        let reversed: Vec<_> = picks.iter().rev().cloned().collect();
+        assert!(predict_conflicts(path, ROOT_BASE, &reversed, &|| false).is_ok());
+        assert_eq!(empty_tree(40), "4b825dc642cb6eb9a060e54bf8d69288fbee4904");
+        assert_eq!(
+            empty_tree(64),
+            "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321"
+        );
+    }
+    #[test]
     #[ignore = "Requires GALL_REBASE_HELPER pointing to a bundled Gall application"]
     fn interactive_rebase_with_bundled_helper() {
         let executable =
@@ -2312,6 +3350,82 @@ mod tests {
         );
     }
     #[test]
+    fn amend_staged_updates_root_or_merge_with_no_checkout() {
+        for amend_root in [true, false] {
+            let temp = repository();
+            let path = temp.path();
+            let first = git(path, &["rev-parse", "HEAD"]).unwrap();
+            let main = git(path, &["symbolic-ref", "--short", "HEAD"]).unwrap();
+            git(path, &["switch", "-qc", "side"]).unwrap();
+            commit(path, "side", "side.txt");
+            git(path, &["switch", "-q", main.trim()]).unwrap();
+            commit(path, "main", "main.txt");
+            git(path, &["merge", "--no-ff", "-qm", "merge side", "side"]).unwrap();
+            let merge = git(path, &["rev-parse", "HEAD"]).unwrap();
+            let old_head = commit(path, "later", "later.txt");
+            std::fs::write(path.join("amend.txt"), "staged\n").unwrap();
+            git(path, &["add", "--", "amend.txt"]).unwrap();
+            std::fs::write(path.join("amend.txt"), "unstaged\n").unwrap();
+            let target = if amend_root {
+                first.trim()
+            } else {
+                merge.trim()
+            };
+            let token = super::super::gitrepository::snapshot(path).unwrap().token;
+            amend_staged(path, target, &token).unwrap();
+
+            let amended = if amend_root { "HEAD~3" } else { "HEAD^" };
+            assert_eq!(
+                git(path, &["show", &format!("{amended}:amend.txt")]).unwrap(),
+                "staged\n"
+            );
+            assert_eq!(git(path, &["show", "HEAD:amend.txt"]).unwrap(), "staged\n");
+            assert_eq!(
+                git(path, &["show", "-s", "--format=%P", "HEAD^"])
+                    .unwrap()
+                    .split_whitespace()
+                    .count(),
+                2
+            );
+            assert!(git(path, &["diff", "--cached", "--name-only"])
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                std::fs::read_to_string(path.join("amend.txt")).unwrap(),
+                "unstaged\n"
+            );
+            let journal = super::super::gitjournal::view(path).unwrap();
+            assert!(journal.entries.last().unwrap().snapshot.is_none());
+            let undo =
+                super::super::gitjournal::move_to(path, journal.applied - 1, journal.applied)
+                    .unwrap();
+            assert!(!undo.contains("could not be applied"));
+            assert_eq!(git(path, &["rev-parse", "HEAD"]).unwrap().trim(), old_head);
+            assert_eq!(git(path, &["show", ":amend.txt"]).unwrap(), "staged\n");
+        }
+    }
+
+    #[test]
+    fn conflicting_older_amend_keeps_index_and_working_file() {
+        let temp = repository();
+        let path = temp.path();
+        let first = git(path, &["rev-parse", "HEAD"]).unwrap();
+        let head = commit(path, "later", "base.txt");
+        std::fs::write(path.join("base.txt"), "staged\n").unwrap();
+        git(path, &["add", "--", "base.txt"]).unwrap();
+        std::fs::write(path.join("base.txt"), "unstaged\n").unwrap();
+        let token = super::super::gitrepository::snapshot(path).unwrap().token;
+        let error = amend_staged(path, first.trim(), &token).unwrap_err();
+        assert!(error.to_string().contains("base.txt"));
+        assert_eq!(git(path, &["rev-parse", "HEAD"]).unwrap().trim(), head);
+        assert_eq!(git(path, &["show", ":base.txt"]).unwrap(), "staged\n");
+        assert_eq!(
+            std::fs::read_to_string(path.join("base.txt")).unwrap(),
+            "unstaged\n"
+        );
+    }
+
+    #[test]
     fn quick_history_actions_reject_stale_and_root_context_without_writes() {
         let temp = repository();
         let path = temp.path();
@@ -2330,10 +3444,218 @@ mod tests {
         assert!(quick_edit(path, &next, QuickAction::Drop, &initial.token, &binary).is_err());
         let state = super::super::gitrepository::snapshot(path).unwrap();
         assert!(quick_edit(path, &next, QuickAction::MoveLater, &state.token, &binary).is_err());
-        assert!(quick_edit(path, &next, QuickAction::Fixup, &state.token, &binary).is_err());
         assert_eq!(git(path, &["rev-parse", "HEAD"]).unwrap().trim(), next);
         assert!(path.join("next.txt").exists());
     }
+    #[test]
+    fn quick_fixup_and_squash_keep_the_merge_parents() {
+        for (action, later) in [(QuickAction::Fixup, false), (QuickAction::Squash, true)] {
+            let d = repository();
+            let p = d.path();
+            let main = git(p, &["symbolic-ref", "--short", "HEAD"]).unwrap();
+            git(p, &["switch", "-qc", "topic"]).unwrap();
+            commit(p, "topic", "topic.txt");
+            git(p, &["switch", "-q", main.trim()]).unwrap();
+            git(p, &["merge", "--no-ff", "-qm", "merge topic", "topic"]).unwrap();
+            let parents = git(p, &["show", "-s", "--format=%P", "HEAD"]).unwrap();
+            let child = commit(p, "follow-up", "follow-up.txt");
+            let tree = git(p, &["rev-parse", "HEAD^{tree}"]).unwrap();
+            if later {
+                commit(p, "later", "later.txt");
+            }
+            let combined = if later { "HEAD^" } else { "HEAD" };
+            let token = super::super::gitrepository::snapshot(p).unwrap().token;
+            quick_edit(p, &child, action, &token, &std::env::current_exe().unwrap()).unwrap();
+            assert_eq!(
+                git(p, &["show", "-s", "--format=%P", combined]).unwrap(),
+                parents
+            );
+            assert_eq!(
+                git(p, &["rev-parse", &format!("{combined}^{{tree}}")]).unwrap(),
+                tree
+            );
+            let message = git(p, &["show", "-s", "--format=%B", combined]).unwrap();
+            assert_eq!(message.contains("follow-up"), action == QuickAction::Squash);
+        }
+    }
+
+    #[test]
+    fn quick_drop_merge_removes_its_side_and_preserves_a_later_merge() {
+        let d = repository();
+        let p = d.path();
+        let main = git(p, &["symbolic-ref", "--short", "HEAD"]).unwrap();
+        git(p, &["switch", "-qc", "drop-side"]).unwrap();
+        let imported = commit(p, "imported", "imported.txt");
+        git(p, &["switch", "-q", main.trim()]).unwrap();
+        commit(p, "main", "main.txt");
+        git(
+            p,
+            &["merge", "--no-ff", "-qm", "drop this merge", "drop-side"],
+        )
+        .unwrap();
+        let dropped = git(p, &["rev-parse", "HEAD"]).unwrap();
+        git(p, &["switch", "-qc", "keep-side"]).unwrap();
+        commit(p, "keep side", "keep-side.txt");
+        git(p, &["switch", "-q", main.trim()]).unwrap();
+        commit(p, "keep main", "keep-main.txt");
+        git(
+            p,
+            &["merge", "--no-ff", "-qm", "keep this merge", "keep-side"],
+        )
+        .unwrap();
+        let original = git(p, &["rev-parse", "HEAD"]).unwrap();
+        let token = super::super::gitrepository::snapshot(p).unwrap().token;
+
+        quick_edit(
+            p,
+            dropped.trim(),
+            QuickAction::Drop,
+            &token,
+            &std::env::current_exe().unwrap(),
+        )
+        .unwrap();
+        assert!(!p.join("imported.txt").exists());
+        assert!(p.join("keep-main.txt").exists() && p.join("keep-side.txt").exists());
+        assert_eq!(
+            git(p, &["rev-list", "--count", "--merges", "HEAD"])
+                .unwrap()
+                .trim(),
+            "1"
+        );
+        assert!(git(p, &["merge-base", "--is-ancestor", &imported, "HEAD"]).is_err());
+        assert_eq!(
+            git(p, &["rev-parse", "refs/heads/drop-side"])
+                .unwrap()
+                .trim(),
+            imported
+        );
+        assert_eq!(
+            git(
+                p,
+                &[
+                    "rev-parse",
+                    &format!("refs/gall/recovery/{}", original.trim())
+                ]
+            )
+            .unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn quick_drop_keeps_the_rewritten_detached_tip_reachable() {
+        let d = repository();
+        let p = d.path();
+        let main = git(p, &["symbolic-ref", "--short", "HEAD"]).unwrap();
+        git(p, &["switch", "-qc", "topic"]).unwrap();
+        commit(p, "topic", "topic.txt");
+        git(p, &["switch", "-q", main.trim()]).unwrap();
+        git(p, &["merge", "--no-ff", "-qm", "drop this merge", "topic"]).unwrap();
+        let merge = git(p, &["rev-parse", "HEAD"]).unwrap();
+        git(p, &["switch", "-q", "--detach"]).unwrap();
+        commit(p, "later", "later.txt");
+        let token = super::super::gitrepository::snapshot(p).unwrap().token;
+
+        quick_edit(
+            p,
+            merge.trim(),
+            QuickAction::Drop,
+            &token,
+            &std::env::current_exe().unwrap(),
+        )
+        .unwrap();
+        let rewritten = git(p, &["rev-parse", "HEAD"]).unwrap();
+        assert!(git(p, &["symbolic-ref", "-q", "HEAD"]).is_err());
+        assert_ne!(rewritten, merge);
+        git(p, &["switch", "-q", main.trim()]).unwrap();
+        let recovery = format!("refs/gall/recovery/{}", rewritten.trim());
+        assert_eq!(
+            git(p, &["rev-parse", "--verify", &recovery]).unwrap(),
+            rewritten
+        );
+    }
+
+    #[test]
+    fn quick_drop_does_not_silently_flatten_a_merge() {
+        let temp = repository();
+        let path = temp.path();
+        let root = git(path, &["rev-parse", "HEAD"]).unwrap();
+        let main = git(path, &["symbolic-ref", "--short", "HEAD"]).unwrap();
+        git(path, &["switch", "-qc", "topic"]).unwrap();
+        commit(path, "topic", "topic.txt");
+        git(path, &["switch", "-q", main.trim()]).unwrap();
+        git(path, &["merge", "--no-ff", "-qm", "merge topic", "topic"]).unwrap();
+        let merged = git(path, &["rev-parse", "HEAD"]).unwrap();
+        let token = super::super::gitrepository::snapshot(path).unwrap().token;
+        let error = quick_edit(
+            path,
+            root.trim(),
+            QuickAction::Drop,
+            &token,
+            &std::env::current_exe().unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("merges"));
+        assert_eq!(git(path, &["rev-parse", "HEAD"]).unwrap(), merged);
+        assert!(path.join("base.txt").exists() && path.join("topic.txt").exists());
+        assert!(!rebase_in_progress(&git_dir(path).unwrap()));
+    }
+
+    #[test]
+    #[ignore = "Requires GALL_REBASE_HELPER pointing to a bundled Gall application"]
+    fn quick_drop_and_move_later_can_replay_from_the_root() {
+        let binary =
+            PathBuf::from(std::env::var_os("GALL_REBASE_HELPER").expect("Set GALL_REBASE_HELPER"));
+        for (action, subjects, keeps_base) in [
+            (QuickAction::Drop, "second", false),
+            (QuickAction::MoveLater, "second\nbase", true),
+        ] {
+            let temp = repository();
+            let path = temp.path();
+            let root = git(path, &["rev-parse", "HEAD"]).unwrap();
+            commit(path, "second", "second.txt");
+            let token = super::super::gitrepository::snapshot(path).unwrap().token;
+            quick_edit(path, root.trim(), action, &token, &binary).unwrap();
+            assert_eq!(
+                git(path, &["log", "--reverse", "--format=%s"])
+                    .unwrap()
+                    .trim(),
+                subjects
+            );
+            assert_eq!(path.join("base.txt").exists(), keeps_base);
+            assert!(path.join("second.txt").exists());
+            assert!(!rebase_in_progress(&git_dir(path).unwrap()));
+        }
+    }
+
+    #[test]
+    #[ignore = "Requires GALL_REBASE_HELPER pointing to a bundled Gall application"]
+    fn quick_fixup_and_squash_can_combine_with_the_root_commit() {
+        let binary =
+            PathBuf::from(std::env::var_os("GALL_REBASE_HELPER").expect("Set GALL_REBASE_HELPER"));
+        for action in [QuickAction::Fixup, QuickAction::Squash] {
+            let temp = repository();
+            let path = temp.path();
+            let original = git(path, &["show", "-s", "--format=%s", "HEAD"]).unwrap();
+            let next = commit(path, "second commit", "second.txt");
+            let tree = git(path, &["rev-parse", "HEAD^{tree}"]).unwrap();
+            let token = super::super::gitrepository::snapshot(path).unwrap().token;
+            quick_edit(path, &next, action, &token, &binary).unwrap();
+            assert_eq!(
+                git(path, &["rev-list", "--count", "HEAD"]).unwrap().trim(),
+                "1"
+            );
+            assert_eq!(git(path, &["rev-parse", "HEAD^{tree}"]).unwrap(), tree);
+            let message = git(path, &["show", "-s", "--format=%B", "HEAD"]).unwrap();
+            assert!(message.starts_with(original.trim_end()));
+            assert_eq!(
+                message.contains("second commit"),
+                action == QuickAction::Squash
+            );
+            assert!(!rebase_in_progress(&git_dir(path).unwrap()));
+        }
+    }
+
     #[test]
     #[ignore = "Requires GALL_REBASE_HELPER pointing to a bundled Gall application"]
     fn quick_history_actions_with_bundled_helper() {
@@ -2408,6 +3730,56 @@ mod tests {
                 .is_none());
         }
     }
+    #[test]
+    fn a_plan_of_thousands_of_commits_opens_and_is_checked_for_conflicts() {
+        let temp = repository();
+        let path = temp.path();
+        let base = git(path, &["rev-parse", "HEAD"]).unwrap().trim().to_owned();
+        // Made by fast-import: a process for each commit would take minutes.
+        let mut stream = String::new();
+        for i in 0..1_500 {
+            let from = if i == 0 {
+                format!("from {base}\n")
+            } else {
+                String::new()
+            };
+            stream.push_str(&format!(
+                "commit refs/heads/long\ncommitter T <t@example.com> {} +0000\ndata 4\nc{i:03}\n{from}M 644 inline f{}.txt\ndata 5\n{i:04}\n\n",
+                1_700_000_000 + i,
+                i % 7
+            ).replace("data 4\nc", if i < 1000 { "data 4\nc" } else { "data 5\nc" }));
+        }
+        let mut child = std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["fast-import", "--quiet"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stream.as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        git(path, &["checkout", "-q", "long"]).unwrap();
+        let plan = super::plan(path, &base).unwrap();
+        assert_eq!(plan.commits.len(), 1_500);
+        let entries: Vec<_> = plan
+            .commits
+            .iter()
+            .map(|c| entry(&c.id, RewriteAction::Pick, ""))
+            .collect();
+        validate_entries(&plan, &entries).unwrap();
+        // Clean where Git can do it in one process; otherwise refused instead of taking minutes.
+        match predict_conflicts(path, &base, &entries, &|| false) {
+            Ok(found) => assert!(found.is_empty()),
+            Err(error) => assert!(error.to_string().contains("newer Git")),
+        }
+        assert!(predict_conflicts(path, &base, &entries, &|| true).is_err());
+    }
+
     #[test]
     fn pending_sequences_reject_scripts_and_include_fixup_message_commits() {
         let temp = repository();

@@ -7,6 +7,8 @@ export interface BrowserController {
   path(): string;
   entries(): FileEntry[];
   selection(): FileEntry[];
+  /** Only what the user selected (`selection()` falls back to the focused item). */
+  explicitSelection?(): FileEntry[];
   focused(): FileEntry | null;
   reload(): void;
   select(paths: string[], focusPath?: string): void;

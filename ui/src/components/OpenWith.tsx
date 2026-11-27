@@ -1,9 +1,11 @@
-// "Open with…" palette, also used for "Terminal here with…". Lists the applications
-// (or terminals) for the selection; typing filters them or becomes a custom command.
-// Enter opens once, Ctrl+Enter also makes it the default (for the terminal, or for the
-// file type in the scope picked with Tab: everywhere, the project, the folder, the file),
-// so there is no settings page to visit and no submenu per program.
+// "Open with…" palette, also used for "Terminal here with…" and "Edit with…".
+// Lists the recommended applications for the selection plus all installed applications
+// on the OS; typing filters both or becomes a custom command.
+// Enter opens once, Ctrl+Enter remembers in Gall (for the scope picked with Tab:
+// everywhere, the project, the folder, or only this file), and Alt+Enter sets the
+// OS-wide system default (Linux / macOS).
 import { useEffect, useMemo, useRef, useState } from "react";
+import { tt } from "../i18n";
 import { api } from "../api/ipc";
 import type { AppChoice, OpenRule } from "../api/types";
 import { fuzzyMatch } from "../core/fuzzy";
@@ -14,17 +16,27 @@ import { useStore } from "../state/store";
 import { Icon } from "./Icon";
 import { Highlight } from "./QuickOpen";
 import { primaryMod } from "../core/keymap";
+import { platformLabel } from "../core/keymap";
 
 type Row =
-  | { kind: "app"; app: AppChoice; tag: string; star?: boolean; positions: number[] }
+  | { kind: "app"; app: AppChoice; tag: string; star?: boolean; positions: number[]; other?: boolean }
+  | { kind: "more"; count: number }
   | { kind: "system"; tag: string }
   | { kind: "dialog" }
   | { kind: "custom"; command: string };
+
+function canSetOsDefault(app: AppChoice, platform: string | undefined): boolean {
+  if (platform === "linux") return app.command.startsWith("desktop:");
+  if (platform === "macos") return app.command.startsWith("macos:");
+  return false;
+}
 
 export function OpenWith({ paths, mode }: { paths: string[]; mode: "file" | "terminal" | "editor" }) {
   const settings = useStore((s) => s.settings)!;
   const info = useStore((s) => s.info);
   const [apps, setApps] = useState<AppChoice[] | null>(null);
+  const [allApps, setAllApps] = useState<AppChoice[] | null>(null);
+  const [showAll, setShowAll] = useState(false);
   const [q, setQ] = useState("");
   const [idx, setIdx] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -49,22 +61,33 @@ export function OpenWith({ paths, mode }: { paths: string[]; mode: "file" | "ter
   const subject = paths.length === 1 ? `“${basename(paths[0])}”` : `${paths.length} files`;
 
   useEffect(() => {
+    let alive = true;
     const load = terminal ? api.terminalApps()
       // Editors: the known ones, then whatever else is registered for the file.
       : editor ? Promise.all([api.editorApps(), api.openWithApps(paths[0]).catch(() => [])]).then(([ed, reg]) => [...ed, ...reg.filter((r) => !ed.some((e) => e.name === r.name))].map((a) => ({ ...a, default: false })))
       : api.openWithApps(paths[0]);
-    load.then(setApps).catch((e) => { A.fail(e); setApps([]); });
-    if (!single) api.gitRoot(paths[0]).then(setGitRoot).catch(() => {});
+    load.then((res) => { if (alive) setApps(res); }).catch((e) => { if (alive) { A.fail(e); setApps([]); } });
+    if (!single) {
+      api.gitRoot(paths[0]).then((r) => { if (alive) setGitRoot(r); }).catch(() => {});
+      api.openWithAllApps().then((res) => { if (alive) setAllApps(res); }).catch(() => { if (alive) setAllApps([]); });
+    }
     inputRef.current?.focus();
+    return () => { alive = false; };
   }, [paths, terminal, editor, single]);
+
+  const otherApps = useMemo(() => {
+    if (single || !allApps) return [];
+    const listed = apps ?? [];
+    return allApps.filter((a) => a.command !== current && !listed.some((r) => r.command === a.command || r.id === a.id));
+  }, [single, allApps, apps, current]);
 
   const rows = useMemo<Row[]>(() => {
     const list = apps ?? [];
     const query = q.trim();
     const out: Row[] = [];
-    const add = (app: AppChoice, tag: string, star = false) => {
+    const add = (app: AppChoice, tag: string, star = false, other = false) => {
       const m = fuzzyMatch(query, app.name);
-      if (m) out.push({ kind: "app", app, tag, star, positions: m.positions });
+      if (m) out.push({ kind: "app", app, tag, star, positions: m.positions, other });
     };
     // The current default first: the stored rule / terminal, even if it isn't in the list.
     const known = list.find((a) => a.command === current);
@@ -73,18 +96,51 @@ export function OpenWith({ paths, mode }: { paths: string[]; mode: "file" | "ter
       if (a.command === current) continue;
       add(a, a.default ? (terminal ? "auto-detected" : "system default") : "");
     }
+    if (!single && !showAll && !query && otherApps.length > 0) {
+      out.push({ kind: "more", count: otherApps.length });
+    }
+    if (!single && (showAll || query)) {
+      for (const a of otherApps) {
+        add(a, showAll && !query ? tt("all applications") : "", false, true);
+      }
+    }
     if (!single && (rule || !list.some((a) => a.default)) && fuzzyMatch(query, "System default"))
       out.push({ kind: "system", tag: rule ? `forget ${rule.name}` : "" });
     if (!single && info?.platform === "windows" && paths.length === 1 && fuzzyMatch(query, "Windows dialog")) out.push({ kind: "dialog" });
     if (query) out.push({ kind: "custom", command: query });
     return out;
-  }, [apps, q, current, rule, ruleScope, terminal, editor, single, info, paths.length]);
+  }, [apps, otherApps, showAll, q, current, rule, ruleScope, terminal, editor, single, info, paths.length]);
 
   const cur = rows[Math.min(idx, rows.length - 1)];
   const close = () => A.openOverlay(null);
+  const canOsDefault = !single && cur?.kind === "app" && canSetOsDefault(cur.app, info?.platform);
+
+  const setOsDefault = async (app: AppChoice, thenOpen: boolean) => {
+    try {
+      const target = await api.openWithSetDefault(paths[0], app.id);
+      A.notify(tt("{name} is now the system default for {target}", { name: app.name, target }), "success");
+      setApps((prev) => {
+        const base = prev ?? [];
+        const exists = base.some((a) => a.id === app.id);
+        const next = exists ? base.map((a) => ({ ...a, default: a.id === app.id })) : [{ ...app, default: true }, ...base.map((a) => ({ ...a, default: false }))];
+        return next.sort((a, b) => Number(b.default) - Number(a.default));
+      });
+      if (thenOpen) {
+        close();
+        api.openWithRun(paths, app.command).catch(A.fail);
+      }
+    } catch (e) {
+      A.fail(e);
+    }
+  };
 
   const accept = async (row: Row | undefined, always: boolean) => {
     if (!row) return;
+    if (row.kind === "more") {
+      setShowAll(true);
+      inputRef.current?.focus();
+      return;
+    }
     close();
     if (row.kind === "dialog") {
       api.openWithDialog(paths[0]).catch(A.fail);
@@ -109,7 +165,7 @@ export function OpenWith({ paths, mode }: { paths: string[]; mode: "file" | "ter
       return;
     }
     if (always) {
-      if (!scope) A.notify("Ctrl+Enter remembers a program per file type; select files of one type", "warn");
+      if (!scope) A.notify(platformLabel("Ctrl+Enter remembers a program per file type; select files of one type"), "warn");
       else {
         const rest = settings.openRules.filter((r) => !sameScope(r, scope));
         const next: OpenRule[] = command === "system" ? rest : [...rest, { target: scope.target, ...(scope.dir ? { dir: scope.dir } : {}), name, command }];
@@ -146,6 +202,10 @@ export function OpenWith({ paths, mode }: { paths: string[]; mode: "file" | "ter
     if (e.key === "ArrowUp" || (e.ctrlKey && (e.key === "k" || e.key === "p"))) return move(-1);
     if (e.key === "Enter") {
       e.preventDefault();
+      if (e.altKey && canOsDefault && cur?.kind === "app") {
+        void setOsDefault(cur.app, true);
+        return;
+      }
       accept(cur, primaryMod(e));
     }
   };
@@ -157,35 +217,44 @@ export function OpenWith({ paths, mode }: { paths: string[]; mode: "file" | "ter
         <div className="qo-input">
           <Icon name={terminal ? "terminal" : editor ? "rename" : "open"} size={17} />
           <span className="ow-title">{terminal ? `Terminal in “${basename(paths[0]) || paths[0]}” with` : editor ? `Edit ${subject} with` : `Open ${subject} with`}</span>
-          <input ref={inputRef} value={q} spellCheck={false} placeholder={terminal ? "filter, or type a command: wezterm start --always-new-process --cwd {dir}" : "filter, or type a command: zed {path}"}
+          <input ref={inputRef} value={q} spellCheck={false} placeholder={terminal ? "filter, or type a command: wezterm start --always-new-process --cwd {dir}" : "filter any app, or type a command: zed {path}"}
             onChange={(e) => { setQ(e.target.value); setIdx(0); }} />
         </div>
         <div className="qo-list">
-          {apps === null && <div className="qo-empty">Looking for applications…</div>}
+          {apps === null && <div className="qo-empty">{tt("Looking for applications…")}</div>}
           {rows.map((r, i) => (
-            <div key={i} className={`qo-row cmd ${i === idx ? "on" : ""}`} onMouseMove={() => i !== idx && setIdx(i)} onClick={(e) => accept(r, primaryMod(e))}>
+            <div key={i} className={`qo-row cmd ${r.kind === "more" ? "qo-wider" : ""} ${i === idx ? "on" : ""}`} onMouseMove={() => i !== idx && setIdx(i)} onClick={(e) => accept(r, primaryMod(e))}>
               <span className="ow-star">{r.kind === "app" && r.star ? "★" : ""}</span>
-              {!q && i < 9 && <kbd className="ow-num">{i + 1}</kbd>}
+              {!q && i < 9 && r.kind !== "more" && <kbd className="ow-num">{i + 1}</kbd>}
               <span className="qo-name">
                 {r.kind === "app" ? <Highlight text={r.app.name} positions={r.positions} />
+                  : r.kind === "more" ? tt("Show all applications…")
                   : r.kind === "system" ? "System default"
                   : r.kind === "dialog" ? "Windows “Open with” dialog…"
-                  : <>Run <code>{r.command}</code></>}
+                  : <>{tt("Run")} <code>{r.command}</code></>}
               </span>
               <span className="ow-tag">
-                {r.kind === "app" ? r.tag : r.kind === "system" ? r.tag : r.kind === "custom" ? (terminal ? "{dir} = the folder" : "{path} = the file, {dir} = its folder") : ""}
+                {r.kind === "app" ? r.tag
+                  : r.kind === "more" ? tt("{count} more installed", { count: r.count })
+                  : r.kind === "system" ? r.tag
+                  : r.kind === "custom" ? (terminal ? "{dir} = the folder" : "{path} = the file, {dir} = its folder") : ""}
               </span>
             </div>
           ))}
-          {apps !== null && rows.length === 0 && <div className="qo-empty">No match. Type a full command to run it.</div>}
+          {apps !== null && rows.length === 0 && <div className="qo-empty">{tt("No match. Type a full command to run it.")}</div>}
         </div>
         <div className="qo-foot">
           <span className="qo-status">{!q ? "j/k move · 1–9 pick · " : ""}{terminal ? "Terminal here (F10) uses ★" : editor ? "Edit in editor uses ★" : rule ? `★ opens these on Enter (${ruleScope})` : "Enter on a file uses the system default"}</span>
           <span className="qo-hints">
-            <kbd>↵</kbd> open <kbd>Ctrl ↵</kbd> {alwaysHint}
+            <kbd>↵</kbd> open <kbd>{platformLabel("Ctrl ↵")}</kbd> {alwaysHint}
             {scope && (
-              <button className="chip on" title="Where Ctrl+Enter applies (Tab / Shift+Tab)" onClick={() => { setScopeIdx((si + 1) % scopes.length); inputRef.current?.focus(); }}>
+              <button className="chip on" title={tt("Where Ctrl+Enter applies (Tab / Shift+Tab)")} onClick={() => { setScopeIdx((si + 1) % scopes.length); inputRef.current?.focus(); }}>
                 {scope.label}{scopes.length > 1 && <kbd>Tab</kbd>}
+              </button>
+            )}
+            {canOsDefault && cur?.kind === "app" && (
+              <button className="chip" title={tt("Set as the operating system default for this file type (Alt+Enter)")} onClick={() => { void setOsDefault(cur.app, false); inputRef.current?.focus(); }}>
+                {tt("OS default")} <kbd>Alt ↵</kbd>
               </button>
             )}
             <kbd>Esc</kbd> close

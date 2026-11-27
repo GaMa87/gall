@@ -3,15 +3,18 @@
 // that flags problems before anything is renamed. "Edit as text" lists one name per line
 // for editing by hand (as in vidir / oil.nvim). One Ctrl+Z reverts the whole rename.
 import { useEffect, useMemo, useRef, useState } from "react";
+import { tt } from "../i18n";
 import { api } from "../api/ipc";
 import type { FileEntry } from "../api/types";
 import { DEFAULT_RULES, ISSUE_TEXT, namesFromText, newNames, renameIssues, type CaseMode, type RenameRules } from "../core/batchRename";
 import { basename, join, parent } from "../core/path";
+import { operationError } from "../core/operationError";
 import * as A from "../state/actions";
 import { controller } from "../state/controllers";
 import { useStore } from "../state/store";
 import { FileIcon, Icon } from "./Icon";
 import { primaryMod } from "../core/keymap";
+import { platformLabel } from "../core/keymap";
 
 const TOKENS: { token: string; label: string; title: string }[] = [
   { token: "{name}", label: "Name", title: "The current name without the extension" },
@@ -34,6 +37,7 @@ export function BatchRename({ b, entries }: { b: number; entries: FileEntry[] })
   const [text, setText] = useState("");
   const [others, setOthers] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
+  const [applyError, setApplyError] = useState<string | null>(null);
   const templateRef = useRef<HTMLInputElement>(null);
   const textRef = useRef<HTMLTextAreaElement>(null);
   const close = () => A.openOverlay(null);
@@ -80,16 +84,18 @@ export function BatchRename({ b, entries }: { b: number; entries: FileEntry[] })
   const apply = async () => {
     if (!canApply) return;
     setBusy(true);
+    setApplyError(null);
     try {
       const pairs = entries.map((e, i) => [e.path, names[i]] as [string, string]).filter(([p, n]) => basename(p) !== n);
-      const out = await api.batchRename(pairs);
+      const { paths: out, undoId } = await api.batchRenameWithUndo(pairs);
       close();
-      A.notify(`Renamed ${A.items(out.length)}`, "success", { label: "Undo", run: A.undo });
+      A.notify(`Renamed ${A.items(out.length)}`, "success", A.undoAction(undoId));
       A.refreshUndo();
       const renamed = names.map((n) => join(dir, n));
       controller(b)?.select(renamed, renamed[0]);
     } catch (e) {
       A.fail(e);
+      setApplyError(operationError(String(e), platform).text);
       setBusy(false);
     }
   };
@@ -109,14 +115,14 @@ export function BatchRename({ b, entries }: { b: number; entries: FileEntry[] })
           <b>Rename {A.items(entries.length)}</b>
           <span className="brn-sum">{changed ? `${A.items(changed)} will change` : "nothing changes yet"}</span>
           <div className="seg">
-            <button className={textMode ? "" : "on"} onClick={() => setTextMode(false)} title="Template, find & replace, case">Rules</button>
-            <button className={textMode ? "on" : ""} onClick={() => (textMode ? null : toText())} title="One name per line, edited by hand">Edit as text</button>
+            <button className={textMode ? "" : "on"} onClick={() => setTextMode(false)} title={tt("Template, find & replace, case")}>{tt("Rules")}</button>
+            <button className={textMode ? "on" : ""} onClick={() => (textMode ? null : toText())} title={tt("One name per line, edited by hand")}>{tt("Edit as text")}</button>
           </div>
         </div>
         {!textMode && (
           <div className="brn-rules">
             <label className="brn-field">
-              <span>Name</span>
+              <span>{tt("Name")}</span>
               <input ref={templateRef} type="text" value={rules.template} spellCheck={false} placeholder="{name}" onChange={(e) => set("template", e.target.value)} />
             </label>
             <div className="brn-tokens">
@@ -125,22 +131,22 @@ export function BatchRename({ b, entries }: { b: number; entries: FileEntry[] })
               ))}
             </div>
             <label className="brn-field">
-              <span>Find</span>
-              <input type="text" value={rules.find} spellCheck={false} placeholder="text to replace" onChange={(e) => set("find", e.target.value)} />
-              <button className={`tgl ${rules.matchCase ? "on" : ""}`} title="Match case" onClick={() => set("matchCase", !rules.matchCase)}>Aa</button>
-              <button className={`tgl ${rules.regex ? "on" : ""}`} title="Regular expression ($1 in Replace refers to a group)" onClick={() => set("regex", !rules.regex)}>.*</button>
+              <span>{tt("Find")}</span>
+              <input type="text" value={rules.find} spellCheck={false} placeholder={tt("text to replace")} onChange={(e) => set("find", e.target.value)} />
+              <button className={`tgl ${rules.matchCase ? "on" : ""}`} title={tt("Match case")} onClick={() => set("matchCase", !rules.matchCase)}>Aa</button>
+              <button className={`tgl ${rules.regex ? "on" : ""}`} title={tt("Regular expression ($1 in Replace refers to a group)")} onClick={() => set("regex", !rules.regex)}>.*</button>
             </label>
             <label className="brn-field">
-              <span>Replace</span>
-              <input type="text" value={rules.replace} spellCheck={false} placeholder="with" onChange={(e) => set("replace", e.target.value)} />
+              <span>{tt("Replace")}</span>
+              <input type="text" value={rules.replace} spellCheck={false} placeholder={tt("with")} onChange={(e) => set("replace", e.target.value)} />
             </label>
             <div className="brn-opts">
               <div className="seg">
                 {CASES.map((c) => <button key={c.id} className={rules.caseMode === c.id ? "on" : ""} onClick={() => set("caseMode", c.id)}>{c.label}</button>)}
               </div>
-              <label title="Counter: first number">Start <input type="number" value={rules.start} onChange={(e) => set("start", Number(e.target.value) || 0)} /></label>
-              <label title="Counter: added for each item">Step <input type="number" value={rules.step} onChange={(e) => set("step", Number(e.target.value) || 1)} /></label>
-              <label className="brn-check"><input type="checkbox" checked={rules.withExt} onChange={(e) => set("withExt", e.target.checked)} /> Rename extensions too</label>
+              <label title={tt("Counter: first number")}>{tt("Start")} <input type="number" value={rules.start} onChange={(e) => set("start", Number(e.target.value) || 0)} /></label>
+              <label title={tt("Counter: added for each item")}>{tt("Step")} <input type="number" value={rules.step} onChange={(e) => set("step", Number(e.target.value) || 1)} /></label>
+              <label className="brn-check"><input type="checkbox" checked={rules.withExt} onChange={(e) => set("withExt", e.target.checked)} /> {tt("Rename extensions too")}</label>
             </div>
           </div>
         )}
@@ -163,9 +169,10 @@ export function BatchRename({ b, entries }: { b: number; entries: FileEntry[] })
             );
           })}
         </div>
+        {applyError && <div className="brn-error brn-apply-error" role="alert">{tt(applyError)}</div>}
         <div className="foot brn-foot">
-          <span className="brn-hint">{problems ? `${A.items(problems)} to fix` : "Enter renames · one Ctrl+Z undoes all"}</span>
-          <button className="btn" title="Esc" onClick={close}>Cancel</button>
+          <span className="brn-hint">{problems ? `${A.items(problems)} to fix` : platformLabel("Enter renames · one Ctrl+Z undoes all")}</span>
+          <button className="btn" title="Esc" onClick={close}>{tt("Cancel")}</button>
           <button className="btn primary" disabled={!canApply} onClick={apply}>Rename{changed ? ` ${A.items(changed)}` : ""}</button>
         </div>
       </div>

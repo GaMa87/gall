@@ -13,7 +13,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 def rust():
     meta = json.loads(subprocess.check_output(["cargo", "metadata", "--format-version", "1", "--locked"], cwd=ROOT))
-    ours = {"gall", "gall-core"}
+    ours = {"gall", "gall-core", "gall-compare", "gall-portal"}
     return sorted(
         ((p["name"], p["version"], p.get("license") or "see repository", p.get("repository") or "")
          for p in meta["packages"] if p["name"] not in ours),

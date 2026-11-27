@@ -1,14 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/gall-core", "src-tauri"]
+members = ["crates/gall-compare", "crates/gall-core", "crates/gall-portal", "src-tauri"]
 
 [workspace.package]
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 authors = ["Matej Gajšek and Gall contributors"]
 repository = "https://github.com/GaMa87/gall"
-homepage = "https://github.com/GaMa87/gall"
 rust-version = "1.95"
 
 [workspace.dependencies]

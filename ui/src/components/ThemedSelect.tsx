@@ -1,9 +1,10 @@
 import { useId, useLayoutEffect, useRef, useState, type SelectHTMLAttributes } from "react";
 import { createPortal } from "react-dom";
+import { dropdownBox, type DropdownBox } from "../core/anchor";
+import { HoverGuard } from "../core/hover";
 import "../styles/themedSelect.css";
 
 type Item = { value: string; label: string; disabled: boolean; group: string | null };
-type Box = { left: number; top: number; width: number; maxHeight: number; upwards: boolean };
 
 /** Keep the native form control and change contract, but paint its popup with Gall's theme.
  * WebKitGTK's native popup uses the desktop palette even when option CSS says otherwise.
@@ -11,7 +12,8 @@ type Box = { left: number; top: number; width: number; maxHeight: number; upward
 export function ThemedSelect({ children, onMouseDown, onClick, onKeyDown, onBlur, ...props }: SelectHTMLAttributes<HTMLSelectElement>) {
   const control = useRef<HTMLSelectElement>(null), menu = useRef<HTMLDivElement>(null);
   const id = useId();
-  const [box, setBox] = useState<Box | null>(null), [items, setItems] = useState<Item[]>([]), [active, setActive] = useState(-1);
+  const hover = useRef(new HoverGuard(false));
+  const [box, setBox] = useState<DropdownBox | null>(null), [items, setItems] = useState<Item[]>([]), [active, setActive] = useState(-1);
   const search = useRef({ text: "", time: 0 });
   const read = () => Array.from(control.current?.options ?? []).filter((o) => !o.hidden).map((o): Item => {
     const group = o.parentElement instanceof HTMLOptGroupElement ? o.parentElement : null;
@@ -22,15 +24,12 @@ export function ThemedSelect({ children, onMouseDown, onClick, onKeyDown, onBlur
     const select = control.current;
     if (!select || select.disabled) return;
     select.focus();
-    const next = read(), rect = select.getBoundingClientRect(), gap = 5, margin = 8;
-    const below = window.innerHeight - rect.bottom - margin - gap, above = rect.top - margin - gap;
-    const upwards = below < 180 && above > below;
-    const maxHeight = Math.max(0, Math.min(320, upwards ? above : below));
-    const width = Math.min(Math.max(rect.width, 160), window.innerWidth - margin * 2);
+    const next = read();
+    hover.current.reset();
     setItems(next);
     const selected = next.findIndex((o) => o.value === select.value && !o.disabled);
     setActive(selected >= 0 ? selected : next.findIndex((o) => !o.disabled));
-    setBox({ left: Math.max(margin, Math.min(rect.left, window.innerWidth - width - margin)), top: upwards ? rect.top - gap : rect.bottom + gap, width, maxHeight, upwards });
+    setBox(dropdownBox(select.getBoundingClientRect(), { minWidth: 160, maxHeight: 320 }, window.innerWidth, window.innerHeight));
   };
   const choose = (index: number) => {
     const item = items[index], select = control.current;
@@ -115,13 +114,13 @@ export function ThemedSelect({ children, onMouseDown, onClick, onKeyDown, onBlur
       onClick={(event) => { onClick?.(event); event.preventDefault(); if (event.detail === 0 && !box) show(); }}
       onKeyDown={key} onBlur={(event) => { onBlur?.(event); close(); }}>{children}</select>
     {box && createPortal(<div ref={menu} id={id} className="themed-select-menu" role="listbox" aria-label={props["aria-label"] ?? control.current?.labels?.[0]?.textContent ?? props.title ?? "Options"}
-      style={{ left: box.left, top: box.upwards ? undefined : box.top, bottom: box.upwards ? window.innerHeight - box.top : undefined, width: box.width, maxHeight: box.maxHeight }}
+      style={box}
       onMouseDown={(event) => event.preventDefault()}>
       {items.map((item, index) => <div key={index}>
         {item.group !== null && (index === 0 || items[index - 1].group !== item.group) && <div className="themed-select-group-label">{item.group}</div>}
         <div id={`${id}-${index}`} role="option" aria-selected={item.value === control.current?.value} aria-disabled={item.disabled} data-index={index}
           className={`themed-select-option${active === index ? " active" : ""}${item.group !== null ? " grouped" : ""}`}
-          onMouseEnter={() => { if (!item.disabled) setActive(index); }} onClick={() => choose(index)}>{item.label}</div>
+          onMouseEnter={(event) => { if (hover.current.moved(event) && !item.disabled) setActive(index); }} onMouseMove={(event) => { if (hover.current.moved(event) && !item.disabled) setActive(index); }} onClick={() => choose(index)}>{item.label}</div>
       </div>)}
     </div>, document.body)}
   </>;

@@ -4,6 +4,7 @@
 // the browsers are out of reach there. In the sidebar they show on hover, since the
 // browsers are right next to it. Nothing is shown in the classic layout (one browser).
 import { useStore } from "../state/store";
+import { tt } from "../i18n";
 
 /** A window split in two with half `b` filled. */
 export function PaneGlyph({ b, vertical }: { b: number; vertical: boolean }) {
@@ -11,7 +12,7 @@ export function PaneGlyph({ b, vertical }: { b: number; vertical: boolean }) {
   return (
     <svg width="16" height="12" viewBox="0 0 16 12" aria-hidden>
       <rect x="1" y="1" width="14" height="10" rx="1.5" fill="none" stroke="currentColor" strokeWidth="1.2" />
-      <path d={vertical ? "M1 6h14" : "M8 1v10"} stroke="currentColor" strokeWidth="1" />
+      <path d={vertical ? tt("M1 6h14") : tt("M8 1v10")} stroke="currentColor" strokeWidth="1" />
       <rect {...half} rx="0.8" fill="currentColor" opacity="0.75" />
     </svg>
   );
@@ -34,7 +35,7 @@ export function PanePick({ onPick, className = "" }: { onPick: (b: number) => vo
   return (
     <span className={`pane-pick ${className}`}>
       {[0, 1].map((b) => (
-        <button key={b} title={`Open in the ${side(b)} browser`} onClick={(e) => { e.stopPropagation(); onPick(b); }}>
+        <button key={b} title={tt(`Open in the ${side(b).toLowerCase()} browser`)} onClick={(e) => { e.stopPropagation(); onPick(b); }}>
           <PaneGlyph b={b} vertical={vertical} />
         </button>
       ))}

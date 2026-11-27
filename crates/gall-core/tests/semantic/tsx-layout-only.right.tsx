@@ -1,0 +1,1 @@
+const A=()=>{return <div className="a">{x}</div>};

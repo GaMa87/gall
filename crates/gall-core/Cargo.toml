@@ -6,13 +6,14 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 rust-version.workspace = true
+publish = false
 readme = "../../README.md"
 keywords = ["file-manager", "miller-columns", "filesystem", "dual-pane", "undo"]
 categories = ["filesystem", "gui"]
 
 [dependencies]
+gall-compare = { path = "../gall-compare" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -33,7 +34,7 @@ ignore = "0.4.34"
 grep-searcher = "0.1.17"
 grep-regex = "0.1.14"
 grep-matcher = "0.1.9"
-similar = { version = "2", features = ["inline", "unicode"] }
+similar = { version = "3", features = ["inline", "unicode"] }
 imara-diff = "0.2"
 syntect = { version = "5.3", default-features = false, features = ["parsing", "regex-fancy", "yaml-load"] }
 two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
@@ -47,22 +48,38 @@ flate2 = "1.1.10"
 sha1 = "0.11.0"
 sha2 = "0.11.1"
 tempfile = "3"
-lzma-rust2 = "0.23"
-sevenz-rust2 = { version = "0.24.2", default-features = false, features = ["aes256", "compress", "util", "deflate", "ppmd"] }
+lzma-rust2 = "0.25"
+sevenz-rust2 = { version = "0.25.0", default-features = false, features = ["aes256", "compress", "util", "deflate", "ppmd"] }
 ruzstd = "0.9.1"
 bzip2-rs = "0.1.2"
 fontdb = "0.24.0"
+minisign-verify = "0.3"
+semver = "1"
+base64 = "0.23"
+# Already in the lock file (a dependency of calamine); parses the XBEL of KDE Places. It never loads external
+# entities, and DTDs are refused (a plain DOCTYPE is removed first, see `favorites_import`).
+roxmltree = "0.20"
+# Already in the lock file (a dependency of tauri); parses the binary NSKeyedArchiver plist of
+# macOS Finder sidebar favorites (`FavoriteItems.sfl3`).
+plist = "1.10.3"
+tree-sitter = "0.27.2"
+tree-sitter-rust = "0.24.2"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-typescript = "0.23.2"
+globset = "0.4"
+lopdf = "0.47.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Already pulled in by `trash`; used directly for `trashItemAtURL`, which reports where the
-# item went (the `trash` crate cannot list or restore on macOS).
+# item went (the `trash` crate cannot list or restore on macOS), and for resolving macOS
+# Finder sidebar bookmarks without mounting or showing permission dialogs.
 objc2 = "0.6.2"
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSError", "NSFileManager", "NSString", "NSURL"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSData", "NSError", "NSFileManager", "NSString", "NSURL"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56"
 dunce = "1.0.5"
-windows = { version = "0.62.2", features = ["Win32_System_Com", "Win32_UI_Shell", "Win32_Storage_FileSystem"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Threading", "Win32_UI_Shell", "Win32_Storage_FileSystem"] }

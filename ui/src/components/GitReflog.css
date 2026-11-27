@@ -1,0 +1,15 @@
+.gr { width: min(560px, calc(100% - 28px)); }
+.gr-search { flex: none; padding: 8px 12px; border-bottom: 1px solid var(--border-soft); }
+.gr-search input { width: 100%; padding: 6px 8px; }
+.gr-note { padding: 8px 14px; }
+.gr-row { padding: 6px 8px; border-radius: var(--radius); cursor: default; }
+.gr-row:hover { background: var(--row-hover); }
+.gr-row.on { background: var(--accent-soft); }
+.gr-row > div { display: flex; gap: 8px; align-items: baseline; min-width: 0; }
+.gr-row code { flex: none; color: var(--readable-accent-text, var(--accent-text)); font-size: 11px; }
+.gr-row b { flex: none; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.gr-row span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.gr-row small { color: var(--readable-fg-dim, var(--fg-dim)); font-size: 11px; }
+.gr-row.gall b { color: var(--readable-accent-text, var(--accent-text)); }
+.gr-actions { display: flex; gap: 8px; }
+.gr-actions kbd { margin-inline-start: 6px; }

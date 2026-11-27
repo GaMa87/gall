@@ -1,0 +1,78 @@
+# DRAFT Flathub manifest for Gall. Not built or submitted yet: it has not been run through
+# flatpak-builder (not available on the machine it was written on). See "Flathub" in
+# packaging/README.md for the steps that are left (offline sources, runtime version, review).
+#
+# Build locally once the two generated source files exist next to this file:
+#   flatpak-builder --user --install --force-clean build-dir io.github.gama87.Gall.yml
+#
+# App ID: Flathub accepts only IDs for a domain or code host you control, hence
+# io.github.gama87.Gall (Gall's Tauri identifier org.gall.app stays as it is: inside the sandbox it
+# only names data folders). The desktop file, icons and AppStream metadata get this ID below.
+app-id: io.github.gama87.Gall
+runtime: org.gnome.Platform
+# Bump to the GNOME runtime that is current when the manifest is submitted (it brings WebKitGTK 4.1,
+# GTK 3 and GStreamer, which Gall needs).
+runtime-version: '49'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+  - org.freedesktop.Sdk.Extension.node22
+command: gall
+
+finish-args:
+  # Window: Wayland first, X11 as the fallback, GPU for WebKitGTK.
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  # A file manager works on every file of the user. Flathub accepts host access for file managers.
+  - --filesystem=host
+  # Network places and removable media in the sidebar (gvfs, UDisks2).
+  - --filesystem=xdg-run/gvfs
+  - --filesystem=xdg-run/gvfsd
+  - --talk-name=org.gtk.vfs.*
+  - --talk-name=org.freedesktop.UDisks2
+  # "Open with", "Terminal here", editors and Git run on the host: the app starts them with
+  # `flatpak-spawn --host` when /.flatpak-info exists (crates/gall-core/src/util/hostspawn.rs).
+  - --talk-name=org.freedesktop.Flatpak
+  # Git over the network and network shares.
+  - --share=network
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/node22/bin
+  env:
+    # Where the offline sources of cargo-sources.json and node-sources.json are unpacked.
+    CARGO_HOME: /run/build/gall/cargo
+    XDG_CACHE_HOME: /run/build/gall/flatpak-node/cache
+    npm_config_offline: 'true'
+
+modules:
+  - name: gall
+    buildsystem: simple
+    build-commands:
+      # The frontend first: the Rust build embeds it (tauri::generate_context!).
+      - npm ci --offline --no-audit --no-fund --prefix ui
+      - npm --prefix ui run build
+      - cargo --offline build --release --locked -p gall --features tauri/custom-protocol
+
+      - install -Dm755 target/release/gall /app/bin/gall
+
+      # Desktop file, AppStream metadata and icons carry the Flatpak's app ID.
+      - sed -e 's/^Icon=gall$/Icon=io.github.gama87.Gall/' packaging/linux/gall.desktop > io.github.gama87.Gall.desktop
+      - install -Dm644 io.github.gama87.Gall.desktop /app/share/applications/io.github.gama87.Gall.desktop
+      - sed -e 's/org\.gall\.app/io.github.gama87.Gall/g' packaging/linux/org.gall.app.metainfo.xml > io.github.gama87.Gall.metainfo.xml
+      - install -Dm644 io.github.gama87.Gall.metainfo.xml /app/share/metainfo/io.github.gama87.Gall.metainfo.xml
+      - install -Dm644 assets/icon.svg /app/share/icons/hicolor/scalable/apps/io.github.gama87.Gall.svg
+      - for size in 32 64 128; do install -Dm644 "src-tauri/icons/${size}x${size}.png" "/app/share/icons/hicolor/${size}x${size}/apps/io.github.gama87.Gall.png"; done
+      - install -Dm644 LICENSE /app/share/licenses/io.github.gama87.Gall/LICENSE
+      - install -Dm644 THIRD-PARTY-NOTICES.md /app/share/licenses/io.github.gama87.Gall/THIRD-PARTY-NOTICES.md
+
+    sources:
+      # The tagged release (commit of v0.2.2); point it at the release being submitted.
+      - type: git
+        url: https://github.com/GaMa87/gall.git
+        tag: v0.2.2
+        commit: 3b295e1bedad3011a392ef2cfc95d4f3fdc017fe
+      # Generated, not committed (see packaging/README.md, "Flathub"):
+      - cargo-sources.json
+      - node-sources.json

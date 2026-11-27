@@ -10,8 +10,10 @@
 # and checks the packages. It cannot build Windows or macOS: for those, run the Release
 # workflow on GitHub with "dry_run" ticked (see the header of release.yml).
 #
-# Needs podman or docker and network access. First run ~15 minutes; later runs reuse
-# volumes named gall-dryrun-* (remove them with `podman volume rm`).
+# --quick needs no container engine: it lints with a native `actionlint` when there is one (else
+# through podman or docker). The full run needs a working podman or docker and network access.
+# First run ~15 minutes; later runs reuse volumes named gall-dryrun-* (remove them with
+# `podman volume rm`).
 set -euo pipefail
 
 quick=0
@@ -20,12 +22,23 @@ quick=0
 root=$(git rev-parse --show-toplevel)
 cd "$root"
 engine=${CONTAINER_ENGINE:-$(command -v podman || command -v docker || true)}
-[[ -n "$engine" ]] || { echo "podman or docker is required" >&2; exit 1; }
 workflow=.github/workflows/release.yml
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 fail() { echo "DRY RUN FAILED: $*" >&2; exit 1; }
 step() { printf '\n== %s\n' "$*"; }
+
+# A container engine that answers (a docker CLI without a running daemon does not count).
+engine_works() { [[ -n "$engine" ]] && "$engine" info >/dev/null 2>&1; }
+no_engine_msg() {
+  if [[ -z "$engine" ]]; then echo "no podman or docker found"
+  else echo "$engine does not respond (is its daemon or socket running?)"; fi
+}
+# The full run builds in a container: say so now, not after the lint and the speed tests.
+if (( ! quick )) && ! engine_works; then
+  echo "$(no_engine_msg). The full dry run builds in a container: start podman or docker, or use --quick." >&2
+  exit 1
+fi
 
 # The `run:` text of one named step of the workflow, dedented.
 extract() {
@@ -48,12 +61,19 @@ PY
 }
 
 step "Workflow syntax (actionlint)"
-"$engine" run --rm -v "$root":/repo:ro -w /repo --security-opt label=disable \
-  docker.io/rhysd/actionlint:latest -color "$workflow" || fail "actionlint found problems"
+if command -v actionlint >/dev/null 2>&1; then
+  actionlint -color "$workflow" || fail "actionlint found problems"
+elif engine_works; then
+  "$engine" run --rm -v "$root":/repo:ro -w /repo --security-opt label=disable \
+    docker.io/rhysd/actionlint:latest -color "$workflow" || fail "actionlint found problems"
+else
+  fail "actionlint is not installed and $(no_engine_msg). Install actionlint (pacman -S actionlint, brew install actionlint, or go install github.com/rhysd/actionlint/cmd/actionlint@latest) or start podman or docker."
+fi
 
 mkdir -p "$work/steps" "$work/keys"
 extract "Prepare signed updater build" > "$work/steps/prepare.sh"
 extract "Install Tauri system dependencies (Linux)" > "$work/steps/deps.sh"
+extract "Build signed Linux self-update archive" > "$work/steps/linux-update.sh"
 
 # The prepare step on its own, without a container: bad keys must stop it at once, a
 # Windows workspace path must come out with forward slashes only.
@@ -99,6 +119,8 @@ tar --exclude=./target --exclude=./node_modules --exclude=./ui/node_modules --ex
 
 cat > "$work/inside.sh" <<'INSIDE'
 set -euo pipefail
+# Ensure host cleanup of /work succeeds when running under a root Docker daemon.
+trap 'rm -rf /work/src/node_modules /work/src/ui/node_modules /work/src/ui/dist /work/src/dist /work/keys /work/.updater-release.json /work/out.txt 2>/dev/null || true' EXIT
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq curl ca-certificates git build-essential file xz-utils sudo rpm >/dev/null
@@ -126,14 +148,18 @@ echo "building with --config $config"
 rm -rf target/release/bundle
 # Same command tauri-action runs.
 npm run tauri build -- --config "$config"
+bash -e -o pipefail /work/steps/linux-update.sh
 
 b=target/release/bundle
 shopt -s nullglob
-deb=($b/deb/*.deb); rpm=($b/rpm/*.rpm); img=($b/appimage/*.AppImage)
-[[ ${#deb[@]} -eq 1 && ${#rpm[@]} -eq 1 && ${#img[@]} -eq 1 ]] || { echo "missing deb, rpm or AppImage"; exit 1; }
-for f in "${img[0]}" ; do
+deb=($b/deb/*.deb); rpm=($b/rpm/*.rpm); img=($b/appimage/*.AppImage); upd=(dist/*_linux_x86_64_update.tar.gz)
+[[ ${#deb[@]} -eq 1 && ${#rpm[@]} -eq 1 && ${#img[@]} -eq 1 && ${#upd[@]} -eq 1 ]] || { echo "missing deb, rpm, AppImage, or update archive"; exit 1; }
+for f in "${img[0]}" "${upd[0]}"; do
   [[ -s "$f.sig" ]] || { echo "missing signature for $f"; exit 1; }
 done
+entries=$(tar -tzf "${upd[0]}")
+grep -qx 'gall' <<< "$entries" || { echo "update archive missing gall"; exit 1; }
+grep -qx 'gall.sig' <<< "$entries" || { echo "update archive missing gall.sig"; exit 1; }
 # The desktop file must make Gall selectable as the default file manager.
 dpkg-deb -x "${deb[0]}" /tmp/debroot
 desk=$(find /tmp/debroot -name '*.desktop' | head -1)

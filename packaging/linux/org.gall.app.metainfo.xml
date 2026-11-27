@@ -19,14 +19,14 @@
       <li>Dark and light themes, Nerd Font icons and custom CSS themes (Gruvbox and Night Owl included)</li>
     </ul>
   </description>
-  <launchable type="desktop-id">Gall.desktop</launchable>
+  <launchable type="desktop-id">gall.desktop</launchable>
   <url type="homepage">https://github.com/GaMa87/gall</url>
   <url type="bugtracker">https://github.com/GaMa87/gall/issues</url>
   <url type="vcs-browser">https://github.com/GaMa87/gall</url>
   <developer id="io.github.gama87"><name>Gall contributors</name></developer>
   <categories><category>System</category><category>FileManager</category><category>Utility</category></categories>
   <keywords><keyword>file manager</keyword><keyword>miller columns</keyword><keyword>dual pane</keyword><keyword>explorer</keyword><keyword>finder</keyword><keyword>commander</keyword><keyword>search</keyword><keyword>diff</keyword><keyword>compare</keyword><keyword>vim</keyword></keywords>
-  <provides><mediatype>inode/directory</mediatype></provides>
+  <provides><mediatype>inode/directory</mediatype><dbus type="user">org.freedesktop.FileManager1</dbus></provides>
   <content_rating type="oars-1.1" />
   <screenshots>
     <screenshot type="default"><caption>Two browsers with Miller columns</caption><image>https://raw.githubusercontent.com/GaMa87/gall/main/docs/screenshots/main.png</image></screenshot>
@@ -35,5 +35,5 @@
     <screenshot><caption>Every shortcut in one searchable sheet</caption><image>https://raw.githubusercontent.com/GaMa87/gall/main/docs/screenshots/key-sheet.png</image></screenshot>
     <screenshot><caption>Light theme with a thumbnail grid</caption><image>https://raw.githubusercontent.com/GaMa87/gall/main/docs/screenshots/light-grid.png</image></screenshot>
   </screenshots>
-  <releases><release version="0.2.2" date="2026-11-15"/><release version="0.2.1" date="2026-11-11"/><release version="0.2.0" date="2026-11-09"/><release version="0.1.3" date="2026-11-05"/><release version="0.1.2" date="2026-11-04"/><release version="0.1.1" date="2026-11-03"/><release version="0.1.0" date="2026-10-31"/></releases>
+  <releases><release version="0.3.0" date="2026-11-27"/><release version="0.2.2" date="2026-11-15"/><release version="0.2.1" date="2026-11-11"/><release version="0.2.0" date="2026-11-09"/><release version="0.1.3" date="2026-11-05"/><release version="0.1.2" date="2026-11-04"/><release version="0.1.1" date="2026-11-03"/><release version="0.1.0" date="2026-10-31"/></releases>
 </component>

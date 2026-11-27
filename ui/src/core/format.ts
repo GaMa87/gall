@@ -1,4 +1,5 @@
 // Display formatting helpers.
+import { formatLocale } from "../i18n";
 
 const UNITS = ["B", "KB", "MB", "GB", "TB", "PB"];
 
@@ -10,7 +11,9 @@ export function formatSize(bytes: number): string {
     v /= 1024;
     u++;
   }
-  return `${v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v.toFixed(2)} ${UNITS[u]}`;
+  const digits = v >= 100 ? 0 : v >= 10 ? 1 : 2;
+  // The decimal separator follows the language ("1,50 MB" in Slovenian).
+  return `${v.toLocaleString(formatLocale(), { minimumFractionDigits: digits, maximumFractionDigits: digits, useGrouping: false })} ${UNITS[u]}`;
 }
 
 const pad = (n: number) => String(n).padStart(2, "0");

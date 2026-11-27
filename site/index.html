@@ -1,94 +1,834 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Gall file manager – keyboard-first, instant search, compare tool | Linux, Windows, macOS</title>
-<meta name="description" content="Gall is a free, open-source file manager for Linux, Windows and macOS: Miller columns and dual pane, instant search over the whole computer, a compare tool for text, Excel and images, Git status, Vim keys and undo.">
-<meta name="google-site-verification" content="-ALVVCwPtS6J9P0Iv3AP4kx9Nu0lSHXKCzDPmUXh8Ww" />
-<link rel="canonical" href="https://gama87.github.io/gall/">
-<link rel="icon" href="icon.png">
-<meta property="og:type" content="website">
-<meta property="og:title" content="Gall file manager – keyboard-first, instant search, compare tool">
-<meta property="og:description" content="Free and open source. Find any file in milliseconds, search inside every file, compare code, Excel sheets and photos, use Vim keys, undo anything.">
-<meta property="og:url" content="https://gama87.github.io/gall/">
-<meta property="og:image" content="https://gama87.github.io/gall/social-preview.png">
-<meta name="twitter:card" content="summary_large_image">
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org",
-  "@type": "SoftwareApplication",
-  "name": "Gall",
-  "alternateName": "Gall file manager",
-  "applicationCategory": "UtilitiesApplication",
-  "operatingSystem": "Linux, Windows, macOS",
-  "description": "Keyboard-first file manager with Miller columns, dual pane, instant search over the whole computer, a compare tool for text, spreadsheets and images, Git status and Vim keys.",
-  "url": "https://gama87.github.io/gall/",
-  "downloadUrl": "https://github.com/GaMa87/gall/releases/latest",
-  "codeRepository": "https://github.com/GaMa87/gall",
-  "license": "https://opensource.org/licenses/MIT",
-  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "EUR" }
-}
-</script>
-<style>
-:root{color-scheme:dark;--bg:#1e1e2e;--fg:#cdd6f4;--dim:#a6adc8;--accent:#a6e3a1;--card:#313244}
-*{box-sizing:border-box}
-body{margin:0;font:17px/1.6 system-ui,sans-serif;background:var(--bg);color:var(--fg)}
-main{max-width:920px;margin:0 auto;padding:48px 20px}
-h1{font-size:2.4rem;line-height:1.2;margin:.4em 0}
-h2{margin-top:2.2em}
-a{color:var(--accent)}
-.lead{font-size:1.2rem;color:var(--dim)}
-.btn{display:inline-block;background:var(--accent);color:#11111b;padding:12px 22px;border-radius:8px;font-weight:600;text-decoration:none;margin:6px 8px 6px 0}
-.btn.alt{background:var(--card);color:var(--fg)}
-img.shot{width:100%;height:auto;border-radius:10px;margin:18px 0}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}
-.card{background:var(--card);padding:16px 18px;border-radius:10px}
-.card h3{margin:.1em 0 .3em}
-code{background:var(--card);padding:2px 6px;border-radius:4px}
-footer{color:var(--dim);margin-top:3em;font-size:.9rem}
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Gall — Keyboard-first file manager with breadcrumbs, instant search, compare &amp; Git workspace</title>
+  <meta name="description" content="Gall is a free, open-source file manager for Linux, Windows and macOS: clickable breadcrumbs and dual panes, millisecond search across your computer, a compare tool for code, Excel and images, a Git workspace, Vim keys and undo.">
+  <meta name="google-site-verification" content="-ALVVCwPtS6J9P0Iv3AP4kx9Nu0lSHXKCzDPmUXh8Ww">
+  <link rel="canonical" href="https://gama87.github.io/gall/">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="icon" href="icon.png" type="image/png">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Gall — Keyboard-first file manager with breadcrumbs, instant search, compare &amp; Git">
+  <meta property="og:description" content="Free and open source (MIT). Breadcrumbs + dual pane, instant search, code/Excel/image diff, built-in Git workspace, Vim keys and universal undo.">
+  <meta property="og:url" content="https://gama87.github.io/gall/">
+  <meta property="og:image" content="https://gama87.github.io/gall/social-preview.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&family=Space+Grotesk:wght@600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "Gall",
+    "alternateName": "Gall file manager",
+    "applicationCategory": "UtilitiesApplication",
+    "operatingSystem": "Linux, Windows, macOS",
+    "description": "Keyboard-first file manager with breadcrumb navigation, dual panes, Workspaces, instant search over the whole computer, a compare tool for text, spreadsheets and images, a Git workspace and Vim keys.",
+    "url": "https://gama87.github.io/gall/",
+    "downloadUrl": "https://github.com/GaMa87/gall/releases/latest",
+    "codeRepository": "https://github.com/GaMa87/gall",
+    "license": "https://opensource.org/licenses/MIT",
+    "offers": { "@type": "Offer", "price": "0", "priceCurrency": "EUR" }
+  }
+  </script>
 </head>
 <body>
-<main>
-<img src="icon.png" width="80" height="80" alt="Gall icon">
-<h1>Gall – the file manager for keyboard lovers</h1>
-<p class="lead">Gall is a free, open-source file manager for Linux, Windows and macOS. Find any file in milliseconds, search inside every file, compare code, Excel sheets and photos, see Git status, use Vim keys and undo anything.</p>
-<p>
-<a class="btn" href="https://github.com/GaMa87/gall/releases/latest">Download Gall</a>
-<a class="btn alt" href="https://github.com/GaMa87/gall">Source on GitHub</a>
-</p>
-<img class="shot" src="screenshots/main.png" alt="Gall file manager with two browsers, Miller columns and file lists">
+  <a class="skip-link" href="#main">Skip to content</a>
 
-<h2>Why a new file manager?</h2>
-<div class="grid">
-<div class="card"><h3>Instant search</h3><p>Fuzzy search over every file name on the computer as you type, plus ripgrep-powered search inside files.</p></div>
-<div class="card"><h3>Compare anything</h3><p>Text and code, Excel/ODS/CSV cell by cell, images (swipe, onion skin, pixel diff) and whole folders.</p></div>
-<div class="card"><h3>Miller columns + dual pane</h3><p>Finder-style columns and an orthodox two-pane layout in one app, with tabs.</p></div>
-<div class="card"><h3>Vim keys</h3><p>Explorer, Total Commander and Vim profiles, a which-key menu on <code>Space</code>, a searchable sheet of every shortcut on <code>?</code>, chord shortcuts rebindable.</p></div>
-<div class="card"><h3>Made for your desktop</h3><p>Nerd Font icons, dark and light themes, Gruvbox and Night Owl, your own CSS themes. On Windows, browse WSL distributions like drives.</p></div>
-<div class="card"><h3>Git workspace</h3><p>Status letters next to files, a history graph, line-by-line staging and commits, branches, stashes, interactive rebase and a three-way conflict editor, with lazygit-style keys.</p></div>
-<div class="card"><h3>Undo for file operations</h3><p>Copy, move, rename, batch rename, folder merges and delete to trash are undone with <code>Ctrl+Z</code>.</p></div>
-<div class="card"><h3>Previews and archives</h3><p>Syntax-coloured code, rendered Markdown, PDF, images, video and audio next to the list. Zip, 7z and tar archives open like folders.</p></div>
-<div class="card"><h3>Everyday tools</h3><p>Batch rename with templates and regex, folder sizes, colour tags, notes, file templates, Vim folder marks and a system monitor in the sidebar.</p></div>
-</div>
+  <header class="site-header">
+    <div class="wrap nav-bar">
+      <a class="brand" href="#top" aria-label="Gall home">
+        <img src="icon.png" width="30" height="30" alt="">
+        <span>Gall</span>
+        <span class="brand-tag">MIT</span>
+      </a>
 
-<img class="shot" src="screenshots/compare-excel.png" alt="Comparing two Excel files cell by cell in Gall">
+      <nav aria-label="Primary navigation">
+        <ul class="nav-links">
+          <li><a href="#search">Search</a></li>
+          <li><a href="#compare">Compare</a></li>
+          <li><a href="#keyboard">Keys</a></li>
+          <li><a href="#git">Git</a></li>
+          <li><a href="#install">Install</a></li>
+        </ul>
+      </nav>
 
-<h2>Install</h2>
-<ul>
-<li><b>Fedora:</b> <code>sudo dnf copr enable gama87/gall &amp;&amp; sudo dnf install gall</code></li>
-<li><b>Linux, any distribution:</b> AppImage, <code>.deb</code> or <code>.rpm</code> from <a href="https://github.com/GaMa87/gall/releases/latest">GitHub Releases</a></li>
-<li><b>Windows:</b> installer, MSI or a portable zip that runs from a USB stick</li>
-<li><b>macOS:</b> <code>.dmg</code> for Apple silicon and Intel</li>
-</ul>
-<p>Built with Rust, Tauri and React: a small native app without a bundled Chromium. MIT licensed. Gall is an independent, clean-room project.</p>
+      <div class="nav-actions">
+        <button class="icon-btn" id="palette-open" type="button" aria-haspopup="dialog" aria-controls="quick-palette" title="Open shortcut &amp; jump palette (?)">
+          <kbd>?</kbd>
+          <span class="btn-label">Keys</span>
+        </button>
+        <button class="icon-btn" id="theme-toggle" type="button" aria-pressed="false" title="Switch color theme" aria-label="Switch color theme">
+          <svg class="theme-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="4"></circle>
+            <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"></path>
+          </svg>
+          <span class="btn-label" id="theme-toggle-label">Light</span>
+        </button>
+        <a class="btn btn-primary btn-sm" href="https://github.com/GaMa87/gall/releases/latest">Download</a>
+      </div>
+    </div>
+  </header>
 
-<h2>Questions</h2>
-<p>Inside Gall, press <code>?</code> for every shortcut, and see <i>Settings › About</i> for tips &amp; tricks.</p>
-<p>Found a bug or missing a feature? Use <i>Report a bug</i> in Gall's About window, or <a href="https://github.com/GaMa87/gall/issues">open an issue</a>. Read the <a href="https://github.com/GaMa87/gall#readme">full documentation</a>, the <a href="https://github.com/GaMa87/gall#git-workspace">Git workspace guide</a> or the <a href="https://github.com/GaMa87/gall/blob/main/CHANGELOG.md">changelog</a>.</p>
+  <main id="main">
+    <!-- ==================================================================
+         HERO
+         ================================================================== -->
+    <section class="hero" id="top" aria-labelledby="hero-title">
+      <div class="wrap">
+        <div class="hero-grid">
+          <div>
+            <p class="eyebrow">
+              <span class="eyebrow-dot" aria-hidden="true"></span>
+              <span>Linux · Windows · macOS · Rust &amp; Tauri</span>
+            </p>
+            <h1 id="hero-title">
+              The file manager built for the <span class="accent-word">keyboard</span>.
+            </h1>
+          </div>
 
-<footer>Gall file manager · <a href="https://github.com/GaMa87/gall">GaMa87/gall</a> · MIT license</footer>
-</main>
+          <div class="hero-right">
+            <p class="lead">
+              Clickable breadcrumbs and orthodox dual panes in one native app — paired with
+              millisecond whole-disk search, code/Excel/image diff, a built-in Git workspace,
+              and <kbd>Ctrl+Z</kbd> undo for every file operation.
+            </p>
+            <div class="cta-row">
+              <a class="btn btn-primary" href="https://github.com/GaMa87/gall/releases/latest">Download Gall</a>
+              <a class="btn btn-secondary" href="https://github.com/GaMa87/gall">Source on GitHub</a>
+            </div>
+            <ul class="trust-strip" aria-label="Key guarantees">
+              <li>Free &amp; MIT licensed</li>
+              <li>No bundled Chromium</li>
+              <li>Portable Windows ZIP</li>
+              <li>Clean-room Rust core</li>
+            </ul>
+          </div>
+        </div>
+
+        <!-- Hero Interactive Layout Stage -->
+        <div class="stage-shell" data-tabs="hero">
+          <div class="stage-toolbar">
+            <div class="stage-path">
+              <span class="stage-dots" aria-hidden="true"><span></span><span></span><span></span></span>
+              <span data-stage-path>~/Pictures/Iceland — Dual Pane &amp; Breadcrumbs</span>
+            </div>
+            <div class="seg-tabs" role="tablist" aria-label="Workspace layout views">
+              <button
+                class="seg-tab"
+                type="button"
+                role="tab"
+                id="tab-hero-dual"
+                aria-selected="true"
+                aria-controls="panel-hero-dual"
+                data-path="~/Pictures/Iceland — Dual Pane &amp; Breadcrumbs"
+                data-caption="<strong>Dual pane + interactive breadcrumbs.</strong> Click any path segment to jump or drop files straight onto it, group files by type, track Git status inline and monitor system telemetry."
+                data-hint="Toggle layout <kbd>Ctrl+Shift+L</kbd>">
+                Dual Dark
+              </button>
+              <button
+                class="seg-tab"
+                type="button"
+                role="tab"
+                id="tab-hero-stacked"
+                aria-selected="false"
+                tabindex="-1"
+                aria-controls="panel-hero-stacked"
+                data-path="~/Projects/website — Stacked Dual Pane"
+                data-caption="<strong>Stacked dual browsers with breadcrumbs.</strong> Long paths and wide detail columns stay readable across the full window width."
+                data-hint="Edit path <kbd>Ctrl+L</kbd>">
+                Stacked
+              </button>
+              <button
+                class="seg-tab"
+                type="button"
+                role="tab"
+                id="tab-hero-light"
+                aria-selected="false"
+                tabindex="-1"
+                aria-controls="panel-hero-light"
+                data-path="~/Pictures/Iceland — Light Theme Thumbnail Grid"
+                data-caption="<strong>Light theme &amp; thumbnail grid.</strong> Built-in dark, light, Gruvbox, Night Owl and live-reloaded custom CSS themes."
+                data-hint="Resize thumbnails <kbd>Ctrl+Wheel</kbd>">
+                Light Grid
+              </button>
+            </div>
+          </div>
+
+          <div class="stage-viewport">
+            <figure class="stage-panel is-active" id="panel-hero-dual" role="tabpanel" aria-labelledby="tab-hero-dual">
+              <img
+                src="screenshots/main.png"
+                width="1600"
+                height="1000"
+                fetchpriority="high"
+                decoding="async"
+                alt="Gall file manager showing dual browsers with breadcrumb bars, grouped file lists, inline Git status, Workspaces, and the sidebar system monitor in dark mode">
+            </figure>
+            <figure class="stage-panel" id="panel-hero-stacked" role="tabpanel" aria-labelledby="tab-hero-stacked" aria-hidden="true">
+              <img
+                src="screenshots/stacked.png"
+                width="1600"
+                height="1000"
+                loading="lazy"
+                decoding="async"
+                alt="Gall file manager in stacked dual-browser layout with breadcrumb bars">
+            </figure>
+            <figure class="stage-panel" id="panel-hero-light" role="tabpanel" aria-labelledby="tab-hero-light" aria-hidden="true">
+              <img
+                src="screenshots/light-grid.png"
+                width="1600"
+                height="1000"
+                loading="lazy"
+                decoding="async"
+                alt="Gall file manager in light theme with breadcrumb bars, thumbnail grid view on the left and grouped details list on the right">
+            </figure>
+          </div>
+
+          <div class="stage-caption-bar">
+            <span data-stage-caption><strong>Dual pane + interactive breadcrumbs.</strong> Click any path segment to jump or drop files straight onto it, group files by type, track Git status inline and monitor system telemetry.</span>
+            <span class="stage-hint" data-stage-hint>Toggle layout <kbd>Ctrl+Shift+L</kbd></span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================================================================
+         01 / SEARCH & MOTION REEL
+         ================================================================== -->
+    <section class="band" id="search" aria-labelledby="search-title">
+      <div class="wrap">
+        <div class="band-header" data-reveal>
+          <div>
+            <p class="section-index">01 / Instant Search &amp; Flow</p>
+            <h2 id="search-title">Find any file or line before your hand leaves home row.</h2>
+          </div>
+          <p class="section-intro">
+            A parallel Rust index answers fuzzy queries over hundreds of thousands of paths in milliseconds,
+            while ripgrep streams content matches with live previews — skipping build noise via
+            <code>.gitignore</code> and <code>.gallignore</code>.
+          </p>
+        </div>
+
+        <div class="reel-layout" data-tabs="reel" data-reveal>
+          <div class="reel-list" role="tablist" aria-label="Workflow recordings">
+            <button
+              class="reel-item"
+              type="button"
+              role="tab"
+              id="tab-reel-quickopen"
+              aria-selected="true"
+              aria-controls="panel-reel-quickopen"
+              data-path="Quick Open — 360,000 indexed paths"
+              data-caption="<strong>Quick Open.</strong> Fuzzy fzf-style filters (<code>ext:jpg</code>, <code>'exact</code>, <code>!not</code>) with instant live preview. Press <kbd>Tab</kbd> to widen from folder to everywhere."
+              data-hint="<kbd>Ctrl+P</kbd> or <kbd>Space</kbd> <kbd>Space</kbd>">
+              <span class="reel-item-head">
+                <span class="reel-item-title">Quick Open across the disk</span>
+                <kbd>Ctrl+P</kbd>
+              </span>
+              <p>Searches the open folder first, widens to the whole machine on Tab, and unlocks ignored files on Alt+I.</p>
+            </button>
+
+            <button
+              class="reel-item"
+              type="button"
+              role="tab"
+              id="tab-reel-grep"
+              aria-selected="false"
+              tabindex="-1"
+              aria-controls="panel-reel-grep"
+              data-path="Find in Files — ripgrep engine"
+              data-caption="<strong>Find text inside files.</strong> Results stream grouped by file with match previews, regex, whole-word and scope switching (folder, home, whole drive)."
+              data-hint="<kbd>Ctrl+F</kbd> / <kbd>Ctrl+Shift+F</kbd>">
+              <span class="reel-item-head">
+                <span class="reel-item-title">Ripgrep content search</span>
+                <kbd>Ctrl+F</kbd>
+              </span>
+              <p>Find any symbol, variable, or sentence across thousands of files without touching a terminal.</p>
+            </button>
+
+            <button
+              class="reel-item"
+              type="button"
+              role="tab"
+              id="tab-reel-vim"
+              aria-selected="false"
+              tabindex="-1"
+              aria-controls="panel-reel-vim"
+              data-path="Vim Navigation — j k l h &amp; marks"
+              data-caption="<strong>Native Vim navigation.</strong> Move with <code>j</code>/<code>k</code>, climb or enter with <code>h</code>/<code>l</code>, jump with <code>gg</code>/<code>G</code>, and bookmark folders with persistent marks (<code>m a</code>, <code>' a</code>)."
+              data-hint="<kbd>j</kbd> <kbd>k</kbd> <kbd>h</kbd> <kbd>l</kbd>">
+              <span class="reel-item-head">
+                <span class="reel-item-title">Vim motions &amp; folder marks</span>
+                <kbd>j k l h</kbd>
+              </span>
+              <p>Move effortlessly through folder trees, filter inline with <code>/</code>, yank/cut/paste with <code>yy</code> <code>dd</code> <code>p</code>.</p>
+            </button>
+
+            <button
+              class="reel-item"
+              type="button"
+              role="tab"
+              id="tab-reel-whichkey"
+              aria-selected="false"
+              tabindex="-1"
+              aria-controls="panel-reel-whichkey"
+              data-path="Which-Key Command Menu"
+              data-caption="<strong>Discoverable command groups.</strong> Press <kbd>Space</kbd> in Vim mode (or double-tap <kbd>Ctrl</kbd> in Explorer/Commander) to see every grouped action."
+              data-hint="<kbd>Space</kbd> / <kbd>Ctrl</kbd> <kbd>Ctrl</kbd>">
+              <span class="reel-item-head">
+                <span class="reel-item-title">LazyVim-style which-key</span>
+                <kbd>Space</kbd>
+              </span>
+              <p>Never memorize 80 chords: every prefix reveals its next keys cleanly in context.</p>
+            </button>
+          </div>
+
+          <div class="stage-shell">
+            <div class="stage-toolbar">
+              <div class="stage-path">
+                <span class="stage-dots" aria-hidden="true"><span></span><span></span><span></span></span>
+                <span data-stage-path>Quick Open — 360,000 indexed paths</span>
+              </div>
+              <span class="stage-hint" data-stage-hint><kbd>Ctrl+P</kbd> or <kbd>Space</kbd> <kbd>Space</kbd></span>
+            </div>
+
+            <div class="stage-viewport">
+              <figure class="stage-panel is-active" id="panel-reel-quickopen" role="tabpanel" aria-labelledby="tab-reel-quickopen">
+                <img
+                  src="screenshots/quick-open.gif"
+                  width="1000"
+                  height="625"
+                  loading="lazy"
+                  decoding="async"
+                  alt="Animated recording of Quick Open finding a photo among 360,000 indexed paths in 33 milliseconds">
+              </figure>
+              <figure class="stage-panel" id="panel-reel-grep" role="tabpanel" aria-labelledby="tab-reel-grep" aria-hidden="true">
+                <img
+                  data-src="screenshots/find-in-files.gif"
+                  src="screenshots/main.png"
+                  width="1000"
+                  height="625"
+                  loading="lazy"
+                  decoding="async"
+                  alt="Animated recording of Find in Files searching thousands of source files with live match previews">
+              </figure>
+              <figure class="stage-panel" id="panel-reel-vim" role="tabpanel" aria-labelledby="tab-reel-vim" aria-hidden="true">
+                <img
+                  data-src="screenshots/vim.gif"
+                  src="screenshots/main.png"
+                  width="1000"
+                  height="625"
+                  loading="lazy"
+                  decoding="async"
+                  alt="Animated recording of navigating folders rapidly with Vim keys j, k, l and h">
+              </figure>
+              <figure class="stage-panel" id="panel-reel-whichkey" role="tabpanel" aria-labelledby="tab-reel-whichkey" aria-hidden="true">
+                <img
+                  data-src="screenshots/which-key.gif"
+                  src="screenshots/main.png"
+                  width="1000"
+                  height="625"
+                  loading="lazy"
+                  decoding="async"
+                  alt="Animated recording of pressing Space to open Gall's grouped which-key command menu">
+              </figure>
+            </div>
+
+            <div class="stage-caption-bar">
+              <span data-stage-caption><strong>Quick Open.</strong> Fuzzy fzf-style filters (<code>ext:jpg</code>, <code>'exact</code>, <code>!not</code>) with instant live preview. Press <kbd>Tab</kbd> to widen from folder to everywhere.</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================================================================
+         02 / COMPARE LAB
+         ================================================================== -->
+    <section class="band" id="compare" aria-labelledby="compare-title">
+      <div class="wrap">
+        <div class="band-header" data-reveal>
+          <div>
+            <p class="section-index">02 / Built-In Compare</p>
+            <h2 id="compare-title">Compare code, Excel, images, and folders in one keystroke.</h2>
+          </div>
+          <p class="section-intro">
+            Select two files and press <kbd>Ctrl+Shift+D</kbd> (or <kbd>=</kbd> <kbd>=</kbd> in Vim),
+            drop one file onto another, or compare directly against any Git commit (<kbd>=</kbd> <kbd>g</kbd>)
+            or your clipboard.
+          </p>
+        </div>
+
+        <div class="stage-shell" data-tabs="compare" data-reveal>
+          <div class="stage-toolbar">
+            <div class="stage-path">
+              <span class="stage-dots" aria-hidden="true"><span></span><span></span><span></span></span>
+              <span data-stage-path>index.old.html ⇄ index.html — Structural Code Diff</span>
+            </div>
+            <div class="seg-tabs" role="tablist" aria-label="Compare modes">
+              <button
+                class="seg-tab"
+                type="button"
+                role="tab"
+                id="tab-cmp-code"
+                aria-selected="true"
+                aria-controls="panel-cmp-code"
+                data-path="index.old.html ⇄ index.html — Structural Code Diff"
+                data-caption="<strong>Token-aware code &amp; text diff.</strong> Reformatting stays dimmed while real logic changes stand out. Edit, copy hunks across (<kbd>Alt+→</kbd>) and save inline."
+                data-hint="Next change <kbd>n</kbd> / <kbd>N</kbd> · Unified <kbd>u</kbd>">
+                Code &amp; Text
+              </button>
+              <button
+                class="seg-tab"
+                type="button"
+                role="tab"
+                id="tab-cmp-excel"
+                aria-selected="false"
+                tabindex="-1"
+                aria-controls="panel-cmp-excel"
+                data-path="Budget 2025.xlsx ⇄ Budget 2026.xlsx — Cell-by-Cell"
+                data-caption="<strong>Excel, ODS &amp; CSV cell by cell.</strong> Automatically detects key columns to align moved rows and flags every added, removed or edited cell."
+                data-hint="Filter changes only · Match by key column">
+                Excel &amp; CSV
+              </button>
+              <button
+                class="seg-tab"
+                type="button"
+                role="tab"
+                id="tab-cmp-image"
+                aria-selected="false"
+                tabindex="-1"
+                aria-controls="panel-cmp-image"
+                data-path="Aurora.jpg ⇄ Aurora (edited).jpg — Image Swipe"
+                data-caption="<strong>Image diff four ways.</strong> Inspect visual edits side by side, with a draggable swipe divider, onion skin overlay, or pixel-difference percentage."
+                data-hint="Switch modes <kbd>1</kbd>–<kbd>4</kbd>">
+                Images
+              </button>
+            </div>
+          </div>
+
+          <div class="stage-viewport">
+            <figure class="stage-panel is-active" id="panel-cmp-code" role="tabpanel" aria-labelledby="tab-cmp-code">
+              <img
+                src="screenshots/compare-text.png"
+                width="1600"
+                height="1000"
+                loading="lazy"
+                decoding="async"
+                alt="Side-by-side HTML code comparison in Gall showing syntax colouring and word-level changes">
+            </figure>
+            <figure class="stage-panel" id="panel-cmp-excel" role="tabpanel" aria-labelledby="tab-cmp-excel" aria-hidden="true">
+              <img
+                src="screenshots/compare-excel.png"
+                width="1600"
+                height="1000"
+                loading="lazy"
+                decoding="async"
+                alt="Comparing two Excel spreadsheets cell by cell in Gall with key-column row matching">
+            </figure>
+            <figure class="stage-panel" id="panel-cmp-image" role="tabpanel" aria-labelledby="tab-cmp-image" aria-hidden="true">
+              <img
+                src="screenshots/compare-image.png"
+                width="1600"
+                height="1000"
+                loading="lazy"
+                decoding="async"
+                alt="Image comparison in Gall using the interactive swipe divider mode">
+            </figure>
+          </div>
+
+          <div class="stage-caption-bar">
+            <span data-stage-caption><strong>Token-aware code &amp; text diff.</strong> Reformatting stays dimmed while real logic changes stand out. Edit, copy hunks across (<kbd>Alt+→</kbd>) and save inline.</span>
+            <span class="stage-hint" data-stage-hint>Next change <kbd>n</kbd> / <kbd>N</kbd> · Unified <kbd>u</kbd></span>
+          </div>
+        </div>
+
+        <div class="compare-rail" data-reveal>
+          <div class="rail-cell">
+            <div class="rail-tag">Folders &amp; Matrix</div>
+            <h3>Sync whole directories</h3>
+            <p>Compare folder trees, mirror or copy selective rows with preview and undo, or select many files to spot the odd one out in a similarity matrix.</p>
+          </div>
+          <div class="rail-cell">
+            <div class="rail-tag">Documents &amp; Binary</div>
+            <h3>PDF, DOCX &amp; Hex compare</h3>
+            <p>Positioned document comparison for <code>.pdf</code> and <code>.docx</code> pairs, plus a chunked hex compare that jumps straight between changed bytes.</p>
+          </div>
+          <div class="rail-cell">
+            <div class="rail-tag">CLI &amp; Git Integration</div>
+            <h3>Works as your external diff tool</h3>
+            <p>Invoke <code>gall diff --wait</code> or <code>gall merge</code> from Git and scripts, export HTML/PDF reports, or apply <code>.patch</code> files directly.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================================================================
+         03 / KEYBOARD CRAFT & HONEST INTERACTIONS
+         ================================================================== -->
+    <section class="band" id="keyboard" aria-labelledby="keyboard-title">
+      <div class="wrap">
+        <div class="band-header" data-reveal>
+          <div>
+            <p class="section-index">03 / Keyboard &amp; Ergonomics</p>
+            <h2 id="keyboard-title">Familiar muscle memory, zero guesswork.</h2>
+          </div>
+          <p class="section-intro">
+            Start with Windows Explorer, Total Commander, or Vim profiles — every chord is rebindable,
+            <kbd>?</kbd> opens a searchable reference, and mouse interactions stay equally clear.
+          </p>
+        </div>
+
+        <div class="editorial-split" data-reveal>
+          <figure class="figure-card">
+            <div class="figure-media">
+              <img
+                src="screenshots/key-sheet.png"
+                width="1600"
+                height="1000"
+                loading="lazy"
+                decoding="async"
+                alt="Gall searchable keyboard shortcut reference sheet opened with the ? key">
+            </div>
+            <div class="figure-body">
+              <h3>Searchable shortcut sheet on <kbd>?</kbd></h3>
+              <p>Shows only the keys active in your current profile and panel, with explicit notation for held chords vs. sequential presses.</p>
+              <table class="profile-matrix" aria-label="Function keys across keyboard profiles">
+                <thead>
+                  <tr>
+                    <th scope="col">Key</th>
+                    <th scope="col">Explorer</th>
+                    <th scope="col">Commander</th>
+                    <th scope="col">Vim</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>F2</td>
+                    <td>Rename</td>
+                    <td>Refresh</td>
+                    <td>Rename</td>
+                  </tr>
+                  <tr>
+                    <td>F3</td>
+                    <td>Name search</td>
+                    <td>Preview</td>
+                    <td>Name search</td>
+                  </tr>
+                  <tr>
+                    <td>F5 / F6</td>
+                    <td>Refresh / Pane</td>
+                    <td>Copy / Move</td>
+                    <td>Refresh / Move</td>
+                  </tr>
+                  <tr>
+                    <td>Leader</td>
+                    <td>Ctrl → Ctrl</td>
+                    <td>Ctrl → Ctrl</td>
+                    <td>Space</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </figure>
+
+          <div class="side-stack">
+            <div class="monitor-module">
+              <div class="monitor-shot">
+                <img
+                  src="screenshots/system-monitor.png"
+                  width="345"
+                  height="408"
+                  loading="lazy"
+                  decoding="async"
+                  alt="Gall sidebar system monitor showing CPU, GPU, and memory rings with temperatures and network/disk throughput">
+              </div>
+              <div class="monitor-copy">
+                <h3>Machine telemetry in the sidebar</h3>
+                <p>CPU, GPU/VRAM, and memory rings with live temperatures, plus expandable network and disk throughput alongside drive capacity bars. Collapses cleanly when space is tight.</p>
+              </div>
+            </div>
+
+            <figure class="figure-card">
+              <div class="figure-media">
+                <img
+                  src="screenshots/drag.png"
+                  width="1600"
+                  height="1000"
+                  loading="lazy"
+                  decoding="async"
+                  alt="Gall drag and drop badge clearly stating Move to assets with Ctrl to copy and Alt to link">
+              </div>
+              <div class="figure-body">
+                <h3>Honest drag &amp; drop, universal <kbd>Ctrl+Z</kbd> undo</h3>
+                <p>Every drag shows an explicit action badge before you release. Copy, move, rename, batch regex rename, folder merge, extract, and delete-to-trash all reverse cleanly with <kbd>Ctrl+Z</kbd>.</p>
+              </div>
+            </figure>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================================================================
+         04 / GIT WORKSPACE & CORE ARCHITECTURE
+         ================================================================== -->
+    <section class="band" id="git" aria-labelledby="git-title">
+      <div class="wrap">
+        <div class="band-header" data-reveal>
+          <div>
+            <p class="section-index">04 / Git Workspace &amp; Architecture</p>
+            <h2 id="git-title">A full Git workspace and native desktop toolkit inside your file manager.</h2>
+          </div>
+          <p class="section-intro">
+            Press <kbd>g</kbd> <kbd>r</kbd> or click the status bar to open your repository:
+            inspect history, stage single lines, rebase interactively, and manage worktrees
+            without touching files until you ask.
+          </p>
+        </div>
+
+        <div class="stage-shell" style="margin-bottom: 36px;" data-reveal>
+          <div class="stage-toolbar">
+            <div class="stage-path">
+              <span class="stage-dots" aria-hidden="true"><span></span><span></span><span></span></span>
+              <span>Git workspace — website (main · commit graph, branches &amp; details)</span>
+            </div>
+            <span class="stage-hint">Open workspace <kbd>g</kbd> <kbd>r</kbd></span>
+          </div>
+          <div class="stage-viewport">
+            <figure class="stage-panel is-active">
+              <img
+                src="screenshots/git-workspace.png"
+                width="1600"
+                height="1000"
+                loading="lazy"
+                decoding="async"
+                alt="Gall Git workspace showing the commit graph, branches, tags, Working Changes row, commit details, and lazygit-style shortcut bar">
+            </figure>
+          </div>
+          <div class="stage-caption-bar">
+            <span><strong>Git workspace built right in.</strong> Commit graph, branch/tag/stash sidebar, diff/file/history/blame tabs, and contextual lazygit-style shortcuts.</span>
+            <span class="stage-hint"><kbd>?</kbd> Panel keys</span>
+          </div>
+        </div>
+
+        <div class="spec-grid" data-reveal>
+          <article class="spec-row">
+            <div class="spec-meta">
+              <span class="spec-label">Git Workspace</span>
+              <a href="https://github.com/GaMa87/gall#git-workspace">Full Git guide →</a>
+            </div>
+            <h3>Graph, line staging, rebase &amp; three-way merge</h3>
+            <p>Browse up to 20,000 commits, inspect rename-aware file history and blame, stage individual lines or hunks, rewrite commits (reword, squash, fixup, drop, interactive rebase), forecast branch conflicts, and resolve merges in a three-way editor — with lazygit-style keys or menus.</p>
+            <div class="spec-keys">
+              <span><kbd>g</kbd><kbd>r</kbd> Open repo</span>
+              <span><kbd>Ctrl+Alt+W</kbd> Worktrees</span>
+              <span><kbd>u</kbd> Undo Git op</span>
+            </div>
+          </article>
+
+          <article class="spec-row">
+            <div class="spec-meta">
+              <span class="spec-label">Workspaces &amp; Tab Pairs</span>
+            </div>
+            <h3>Structured multi-project flow</h3>
+            <p>Organize numbered Workspaces (<kbd>Alt+1..9</kbd>) with Drop Portals, link dual tabs in Tandem or Flow pipelines, and browse archives (<code>zip</code>, <code>7z</code>, <code>tar.gz/xz/zst</code>) like regular folders.</p>
+            <div class="spec-keys">
+              <span><kbd>Ctrl+T</kbd> New tab</span>
+              <span><kbd>Ctrl+Shift+T</kbd> Reopen</span>
+              <span><kbd>Alt+P</kbd> Preview pane</span>
+            </div>
+          </article>
+
+          <article class="spec-row">
+            <div class="spec-meta">
+              <span class="spec-label">Previews &amp; Batch Tools</span>
+            </div>
+            <h3>Inspect and transform without extra apps</h3>
+            <p>Syntax-highlighted code, rendered Markdown, PDF, images with cursor zoom, video/audio with frame stepping, and interactive 3D STL models. Batch rename with templates and regex, calculate folder sizes, add colour tags, and take <code>.2do</code> folder notes.</p>
+            <div class="spec-keys">
+              <span><kbd>F2</kbd> Batch rename</span>
+              <span><kbd>Ctrl+Alt+S</kbd> Folder sizes</span>
+              <span><kbd>F10</kbd> Terminal here</span>
+            </div>
+          </article>
+
+          <article class="spec-row">
+            <div class="spec-meta">
+              <span class="spec-label">Platform Native</span>
+            </div>
+            <h3>Linux, Windows &amp; macOS — built to belong</h3>
+            <p>Browse WSL distributions like drives on Windows, use <code>xdg-desktop-portal-gall</code> as your Linux Open/Save dialog, rely on APFS copy-on-write and Finder clipboard interop on macOS, and script workflows with <code>gall search</code> / <code>gall grep --json</code>.</p>
+            <div class="spec-keys">
+              <span>Nerd Font &amp; Catppuccin icons</span>
+              <span aria-hidden="true">·</span>
+              <span>Gruvbox, Night Owl &amp; custom CSS</span>
+            </div>
+          </article>
+        </div>
+
+        <div class="arch-strip" data-reveal>
+          <div class="arch-diagram" aria-label="Gall architecture diagram">
+            <span class="arch-node">React + TypeScript UI</span>
+            <span class="arch-arrow" aria-hidden="true">── typed IPC ──▶</span>
+            <span class="arch-node">Tauri v2 Shell</span>
+            <span class="arch-arrow" aria-hidden="true">──▶</span>
+            <span class="arch-node is-core">gall-core (pure Rust)</span>
+          </div>
+          <a href="https://github.com/GaMa87/gall/blob/main/docs/03-architecture.md">Read architecture docs →</a>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================================================================
+         05 / INSTALL
+         ================================================================== -->
+    <section class="band" id="install" aria-labelledby="install-title">
+      <div class="wrap">
+        <div class="band-header" data-reveal>
+          <div>
+            <p class="section-index">05 / Install</p>
+            <h2 id="install-title">Up and running in seconds.</h2>
+          </div>
+          <p class="section-intro">
+            Prebuilt packages for Linux, Windows, and macOS — with signed background updates
+            and a zero-install portable ZIP for Windows.
+          </p>
+        </div>
+
+        <div class="install-shell" data-reveal>
+          <div class="install-box" data-tabs="install">
+            <div class="install-tabs" role="tablist" aria-label="Operating system install instructions">
+              <button class="install-tab" type="button" role="tab" id="tab-os-fedora" aria-selected="true" aria-controls="panel-os-fedora" data-os="fedora">Fedora COPR</button>
+              <button class="install-tab" type="button" role="tab" id="tab-os-linux" aria-selected="false" tabindex="-1" aria-controls="panel-os-linux" data-os="linux">Linux</button>
+              <button class="install-tab" type="button" role="tab" id="tab-os-windows" aria-selected="false" tabindex="-1" aria-controls="panel-os-windows" data-os="windows">Windows</button>
+              <button class="install-tab" type="button" role="tab" id="tab-os-macos" aria-selected="false" tabindex="-1" aria-controls="panel-os-macos" data-os="macos">macOS</button>
+            </div>
+
+            <div class="install-panel" id="panel-os-fedora" role="tabpanel" aria-labelledby="tab-os-fedora">
+              <h3>Install via Fedora COPR</h3>
+              <p>Tracks releases automatically and registers Gall as a system file manager (so <code>Meta+E</code> can launch Gall on Plasma).</p>
+              <div class="cmd-block">
+                <code>sudo dnf copr enable gama87/gall &amp;&amp; sudo dnf install gall</code>
+                <button class="copy-btn" type="button" data-copy="sudo dnf copr enable gama87/gall && sudo dnf install gall">Copy</button>
+              </div>
+              <p class="install-note">Also available as standalone <code>.rpm</code>, <code>.deb</code>, and <code>AppImage</code> packages on <a href="https://github.com/GaMa87/gall/releases/latest">GitHub Releases</a>.</p>
+            </div>
+
+            <div class="install-panel" id="panel-os-linux" role="tabpanel" aria-labelledby="tab-os-linux" hidden>
+              <h3>Any Linux distribution</h3>
+              <p>Download the <code>AppImage</code>, <code>.deb</code> (Debian, Ubuntu, Mint), or <code>.rpm</code> (Fedora, openSUSE) from GitHub Releases.</p>
+              <div class="cmd-block">
+                <code>chmod +x Gall_*.AppImage &amp;&amp; ./Gall_*.AppImage</code>
+                <button class="copy-btn" type="button" data-copy="chmod +x Gall_*.AppImage && ./Gall_*.AppImage">Copy</button>
+              </div>
+              <p class="install-note">Debian/Ubuntu: <code>sudo apt install ./Gall_*.deb</code> · Fedora/openSUSE: <code>sudo dnf install ./Gall-*.rpm</code>. Optional <code>xdg-desktop-portal-gall</code> FileChooser backend included in packaging.</p>
+            </div>
+
+            <div class="install-panel" id="panel-os-windows" role="tabpanel" aria-labelledby="tab-os-windows" hidden>
+              <h3>Windows 10 / 11 (Installer, MSI, or Portable ZIP)</h3>
+              <p>Choose the setup <code>.exe</code> / <code>.msi</code> installer, or unzip the portable build anywhere and run <code>gall.exe</code>.</p>
+              <div class="cmd-block">
+                <code>Gall-&lt;version&gt;-windows-x64-portable.zip</code>
+                <a class="copy-btn" style="text-decoration:none;display:inline-flex;align-items:center;" href="https://github.com/GaMa87/gall/releases/latest">Releases →</a>
+              </div>
+              <p class="install-note">USB-ready: create an empty file named <code>portable</code> next to <code>gall.exe</code> to keep all settings, cache and logs in <code>./UserData</code> beside it. WSL distributions appear directly in the Drives sidebar.</p>
+            </div>
+
+            <div class="install-panel" id="panel-os-macos" role="tabpanel" aria-labelledby="tab-os-macos" hidden>
+              <h3>macOS (Apple silicon &amp; Intel)</h3>
+              <p>Download <code>Gall_&lt;version&gt;_aarch64.dmg</code> (Apple silicon) or <code>_x64.dmg</code> (Intel), open it, and drag Gall to Applications.</p>
+              <div class="cmd-block">
+                <code>open -a Gall ~/Projects</code>
+                <button class="copy-btn" type="button" data-copy="open -a Gall ~/Projects">Copy</button>
+              </div>
+              <p class="install-note">Note: macOS builds are not notarised yet — if macOS blocks first launch, allow it in <em>System Settings › Privacy &amp; Security › Open Anyway</em>.</p>
+            </div>
+          </div>
+
+          <aside class="install-aside" aria-label="Download and documentation links">
+            <h3>Get the latest release</h3>
+            <p>Signed updates check in the background and restart straight into new versions. Full source, issue tracker, and documentation live on GitHub.</p>
+            <a class="btn btn-primary" href="https://github.com/GaMa87/gall/releases/latest">Download from GitHub</a>
+            <div class="aside-links">
+              <a href="https://github.com/GaMa87/gall#readme">Full documentation &amp; CLI usage →</a>
+              <a href="https://github.com/GaMa87/gall#git-workspace">Git workspace guide →</a>
+              <a href="https://github.com/GaMa87/gall/blob/main/CHANGELOG.md">Release changelog →</a>
+              <a href="https://github.com/GaMa87/gall/issues">Report a bug or request a feature →</a>
+            </div>
+          </aside>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap">
+      <div class="footer-grid">
+        <a class="brand" href="#top">
+          <img src="icon.png" width="26" height="26" alt="">
+          <span>Gall file manager</span>
+        </a>
+        <ul class="footer-links">
+          <li><a href="https://github.com/GaMa87/gall">GitHub</a></li>
+          <li><a href="https://github.com/GaMa87/gall/releases/latest">Releases</a></li>
+          <li><a href="https://github.com/GaMa87/gall/blob/main/CHANGELOG.md">Changelog</a></li>
+          <li><a href="https://github.com/GaMa87/gall/blob/main/docs/00-clean-room-policy.md">Clean-room policy</a></li>
+          <li><a href="https://github.com/GaMa87/gall/blob/main/LICENSE">MIT License</a></li>
+          <li><a href="https://revolut.me/gama87">Support Gall</a></li>
+        </ul>
+      </div>
+      <p class="footer-legal">
+        MIT licensed · Built with Rust, Tauri and React. Gall is an independent, clean-room project inspired by orthodox dual-pane file managers, containing no third-party proprietary code or assets. Inside Gall, press <kbd>?</kbd> for every shortcut.
+      </p>
+    </div>
+  </footer>
+
+  <!-- Signature Interactive Modal: Quick Jump & Shortcut Reference (? key) -->
+  <div class="palette-backdrop" id="quick-palette" role="dialog" aria-modal="true" aria-labelledby="palette-title" hidden>
+    <div class="palette-dialog">
+      <div class="palette-head">
+        <h2 id="palette-title">Quick Jump &amp; Gall Shortcuts</h2>
+        <button class="icon-btn" id="palette-close" type="button" aria-label="Close shortcut palette">
+          <kbd>Esc</kbd>
+        </button>
+      </div>
+
+      <div class="palette-section">
+        <p class="palette-section-title">Navigate this page</p>
+        <ul class="palette-list">
+          <li><a class="palette-action" href="#search" data-palette-jump><span>01 · Instant Search &amp; Motion Reel</span><span class="palette-keys">#search</span></a></li>
+          <li><a class="palette-action" href="#compare" data-palette-jump><span>02 · Built-in Compare Lab</span><span class="palette-keys">#compare</span></a></li>
+          <li><a class="palette-action" href="#keyboard" data-palette-jump><span>03 · Keyboard Profiles &amp; Sidebar Monitor</span><span class="palette-keys">#keyboard</span></a></li>
+          <li><a class="palette-action" href="#git" data-palette-jump><span>04 · Git Workspace &amp; Architecture</span><span class="palette-keys">#git</span></a></li>
+          <li><a class="palette-action" href="#install" data-palette-jump><span>05 · Install Packages</span><span class="palette-keys">#install</span></a></li>
+          <li>
+            <button class="palette-action" type="button" data-palette-theme>
+              <span>Toggle Dark / Light page theme</span>
+              <span class="palette-keys">Theme</span>
+            </button>
+          </li>
+        </ul>
+      </div>
+
+      <div class="palette-section">
+        <p class="palette-section-title">Signature shortcuts inside Gall</p>
+        <ul class="palette-list">
+          <li class="palette-action" style="cursor:default"><span>Quick Open (folder → everywhere on Tab)</span><span class="palette-keys"><kbd>Ctrl+P</kbd></span></li>
+          <li class="palette-action" style="cursor:default"><span>Find text inside files (ripgrep)</span><span class="palette-keys"><kbd>Ctrl+F</kbd></span></li>
+          <li class="palette-action" style="cursor:default"><span>Compare two selected files</span><span class="palette-keys"><kbd>Ctrl+Shift+D</kbd></span></li>
+          <li class="palette-action" style="cursor:default"><span>Open Git workspace (Vim)</span><span class="palette-keys"><kbd>g</kbd><kbd>r</kbd></span></li>
+          <li class="palette-action" style="cursor:default"><span>Undo last file operation</span><span class="palette-keys"><kbd>Ctrl+Z</kbd></span></li>
+          <li class="palette-action" style="cursor:default"><span>Full searchable shortcut sheet</span><span class="palette-keys"><kbd>?</kbd></span></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js" defer></script>
 </body>
 </html>

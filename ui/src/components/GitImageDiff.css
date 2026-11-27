@@ -1,0 +1,8 @@
+.gid { display: flex; flex-direction: column; flex: 1; min-height: 220px; height: 100%; }
+.gid-sizes { flex: none; margin: 0; padding: 6px 14px; color: var(--readable-fg-dim, var(--fg-dim)); font-size: 11px; font-variant-numeric: tabular-nums; }
+.gid-single { flex: 1; min-height: 0; margin: 0; padding: 14px; display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.gid-single img { flex: 1; min-height: 0; max-width: 100%; object-fit: contain; }
+.gid-single figcaption { color: var(--readable-fg-dim, var(--fg-dim)); font-size: 11px; }
+.gc-image { display: flex; flex-direction: column; white-space: normal; }
+.gid .imgcmp { min-height: 180px; }
+.gid-toggle { margin: 6px 12px 0; align-self: flex-start; font-size: 11px; }

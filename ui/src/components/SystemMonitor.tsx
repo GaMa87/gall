@@ -1,9 +1,11 @@
 // Sidebar system monitor: CPU / GPU / memory meters and expandable details
-// (network, disk I/O, temperatures). Toggled from the sidebar toolbar.
+// (network, disk I/O, temperatures). Toggled from the sidebar toolbar. A short sidebar hides it
+// so five History rows stay visible; the toolbar button can still show it (see `monitorShown`).
 // Colours: the first three slots of the validated categorical palette (blue, orange,
 // aqua), stepped per theme in app.css (--sm-cpu / --sm-gpu / --sm-mem). Values and
 // labels use text tokens, so no reading depends on colour alone.
 import { useEffect, useMemo, useState } from "react";
+import { tt } from "../i18n";
 import { api } from "../api/ipc";
 import type { SysStats } from "../api/types";
 import { formatSize } from "../core/format";
@@ -86,10 +88,18 @@ function Meter({ label, note, value, color, top, topRow, sub, hint }: {
   );
 }
 
+function CompactMeter({ label, short, value }: { label: string; short: string; value: number | null }) {
+  const reading = value == null ? "–" : `${Math.round(value)}%`;
+  return <span className="sm-reading" title={`${label}: ${reading}`}>
+    <span className="sm-caption">{label} </span><span className="sm-initial" aria-hidden>{short}</span>{reading}
+  </span>;
+}
+
 export function SystemMonitor() {
   const enabled = useStore((s) => s.settings?.showSystemMonitor ?? true);
   const s = useStats(enabled);
   const [open, setOpen] = useState(() => localStorage.getItem("sysmon:details") === "1");
+  const [expanded, setExpanded] = useState(false);
   const showGpu = s?.gpu != null;
   // Temperatures go above the rings; no row for them where there are no sensors.
   const topRow = s?.cpuTemp != null || (showGpu && s?.gpuTemp != null);
@@ -97,39 +107,48 @@ export function SystemMonitor() {
   const subtitle = useMemo(() => [s?.os.replace(/^Linux \((.*)\)$/, "$1"), s?.cpuModel.replace(/ with .*$/, "")].filter(Boolean).join(" · "), [s?.os, s?.cpuModel]);
   if (!enabled) return null;
 
-  const menu = (e: React.MouseEvent) => A.showMenu(e.clientX, e.clientY, [
-    { label: "Hide system monitor", run: () => A.updateSettings({ showSystemMonitor: false }) },
+  const menu = (e: React.MouseEvent) => A.showMenuFor(e, [
+    { label: "Hide system monitor", run: () => A.toggleSystemMonitor(false) },
   ]);
 
   return (
-    <div className="sysmon group">
-      {/* Same head as the Drives / History groups, so it reads as part of the sidebar. */}
-      <div className="group-head">
-        <span className="sm-dot" title="Live" />
-        <span className="title" title={[s?.host, subtitle].filter(Boolean).join("\n")}>{s?.host || "System"}</span>
-        <button className="icon-btn" title="Monitor options" onClick={menu}><Icon name="more" /></button>
-      </div>
-      <div className="sm-meters">
-        <Meter label="CPU" value={s?.cpu ?? null} color="var(--sm-cpu)" topRow={topRow} top={temp(s?.cpuTemp ?? null)} sub={s ? `${s.cpuCores} threads` : null}
-          hint="Processor load over all cores; below: how many threads it runs at once" />
-        {showGpu && (
-          <Meter label="GPU" value={s!.gpu} color="var(--sm-gpu)" topRow={topRow} top={temp(s!.gpuTemp)}
-            note={s!.gpuMemUsed != null && s!.gpuMemTotal ? "VRAM" : undefined}
-            sub={s!.gpuMemUsed != null && s!.gpuMemTotal ? memText(s!.gpuMemUsed, s!.gpuMemTotal) : null}
-            hint={"Graphics card load (its busiest engine); below: its own video memory (VRAM) in use / in total.\nA laptop's graphics card that is not in use rests at 0 %."} />
-        )}
-        <Meter label="Memory" value={memPct} color="var(--sm-mem)" topRow={topRow} sub={s ? memText(s.memUsed, s.memTotal) : null}
-          hint="Main memory (RAM) in use / in total" />
-      </div>
-      <button className="sm-toggle" title="Show or hide details" onClick={() => { setOpen(!open); localStorage.setItem("sysmon:details", open ? "0" : "1"); }}>
-        <Icon name={open ? "chevronDown" : "chevronRight"} size={12} /> Network and disk
+    <div className={`sysmon group ${expanded ? "sm-expanded" : ""}`}>
+      <button type="button" className="sm-compact" aria-expanded={expanded} aria-controls="system-monitor-details"
+        title={tt("Show or hide details")} onClick={() => setExpanded((value) => !value)}>
+        <CompactMeter label={tt("CPU")} short="C" value={s?.cpu ?? null} />
+        {showGpu && <CompactMeter label={tt("GPU")} short="G" value={s?.gpu ?? null} />}
+        <CompactMeter label="RAM" short="R" value={memPct} />
+        <Icon name={expanded ? "chevronDown" : "chevronRight"} size={12} />
       </button>
-      {open && s && (
-        <div className="sm-details">
-          <div><span>Network</span><b>↓ {rate(s.netRx)}  ↑ {rate(s.netTx)}</b></div>
-          <div><span>Disk I/O</span><b>R {rate(s.diskRead)}  W {rate(s.diskWrite)}</b></div>
+      <div className="sm-full" id="system-monitor-details">
+        {/* Same head as the Drives / History groups, so it reads as part of the sidebar. */}
+        <div className="group-head">
+          <span className="sm-dot" title={tt("Live")} />
+          <span className="title" title={[s?.host, subtitle].filter(Boolean).join("\n")}>{s?.host || "System"}</span>
+          <button className="icon-btn" title={tt("Monitor options")} onClick={menu}><Icon name="more" /></button>
         </div>
-      )}
+        <div className="sm-meters">
+          <Meter label={tt("CPU")} value={s?.cpu ?? null} color="var(--sm-cpu)" topRow={topRow} top={temp(s?.cpuTemp ?? null)} sub={s ? tt("{count} threads", { count: s.cpuCores }) : null}
+            hint="Processor load over all cores; below: how many threads it runs at once" />
+          {showGpu && (
+            <Meter label={tt("GPU")} value={s!.gpu} color="var(--sm-gpu)" topRow={topRow} top={temp(s!.gpuTemp)}
+              note={s!.gpuMemUsed != null && s!.gpuMemTotal ? "VRAM" : undefined}
+              sub={s!.gpuMemUsed != null && s!.gpuMemTotal ? memText(s!.gpuMemUsed, s!.gpuMemTotal) : null}
+              hint={"Graphics card load (its busiest engine); below: its own video memory (VRAM) in use / in total.\nA laptop's graphics card that is not in use rests at 0 %."} />
+          )}
+          <Meter label={tt("Memory")} value={memPct} color="var(--sm-mem)" topRow={topRow} sub={s ? memText(s.memUsed, s.memTotal) : null}
+            hint="Main memory (RAM) in use / in total" />
+        </div>
+        <button className="sm-toggle" title={tt("Show or hide details")} onClick={() => { setOpen(!open); localStorage.setItem("sysmon:details", open ? "0" : "1"); }}>
+          <Icon name={open ? "chevronDown" : "chevronRight"} size={12} /> {tt("Network and disk")}
+        </button>
+        {open && s && (
+          <div className="sm-details">
+            <div><span>{tt("Network")}</span><b>↓ {rate(s.netRx)}  ↑ {rate(s.netTx)}</b></div>
+            <div><span>{tt("Disk I/O")}</span><b>R {rate(s.diskRead)}  W {rate(s.diskWrite)}</b></div>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

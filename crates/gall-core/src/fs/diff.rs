@@ -9,7 +9,9 @@ use similar::{Algorithm, DiffTag, TextDiff};
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use super::ignorerules::Rules;
 use super::structural::{self, Mark, Syntax};
 use crate::error::IoContext;
 use crate::{CoreError, Result};
@@ -32,6 +34,12 @@ pub enum DiffSource {
         path: PathBuf,
         commit: String,
     },
+    /// A repository-relative path in a fixed commit, independent of its worktree spelling.
+    GitBlob {
+        root: PathBuf,
+        file: String,
+        commit: String,
+    },
     /// Text supplied by the caller (e.g. the clipboard, read by the app).
     Text {
         label: String,
@@ -39,19 +47,78 @@ pub enum DiffSource {
     },
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+/// Which whitespace differences between two lines do not count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Whitespace {
+    /// Every difference counts.
+    #[default]
+    None,
+    /// Indentation does not count.
+    Leading,
+    /// Whitespace at the end of a line does not count (a line ending is not whitespace here).
+    Trailing,
+    /// Runs of whitespace are one space and the ends of a line do not count.
+    All,
+}
+
+/// How finely a changed line is marked inside.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Granularity {
+    /// The line is changed as a whole; nothing is marked inside it.
+    Line,
+    /// Changed words (and the differing characters of a similar word).
+    #[default]
+    Word,
+    /// Changed characters, as Unicode grapheme clusters: a letter with its combining marks is one.
+    Char,
+}
+
+/// Lines (both together, in bytes) up to which the character view runs; longer ones are marked by
+/// word, which is much cheaper.
+const MAX_CHAR_VIEW: usize = 20_000;
+
+impl DiffOptions {
+    /// The mode in force, including the old boolean setting.
+    pub fn whitespace_mode(&self) -> Whitespace {
+        if self.ignore_whitespace {
+            Whitespace::All
+        } else {
+            self.whitespace
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct DiffOptions {
+    /// Settings saved before `whitespace` existed: `true` means `Whitespace::All`.
     pub ignore_whitespace: bool,
+    /// Which whitespace differences are ignored; `ignore_whitespace` overrides it with `All`.
+    pub whitespace: Whitespace,
     pub ignore_case: bool,
     /// Treat CRLF and LF as equal (on by default in the UI).
     pub ignore_eol: bool,
     /// Minimal diff (Myers): the fewest changed lines. Off: histogram diff,
     /// which reads better.
     pub minimal: bool,
+    /// How finely changed lines are marked inside.
+    pub granularity: Granularity,
+    /// Ignore comments (as the language of the files defines them; plain text has none, and where
+    /// the lexer is not sure the text is read literally, so nothing is ignored by mistake).
+    pub ignore_comments: bool,
+    /// Regular expressions: a line that one matches is ignored (compares as an empty line).
+    pub ignore_lines: Vec<String>,
+    /// Regular expressions: the text one matches is ignored inside a line.
+    pub ignore_text: Vec<String>,
     /// Compare changed lines by their tokens: a change of layout alone (line breaks,
     /// indentation, alignment) is told apart from a change of content.
     pub structural: bool,
+    /// Also find moved blocks that were edited on the way (opt-in): anchored by lines that
+    /// are unique in both files, never by repeated boilerplate. Ambiguous candidates stay
+    /// ordinary removed and added lines.
+    pub moves_edited: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -62,6 +129,9 @@ pub struct Side {
     pub size: u64,
     pub crlf: bool,
     pub final_newline: bool,
+    /// Size and modification time of a file when it was read (empty for anything else): a save
+    /// that carries it is refused when the file changed on disk meanwhile.
+    pub revision: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -111,14 +181,7 @@ pub struct TextDiffResult {
     pub right_marks: BTreeMap<usize, Spans>,
 }
 
-/// `len` lines removed at left `a` and added at right `b`: moved, not changed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Move {
-    pub a: usize,
-    pub b: usize,
-    pub len: usize,
-}
+pub use gall_compare::lines::Move;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -152,6 +215,10 @@ fn label_of(p: &Path) -> String {
 }
 
 fn load(src: &DiffSource) -> Result<Loaded> {
+    load_comparison_input(src, false)
+}
+
+fn load_comparison_input(src: &DiffSource, bounded: bool) -> Result<Loaded> {
     match src {
         DiffSource::File { path } => {
             let meta = std::fs::metadata(path).ctx("read", path)?;
@@ -165,6 +232,7 @@ fn load(src: &DiffSource) -> Result<Loaded> {
                 size,
                 crlf: false,
                 final_newline: false,
+                revision: super::ops::file_revision(path).unwrap_or_default(),
             };
             if size > MAX_TEXT_BYTES {
                 return Ok(Loaded {
@@ -173,9 +241,21 @@ fn load(src: &DiffSource) -> Result<Loaded> {
                     stream: Some(path.clone()),
                 });
             }
+            let mut side = side;
+            let mut bytes = Vec::new();
+            if bounded {
+                super::open_regular(path)
+                    .ctx("open", path)?
+                    .take(MAX_TEXT_BYTES + 1)
+                    .read_to_end(&mut bytes)
+                    .ctx("read", path)?;
+                side.size = bytes.len() as u64;
+            } else {
+                bytes = super::read_regular(path).ctx("read", path)?;
+            }
             Ok(Loaded {
                 side,
-                bytes: super::read_regular(path).ctx("read", path)?,
+                bytes,
                 stream: None,
             })
         }
@@ -190,7 +270,12 @@ fn load(src: &DiffSource) -> Result<Loaded> {
             {
                 return Err(CoreError::Other("invalid commit ID".into()));
             }
-            let bytes = git_revision_bytes(path, revision)?;
+            let (size, bytes) = if bounded {
+                bounded_git_revision_bytes(path, revision)?
+            } else {
+                let bytes = git_revision_bytes(path, revision)?;
+                (bytes.len() as u64, bytes)
+            };
             Ok(Loaded {
                 side: Side {
                     label: format!(
@@ -203,9 +288,33 @@ fn load(src: &DiffSource) -> Result<Loaded> {
                         }
                     ),
                     path: Some(path.clone()),
-                    size: bytes.len() as u64,
+                    size,
                     crlf: false,
                     final_newline: false,
+                    revision: String::new(),
+                },
+                bytes,
+                stream: None,
+            })
+        }
+        DiffSource::GitBlob { root, file, commit } => {
+            super::gitinspect::relative_file(file)?;
+            let commit = super::gitinspect::commit_id(root, commit)?;
+            let object = format!("{commit}:{file}");
+            let (size, bytes) = if bounded {
+                bounded_git_object_bytes(root, &object)?
+            } else {
+                let bytes = git(root, &["cat-file", "blob", &object])?;
+                (bytes.len() as u64, bytes)
+            };
+            Ok(Loaded {
+                side: Side {
+                    label: format!("{file} ({})", &commit[..12]),
+                    path: None,
+                    size,
+                    crlf: false,
+                    final_newline: false,
+                    revision: String::new(),
                 },
                 bytes,
                 stream: None,
@@ -218,8 +327,13 @@ fn load(src: &DiffSource) -> Result<Loaded> {
                 size: text.len() as u64,
                 crlf: false,
                 final_newline: false,
+                revision: String::new(),
             },
-            bytes: text.clone().into_bytes(),
+            bytes: if bounded && text.len() as u64 > MAX_TEXT_BYTES {
+                Vec::new()
+            } else {
+                text.as_bytes().to_vec()
+            },
             stream: None,
         }),
     }
@@ -234,10 +348,34 @@ fn as_text(bytes: &[u8]) -> Option<&str> {
 }
 
 pub fn compare(a: &DiffSource, b: &DiffSource, opts: DiffOptions) -> Result<DiffResult> {
+    compare_with_cancel(a, b, opts, &AtomicBool::new(false))
+}
+
+/// `compare` that ends with `CoreError::Cancelled` soon after `cancel` is set, also in the middle of a large
+/// comparison (a report export is cancelled while its current pair is still running).
+pub fn compare_with_cancel(
+    a: &DiffSource,
+    b: &DiffSource,
+    opts: DiffOptions,
+    cancel: &AtomicBool,
+) -> Result<DiffResult> {
+    let stopped = || {
+        if cancel.load(Ordering::Relaxed) {
+            Err(CoreError::Cancelled)
+        } else {
+            Ok(())
+        }
+    };
+    stopped()?;
+    // A rule that does not compile is refused with its reason, not left out of the comparison.
+    Rules::compile(&opts.ignore_lines, &opts.ignore_text).map_err(CoreError::Other)?;
     let mut la = load(a)?;
+    stopped()?;
     let mut lb = load(b)?;
+    stopped()?;
     if la.stream.is_some() || lb.stream.is_some() {
-        let bin = compare_streams(&la, &lb, "file too large for a text comparison")?;
+        let bin =
+            compare_streams_with_cancel(&la, &lb, "file too large for a text comparison", cancel)?;
         return Ok(DiffResult {
             left: la.side,
             right: lb.side,
@@ -253,7 +391,8 @@ pub fn compare(a: &DiffSource, b: &DiffSource, opts: DiffOptions) -> Result<Diff
             lb.side.final_newline = tb.is_empty() || tb.ends_with('\n');
             // The language of the newer side, else of the older one.
             let syntax = Syntax::for_names(&[&lb.side.label, &la.side.label]);
-            let text = diff_text_as(ta, tb, opts, syntax);
+            // This form cannot report an invalid rule (refused above), and ends early when cancelled.
+            let text = diff_text_with_cancel(ta, tb, opts, syntax, true, cancel)?;
             Ok(DiffResult {
                 left: la.side,
                 right: lb.side,
@@ -262,7 +401,7 @@ pub fn compare(a: &DiffSource, b: &DiffSource, opts: DiffOptions) -> Result<Diff
             })
         }
         _ => {
-            let bin = compare_streams(&la, &lb, "binary content")?;
+            let bin = compare_streams_with_cancel(&la, &lb, "binary content", cancel)?;
             Ok(DiffResult {
                 left: la.side,
                 right: lb.side,
@@ -273,20 +412,104 @@ pub fn compare(a: &DiffSource, b: &DiffSource, opts: DiffOptions) -> Result<Diff
     }
 }
 
+/// Metadata and immutable text data for the paged comparison API.
+pub struct PagedDiff {
+    pub left: Side,
+    pub right: Side,
+    pub text: Option<crate::compare::Comparison>,
+    pub binary: Option<BinaryDiffResult>,
+    pub limit: Option<crate::compare::InputError>,
+}
+
+pub fn compare_paged(
+    a: &DiffSource,
+    b: &DiffSource,
+    opts: DiffOptions,
+    cancel: &AtomicBool,
+) -> Result<PagedDiff> {
+    use crate::compare::{Comparison, InputError};
+    let check = || {
+        if cancel.load(Ordering::Relaxed) {
+            Err(CoreError::Cancelled)
+        } else {
+            Ok(())
+        }
+    };
+    check()?;
+    // An invalid rule is an error with its reason here, not a comparison that looks cancelled.
+    Rules::compile(&opts.ignore_lines, &opts.ignore_text).map_err(CoreError::Other)?;
+    let mut left = load_comparison_input(a, true)?;
+    check()?;
+    let mut right = load_comparison_input(b, true)?;
+    check()?;
+    let (text, binary, limit) =
+        if left.side.size > MAX_TEXT_BYTES || right.side.size > MAX_TEXT_BYTES {
+            (None, None, Some(InputError::TooManyBytes))
+        } else {
+            match Comparison::new(
+                &left.bytes,
+                &right.bytes,
+                &[&right.side.label, &left.side.label],
+                opts,
+                cancel,
+            ) {
+                Ok(text) => {
+                    left.side.crlf = text.left.crlf;
+                    left.side.final_newline = text.left.final_newline;
+                    right.side.crlf = text.right.crlf;
+                    right.side.final_newline = text.right.final_newline;
+                    (Some(text), None, None)
+                }
+                Err(InputError::Cancelled) => return Err(CoreError::Cancelled),
+                Err(InputError::Binary) => (
+                    None,
+                    Some(compare_streams_with_cancel(
+                        &left,
+                        &right,
+                        "binary content",
+                        cancel,
+                    )?),
+                    None,
+                ),
+                Err(limit) => (None, None, Some(limit)),
+            }
+        };
+    check()?;
+    Ok(PagedDiff {
+        left: left.side,
+        right: right.side,
+        text,
+        binary,
+        limit,
+    })
+}
+
 /// Byte comparison; streams from disk for files that were not loaded.
 fn compare_streams(a: &Loaded, b: &Loaded, reason: &str) -> Result<BinaryDiffResult> {
-    fn reader(l: &Loaded) -> Result<Box<dyn Read>> {
+    compare_streams_with_cancel(a, b, reason, &AtomicBool::new(false))
+}
+
+fn compare_streams_with_cancel(
+    a: &Loaded,
+    b: &Loaded,
+    reason: &str,
+    cancel: &AtomicBool,
+) -> Result<BinaryDiffResult> {
+    fn reader(l: &Loaded) -> Result<Box<dyn Read + '_>> {
         Ok(match &l.stream {
             Some(p) => Box::new(std::io::BufReader::new(
                 super::open_regular(p).ctx("open", p)?,
             )),
-            None => Box::new(std::io::Cursor::new(l.bytes.clone())),
+            None => Box::new(std::io::Cursor::new(l.bytes.as_slice())),
         })
     }
     let (mut ra, mut rb) = (reader(a)?, reader(b)?);
     let (mut ba, mut bb) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
     let mut off: u64 = 0;
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(CoreError::Cancelled);
+        }
         let na = read_full(&mut ra, &mut ba)?;
         let nb = read_full(&mut rb, &mut bb)?;
         let n = na.min(nb);
@@ -327,26 +550,63 @@ fn read_full(r: &mut dyn Read, buf: &mut [u8]) -> Result<usize> {
     Ok(n)
 }
 
-fn split_lines(t: &str) -> Vec<String> {
-    let mut v: Vec<String> = t
-        .split('\n')
-        .map(|l| l.strip_suffix('\r').unwrap_or(l).to_string())
-        .collect();
+/// The lines of a text with their `\r` kept, and without the empty piece after a final `\n`.
+fn raw_lines(t: &str) -> Vec<&str> {
+    let mut v: Vec<&str> = t.split('\n').collect();
     if v.last().is_some_and(|l| l.is_empty()) {
         v.pop(); // trailing newline is not an extra empty line
     }
     v
 }
 
-fn normalize(line: &str, raw: &str, opts: DiffOptions) -> String {
+/// The display lines. The final piece is dropped before its `\r` is stripped, so a last line that
+/// is only a `\r` stays one (an input of one `\r` is one empty line, not none).
+fn split_lines(t: &str) -> Vec<String> {
+    raw_lines(t)
+        .into_iter()
+        .map(|l| l.strip_suffix('\r').unwrap_or(l).to_string())
+        .collect()
+}
+
+/// `line` without the byte ranges (sorted, not overlapping, on character boundaries). A `\r` that
+/// ends a raw line lies outside them and stays.
+fn without_ranges(line: &str, ranges: &[(usize, usize)]) -> String {
+    let mut kept = String::with_capacity(line.len());
+    let mut at = 0;
+    for &(start, end) in ranges {
+        if start >= at && end <= line.len() {
+            kept.push_str(&line[at..start]);
+            at = end;
+        }
+    }
+    kept.push_str(&line[at..]);
+    kept
+}
+
+fn normalize(line: &str, raw: &str, opts: &DiffOptions, rules: &Rules) -> String {
+    if rules.ignores_line(line) {
+        return String::new();
+    }
     let mut s = if opts.ignore_eol {
         line.to_string()
     } else {
         raw.to_string()
     };
-    if opts.ignore_whitespace {
-        s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if !rules.is_empty() {
+        s = rules.strip(&s);
     }
+    s = match opts.whitespace_mode() {
+        Whitespace::None => s,
+        Whitespace::All => s.split_whitespace().collect::<Vec<_>>().join(" "),
+        Whitespace::Leading => s.trim_start().to_string(),
+        Whitespace::Trailing => {
+            // A line ending that is compared (`ignore_eol` off) is not whitespace of the line.
+            match s.strip_suffix('\r') {
+                Some(rest) => format!("{}\r", rest.trim_end()),
+                None => s.trim_end().to_string(),
+            }
+        }
+    };
     if opts.ignore_case {
         s = s.to_lowercase();
     }
@@ -358,44 +618,110 @@ pub fn diff_text(a: &str, b: &str, opts: DiffOptions) -> TextDiffResult {
 }
 
 /// `diff_text` with the token rules of the files' language, for `opts.structural`.
-pub fn diff_text_as(a: &str, b: &str, opts: DiffOptions, syntax: Syntax) -> TextDiffResult {
+pub fn diff_text_as(a: &str, b: &str, mut opts: DiffOptions, syntax: Syntax) -> TextDiffResult {
+    // This form cannot report an error: rules that do not compile are left out here, while the
+    // callers that return a `Result` refuse them with the reason.
+    if Rules::compile(&opts.ignore_lines, &opts.ignore_text).is_err() {
+        opts.ignore_lines.clear();
+        opts.ignore_text.clear();
+    }
+    diff_text_with_cancel(a, b, opts, syntax, true, &AtomicBool::new(false))
+        .expect("the legacy comparison has no cancellation source")
+}
+
+pub(crate) fn diff_text_with_cancel(
+    a: &str,
+    b: &str,
+    opts: DiffOptions,
+    syntax: Syntax,
+    detailed: bool,
+    cancel: &AtomicBool,
+) -> Result<TextDiffResult> {
+    let check = || {
+        if cancel.load(Ordering::Relaxed) {
+            Err(CoreError::Cancelled)
+        } else {
+            Ok(())
+        }
+    };
+    check()?;
+    let rules = Rules::compile(&opts.ignore_lines, &opts.ignore_text).map_err(CoreError::Other)?;
     let left = split_lines(a);
     let right = split_lines(b);
     // Raw lines keep "\r" so CRLF vs LF counts as a change unless ignore_eol.
-    let raw = |t: &str| -> Vec<String> {
-        let mut v: Vec<String> = t.split('\n').map(str::to_string).collect();
-        if v.last().is_some_and(|l| l.is_empty()) {
-            v.pop();
-        }
-        v
-    };
+    let raw = |t: &str| -> Vec<String> { raw_lines(t).into_iter().map(str::to_string).collect() };
     let (ra, rb) = (raw(a), raw(b));
-    let na: Vec<String> = left
+    // With comments ignored the lines that are compared lack them; the lines shown stay whole.
+    let (ra_cmp, rb_cmp, left_cmp, right_cmp);
+    let (compared_ra, compared_rb, compared_left, compared_right) = if opts.ignore_comments {
+        let cut = |lines: &[String], comments: &[Vec<(usize, usize)>]| -> Vec<String> {
+            lines
+                .iter()
+                .zip(comments)
+                .map(|(line, ranges)| without_ranges(line, ranges))
+                .collect()
+        };
+        let (ca, cb) = (
+            structural::comment_ranges(&left, syntax),
+            structural::comment_ranges(&right, syntax),
+        );
+        left_cmp = cut(&left, &ca);
+        right_cmp = cut(&right, &cb);
+        ra_cmp = cut(&ra, &ca);
+        rb_cmp = cut(&rb, &cb);
+        (&ra_cmp, &rb_cmp, &left_cmp, &right_cmp)
+    } else {
+        (&ra, &rb, &left, &right)
+    };
+    let na: Vec<String> = compared_left
         .iter()
-        .zip(&ra)
-        .map(|(l, r)| normalize(l, r, opts))
+        .zip(compared_ra)
+        .map(|(l, r)| normalize(l, r, &opts, &rules))
         .collect();
-    let nb: Vec<String> = right
+    let nb: Vec<String> = compared_right
         .iter()
-        .zip(&rb)
-        .map(|(l, r)| normalize(l, r, opts))
+        .zip(compared_rb)
+        .map(|(l, r)| normalize(l, r, &opts, &rules))
         .collect();
 
-    let hunks = line_hunks(&na, &nb, opts.minimal);
-    let moves = find_moves(&na, &nb, &hunks);
+    check()?;
+    let hunks = gall_compare::lines::line_hunks(&na, &nb, opts.minimal);
+    check()?;
+    let moves = if detailed {
+        let mut moves = gall_compare::lines::find_moves(&na, &nb, &hunks);
+        if opts.moves_edited {
+            // An edited block swallows the exact moves inside it (their lines anchor it).
+            let edited = gall_compare::lines::find_edited_moves(&na, &nb, &hunks);
+            moves.retain(|m| {
+                edited.iter().all(|e| {
+                    (m.a + m.len <= e.a || e.a + e.len <= m.a)
+                        && (m.b + m.b_len <= e.b || e.b + e.b_len <= m.b)
+                })
+            });
+            moves.extend(edited);
+        }
+        moves.sort_by_key(|m| (m.a, m.b));
+        for (k, m) in moves.iter_mut().enumerate() {
+            m.id = k + 1;
+        }
+        moves
+    } else {
+        Vec::new()
+    };
     let (mut moved_a, mut moved_b) = (vec![false; na.len()], vec![false; nb.len()]);
     for m in &moves {
         moved_a[m.a..m.a + m.len].fill(true);
-        moved_b[m.b..m.b + m.len].fill(true);
+        moved_b[m.b..m.b + m.b_len].fill(true);
     }
 
-    let mut blocks = if opts.structural {
+    check()?;
+    let mut blocks = if detailed && opts.structural {
         structural::compare_hunks(
             &left,
             &right,
             &hunks,
             syntax,
-            opts.ignore_whitespace,
+            opts.whitespace_mode() == Whitespace::All,
             opts.ignore_case,
         )
     } else {
@@ -442,6 +768,7 @@ pub fn diff_text_as(a: &str, b: &str, opts: DiffOptions, syntax: Syntax) -> Text
         }
     };
     for (n, (a0, a1, b0, b1)) in hunks.into_iter().enumerate() {
+        check()?;
         equal(&mut ops, pa, pb, a0 - pa);
         let (al, bl) = (a1 - a0, b1 - b0);
         // Compared by tokens: the marks say what changed on each line.
@@ -461,13 +788,14 @@ pub fn diff_text_as(a: &str, b: &str, opts: DiffOptions, syntax: Syntax) -> Text
             (0, _) => "insert",
             _ => "replace",
         };
-        if tag == "replace" {
+        if detailed && tag == "replace" {
             // Moved lines are not edits of their neighbours: leave them out of pairing.
             let ia: Vec<usize> = (a0..a1).filter(|&i| !moved_a[i]).collect();
             let ib: Vec<usize> = (b0..b1).filter(|&j| !moved_b[j]).collect();
             let la: Vec<String> = ia.iter().map(|&i| left[i].clone()).collect();
             let lb: Vec<String> = ib.iter().map(|&j| right[j].clone()).collect();
             for (i, j) in pair_lines(&la, &lb) {
+                check()?;
                 let (a, b) = (ia[i], ib[j]);
                 let (sa, sb) = if by_tokens {
                     let of = |marks: &BTreeMap<usize, Spans>, line| {
@@ -475,7 +803,7 @@ pub fn diff_text_as(a: &str, b: &str, opts: DiffOptions, syntax: Syntax) -> Text
                     };
                     (of(&left_marks, a), of(&right_marks, b))
                 } else {
-                    word_spans(&left[a], &right[b])
+                    inline_spans(opts.granularity, &left[a], &right[b])
                 };
                 pairs.push(LinePair {
                     a,
@@ -504,7 +832,8 @@ pub fn diff_text_as(a: &str, b: &str, opts: DiffOptions, syntax: Syntax) -> Text
     } else {
         same as f32 / total as f32
     };
-    TextDiffResult {
+    check()?;
+    Ok(TextDiffResult {
         left_lines: left,
         right_lines: right,
         ops,
@@ -515,106 +844,7 @@ pub fn diff_text_as(a: &str, b: &str, opts: DiffOptions, syntax: Syntax) -> Text
         moves,
         left_marks,
         right_marks,
-    }
-}
-
-/// Fewest lines in a moved block.
-const MOVE_MIN_LINES: usize = 3;
-/// Fewest non-blank characters in a moved block (three lines of "}" are no move).
-const MOVE_MIN_CHARS: usize = 20;
-/// Candidate positions tried per line (repeated lines would make this quadratic).
-const MOVE_MAX_CANDIDATES: usize = 64;
-
-/// Blocks of removed lines that reappear, in the same order, among the added
-/// lines (compared without leading/trailing whitespace, so re-indented code
-/// still counts). Greedy, longest match first at each removed line.
-fn find_moves(na: &[String], nb: &[String], hunks: &[(usize, usize, usize, usize)]) -> Vec<Move> {
-    let (mut del, mut ins) = (vec![false; na.len()], vec![false; nb.len()]);
-    for &(a0, a1, b0, b1) in hunks {
-        del[a0..a1].fill(true);
-        ins[b0..b1].fill(true);
-    }
-    let key = |s: &str| s.trim().to_string();
-    let mut at: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
-    for (j, l) in nb.iter().enumerate() {
-        if ins[j] {
-            let v = at.entry(key(l)).or_default();
-            if v.len() < MOVE_MAX_CANDIDATES {
-                v.push(j);
-            }
-        }
-    }
-    let mut used = vec![false; nb.len()];
-    let mut moves = Vec::new();
-    let mut i = 0;
-    while i < na.len() {
-        let k = key(&na[i]);
-        if !del[i] || k.chars().filter(|c| !c.is_whitespace()).count() < 2 {
-            i += 1;
-            continue;
-        }
-        let mut best = (0usize, 0usize); // (len, b)
-        for &j in at.get(&k).map(|v| v.as_slice()).unwrap_or(&[]) {
-            let mut n = 0;
-            while i + n < na.len()
-                && j + n < nb.len()
-                && del[i + n]
-                && ins[j + n]
-                && !used[j + n]
-                && na[i + n].trim() == nb[j + n].trim()
-            {
-                n += 1;
-            }
-            if n > best.0 {
-                best = (n, j);
-            }
-        }
-        let (n, j) = best;
-        let chars: usize = na[i..i + n]
-            .iter()
-            .map(|l| l.chars().filter(|c| !c.is_whitespace()).count())
-            .sum();
-        if n >= MOVE_MIN_LINES && chars >= MOVE_MIN_CHARS {
-            used[j..j + n].fill(true);
-            moves.push(Move { a: i, b: j, len: n });
-            i += n;
-        } else {
-            i += 1;
-        }
-    }
-    moves
-}
-
-/// Changed line ranges `(a0, a1, b0, b1)`. Histogram diff (as git uses) with the
-/// indent heuristic, so ambiguous blocks start and end where a reader expects
-/// (a whole function, not "}\n\nfn x() {"); `minimal` gives the fewest changed lines.
-fn line_hunks(na: &[String], nb: &[String], minimal: bool) -> Vec<(usize, usize, usize, usize)> {
-    use imara_diff::{Algorithm, Diff, InternedInput, Interner};
-    let mut interner = Interner::new(na.len() + nb.len());
-    let before = na.iter().map(|s| interner.intern(s.as_str())).collect();
-    let after = nb.iter().map(|s| interner.intern(s.as_str())).collect();
-    let input = InternedInput {
-        before,
-        after,
-        interner,
-    };
-    let alg = if minimal {
-        Algorithm::MyersMinimal
-    } else {
-        Algorithm::Histogram
-    };
-    let mut diff = Diff::compute(alg, &input);
-    diff.postprocess_lines(&input);
-    diff.hunks()
-        .map(|h| {
-            (
-                h.before.start as usize,
-                h.before.end as usize,
-                h.after.start as usize,
-                h.after.end as usize,
-            )
-        })
-        .collect()
+    })
 }
 
 /// Lines that count as "the same line, changed" rather than one removed and another added.
@@ -740,6 +970,44 @@ fn utf16(s: &str) -> usize {
     s.encode_utf16().count()
 }
 
+/// The changed ranges of two lines at the chosen granularity, in UTF-16 offsets.
+fn inline_spans(granularity: Granularity, a: &str, b: &str) -> (Spans, Spans) {
+    match granularity {
+        Granularity::Line => (Vec::new(), Vec::new()),
+        Granularity::Word => word_spans(a, b),
+        Granularity::Char if a.len() + b.len() <= MAX_CHAR_VIEW => grapheme_spans(a, b),
+        Granularity::Char => word_spans(a, b),
+    }
+}
+
+/// Changed grapheme clusters of two lines, in UTF-16 offsets. Unlike the word view nothing is
+/// joined: every cluster that differs is marked, and only those.
+fn grapheme_spans(a: &str, b: &str) -> (Spans, Spans) {
+    let diff = TextDiff::configure()
+        .algorithm(Algorithm::Myers)
+        .diff_graphemes(a, b);
+    let (mut sa, mut sb): (Spans, Spans) = (Vec::new(), Vec::new());
+    let (mut pa, mut pb) = (0usize, 0usize);
+    for change in diff.iter_all_changes() {
+        let width = utf16(change.value());
+        match change.tag() {
+            similar::ChangeTag::Equal => {
+                pa += width;
+                pb += width;
+            }
+            similar::ChangeTag::Delete => {
+                push_span(&mut sa, pa, pa + width);
+                pa += width;
+            }
+            similar::ChangeTag::Insert => {
+                push_span(&mut sb, pb, pb + width);
+                pb += width;
+            }
+        }
+    }
+    (sa, sb)
+}
+
 /// Word-level changed ranges of two lines, in UTF-16 offsets (as JavaScript
 /// indexes strings).
 ///
@@ -823,26 +1091,51 @@ pub(super) fn join_gaps(spans: Spans, line: &str) -> Spans {
     out
 }
 
+/// The unified patch of `a` → `b` ([`export_patch`] in the default format).
 pub fn unified_patch(a: &DiffSource, b: &DiffSource) -> Result<String> {
+    export_patch(a, b, super::patch::Format::Unified)
+}
+
+/// The patch of `a` → `b` in a format. The sources are the ones the compare view shows now, a draft with unsaved edits
+/// included. Header names are portable: the path inside the repository for a Git blob or a file of its working tree,
+/// otherwise the name of the file (never an absolute path or a folder of this computer), prefixed `a/` and `b/`.
+pub fn export_patch(
+    a: &DiffSource,
+    b: &DiffSource,
+    format: super::patch::Format,
+) -> Result<String> {
     let (la, lb) = (load(a)?, load(b)?);
     let (Some(ta), Some(tb)) = (as_text(&la.bytes), as_text(&lb.bytes)) else {
         return Err(CoreError::Other("a patch needs two text files".into()));
     };
-    let name = |l: &Loaded| {
+    let repository = [a, b].into_iter().find_map(|source| match source {
+        DiffSource::GitBlob { root, .. } => Some(root),
+        _ => None,
+    });
+    let name = |source: &DiffSource, l: &Loaded| {
+        if let DiffSource::GitBlob { file, .. } = source {
+            return file.to_owned();
+        }
+        if let (Some(root), DiffSource::File { path }) = (repository, source) {
+            if let Ok(relative) = path.strip_prefix(root) {
+                return relative
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/");
+            }
+        }
         l.side
             .path
             .as_ref()
-            .map(|p| p.to_string_lossy().into_owned())
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| l.side.label.clone())
     };
-    Ok(TextDiff::from_lines(ta, tb)
-        .unified_diff()
-        .context_radius(3)
-        .header(
-            &format!("a/{}", name(&la).trim_start_matches('/')),
-            &format!("b/{}", name(&lb).trim_start_matches('/')),
-        )
-        .to_string())
+    let header = |prefix: &str, source: &DiffSource, l: &Loaded| {
+        format!("{prefix}/{}", name(source, l).trim_start_matches('/'))
+    };
+    let patch =
+        super::patch::make_patch(&header("a", a, &la), &header("b", b, &lb), ta, tb, format);
+    Ok(super::patch::write(format, &[patch]))
 }
 
 // ───────────────────────────── git ─────────────────────────────
@@ -882,7 +1175,7 @@ pub fn git_root(path: &Path) -> Option<PathBuf> {
     })
 }
 
-fn git_revision_bytes(path: &Path, revision: &str) -> Result<Vec<u8>> {
+fn git_revision_object(path: &Path, revision: &str) -> Result<(PathBuf, String)> {
     let root =
         git_root(path).ok_or_else(|| CoreError::Other("not inside a Git repository".into()))?;
     let canon = path.canonicalize().ctx("resolve", path)?;
@@ -891,8 +1184,56 @@ fn git_revision_bytes(path: &Path, revision: &str) -> Result<Vec<u8>> {
         .strip_prefix(&root)
         .map_err(|_| CoreError::Other("file is outside the repository".into()))?;
     let rel = rel.to_string_lossy().replace('\\', "/");
-    git(&root, &["show", &format!("{revision}:{rel}")])
+    Ok((root, format!("{revision}:{rel}")))
+}
+
+fn git_revision_bytes(path: &Path, revision: &str) -> Result<Vec<u8>> {
+    let (root, object) = git_revision_object(path, revision)?;
+    git(&root, &["show", &object])
         .map_err(|e| CoreError::Other(format!("file is not in the selected revision: {e}")))
+}
+
+/// Whether a source read through Git still exists: the file in HEAD or in the commit, the blob of a commit. Checks
+/// the object only (no content is read); other sources are always present here. Used to show a restored tab as
+/// missing instead of ready.
+pub fn git_source_present(src: &DiffSource) -> bool {
+    match src {
+        DiffSource::GitHead { path } => git_revision_object(path, "HEAD")
+            .and_then(|(root, object)| git(&root, &["rev-parse", "--verify", &object]))
+            .is_ok(),
+        DiffSource::GitCommit { path, commit } => git_revision_object(path, commit)
+            .and_then(|(root, object)| git(&root, &["rev-parse", "--verify", &object]))
+            .is_ok(),
+        DiffSource::GitBlob { root, file, commit } => {
+            super::gitinspect::relative_file(file).is_ok()
+                && super::gitinspect::commit_id(root, commit)
+                    .and_then(|id| git(root, &["rev-parse", "--verify", &format!("{id}:{file}")]))
+                    .is_ok()
+        }
+        _ => true,
+    }
+}
+
+fn bounded_git_revision_bytes(path: &Path, revision: &str) -> Result<(u64, Vec<u8>)> {
+    let (root, object) = git_revision_object(path, revision)?;
+    bounded_git_object_bytes(&root, &object)
+}
+
+fn bounded_git_object_bytes(root: &Path, object: &str) -> Result<(u64, Vec<u8>)> {
+    let oid = git(root, &["rev-parse", "--verify", object])
+        .map_err(|e| CoreError::Other(format!("file is not in the selected revision: {e}")))?;
+    let oid = String::from_utf8_lossy(&oid);
+    let oid = oid.trim();
+    let size = git(root, &["cat-file", "-s", oid])?;
+    let size: u64 = String::from_utf8_lossy(&size)
+        .trim()
+        .parse()
+        .map_err(|_| CoreError::Other("invalid Git object size".into()))?;
+    if size > MAX_TEXT_BYTES {
+        return Ok((size, Vec::new()));
+    }
+    let bytes = git(root, &["cat-file", "blob", oid])?;
+    Ok((size, bytes))
 }
 
 #[derive(Serialize)]
@@ -942,6 +1283,217 @@ mod tests {
             label: "t".into(),
             text: s.into(),
         }
+    }
+
+    #[test]
+    fn a_final_line_that_is_only_a_carriage_return_is_kept() {
+        // One `\r` is one empty line, not none, and does not compare equal to nothing.
+        assert_eq!(split_lines("\r"), [""]);
+        assert_eq!(split_lines("x\n\r"), ["x", ""]);
+        assert_eq!(split_lines("x\n"), ["x"]);
+        assert_eq!(split_lines(""), Vec::<String>::new());
+        assert_eq!(raw_lines("x\n\r").len(), split_lines("x\n\r").len());
+        let strict = DiffOptions::default();
+        assert!(diff_text("\r", "", strict)
+            .ops
+            .iter()
+            .any(|op| op.tag != "equal"));
+        let eol = DiffOptions {
+            ignore_eol: true,
+            ..DiffOptions::default()
+        };
+        // With line endings ignored a lone `\r` is an empty line, which still differs from no line.
+        assert!(diff_text("\r", "", eol.clone())
+            .ops
+            .iter()
+            .any(|op| op.tag != "equal"));
+        assert!(diff_text("x\n\r", "x\n\n", eol)
+            .ops
+            .iter()
+            .all(|op| op.tag == "equal"));
+    }
+
+    #[test]
+    fn a_comparison_with_the_cancel_flag_set_ends_as_cancelled_and_without_it_equals_compare() {
+        let text = |t: &str| DiffSource::Text {
+            label: "t".into(),
+            text: t.into(),
+        };
+        let (a, b) = (text("one\ntwo\n"), text("one\nthree\n"));
+        let cancelled = AtomicBool::new(true);
+        assert!(matches!(
+            compare_with_cancel(&a, &b, DiffOptions::default(), &cancelled),
+            Err(CoreError::Cancelled)
+        ));
+        let free = AtomicBool::new(false);
+        let with = compare_with_cancel(&a, &b, DiffOptions::default(), &free).unwrap();
+        let plain = compare(&a, &b, DiffOptions::default()).unwrap();
+        assert_eq!(with.text.unwrap().ops.len(), plain.text.unwrap().ops.len());
+    }
+
+    #[test]
+    fn ignore_rules_hide_matched_lines_and_text_and_invalid_ones_are_refused() {
+        let strings = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let options = DiffOptions {
+            ignore_lines: strings(&[r"^\s*//"]),
+            ignore_text: strings(&[r"\d{4}-\d\d-\d\d"]),
+            ..DiffOptions::default()
+        };
+        let a = "// header 1\nbuilt 2026-11-24\nkeep\n";
+        let b = "// another header\nbuilt 2027-01-02\nkeep\n";
+        assert!(diff_text(a, b, options.clone())
+            .ops
+            .iter()
+            .all(|op| op.tag == "equal"));
+        // What no rule matches still differs, and without rules everything differs.
+        assert!(
+            !diff_text(a, "built 2026-11-24\nchanged\n", options.clone())
+                .ops
+                .iter()
+                .all(|op| op.tag == "equal")
+        );
+        assert!(!diff_text(a, b, DiffOptions::default())
+            .ops
+            .iter()
+            .all(|op| op.tag == "equal"));
+        // The result with an invalid rule: the call that returns a `Result` says why.
+        let bad = DiffOptions {
+            ignore_text: strings(&["("]),
+            ..DiffOptions::default()
+        };
+        let error = diff_text_with_cancel(
+            a,
+            b,
+            bad.clone(),
+            Syntax::for_names(&[]),
+            true,
+            &AtomicBool::new(false),
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(error.contains("Invalid ignore rule"), "{error}");
+        // The paged comparison of the window refuses it with the reason too (not as "cancelled").
+        let text = |t: &str| DiffSource::Text {
+            label: "t".into(),
+            text: t.into(),
+        };
+        let error = compare_paged(&text(a), &text(b), bad.clone(), &AtomicBool::new(false))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("Invalid ignore rule"), "{error}");
+        // The comparison of two sources (window, report) refuses it too.
+        let error = compare(&text(a), &text(b), bad.clone())
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("Invalid ignore rule"), "{error}");
+        // The form that cannot fail leaves the rule out instead of panicking.
+        assert!(!diff_text(a, b, bad).ops.iter().all(|op| op.tag == "equal"));
+    }
+
+    #[test]
+    fn ignored_comments_do_not_count_but_comment_marks_inside_strings_do() {
+        let options = DiffOptions {
+            ignore_comments: true,
+            ..DiffOptions::default()
+        };
+        let rust = || Syntax::for_names(&["a.rs"]);
+        let same = |a: &str, b: &str, syntax: Syntax| {
+            diff_text_as(a, b, options.clone(), syntax)
+                .ops
+                .iter()
+                .all(|op| op.tag == "equal")
+        };
+        // A changed trailing comment and a changed block comment do not count.
+        assert!(same(
+            "let x = 1; // one\n/* a\n b */\nfn f() {}\n",
+            "let x = 1; // two\n/* c\n d */\nfn f() {}\n",
+            rust()
+        ));
+        // `//` inside a string literal is code: a change there counts.
+        assert!(!same(
+            "let s = \"a // one\";\n",
+            "let s = \"a // two\";\n",
+            rust()
+        ));
+        // Plain text has no comments, so nothing is ignored.
+        assert!(!same(
+            "x // one\n",
+            "x // two\n",
+            Syntax::for_names(&["a.txt"])
+        ));
+        // Where the lexer is not sure (a shell heredoc) the text is read literally.
+        assert!(!same(
+            "cat <<EOF\n# one\nEOF\n",
+            "cat <<EOF\n# two\nEOF\n",
+            Syntax::for_names(&["a.sh"])
+        ));
+        // The comparison with comments ignored still shows the lines whole.
+        let r = diff_text_as(
+            "a; // one\nb;\n",
+            "a; // two\nc;\n",
+            options.clone(),
+            rust(),
+        );
+        assert!(r.ops.iter().any(|op| op.tag != "equal"));
+        assert_eq!(r.left_lines.first().map(String::as_str), Some("a; // one"));
+    }
+
+    #[test]
+    fn the_character_view_marks_whole_grapheme_clusters_and_the_line_view_marks_nothing() {
+        // `é` as `e` and a combining accent is one cluster: it is marked whole, never the accent alone.
+        let (sa, sb) = inline_spans(Granularity::Char, "cafe\u{301}!", "cafe!");
+        assert_eq!((sa, sb), (vec![(3, 5)], vec![(3, 4)]));
+        // A flag (two regional indicators, four UTF-16 units) and a family emoji with joiners.
+        let (sa, sb) = inline_spans(Granularity::Char, "a\u{1F1F8}\u{1F1EE}b", "ab");
+        assert_eq!((sa, sb), (vec![(1, 5)], Vec::new()));
+        // Unchanged text is not marked, and changed characters are not joined across a gap.
+        let (sa, sb) = inline_spans(Granularity::Char, "a1b2c", "aXbYc");
+        assert_eq!((sa, sb), (vec![(1, 2), (3, 4)], vec![(1, 2), (3, 4)]));
+        let (sa, sb) = inline_spans(Granularity::Line, "a1", "a2");
+        assert!(sa.is_empty() && sb.is_empty());
+        // The word view is what it was.
+        let (sa, _) = inline_spans(Granularity::Word, "count1 x", "count2 x");
+        assert_eq!(sa, vec![(5, 6)]);
+        // A very long line is marked by word, not by character, so it cannot take long.
+        let long_a = format!("{} x", "word ".repeat(MAX_CHAR_VIEW));
+        let long_b = format!("{} y", "word ".repeat(MAX_CHAR_VIEW));
+        let (sa, _) = inline_spans(Granularity::Char, &long_a, &long_b);
+        assert!(!sa.is_empty());
+    }
+
+    #[test]
+    fn whitespace_modes_ignore_only_what_they_name() {
+        let same = |a: &str, b: &str, mode: Whitespace, eol: bool| {
+            let options = DiffOptions {
+                whitespace: mode,
+                ignore_eol: eol,
+                ..DiffOptions::default()
+            };
+            diff_text(a, b, options)
+                .ops
+                .iter()
+                .all(|op| op.tag == "equal")
+        };
+        // Leading: indentation only.
+        assert!(same("    x = 1\n", "x = 1\n", Whitespace::Leading, true));
+        assert!(!same("x = 1  \n", "x = 1\n", Whitespace::Leading, true));
+        assert!(!same("x  =  1\n", "x = 1\n", Whitespace::Leading, true));
+        // Trailing: the end of the line only.
+        assert!(same("x = 1  \n", "x = 1\n", Whitespace::Trailing, true));
+        assert!(!same("  x = 1\n", "x = 1\n", Whitespace::Trailing, true));
+        // A compared line ending is not trailing whitespace.
+        assert!(same("x  \r\n", "x\r\n", Whitespace::Trailing, false));
+        assert!(!same("x\r\n", "x\n", Whitespace::Trailing, false));
+        // All, and the old boolean setting that means the same.
+        assert!(same("  x   =  1  \n", "x = 1\n", Whitespace::All, true));
+        let old: DiffOptions = serde_json::from_str(r#"{"ignoreWhitespace":true}"#).unwrap();
+        assert_eq!(old.whitespace_mode(), Whitespace::All);
+        let new: DiffOptions = serde_json::from_str(r#"{"whitespace":"trailing"}"#).unwrap();
+        assert_eq!(new.whitespace_mode(), Whitespace::Trailing);
+        assert_eq!(DiffOptions::default().whitespace_mode(), Whitespace::None);
     }
 
     #[test]
@@ -1038,6 +1590,131 @@ mod tests {
         assert!(r.pairs.iter().all(|p| p.a < m.a || p.a >= m.a + m.len));
     }
 
+    fn edited_opts() -> DiffOptions {
+        DiffOptions {
+            moves_edited: true,
+            ..DiffOptions::default()
+        }
+    }
+
+    const EDIT_BLOCK: &str = "fn compute_total(items: &[Item]) -> u64 {\n    let mut sum = 0;\n    for item in items {\n        sum += item.price_in_cents();\n    }\n    sum\n}\n";
+
+    /// Twelve distinct lines that stay in place: the block moves across them, so the
+    /// line diff has to show it as removed in one place and added in another.
+    fn stay(tag: &str) -> String {
+        (0..12)
+            .map(|k| format!("stay_{tag}_statement_number_{k}();\n"))
+            .collect()
+    }
+
+    fn edited_pair() -> (String, String) {
+        let s = stay("a");
+        let a = format!("{EDIT_BLOCK}{s}end_of_file_marker();\n");
+        let moved = EDIT_BLOCK.replace(
+            "sum += item.price_in_cents();",
+            "sum += item.price_with_tax();",
+        );
+        let b = format!("{s}{moved}end_of_file_marker();\n");
+        (a, b)
+    }
+
+    #[test]
+    fn edited_move_is_found_only_when_asked() {
+        let (a, b) = edited_pair();
+        let off = diff_text(&a, &b, DiffOptions::default());
+        assert!(off.moves.iter().all(|m| !m.edited));
+        let on = diff_text(&a, &b, edited_opts());
+        let m = on.moves.iter().find(|m| m.edited).expect("an edited move");
+        assert_eq!(
+            on.left_lines[m.a],
+            "fn compute_total(items: &[Item]) -> u64 {"
+        );
+        assert_eq!(
+            on.right_lines[m.b],
+            "fn compute_total(items: &[Item]) -> u64 {"
+        );
+        assert_eq!((m.a, m.len, m.b_len), (0, 7, 7));
+        // The edited line (left line 3) lies inside the block, and the exact move of the
+        // unchanged head is part of the block, not a second move.
+        assert_eq!(on.moves.len(), 1, "{:?}", on.moves);
+    }
+
+    #[test]
+    fn edited_move_may_change_its_length() {
+        let (a, b) = edited_pair();
+        let b = b.replace(
+            "    let mut sum = 0;\n",
+            "    let mut sum = 0;\n    let _debug_note = true;\n",
+        );
+        let r = diff_text(&a, &b, edited_opts());
+        let m = r.moves.iter().find(|m| m.edited).expect("an edited move");
+        assert_eq!((m.len, m.b_len), (7, 8), "{m:?}");
+    }
+
+    #[test]
+    fn edited_blocks_in_place_are_no_moves() {
+        let a = format!("head_line_one\n{EDIT_BLOCK}tail_line_one\n");
+        let b = format!(
+            "head_line_one\n{}tail_line_one\n",
+            EDIT_BLOCK.replace(
+                "sum += item.price_in_cents();",
+                "sum += item.price_with_tax();"
+            )
+        );
+        let r = diff_text(&a, &b, edited_opts());
+        assert!(r.moves.is_empty(), "{:?}", r.moves);
+    }
+
+    #[test]
+    fn repeated_lines_never_anchor_a_move() {
+        // Every substantial line occurs twice on the right: ambiguous, so plain del/add.
+        let block = "let first_value = compute_first();\nlet second_value = compute_second();\nlet third_value = compute_third();\n";
+        let a = format!("start_of_file_marker\n{block}middle_of_file_marker\nend_of_file_marker\n");
+        let b = format!(
+            "middle_of_file_marker\n{block}{block}start_of_file_marker\nend_of_file_marker\n"
+        );
+        let r = diff_text(&a, &b, edited_opts());
+        assert!(r.moves.iter().all(|m| !m.edited), "{:?}", r.moves);
+    }
+
+    #[test]
+    fn one_shared_line_is_not_enough_evidence() {
+        let a = "alpha_unique_statement();\nx1\nx2\nx3\nkeep_one\nkeep_two\n";
+        let b = "keep_one\nkeep_two\ny1\ny2\nalpha_unique_statement();\ny3\n";
+        let r = diff_text(a, b, edited_opts());
+        assert!(r.moves.iter().all(|m| !m.edited), "{:?}", r.moves);
+    }
+
+    #[test]
+    fn moves_get_stable_ids_shared_by_both_ends() {
+        let f = "fn helper(x: u32) -> u32 {\n    let y = x * 2;\n    y + 1\n}\n";
+        let g = "fn another(x: u32) -> u32 {\n    let z = x * 3;\n    z + 2\n}\n";
+        let (s1, s2) = (stay("one"), stay("two"));
+        let a = format!("{f}{s1}{g}{s2}");
+        let b = format!("{s1}{s2}{g}{f}");
+        let one = diff_text(&a, &b, edited_opts());
+        let two = diff_text(&a, &b, edited_opts());
+        let ids = |r: &TextDiffResult| r.moves.iter().map(|m| (m.id, m.a, m.b)).collect::<Vec<_>>();
+        assert_eq!(ids(&one), ids(&two));
+        assert_eq!(one.moves.len(), 2, "{:?}", one.moves);
+        // Ids count in the order of the left start and belong to the block, not to a side.
+        assert_eq!((one.moves[0].id, one.moves[0].a), (1, 0));
+        assert_eq!(one.moves[1].id, 2);
+        assert!(one.moves.iter().all(|m| !m.edited && m.len == m.b_len));
+    }
+
+    #[test]
+    fn whitespace_only_move_stays_exact() {
+        let f = "fn helper(x: u32) -> u32 {\n    let y = x * 2;\n    y + 1\n}\n";
+        let s = stay("w");
+        let a = format!("{f}{s}");
+        let b = format!("{s}{}", f.replace("    ", "\t\t"));
+        let r = diff_text(&a, &b, edited_opts());
+        assert_eq!(r.moves.len(), 1, "{:?}", r.moves);
+        let m = r.moves[0];
+        assert!(!m.edited && m.len == 4 && m.b_len == 4, "{m:?}");
+    }
+
     #[test]
     fn short_or_trivial_blocks_are_not_moves() {
         let r = diff_text(
@@ -1056,7 +1733,7 @@ mod tests {
         };
         let a = "fn a() {\n    call(one, two);\n}\n\nfn b() { old(); }\n";
         let b = "fn a() {\n    call(\n        one,\n        two,\n    );\n}\n\nfn b() { new(); }\n";
-        let r = diff_text_as(a, b, o, Syntax::for_names(&["a.rs"]));
+        let r = diff_text_as(a, b, o.clone(), Syntax::for_names(&["a.rs"]));
         let changed: Vec<&Op> = r.ops.iter().filter(|op| op.tag != "equal").collect();
         assert_eq!(changed.len(), 2);
         // The reflowed call differs only by a trailing comma: one token marked.
@@ -1069,7 +1746,7 @@ mod tests {
         let r = diff_text_as(
             "a(b);\nc();\n",
             "a( b );\nc();\n",
-            o,
+            o.clone(),
             Syntax::for_names(&["a.rs"]),
         );
         assert!(r.ops[0].cosmetic && r.ops[0].tag == "replace");
@@ -1133,6 +1810,51 @@ mod tests {
         )
         .unwrap();
         assert!(same.binary.unwrap().identical);
+    }
+
+    #[test]
+    fn exported_patches_have_portable_names_in_every_format_and_use_the_sources_as_given() {
+        use crate::fs::patch::{parse, Format};
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("some folder").join("deep");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (p, q) = (dir.join("old name.txt"), dir.join("new name.txt"));
+        std::fs::write(&p, "one\ntwo\nthree\n").unwrap();
+        std::fs::write(&q, "one\n2\nthree\n").unwrap();
+        let (a, b) = (
+            DiffSource::File { path: p.clone() },
+            DiffSource::File { path: q },
+        );
+        let unified = export_patch(&a, &b, Format::Unified).unwrap();
+        // File names, not the folders of this computer; quoted, as GNU `patch` reads a name with a space.
+        assert!(
+            unified.starts_with("--- \"a/old name.txt\"\n+++ \"b/new name.txt\"\n"),
+            "{unified}"
+        );
+        assert!(!unified.contains(t.path().to_str().unwrap()));
+        for format in [Format::Unified, Format::Context, Format::Normal] {
+            let text = export_patch(&a, &b, format).unwrap();
+            let patches =
+                parse(format, &text).unwrap_or_else(|e| panic!("{format:?}: {e}\n{text}"));
+            let hunks: Vec<_> = patches.into_iter().flat_map(|p| p.hunks).collect();
+            let (applied, _) = crate::fs::patch::apply_hunks("one\ntwo\nthree\n", &hunks).unwrap();
+            assert_eq!(applied, "one\n2\nthree\n", "{format:?}");
+        }
+        // A draft: the right side is text that is not saved anywhere; the patch is of that text (the draft), not of the file.
+        let draft = DiffSource::Text {
+            label: "draft.txt".into(),
+            text: "one\ntwo\nTHREE\n".into(),
+        };
+        let patch = export_patch(&a, &draft, Format::Unified).unwrap();
+        assert!(
+            patch.contains("+THREE") && patch.contains("+++ b/draft.txt"),
+            "{patch}"
+        );
+        assert!(unified_patch(&a, &draft).unwrap() == patch);
+        // Binary input is no patch.
+        let bin = t.path().join("b.bin");
+        std::fs::write(&bin, [0u8, 1, 2]).unwrap();
+        assert!(export_patch(&a, &DiffSource::File { path: bin }, Format::Unified).is_err());
     }
 
     #[test]
@@ -1310,6 +2032,56 @@ mod image_tests {
         assert_eq!((d.compared, d.changed, d.max_delta), (100, 5, 255));
         assert!(po.exists());
     }
+
+    #[test]
+    fn compare_paged_missing_git_revision_reports_selected_revision_error() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(root)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("first.txt"), "one\n").unwrap();
+        run(&["add", "first.txt"]);
+        run(&["commit", "-qm", "first"]);
+        let first_rev = String::from_utf8(
+            std::process::Command::new("git")
+                .current_dir(root)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let first_rev = first_rev.trim().to_string();
+        let later = root.join("later.txt");
+        std::fs::write(&later, "two\n").unwrap();
+        let err = compare_paged(
+            &DiffSource::GitCommit {
+                path: later.clone(),
+                commit: first_rev,
+            },
+            &DiffSource::File { path: later },
+            DiffOptions::default(),
+            &AtomicBool::new(false),
+        )
+        .err()
+        .expect("missing revision should fail")
+        .to_string();
+        assert!(
+            err.contains("file is not in the selected revision"),
+            "unexpected error: {err}"
+        );
+    }
 }
 
 // ───────────────────────────── many files ─────────────────────────────
@@ -1425,7 +2197,7 @@ fn pair_ratio(a: &Content, b: &Content) -> f32 {
     match (a, b) {
         (Content::Lines(x), Content::Lines(y)) => {
             let ops = similar::capture_diff_slices(Algorithm::Myers, x, y);
-            similar::get_diff_ratio(&ops, x.len(), y.len())
+            similar::diff_ratio(&ops, x.len(), y.len())
         }
         (Content::Bytes(x), Content::Bytes(y)) => (x == y) as u8 as f32,
         (Content::Large(x), Content::Large(y)) => {
@@ -1436,6 +2208,7 @@ fn pair_ratio(a: &Content, b: &Content) -> f32 {
                     size: 0,
                     crlf: false,
                     final_newline: false,
+                    revision: String::new(),
                 },
                 bytes: vec![],
                 stream: Some(x.clone()),
@@ -1447,6 +2220,7 @@ fn pair_ratio(a: &Content, b: &Content) -> f32 {
                     size: 0,
                     crlf: false,
                     final_newline: false,
+                    revision: String::new(),
                 },
                 bytes: vec![],
                 stream: Some(y.clone()),

@@ -949,20 +949,12 @@ pub(crate) struct Block {
     pub changed: bool,
 }
 
-/// Token comparison of the changed blocks `(a0, a1, b0, b1)` of a line diff, one
-/// result per block (`None`: too large, left to the caller).
-pub(crate) fn compare_hunks(
-    left: &[String],
-    right: &[String],
-    hunks: &[(usize, usize, usize, usize)],
-    syntax: Syntax,
-    ignore_space: bool,
-    ignore_case: bool,
-) -> Vec<Option<Block>> {
-    // Shell escapes/heredocs, Lua long brackets, C-family raw strings/text blocks
-    // and continued macros require more grammar context. Preserve the whole file
-    // literally when these markers occur, including unchanged lines above a hunk.
-    let literal = left.iter().chain(right).any(|line| {
+/// Shell escapes/heredocs, Lua long brackets, C-family raw strings/text blocks and continued
+/// macros require more grammar context than the lexer has. When these markers occur anywhere in
+/// the lines (also in unchanged lines above a hunk) the text is read literally, as plain text.
+fn guarded<'a>(syntax: Syntax, lines: impl Iterator<Item = &'a String>) -> Syntax {
+    let mut lines = lines;
+    let literal = lines.any(|line| {
         (syntax == SHELL && (line.contains("<<") || line.contains('\\')))
             || (syntax == LUA
                 && line
@@ -974,7 +966,42 @@ pub(crate) fn compare_hunks(
                 && line.trim_start().starts_with('#')
                 && line.trim_end().ends_with('\\'))
     });
-    let syntax = if literal { PLAIN } else { syntax };
+    if literal {
+        PLAIN
+    } else {
+        syntax
+    }
+}
+
+/// The comments of a text, per line: the byte ranges of the comment tokens (delimiters included)
+/// that the lexer is sure about. Where it is not (see [`guarded`]), and for plain text, none.
+/// The result has one entry per line, so a comment spanning lines is found on each of them.
+pub(crate) fn comment_ranges(lines: &[String], syntax: Syntax) -> Vec<Vec<(usize, usize)>> {
+    let mut found = vec![Vec::new(); lines.len()];
+    let syntax = guarded(syntax, lines.iter());
+    if lines.is_empty() || syntax == PLAIN {
+        return found;
+    }
+    let whole: Range<usize> = 0..lines.len();
+    for token in lex(lines, syntax, true, std::slice::from_ref(&whole)) {
+        if token.real() && token.class & CLASS == COMMENT {
+            found[token.line as usize].push((token.start as usize, token.end as usize));
+        }
+    }
+    found
+}
+
+/// Token comparison of the changed blocks `(a0, a1, b0, b1)` of a line diff, one
+/// result per block (`None`: too large, left to the caller).
+pub(crate) fn compare_hunks(
+    left: &[String],
+    right: &[String],
+    hunks: &[(usize, usize, usize, usize)],
+    syntax: Syntax,
+    ignore_space: bool,
+    ignore_case: bool,
+) -> Vec<Option<Block>> {
+    let syntax = guarded(syntax, left.iter().chain(right));
     let a_ranges: Vec<Range<usize>> = hunks.iter().map(|h| h.0..h.1).collect();
     let b_ranges: Vec<Range<usize>> = hunks.iter().map(|h| h.2..h.3).collect();
     let (ta, tb) = (

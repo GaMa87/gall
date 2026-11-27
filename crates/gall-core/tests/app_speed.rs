@@ -23,8 +23,11 @@
 //! `GALL_SPEED_ONLY` selects comma-separated parts of row names for focused measurements;
 //! omit it for the complete speed check. Use it when recording a new row so existing
 //! limits stay unchanged.
-use gall_core::fs::{archive_view, diff, dircmp, dirsize, grep, index, listing, search, syntax};
+use gall_core::fs::{
+    archive, archive_view, diff, dircmp, dirsize, grep, index, listing, search, syntax,
+};
 use gall_core::storage::Db;
+use gall_core::view::sort;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -93,6 +96,10 @@ struct Fixture {
     tar_gz: PathBuf,
     /// A 7z archive of 5 000 source files in ten solid blocks.
     seven_z: PathBuf,
+    /// A zip archive of the 5 000 source files of `left`, made by `archive::compress`.
+    small_zip: PathBuf,
+    /// Where the compress and extract rows write (emptied after every run).
+    scratch: PathBuf,
 }
 
 fn build(base: &Path) -> Fixture {
@@ -246,6 +253,19 @@ fn build(base: &Path) -> Fixture {
         }
         writer.finish().unwrap();
     }
+    let scratch = base.join("scratch");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let small_zip = {
+        let mut tick = |_| {};
+        archive::compress(
+            std::slice::from_ref(&left),
+            &base.join("small.zip"),
+            archive::ArchiveFormat::Zip,
+            &AtomicBool::new(false),
+            &mut tick,
+        )
+        .unwrap()
+    };
     eprintln!("fixture built in {:.1} s", started.elapsed().as_secs_f32());
     Fixture {
         big,
@@ -259,6 +279,8 @@ fn build(base: &Path) -> Fixture {
         zip,
         tar_gz,
         seven_z,
+        small_zip,
+        scratch,
     }
 }
 
@@ -269,6 +291,34 @@ fn tagged_path(dir: usize, file: usize) -> String {
 }
 
 type Row<'a> = (&'static str, Box<dyn Fn() -> bool + 'a>);
+
+/// 100 000 files of 40 types, as a listing returns them.
+fn many_entries() -> Vec<gall_core::fs::FileEntry> {
+    (0..100_000usize)
+        .map(|i| {
+            let ext = format!("t{:02}", i * 7919 % 40);
+            let name = format!("file {}.{ext}", i * 7919 % 100_000);
+            gall_core::fs::FileEntry {
+                path: format!("/many/{name}"),
+                name,
+                kind: gall_core::fs::EntryKind::File,
+                is_dir: false,
+                is_hidden: false,
+                is_symlink: false,
+                cloud_only: false,
+                mode: None,
+                owner: None,
+                link_target: None,
+                attributes: None,
+                size: (i * 31 % 5_000) as u64,
+                modified: Some((i * 104_729 % 1_000_003) as i64),
+                created: None,
+                ext,
+                readonly: false,
+            }
+        })
+        .collect()
+}
 
 fn rows(f: &Fixture) -> Vec<Row<'_>> {
     let options = |show_hidden, dirs_only| listing::ListOptions {
@@ -319,6 +369,53 @@ fn rows(f: &Fixture) -> Vec<Row<'_>> {
             changed(&archive) && found
         }) as Box<dyn Fn() -> bool>
     };
+    // Packs the 5 000 files of `left` and removes the archive again.
+    let pack = |format: archive::ArchiveFormat, name: &'static str| {
+        let (source, scratch) = (f.left.clone(), f.scratch.clone());
+        Box::new(move || {
+            let mut tick = |_| {};
+            let Ok(made) = archive::compress(
+                std::slice::from_ref(&source),
+                &scratch.join(name),
+                format,
+                never,
+                &mut tick,
+            ) else {
+                return false;
+            };
+            let ok = std::fs::metadata(&made).is_ok_and(|m| m.len() > 10_000);
+            let _ = std::fs::remove_file(&made);
+            ok
+        }) as Box<dyn Fn() -> bool>
+    };
+    // Unpacks `small_zip` (a folder `left` of 5 000 files) into a fresh folder and removes it again.
+    let unpack = {
+        let (zip, scratch) = (f.small_zip.clone(), f.scratch.clone());
+        Box::new(move || {
+            let mut tick = |_| {};
+            let Ok(made) = archive::extract(
+                &zip,
+                &scratch,
+                archive::ExtractMode::Folder,
+                never,
+                &mut tick,
+            ) else {
+                return false;
+            };
+            let files = made
+                .first()
+                .map(|root| {
+                    std::fs::read_dir(root.join("left"))
+                        .map(|d| d.count())
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0);
+            for path in made {
+                let _ = std::fs::remove_dir_all(path);
+            }
+            files > 0
+        }) as Box<dyn Fn() -> bool>
+    };
     let find = |pattern: &'static str, at_least: usize| {
         let tree = f.tree.clone();
         Box::new(move || {
@@ -344,6 +441,23 @@ fn rows(f: &Fixture) -> Vec<Row<'_>> {
         }) as Box<dyn Fn() -> bool>
     };
     let idx: &'static index::FileIndex = Box::leak(Box::new(index::FileIndex::new()));
+    let sorted = |mode| {
+        let entries = many_entries();
+        Box::new(move || {
+            let mut v = entries.clone();
+            let sort = sort::SortSpec {
+                key: sort::SortKey::Modified,
+                descending: true,
+                ..Default::default()
+            };
+            let group = sort::GroupSpec {
+                mode,
+                ..Default::default()
+            };
+            let groups = sort::group_entries(&mut v, &sort, &group);
+            v.len() == 100_000 && groups.len() == if mode.by_type() { 40 } else { 0 }
+        }) as Box<dyn Fn() -> bool>
+    };
     let roots = vec![f.tree.clone(), f.big.clone(), f.appdata.clone()];
     let build_index = {
         let roots = roots.clone();
@@ -366,11 +480,27 @@ fn rows(f: &Fixture) -> Vec<Row<'_>> {
     let lines: Vec<String> = text_a.lines().map(str::to_owned).collect();
     let (left, right) = (f.left.clone(), f.right.clone());
     let (left2, right2) = (f.left.clone(), f.right.clone());
+    let (left3, right3) = (f.left.clone(), f.right.clone());
+    let (left4, right4) = (f.left.clone(), f.right.clone());
+    let (tree_left, tree_right) = (f.tree.clone(), f.appdata.clone());
     let tree = f.tree.clone();
     let cmp = |content| dircmp::DirCmpOptions {
         content,
         hidden: true,
         respect_gitignore: false,
+        ..Default::default()
+    };
+    // Filters that leave out whole folders and single files, and a size range, as the filter form sets them.
+    let filtered = move || dircmp::DirCmpOptions {
+        exclude: vec!["d0*/".to_owned(), "f*7.txt".to_owned()],
+        include: vec!["*.txt".to_owned()],
+        min_size: Some(1),
+        ..cmp(false)
+    };
+    // Hidden files are not shown, so every folder is read once more to find what is not listed.
+    let unlisted = move || dircmp::DirCmpOptions {
+        hidden: false,
+        ..cmp(false)
     };
     let store: &'static Db = Box::leak(Box::new(Db::open(&f.db).unwrap()));
     let sep = std::path::MAIN_SEPARATOR;
@@ -379,6 +509,14 @@ fn rows(f: &Fixture) -> Vec<Row<'_>> {
         .collect();
     let folder = move |dir: usize| format!("{sep}tags{sep}folder{dir:04}");
     vec![
+        (
+            "sort 100 000 entries by date",
+            sorted(sort::GroupMode::Folders),
+        ),
+        (
+            "sort 100 000 entries by date, grouped by type",
+            sorted(sort::GroupMode::FoldersType),
+        ),
         (
             "list a folder of 46 500 entries, hidden shown",
             list(&f.big, true, false, 40_000),
@@ -433,7 +571,9 @@ fn rows(f: &Fixture) -> Vec<Row<'_>> {
         ),
         (
             "diff two files of 40 000 lines by tokens (structural)",
-            Box::new(move || diff::compare(&a2, &b2, structural).is_ok_and(|d| d.text.is_some())),
+            Box::new(move || {
+                diff::compare(&a2, &b2, structural.clone()).is_ok_and(|d| d.text.is_some())
+            }),
         ),
         (
             "highlight 40 000 lines",
@@ -448,6 +588,26 @@ fn rows(f: &Fixture) -> Vec<Row<'_>> {
             Box::new(move || dircmp::compare_dirs(&left2, &right2, cmp(true), never).is_ok()),
         ),
         (
+            "compare two folders of 5 000 files (filtered)",
+            Box::new(move || dircmp::compare_dirs(&left3, &right3, filtered(), never).is_ok()),
+        ),
+        (
+            "compare two folders of 5 000 files (content, read again)",
+            Box::new(move || {
+                let fresh = dircmp::DirCmpOptions {
+                    fresh: true,
+                    ..cmp(true)
+                };
+                dircmp::compare_dirs(&left4, &right4, fresh, never).is_ok()
+            }),
+        ),
+        (
+            "compare a tree of 60 000 files with a profile folder, many folders (hidden files not shown)",
+            Box::new(move || {
+                dircmp::compare_dirs(&tree_left, &tree_right, unlisted(), never).is_ok()
+            }),
+        ),
+        (
             "size of a folder of 60 000 files",
             Box::new(move || dirsize::dir_size(&tree, never, &|_| {}).is_some()),
         ),
@@ -459,6 +619,15 @@ fn rows(f: &Fixture) -> Vec<Row<'_>> {
             "open one file inside a zip archive of 50 000 entries",
             open_inside(&f.zip, "dir250/file49750.rs"),
         ),
+        (
+            "compress a folder of 5 000 files to a zip",
+            pack(archive::ArchiveFormat::Zip, "pack.zip"),
+        ),
+        (
+            "compress a folder of 5 000 files to a tar.gz",
+            pack(archive::ArchiveFormat::TarGz, "pack.tar.gz"),
+        ),
+        ("extract a zip of 5 000 files", unpack),
         (
             "list a tar.gz archive of 20 000 files",
             list_archive(&f.tar_gz, 20_200),

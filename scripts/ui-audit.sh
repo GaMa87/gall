@@ -5,9 +5,14 @@
 # checks every state for overlapping or cut-off text and controls outside the window.
 #   ./scripts/ui-audit.sh [binary]     default: target/debug/gall
 # Needs a build with the bundled UI for reliable results (see CONTRIBUTING.md).
-# Requires KDE Spectacle. Close Gall first. Prints the report; screenshots in out/.
+# Uses a private headless compositor when available (kwin_wayland, labwc, weston,
+# sway, or Xvfb), or the active desktop (auto-floating on Hyprland/Omarchy).
+# Close Gall first. Prints the report; screenshots in out/.
 set -u
-APP="$(realpath "${1:-target/debug/gall}")"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=scripts/gui-session.sh
+. "$REPO_ROOT/scripts/gui-session.sh"
+APP="$(realpath "${1:-$REPO_ROOT/target/debug/gall}")"
 if pgrep -x gall >/dev/null; then echo "Gall is running; close it first."; exit 2; fi
 T="$(mktemp -d -t gall-audit-XXXX)"
 mkdir -p "$T/config" "$T/data" "$T/out" "$T/td"
@@ -37,9 +42,12 @@ ln -s /nonexistent/target Trouble/broken-link
 ln -s loop Trouble/loop
 echo x > Trouble/Vanish/inner/f.txt
 cd "$T"
-export GALL_SELFTEST_DBUS="${DBUS_SESSION_BUS_ADDRESS:-}"
 export XDG_CONFIG_HOME="$T/config" XDG_DATA_HOME="$T/data" GALL_SELFTEST=audit GALL_SELFTEST_DIR="$T/out"
-timeout 400 dbus-run-session -- "$APP" -p "$T/td" -p2 "$T/td/Other" > "$T/app.log" 2>&1
+BACKEND="$(gall_gui_select_backend)" || exit $?
+echo "UI-audit mode: $(gall_gui_backend_label "$BACKEND")"
+printf '#!/bin/sh\nexec "%s" -p "%s/td" -p2 "%s/td/Other"\n' "$APP" "$T" "$T" > "$T/run-app.sh"
+chmod +x "$T/run-app.sh"
+GALL_GUI_BACKEND="$BACKEND" gall_gui_run "$T" 400 "$T/app.log" "$T/run-app.sh" || true
 chmod 755 "$T/td/Trouble/Locked" 2>/dev/null
 if [ -f "$T/out/report.txt" ]; then cat "$T/out/report.txt"; else echo "NO REPORT"; tail -20 "$T/app.log"; fi
 echo "Screenshots: $T/out"

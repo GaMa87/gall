@@ -6,4 +6,12 @@
 .DS_Store
 /node_modules
 /dist
+
+# Agent worktrees (kept out of searches and exports; also in .git/info/exclude)
+/.worktrees/
+/.claude/worktrees/
 ui/tsconfig.tsbuildinfo
+__pycache__/
+
+# The browser module of the comparison, built by scripts/build-compare-wasm.mjs
+/ui/public/compare-wasm/

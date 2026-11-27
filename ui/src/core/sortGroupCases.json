@@ -1,0 +1,107 @@
+{
+  "classify": [
+    ["a.png", false, "ext:png", "kind:image"],
+    ["A.PNG", false, "ext:png", "kind:image"],
+    ["pack.tar.gz", false, "ext:gz", "kind:archive"],
+    ["pack.7z", false, "ext:7z", "kind:archive"],
+    [".bashrc", false, "dot", "kind:code"],
+    [".config.json", false, "ext:json", "kind:code"],
+    [".hidden.", false, "dot", "kind:other"],
+    ["name.", false, "none", "kind:other"],
+    ["two..dots", false, "ext:dots", "kind:other"],
+    ["Makefile", false, "none", "kind:code"],
+    ["LICENSE", false, "none", "kind:document"],
+    ["png", false, "none", "kind:other"],
+    ["READ ME", false, "none", "kind:other"],
+    ["film.MKV", false, "ext:mkv", "kind:video"],
+    ["song.flac", false, "ext:flac", "kind:audio"],
+    ["report.pdf", false, "ext:pdf", "kind:document"],
+    ["sheet.xlsx", false, "ext:xlsx", "kind:document"],
+    ["main.rs", false, "ext:rs", "kind:code"],
+    ["part.stl", false, "ext:stl", "kind:other"],
+    ["what.xyz123", false, "ext:xyz123", "kind:other"],
+    ["folder.png", true, "dir", "dir"],
+    [".git", true, "dir", "dir"]
+  ],
+  "listing": [
+    ["src", true, 0, 50],
+    ["Docs", true, 0, 900],
+    ["b.PNG", false, 100, 20],
+    ["a.png", false, 300, 10],
+    ["c10.png", false, 50, 30],
+    ["c2.png", false, 50, 30],
+    ["notes.txt", false, 10, 500],
+    ["read.txt", false, 700, 5],
+    ["x.md", false, 5, 1],
+    ["pack.tar.gz", false, 2000, 40],
+    [".bashrc", false, 7, 60],
+    ["Makefile", false, 9, 70],
+    ["LICENSE", false, 3, 2],
+    ["end.", false, 1, 3]
+  ],
+  "orders": [
+    {
+      "title": "no grouping mixes folders and files",
+      "sort": { "key": "name", "descending": false, "foldersOnTop": true, "foldersByName": false },
+      "group": { "mode": "none", "order": "name", "byKind": false },
+      "names": [".bashrc", "a.png", "b.PNG", "c2.png", "c10.png", "Docs", "end.", "LICENSE", "Makefile", "notes.txt", "pack.tar.gz", "read.txt", "src", "x.md"],
+      "groups": []
+    },
+    {
+      "title": "folders first has no groups of its own",
+      "sort": { "key": "name", "descending": false, "foldersOnTop": false, "foldersByName": false },
+      "group": { "mode": "folders", "order": "size", "byKind": true },
+      "names": ["Docs", "src", ".bashrc", "a.png", "b.PNG", "c2.png", "c10.png", "end.", "LICENSE", "Makefile", "notes.txt", "pack.tar.gz", "read.txt", "x.md"],
+      "groups": []
+    },
+    {
+      "title": "folders, then types by name, newest first inside each",
+      "sort": { "key": "modified", "descending": true, "foldersOnTop": true, "foldersByName": false },
+      "group": { "mode": "foldersType", "order": "name", "byKind": false },
+      "names": ["Docs", "src", "pack.tar.gz", "x.md", "c10.png", "c2.png", "b.PNG", "a.png", "notes.txt", "read.txt", ".bashrc", "Makefile", "end.", "LICENSE"],
+      "groups": [["dir", 2, 0], ["ext:gz", 1, 2000], ["ext:md", 1, 5], ["ext:png", 4, 500], ["ext:txt", 2, 710], ["dot", 1, 7], ["none", 3, 13]]
+    },
+    {
+      "title": "ascending has the same groups in the same order",
+      "sort": { "key": "modified", "descending": false, "foldersOnTop": true, "foldersByName": false },
+      "group": { "mode": "foldersType", "order": "name", "byKind": false },
+      "names": ["src", "Docs", "pack.tar.gz", "x.md", "a.png", "b.PNG", "c2.png", "c10.png", "read.txt", "notes.txt", ".bashrc", "LICENSE", "end.", "Makefile"],
+      "groups": [["dir", 2, 0], ["ext:gz", 1, 2000], ["ext:md", 1, 5], ["ext:png", 4, 500], ["ext:txt", 2, 710], ["dot", 1, 7], ["none", 3, 13]]
+    },
+    {
+      "title": "types by count, folders among them, smallest first inside",
+      "sort": { "key": "size", "descending": false, "foldersOnTop": true, "foldersByName": false },
+      "group": { "mode": "type", "order": "count", "byKind": false },
+      "names": ["c2.png", "c10.png", "b.PNG", "a.png", "end.", "LICENSE", "Makefile", "notes.txt", "read.txt", "Docs", "src", "pack.tar.gz", "x.md", ".bashrc"],
+      "groups": [["ext:png", 4, 500], ["none", 3, 13], ["ext:txt", 2, 710], ["dir", 2, 0], ["ext:gz", 1, 2000], ["ext:md", 1, 5], ["dot", 1, 7]]
+    },
+    {
+      "title": "types by their most recent change, names descending inside",
+      "sort": { "key": "name", "descending": true, "foldersOnTop": true, "foldersByName": false },
+      "group": { "mode": "foldersType", "order": "recent", "byKind": false },
+      "names": ["src", "Docs", "read.txt", "notes.txt", "Makefile", "LICENSE", "end.", ".bashrc", "pack.tar.gz", "c10.png", "c2.png", "b.PNG", "a.png", "x.md"],
+      "groups": [["dir", 2, 0], ["ext:txt", 2, 710], ["none", 3, 13], ["dot", 1, 7], ["ext:gz", 1, 2000], ["ext:png", 4, 500], ["ext:md", 1, 5]]
+    },
+    {
+      "title": "types by total size",
+      "sort": { "key": "name", "descending": false, "foldersOnTop": false, "foldersByName": false },
+      "group": { "mode": "type", "order": "size", "byKind": false },
+      "names": ["pack.tar.gz", "notes.txt", "read.txt", "a.png", "b.PNG", "c2.png", "c10.png", "end.", "LICENSE", "Makefile", ".bashrc", "x.md", "Docs", "src"],
+      "groups": [["ext:gz", 1, 2000], ["ext:txt", 2, 710], ["ext:png", 4, 500], ["none", 3, 13], ["dot", 1, 7], ["ext:md", 1, 5], ["dir", 2, 0]]
+    },
+    {
+      "title": "kinds",
+      "sort": { "key": "name", "descending": false, "foldersOnTop": true, "foldersByName": false },
+      "group": { "mode": "foldersType", "order": "name", "byKind": true },
+      "names": ["Docs", "src", "pack.tar.gz", ".bashrc", "Makefile", "LICENSE", "notes.txt", "read.txt", "x.md", "a.png", "b.PNG", "c2.png", "c10.png", "end."],
+      "groups": [["dir", 2, 0], ["kind:archive", 1, 2000], ["kind:code", 2, 16], ["kind:document", 4, 718], ["kind:image", 4, 500], ["kind:other", 1, 1]]
+    },
+    {
+      "title": "folders always by name ignore the sort and its direction",
+      "sort": { "key": "modified", "descending": true, "foldersOnTop": true, "foldersByName": true },
+      "group": { "mode": "type", "order": "name", "byKind": true },
+      "names": ["pack.tar.gz", "Makefile", ".bashrc", "notes.txt", "read.txt", "LICENSE", "x.md", "c10.png", "c2.png", "b.PNG", "a.png", "end.", "Docs", "src"],
+      "groups": [["kind:archive", 1, 2000], ["kind:code", 2, 16], ["kind:document", 4, 718], ["kind:image", 4, 500], ["kind:other", 1, 1], ["dir", 2, 0]]
+    }
+  ]
+}

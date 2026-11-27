@@ -2,6 +2,7 @@
 // light → dark, every cell labelled with its percentage), files grouped so
 // near-copies sit together, plus the closest pairs and the odd one out.
 import { useEffect, useMemo, useRef, useState } from "react";
+import { tt } from "../i18n";
 import { api } from "../api/ipc";
 import type { SimilarityMatrix as M } from "../api/types";
 import { formatSize } from "../core/format";
@@ -9,10 +10,10 @@ import * as A from "../state/actions";
 import { FileIcon, Icon } from "./Icon";
 
 const pct = (r: number) => `${Math.round(r * 100)}%`;
-/** Sequential ramp on the accent hue; contrast flips to light text on dark cells. */
+/** A restrained accent ramp keeps the theme foreground readable on every cell. */
 const cellStyle = (r: number) => ({
-  background: `color-mix(in oklab, var(--accent) ${Math.round(8 + r * 80)}%, var(--bg-2))`,
-  color: r > 0.55 ? "#fff" : "var(--fg)",
+  background: `color-mix(in oklab, var(--accent) ${Math.round(8 + r * 16)}%, var(--bg-2))`,
+  color: "var(--fg)",
 });
 
 export function SimilarityMatrix({ paths }: { paths: string[] }) {
@@ -67,18 +68,18 @@ export function SimilarityMatrix({ paths }: { paths: string[] }) {
           <Icon name="compare" size={16} />
           <b>Similarity of {paths.length} files</b>
           <div className="seg">
-            <button className={grouped ? "on" : ""} title="Order so similar files sit together (o)" onClick={() => setGrouped(true)}>Grouped by similarity</button>
-            <button className={!grouped ? "on" : ""} title="Selection order (o)" onClick={() => setGrouped(false)}>Selection order</button>
+            <button className={grouped ? "on" : ""} title={tt("Order so similar files sit together (o)")} onClick={() => setGrouped(true)}>{tt("Grouped by similarity")}</button>
+            <button className={!grouped ? "on" : ""} title={tt("Selection order (o)")} onClick={() => setGrouped(false)}>{tt("Selection order")}</button>
           </div>
           <span className="spacer" />
-          <button className="icon-btn" title="Close (Esc)" onClick={() => A.openOverlay(null)}><Icon name="close" size={15} /></button>
+          <button className="icon-btn" title={tt("Close (Esc)")} onClick={() => A.openOverlay(null)}><Icon name="close" size={15} /></button>
         </header>
         {err && <div className="dv-msg err">{err}</div>}
         {!m && !err && <div className="dv-msg">Comparing {paths.length} files…</div>}
         {m && stats && (
           <div className="sx-body">
             <div className="sx-grid-wrap">
-              <table className="sx-grid" role="grid" aria-label="Pairwise similarity">
+              <table className="sx-grid" role="grid" aria-label={tt("Pairwise similarity")}>
                 <thead>
                   <tr>
                     <th />
@@ -113,19 +114,19 @@ export function SimilarityMatrix({ paths }: { paths: string[] }) {
               </table>
             </div>
             <aside className="sx-side">
-              <h4>Most alike</h4>
+              <h4>{tt("Most alike")}</h4>
               {stats.top.map(([i, j, r]) => (
                 <button key={`${i}-${j}`} className="sx-pair" onClick={() => open(i, j)}>
                   <span className="sx-chip" style={cellStyle(r)}>{r >= 0.9999 ? "=" : pct(r)}</span>
                   <span>{m.names[i]}</span><span className="sx-arrow">↔</span><span>{m.names[j]}</span>
                 </button>
               ))}
-              <h4>Odd one out</h4>
+              <h4>{tt("Odd one out")}</h4>
               <div className="sx-odd"><b>{m.names[stats.odd]}</b> · on average {pct(stats.avg[stats.odd])} similar to the others</div>
               {stats.identical > 0 && <div className="sx-note"><Icon name="check" size={13} /> {stats.identical} identical pair{stats.identical === 1 ? "" : "s"} (=)</div>}
-              <h4>Scale</h4>
+              <h4>{tt("Scale")}</h4>
               <div className="sx-legend"><span>0%</span><i /><span>100%</span></div>
-              <p className="sx-hint">Text files: share of matching lines. Binary or very large files: identical or not. Click a cell (or Enter) to see the differences.</p>
+              <p className="sx-hint">{tt("Text files: share of matching lines. Binary or very large files: identical or not. Click a cell (or Enter) to see the differences.")}</p>
             </aside>
           </div>
         )}

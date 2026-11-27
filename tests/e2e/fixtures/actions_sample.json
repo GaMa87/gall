@@ -1,0 +1,36 @@
+[
+  {
+    "id": "omarchy.localsend",
+    "label": "Send via LocalSend",
+    "pluralLabel": "Send {count} items via LocalSend",
+    "whenCommand": "localsend",
+    "selection": "any",
+    "command": ["localsend", "--headless", "send", "{paths}"]
+  },
+  {
+    "id": "omarchy.transcode",
+    "label": "Transcode media",
+    "pluralLabel": "Transcode {count} media files",
+    "whenCommand": "omarchy-transcode",
+    "selection": "files",
+    "mimePrefixes": ["video/", "audio/", "image/"],
+    "extensions": ["mp4", "mov", "mkv", "png", "jpg"],
+    "terminal": "floating-presentation",
+    "command": ["omarchy-transcode", "{path}"]
+  },
+  {
+    "id": "omarchy.dir_tool",
+    "label": "Inspect directory",
+    "whenCommand": ["e2e-dir-tool", "sh"],
+    "selection": "dirs",
+    "single": true,
+    "command": ["e2e-dir-tool", "--dir", "{dir}", "{path}"]
+  },
+  {
+    "id": "omarchy.missing_tool",
+    "label": "Missing tool action",
+    "whenCommand": ["sh", "definitely-missing-e2e-cmd"],
+    "selection": "any",
+    "command": ["definitely-missing-e2e-cmd", "{paths}"]
+  }
+]

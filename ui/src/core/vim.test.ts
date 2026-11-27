@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildKeymap, DEFAULT_KEYMAP, type Action, type KeyboardProfile } from "./keymap";
+import { ACTION_KEYS } from "./actionsKeys";
 import { buildLeaderTree, buildVimTree, CTRL_TAP, keysForAction, leaderToken, listBindings, physicalLetter, PREVIOUS_MARK, resolve, shadowedByVim, shortcutLabel, splitKeys, treeForSettings, vimToken, type KeyNode } from "./vim";
 
 describe("vim keys", () => {
@@ -27,10 +28,21 @@ describe("vim keys", () => {
     expect(resolve(tree, ["="]).kind).toBe("pending");
     expect(resolve(tree, ["=", "="])).toEqual({ kind: "action", action: "compare" });
     expect(resolve(tree, ["=", "h"])).toEqual({ kind: "action", action: "compareGitHead" });
-    expect(resolve(tree, ["=", "r"]).kind).toBe("none");
-    expect(resolve(tree, ["g", "r"])).toEqual({ kind: "action", action: "gitGraph" });
     expect(resolve(tree, ["=", "g"])).toEqual({ kind: "action", action: "compareGitCommit" });
+    expect(resolve(tree, ["=", "l"])).toEqual({ kind: "action", action: "compareGitLastChange" });
+    expect(resolve(tree, ["g", "r"])).toEqual({ kind: "action", action: "gitGraph" });
+    expect(resolve(tree, ["=", "r"])).toEqual({ kind: "action", action: "gitFileHistory" });
     expect(resolve(tree, ["+", "+"])).toEqual({ kind: "action", action: "focusOther" });
+  });
+
+  it("opens a new window with Ctrl+w n and Space w N, keeping Space w n for the next layout", () => {
+    expect(resolve(tree, ["Ctrl+w", "n"])).toEqual({ kind: "action", action: "newWindow" });
+    expect(resolve(tree, ["Space", "w", "N"])).toEqual({ kind: "action", action: "newWindow" });
+    expect(resolve(tree, ["Space", "w", "n"])).toEqual({ kind: "action", action: "layoutNext" });
+    // Ctrl+Shift+N (new folder) is not a vim key: it stays a chord.
+    expect(resolve(tree, ["Ctrl+Shift+N"]).kind).toBe("none");
+    expect(shadowedByVim("Ctrl+Alt+N")).toBe(false);
+    expect(shadowedByVim("Ctrl+Shift+N")).toBe(false);
   });
 
   it("leader menu with groups", () => {
@@ -80,6 +92,9 @@ describe("vim keys", () => {
     expect(shadowedByVim("Ctrl+H")).toBe(true);
     expect(shadowedByVim("Ctrl+N")).toBe(false);
     expect(shadowedByVim("Ctrl+Shift+H")).toBe(false);
+    expect(shadowedByVim("Ctrl+.")).toBe(false);
+    expect(act("Space", "u", "h")).toEqual({ kind: "action", action: "toggleHidden" });
+    expect(act("Space", "u", "H")).toEqual({ kind: "action", action: "toggleHiddenAll" });
     expect(act("Ctrl+l")).toEqual({ kind: "action", action: "focusRight" });
     expect(act(",", "S")).toEqual({ kind: "action", action: "sortSizeDesc" });
     expect(act("Space", "s", "g")).toEqual({ kind: "action", action: "grepFolder" });
@@ -241,5 +256,50 @@ describe("fuzzyMatch", () => {
     expect(fuzzyMatch("xyz", "New tab")).toBeNull();
     expect(fuzzyMatch("nt", "New tab")!.score).toBeGreaterThan(fuzzyMatch("nt", "Content")!.score);
     expect(fuzzyMatch("Tab", "new tab")).toBeNull();
+  });
+});
+
+describe("leader group for custom actions (actions.d)", () => {
+  const trees = {
+    "vim keys on": buildVimTree("Space"),
+    "vim keys off, leader Space": buildLeaderTree("Space"),
+    "vim keys off, Ctrl tap": buildLeaderTree(CTRL_TAP),
+  };
+  for (const [mode, tree] of Object.entries(trees)) {
+    const lead = mode.endsWith("Ctrl tap") ? CTRL_TAP : "Space";
+
+    it(`opens a pending group on x and takes one key to pick an action (${mode})`, () => {
+      const group = resolve(tree, [lead, "x"]);
+      expect(group.kind).toBe("pending");
+      expect(group.kind === "pending" && group.node.actions).toBe(true);
+      expect(group.kind === "pending" && group.node.label).toBe("+custom actions");
+      expect(resolve(tree, [lead, "x", "1"])).toEqual({ kind: "customAction", key: "1" });
+      expect(resolve(tree, [lead, "x", "0"])).toEqual({ kind: "customAction", key: "0" });
+      expect(resolve(tree, [lead, "x", "q"])).toEqual({ kind: "customAction", key: "q" });
+    });
+
+    it(`ignores keys that cannot name an action and sequences that go on (${mode})`, () => {
+      for (const bad of ["Q", "Space", "Ctrl+d", "Tab", "Escape", "-", "11"]) expect(resolve(tree, [lead, "x", bad]).kind).toBe("none");
+      expect(resolve(tree, [lead, "x", "1", "2"]).kind).toBe("none");
+    });
+  }
+
+  it("takes no key away from vim's own x (cut) or from the other leader groups", () => {
+    const vim = trees["vim keys on"];
+    expect(resolve(vim, ["x"])).toEqual({ kind: "action", action: "cut" });
+    expect(resolve(vim, ["Space", "a", "x"])).toEqual({ kind: "action", action: "extractHere" });
+    expect(resolve(vim, ["Space", "s", "g"])).toEqual({ kind: "action", action: "grepFolder" });
+  });
+
+  it("is not there without a leader key, and never marks other groups", () => {
+    expect(resolve(buildLeaderTree(""), ["x"]).kind).toBe("none");
+    const group = resolve(trees["vim keys on"], ["Space", "o"]);
+    expect(group.kind === "pending" && group.node.actions).toBeFalsy();
+  });
+
+  it("offers as many keys as the group can name, all unique single characters", () => {
+    expect(ACTION_KEYS).toHaveLength(36);
+    expect(new Set(ACTION_KEYS).size).toBe(36);
+    expect([...ACTION_KEYS].every((k) => k.length === 1)).toBe(true);
   });
 });

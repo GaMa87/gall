@@ -1,15 +1,15 @@
 /* Repository selector: a button that looks like the other toolbar controls and a menu in the app's menu style. */
-.rp-button { display: inline-flex; align-items: center; gap: 7px; width: 190px; padding: 4px 8px; font-size: 12px; text-align: left; background: var(--bg-3); border: 1px solid var(--border); border-radius: var(--radius); color: var(--fg); }
+.rp-button { display: inline-flex; align-items: center; gap: 7px; width: 190px; padding: 4px 8px; font-size: 12px; text-align: left; background: var(--bg-3); border: 1px solid var(--border); border-radius: var(--radius); color: var(--readable-fg, var(--fg)); }
 .rp-button:hover:not(:disabled) { border-color: color-mix(in srgb, var(--accent) 55%, var(--border)); }
 .rp-button:focus-visible, .rp-button.open { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
 .rp-button .rp-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.rp-caret { color: var(--fg-faint); font-size: 10px; transition: transform var(--anim); }
+.rp-caret { color: var(--readable-fg-faint, var(--fg-faint)); font-size: 10px; transition: transform var(--anim); }
 .rp-button.open .rp-caret { transform: rotate(180deg); }
 .rp-mark { color: var(--accent); flex-shrink: 0; }
 .rp-badge { font-size: 10px; line-height: 1; padding: 2px 6px; border-radius: 999px; color: var(--accent-text, var(--accent)); background: var(--accent-soft); flex-shrink: 0; }
-.rp-badge.muted { color: var(--fg-faint); background: var(--hover); }
+.rp-badge.muted { color: var(--readable-fg-faint, var(--fg-faint)); background: var(--hover); }
 
-.rp-menu { position: fixed; z-index: 90; overflow: auto; padding: 5px; background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); animation: pop 110ms var(--ease); }
+.rp-menu { position: fixed; z-index: 90; overflow: auto; padding: 5px; background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); }
 .rp-item { position: relative; display: flex; align-items: center; gap: 7px; padding: 6px 10px; border-radius: calc(var(--radius-lg) - 5px); cursor: pointer; white-space: nowrap; font-size: 12px; }
 .rp-item .rp-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .rp-item.kb { background: var(--accent-soft); }

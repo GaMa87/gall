@@ -1,0 +1,13 @@
+.ab { width: min(560px, calc(100% - 28px)); }
+.ab-note { margin: 0; padding: 8px 14px; font-size: 12px; overflow-wrap: anywhere; }
+.ab .gr-search { flex: none; padding: 8px 12px; border-bottom: 1px solid var(--border-soft); }
+.ab .gr-search input { width: 100%; padding: 6px 8px; }
+.ab-commit { padding: 6px 8px; border-radius: var(--radius); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; cursor: default; }
+.ab-commit.on { background: var(--accent-soft); }
+.ab-commit code, .ab-hunk code { color: var(--readable-accent-text, var(--accent-text)); }
+.ab-hunk { display: flex; gap: 10px; align-items: flex-start; padding: 8px; border-bottom: 1px solid var(--border-soft); }
+.ab-hunk > div { flex: 1; min-width: 0; }
+.ab-hunk b { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.ab-hunk small { display: block; color: var(--readable-fg-dim, var(--fg-dim)); font-size: 11px; overflow-wrap: anywhere; }
+.ab-hunk.left { opacity: .75; }
+.ab-hunk pre { margin: 4px 0 0; overflow: auto; font-size: 11px; }

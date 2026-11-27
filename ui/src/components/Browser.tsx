@@ -1,11 +1,13 @@
 // Browser = tabs + navigation + folder pane + details, arranged per layout (W-02…W-06).
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { tt } from "../i18n";
 import type { Layout } from "../api/types";
 import type { Action } from "../core/keymap";
+import { createRafCoalescer, workspaceSplitFlex } from "../core/resizeThrottle";
 import { useKeyLabels } from "../state/keyLabels";
 import * as A from "../state/actions";
-import { useSize } from "../state/hooks";
-import { getState, setState, useStore } from "../state/store";
+import { useWidthAbove } from "../state/hooks";
+import { arrangement, getState, setState, sidebarShown, useStore } from "../state/store";
 import { DetailsPane } from "./DetailsPane";
 import { FolderPane } from "./FolderPane";
 import { Icon } from "./Icon";
@@ -22,7 +24,7 @@ function Browser({ b, layout }: { b: number; layout: Layout }) {
   const tab = browser.tabs[browser.active];
   // In Classic the active browser is the one shown (the other stays mounted, hidden).
   const active = session.activeBrowser === b;
-  const [ref, size] = useSize<HTMLDivElement>();
+  const [ref, wideForDetails] = useWidthAbove<HTMLDivElement>(520);
   const [navH, setNavH] = useStoredSize(`nav-h-${layout}`, 150);
   const [detW, setDetW] = useStoredSize(`details-w-${layout}`, 300);
   const [dragStart, setDragStart] = useState(0);
@@ -49,9 +51,9 @@ function Browser({ b, layout }: { b: number; layout: Layout }) {
     </>
   );
 
-  const details = detailsVisible && size.w > 520 && (
+  const details = detailsVisible && wideForDetails && (
     <>
-      <Splitter dir="v" onDragStart={() => setDragStart(detW)} onDrag={(d) => setDetW(Math.max(180, Math.min(size.w * 0.6, dragStart - d)))} />
+      <Splitter dir="v" onDragStart={() => setDragStart(detW)} onDrag={(d) => setDetW(Math.max(180, Math.min((ref.current?.clientWidth || 800) * 0.6, dragStart - d)))} />
       <div style={{ flex: `0 0 ${detW}px`, display: "flex", minWidth: 0 }}>
         <DetailsPane b={b} path={tab.path} showToolbar={layout !== "classic"} />
       </div>
@@ -66,8 +68,8 @@ function Browser({ b, layout }: { b: number; layout: Layout }) {
           {navColumns ? (
             <>
               <div style={{ height: navH, display: "flex", minHeight: 0, position: "relative" }}>
-                <MillerColumns b={b} path={tab.path} width={size.w} includeCurrent />
-                {navHint && <div className="collapse-hint">Release to switch to breadcrumbs</div>}
+                <MillerColumns b={b} path={tab.path} includeCurrent />
+                {navHint && <div className="collapse-hint">{tt("Release to switch to breadcrumbs")}</div>}
               </div>
               <Splitter
                 dir="h"
@@ -75,7 +77,7 @@ function Browser({ b, layout }: { b: number; layout: Layout }) {
                 onDrag={(d) => {
                   const h = navStart.current + d;
                   setNavHint(h < 70);
-                  setNavH(Math.max(40, Math.min(size.h - 160, h)));
+                  setNavH(Math.max(40, Math.min((ref.current?.clientHeight || 500) - 160, h)));
                 }}
                 onDragEnd={() => {
                   if (navHint) {
@@ -97,7 +99,7 @@ function Browser({ b, layout }: { b: number; layout: Layout }) {
       )}
       {layout === "columns" && navColumns && (
         <div style={{ flex: 1, display: "flex", minHeight: 0 }}>
-          <MillerColumns b={b} path={tab.path} width={size.w - (detailsVisible ? detW : 0)} includeCurrent={false}
+          <MillerColumns b={b} path={tab.path} includeCurrent={false}
             trailing={<div style={{ flex: "1 0 320px", display: "flex", minWidth: 320 }}><FolderPane b={b} path={tab.path} active={active} compact /></div>} />
           {details}
         </div>
@@ -110,68 +112,109 @@ function Browser({ b, layout }: { b: number; layout: Layout }) {
 /** Two browsers with a collapsible divider, or one browser in Classic layout. */
 export function Workspace() {
   const session = useStore((s) => s.session);
-  const [ref, size] = useSize<HTMLDivElement>();
+  const activeWsId = useStore((s) => s.workspaces[s.activeWorkspace]?.id ?? 0);
+  const ref = useRef<HTMLDivElement>(null);
+  const dragTotal = useRef(0);
+  const lastPmX = useRef<number | null>(null);
+  const [narrowWidth, setNarrowWidth] = useState(false);
   const layout = session?.layout ?? "standard";
-  const vertical = layout === "columns";
-  const [ratio, setRatio] = useStoredSize(`split-${layout}`, 500);
+  // Stacked / one browser because of the window size (adaptive layout), else the chosen layout.
+  const vertical = useStore((s) => arrangement(s).vertical);
+  const autoSingle = useStore((s) => arrangement(s).autoSingle);
+  const adaptive = useStore((s) => s.adaptiveMode !== null && s.session?.layout === "standard");
+  const sidebarOpen = useStore(sidebarShown);
+  const [ratio, setRatio] = useStoredSize(`split-${vertical ? "columns" : layout}`, 500);
   const [start, setStart] = useState(0);
   const [hint, setHint] = useState<0 | 1 | null>(null);
-  // The title bar's panel controls sit right above the divider (the middle of the
-  // workspace when one browser is shown). Where the divider is depends only on this
-  // component's layout (its size, the ratio, the layout, collapsed browsers), so it is
-  // measured after each of its renders: window and sidebar resizes, font changes and
-  // splitter drags all re-render it.
-  useLayoutEffect(() => {
+
+  const syncPanelMap = () => {
     const ws = ref.current;
     const bar = document.querySelector<HTMLElement>(".titlebar");
     if (!ws || !bar) return;
     const r = (ws.querySelector<HTMLElement>(":scope > .ws-split.v") ?? ws).getBoundingClientRect();
-    bar.style.setProperty("--pm-x", `${r.left + r.width / 2 - bar.getBoundingClientRect().left}px`);
-  });
+    const x = Math.round((r.left + r.width / 2 - bar.getBoundingClientRect().left) * 2) / 2;
+    if (lastPmX.current !== x) {
+      lastPmX.current = x;
+      bar.style.setProperty("--pm-x", `${x}px`);
+    }
+  };
+
   // Which browsers are on screen, for actions on "the other browser" (none to act on
   // in Classic, with a collapsed browser or in a narrow window).
   const c0s = !!session?.browsers[0].collapsed;
   const c1s = !!session?.browsers[1].collapsed;
-  const narrow = layout !== "columns" && size.w > 0 && size.w < 760;
+  const narrow = adaptive ? autoSingle : layout !== "columns" && narrowWidth;
   const oneShown = !session ? null : layout === "classic" || c0s || c1s || narrow
     ? (layout === "classic" ? session.activeBrowser : c0s ? 1 : c1s ? 0 : session.activeBrowser)
     : null;
+  const single = layout === "classic" || c0s || c1s || (adaptive ? autoSingle : !vertical && narrowWidth);
+
+  // Coalesce workspace resize work to one animation frame: only flip React state when the
+  // narrow threshold changes, and align the title bar's panel map directly in the DOM.
+  useLayoutEffect(() => {
+    const ws = ref.current;
+    if (!ws) return;
+    const measure = () => {
+      const w = ws.clientWidth;
+      const isNarrow = w > 0 && w < 760;
+      setNarrowWidth((prev) => (prev === isNarrow ? prev : isNarrow));
+      syncPanelMap();
+    };
+    const coalescer = createRafCoalescer(measure);
+    const ro = new ResizeObserver(() => coalescer.schedule());
+    ro.observe(ws);
+    measure();
+    return () => {
+      ro.disconnect();
+      coalescer.cancel();
+    };
+  }, [session !== null]);
+
+  // Keep the title bar's panel map aligned right above the divider after discrete layout changes.
+  useLayoutEffect(() => {
+    syncPanelMap();
+  }, [ratio, layout, single, vertical, c0s, c1s, sidebarOpen]);
+
   useEffect(() => {
     const shown = oneShown == null ? [0, 1] : [oneShown];
     if (getState().shownBrowsers.join() !== shown.join()) setState({ shownBrowsers: shown });
   }, [oneShown]);
   if (!session) return <div className="workspace" ref={ref} />;
 
-  const total = vertical ? size.h : size.w;
   const minSize = vertical ? 160 : 300;
   const c0 = session.browsers[0].collapsed;
   const c1 = session.browsers[1].collapsed;
   // Auto-hide one browser if the window is too narrow (not persisted).
-  const tooNarrow = !vertical && size.w > 0 && size.w < 760;
-  const single = layout === "classic" || c0 || c1 || tooNarrow;
+  const tooNarrow = adaptive ? autoSingle : !vertical && narrowWidth;
   const only = layout === "classic" ? session.activeBrowser : c0 ? 1 : c1 ? 0 : session.activeBrowser;
 
   // Both browsers stay in the same place in the tree, the hidden one with display:none:
   // switching between one and two browsers (Classic, ‹ / ›, a narrow window) must not
   // re-create them, which lost the selection, the filter and the scroll position.
   const restore = single && (c0 || c1) && layout !== "classic" && !tooNarrow;
-  const first = Math.max(40, Math.min(total - 40, (ratio / 1000) * total));
   const box = (b: 0 | 1): React.CSSProperties =>
     single && only !== b ? { display: "none" }
-    : { flex: single || b === 1 ? 1 : `0 0 ${first}px`, display: "flex", minWidth: 0, minHeight: 0, position: "relative" };
+    : { flex: single || b === 1 ? 1 : workspaceSplitFlex(ratio), display: "flex", minWidth: 0, minHeight: 0, position: "relative" };
   return (
     <div className={`workspace ${vertical ? "vertical" : ""}`} ref={ref}>
       {restore && c0 && <RestoreStrip vertical={vertical} onClick={() => A.sessionCmd({ op: "collapse", b: 0, collapsed: false })} />}
       <div style={box(0)}>
-        <Browser b={0} layout={layout} />
-        {hint === 0 && <div className="collapse-hint">Release to collapse this browser</div>}
+        <Browser key={`${activeWsId}-0`} b={0} layout={layout} />
+        {hint === 0 && <div className="collapse-hint">{tt("Release to collapse this browser")}</div>}
       </div>
       {!single && <Splitter
         className="ws-split"
         dir={vertical ? "h" : "v"}
         onReset={() => setRatio(500)}
-        onDragStart={() => setStart(first)}
+        onDragStart={() => {
+          const ws = ref.current;
+          const total = ws ? (vertical ? ws.clientHeight : ws.clientWidth) : 0;
+          dragTotal.current = total;
+          setStart(total > 0 ? Math.max(40, Math.min(total - 40, (ratio / 1000) * total)) : 0);
+        }}
         onDrag={(d) => {
+          const total = dragTotal.current;
+          if (total <= 0) return;
           const px = start + d;
           setHint(px < minSize ? 0 : total - px < minSize ? 1 : null);
           setRatio((Math.max(40, Math.min(total - 40, px)) / total) * 1000);
@@ -185,8 +228,8 @@ export function Workspace() {
         }}
       />}
       <div style={box(1)}>
-        <Browser b={1} layout={layout} />
-        {hint === 1 && <div className="collapse-hint">Release to collapse this browser</div>}
+        <Browser key={`${activeWsId}-1`} b={1} layout={layout} />
+        {hint === 1 && <div className="collapse-hint">{tt("Release to collapse this browser")}</div>}
       </div>
       {restore && c1 && <RestoreStrip vertical={vertical} onClick={() => A.sessionCmd({ op: "collapse", b: 1, collapsed: false })} />}
     </div>
@@ -197,7 +240,7 @@ function RestoreStrip({ vertical, onClick }: { vertical: boolean; onClick: () =>
   return (
     <button
       onClick={onClick}
-      title="Show second browser"
+      title={tt("Show second browser")}
       style={{
         flex: "0 0 14px", border: "none", background: "var(--bg)", cursor: "pointer", color: "var(--fg-dim)",
         borderLeft: vertical ? "none" : "1px solid var(--border)", borderTop: vertical ? "1px solid var(--border)" : "none",

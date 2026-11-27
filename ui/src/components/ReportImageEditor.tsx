@@ -3,6 +3,7 @@ import { annotationKey, moveMark, normalizedBox, type AnnotationTool, type Mark 
 import { flattenScreenshot } from "../core/reportMedia";
 import { useStore } from "../state/store";
 import { Icon } from "./Icon";
+import { tt } from "../i18n";
 
 export function useBlobUrl(blob: Blob): string {
   const [url, setUrl] = useState("");
@@ -35,15 +36,15 @@ export function ReportImageEditor({ blob, save, cancel, onBusy }: { blob: Blob; 
     return <rect {...props} x={box.x} y={box.y} width={box.width} height={box.height} fill={mark.tool === "redact" ? "#111111" : "none"} stroke={mark.tool === "redact" ? "none" : props.stroke} />;
   }
   return <div className="report-editor">
-    <div className="report-section-heading"><div><h3>Show us where</h3><p>Point out the problem. Cover private details with Redact.</p></div><Icon name="image" size={24} /></div>
-    <div className="report-editor-tools" role="group" aria-label="Annotation tools">
-      {(["arrow", "rectangle", "redact"] as const).map((value) => <button key={value} className="btn" aria-pressed={tool === value} disabled={busy} onClick={() => setTool(value)}><Icon name={value === "arrow" ? "forward" : value === "redact" ? "lock" : "window"} />{value === "rectangle" ? "Box" : value === "redact" ? "Redact" : "Arrow"}</button>)}
-      <button className="btn" disabled={busy} onClick={() => { setMarks((old) => [...old, { tool, x: 0.25, y: 0.25, endX: 0.5, endY: 0.5 }]); stage.current?.focus(); }}>Add mark</button>
-      <button className="btn" disabled={!marks.length || busy} onClick={() => setMarks((old) => old.slice(0, -1))}><Icon name="undo" />Undo</button>
+    <div className="report-section-heading"><div><h3>{tt("Show us where")}</h3><p>{tt("Point out the problem. Cover private details with Redact.")}</p></div><Icon name="image" size={24} /></div>
+    <div className="report-editor-tools" role="group" aria-label={tt("Annotation tools")}>
+      {(["arrow", "rectangle", "redact"] as const).map((value) => <button key={value} className="btn" aria-pressed={tool === value} disabled={busy} onClick={() => setTool(value)}><Icon name={value === "arrow" ? "forward" : value === "redact" ? "lock" : "window"} />{value === "rectangle" ? tt("Box") : value === "redact" ? tt("Redact") : tt("Arrow")}</button>)}
+      <button className="btn" disabled={busy} onClick={() => { setMarks((old) => [...old, { tool, x: 0.25, y: 0.25, endX: 0.5, endY: 0.5 }]); stage.current?.focus(); }}>{tt("Add mark")}</button>
+      <button className="btn" disabled={!marks.length || busy} onClick={() => setMarks((old) => old.slice(0, -1))}><Icon name="undo" />{tt("Undo")}</button>
     </div>
     <div className="report-editor-stage">
-      <img src={url} alt="Screenshot being annotated" />
-      <svg ref={stage} viewBox="0 0 1 1" preserveAspectRatio="none" tabIndex={0} role="application" aria-label="Screenshot annotations. Drag to draw, or Add mark then use arrow keys to move; Shift resizes. Delete removes the last mark."
+      <img src={url} alt={tt("Screenshot being annotated")} />
+      <svg ref={stage} viewBox="0 0 1 1" preserveAspectRatio="none" tabIndex={0} role="application" aria-label={tt("Screenshot annotations. Drag to draw, or Add mark then use arrow keys to move; Shift resizes. Delete removes the last mark.")}
         onKeyDown={(e) => {
           if (annotationKey(e.key, vim)) {
             e.preventDefault();
@@ -66,13 +67,13 @@ export function ReportImageEditor({ blob, save, cancel, onBusy }: { blob: Blob; 
         {marks.map(draw)}{pending && draw(pending, marks.length)}
       </svg>
     </div>
-    <p className="report-hint">Drag to mark, or Add mark and use {vim ? "h/j/k/l or " : ""}arrow keys. Shift resizes. Redactions are permanently flattened when applied.</p>
+    <p className="report-hint">{tt("Drag to mark, or Add mark and use")} {vim ? "h/j/k/l or " : ""}{tt("arrow keys. Shift resizes. Redactions are permanently flattened when applied.")}</p>
     {error && <p role="alert">{error}</p>}
-    <div className="report-editor-actions"><button className="btn" disabled={busy} onClick={cancel}>Cancel editing</button><button className="btn primary" disabled={busy} onClick={() => {
+    <div className="report-editor-actions"><button className="btn" disabled={busy} onClick={cancel}>{tt("Cancel editing")}</button><button className="btn primary" disabled={busy} onClick={() => {
       setBusy(true); setError(""); onBusy(true);
       void flattenScreenshot(blob, marks).then((next) => {
         if (alive.current) { onBusy(false); save(next); }
       }).catch((e) => { if (alive.current) { setError(String(e)); setBusy(false); onBusy(false); } });
-    }}>{busy ? "Applying..." : "Apply changes"}</button></div>
+    }}>{busy ? tt("Applying...") : tt("Apply changes")}</button></div>
   </div>;
 }

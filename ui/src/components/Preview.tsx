@@ -1,5 +1,6 @@
 // File previews (P-02…P-08). Used by the details pane and the preview window.
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { tt } from "../i18n";
 import { api, fileSrc, mediaSrc } from "../api/ipc";
 import type { FileEntry, PreviewInfo, SyntaxHighlight, VideoProbe } from "../api/types";
 import { imageRefresh, loadImageSnapshot } from "../core/imageRefresh";
@@ -174,11 +175,11 @@ function ModelPreview({ path }: { path: string }) {
   }, [mesh]);
 
   if (err) return <div className="pv-pdf-error">Can't show this model: {err}</div>;
-  if (!mesh) return <div className="pv-icon"><Icon name="model" size={48} /><span>Loading model…</span></div>;
+  if (!mesh) return <div className="pv-icon"><Icon name="model" size={48} /><span>{tt("Loading model…")}</span></div>;
   const size = [0, 1, 2].map((i) => +(mesh.max[i] - mesh.min[i]).toPrecision(4)).join(" × ");
   return (
     <div className="pv-model">
-      <canvas ref={canvas} title="Drag to rotate · wheel to zoom · double-click to reset" />
+      <canvas ref={canvas} title={tt("Drag to rotate · wheel to zoom · double-click to reset")} />
       <span className="pv-model-info">{mesh.triangles.toLocaleString()} triangles · {size}</span>
     </div>
   );
@@ -244,7 +245,7 @@ function MarkdownPreview({ entry, fallback }: { entry: FileEntry; fallback: stri
         ? <CodePreview name={entry.name} text={text ?? ""} />
         : <div className="pv-md" onClick={onClick}><article className="md-body" ref={box} /></div>}
       <div className="pv-badge">
-        <button title="Show the Markdown source or the rendered page" onClick={() => setSource((s) => !s)}>{source ? "Rendered" : "Source"}</button>
+        <button title={tt("Show the Markdown source or the rendered page")} onClick={() => setSource((s) => !s)}>{source ? "Rendered" : "Source"}</button>
       </div>
     </>
   );
@@ -356,12 +357,12 @@ function ImagePreview({ path, w, h }: { path: string; w: number | null; h: numbe
       {nat && (
         <div className="pv-badge" onMouseDown={(e) => e.stopPropagation()} onDoubleClick={(e) => e.stopPropagation()}>
           <span>{nat.w} × {nat.h}</span>
-          <button title="Zoom out (−, wheel)" onClick={() => zoomBy(1 / 1.25)}>−</button>
+          <button title={tt("Zoom out (−, wheel)")} onClick={() => zoomBy(1 / 1.25)}>−</button>
           {view && <span className="pct">{Math.round(view.s * 100)}%</span>}
-          <button title="Zoom in (+, wheel)" onClick={() => zoomBy(1.25)}>+</button>
-          <button title="Actual size (1)" onClick={actual}>1:1</button>
+          <button title={tt("Zoom in (+, wheel)")} onClick={() => zoomBy(1.25)}>+</button>
+          <button title={tt("Actual size (1)")} onClick={actual}>1:1</button>
           {/* Always there (disabled when fitted), so the buttons never move under the pointer. */}
-          <button title="Fit (0, double-click)" onClick={fit} disabled={fitted}>Fit</button>
+          <button title={tt("Fit (0, double-click)")} onClick={fit} disabled={fitted}>{tt("Fit")}</button>
         </div>
       )}
     </div>
@@ -444,16 +445,16 @@ function MediaFallback({ path, kind, err }: { path: string; kind: "video" | "aud
         {meta && <span className="pv-fb-meta">{meta}</span>}
         <small>
           {platform === "linux"
-            ? <>Playback uses the system's GStreamer codecs. Install <code>gstreamer1.0-libav</code> (Debian/Ubuntu), <code>gstreamer1-libav</code> (Fedora) or <code>gst-libav</code> (Arch), then restart Gall.</>
+            ? <>{tt("Playback uses the system's GStreamer codecs. Install")} <code>gstreamer1.0-libav</code> (Debian/Ubuntu), <code>gstreamer1-libav</code> (Fedora) or <code>gst-libav</code> (Arch), then restart Gall.</>
             : platform === "windows"
-              ? <>The built-in player (WebView2) only plays H.264, VP8/VP9 and AV1 video.</>
-              : <>The built-in player cannot decode this format.</>}
-          {!probing && kind === "video" && !p?.ffmpeg && <> Install FFmpeg to see a still frame and the codec here.</>}
+              ? <>{tt("The built-in player (WebView2) only plays H.264, VP8/VP9 and AV1 video.")}</>
+              : <>{tt("The built-in player cannot decode this format.")}</>}
+          {!probing && kind === "video" && !p?.ffmpeg && <> {tt("Install FFmpeg to see a still frame and the codec here.")}</>}
         </small>
         <div className="pv-fb-actions">
-          <button className="btn primary" onClick={() => api.openPath(path).catch(() => {})}>Open in player</button>
+          <button className="btn primary" onClick={() => api.openPath(path).catch(() => {})}>{tt("Open in player")}</button>
         </div>
-        <small className="pv-fb-err" title="Error from the built-in player">{err}</small>
+        <small className="pv-fb-err" title={tt("Error from the built-in player")}>{err}</small>
       </div>
     </div>
   );
@@ -550,7 +551,7 @@ function PdfPreview({ path }: { path: string }) {
     return () => { stale = true; task?.cancel?.(); text?.cancel?.(); };
   }, [doc, page, fitWidth, zoom]);
 
-  if (err) return <div className="pv-icon pv-pdf-error" title={err}><Icon name="pdf" size={56} /><span>PDF preview failed</span><small>{err}</small></div>;
+  if (err) return <div className="pv-icon pv-pdf-error" title={err}><Icon name="pdf" size={56} /><span>{tt("PDF preview failed")}</span><small>{err}</small></div>;
   return (
     // The page scrolls inside; the controls stay in the corner.
     <div className="pv-pdf-wrap">
@@ -579,12 +580,12 @@ function PdfPreview({ path }: { path: string }) {
       </div>
       {doc && (
         <div className="pv-badge">
-          <button title="Previous page (←)" onClick={() => setPage((p) => Math.max(1, p - 1))}>‹</button>
+          <button title={tt("Previous page (←)")} onClick={() => setPage((p) => Math.max(1, p - 1))}>‹</button>
           <span>{page} / {doc.numPages}</span>
-          <button title="Next page (→)" onClick={() => setPage((p) => Math.min(doc.numPages, p + 1))}>›</button>
-          <button title="Zoom out (−, Ctrl+wheel)" onClick={() => zoomBy(1 / 1.25)}>−</button>
-          <button className="pct" title="Back to fit (0)" onClick={() => setZoom(1)}>{Math.round(zoom * 100)}%</button>
-          <button title="Zoom in (+, Ctrl+wheel)" onClick={() => zoomBy(1.25)}>+</button>
+          <button title={tt("Next page (→)")} onClick={() => setPage((p) => Math.min(doc.numPages, p + 1))}>›</button>
+          <button title={tt("Zoom out (−, Ctrl+wheel)")} onClick={() => zoomBy(1 / 1.25)}>−</button>
+          <button className="pct" title={tt("Back to fit (0)")} onClick={() => setZoom(1)}>{Math.round(zoom * 100)}%</button>
+          <button title={tt("Zoom in (+, Ctrl+wheel)")} onClick={() => zoomBy(1.25)}>+</button>
           <button title={fitWidth ? "Fit the whole page in the window" : "Fit the page width to the window"} onClick={() => { setFitWidth((f) => !f); setZoom(1); }}>{fitWidth ? "Fit page" : "Fit width"}</button>
         </div>
       )}

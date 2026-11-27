@@ -1,0 +1,5 @@
+/* Hint mode: labels above the controls, a bar at the bottom. Nothing here takes the pointer. */
+.hint-layer { position: fixed; inset: 0; z-index: 100000; pointer-events: none; }
+.hint-label { position: fixed; transform: translate(-2px, -2px); padding: 0 5px; min-width: 14px; text-align: center; font: 700 11px/16px var(--mono, monospace); text-transform: uppercase; color: #1d1600; background: #ffd84d; border: 1px solid #b38f00; border-radius: 4px; box-shadow: 0 1px 3px rgb(0 0 0 / 40%); }
+.hint-label b { color: #543000; }
+.hint-bar { position: fixed; left: 50%; bottom: 14px; transform: translateX(-50%); padding: 6px 14px; border-radius: var(--radius-pill, 999px); background: var(--bg-elevated, #222); color: var(--readable-fg, var(--fg, #eee)); border: 1px solid var(--accent, #4a90e2); box-shadow: 0 4px 16px rgb(0 0 0 / 40%); font-size: 12px; max-width: 92vw; }

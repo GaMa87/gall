@@ -1,20 +1,28 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { isValidElement, type KeyboardEvent, type ReactElement } from "react";
+import type { WorktreeState } from "../core/gitWorktree";
 
 const hooks = vi.hoisted(() => ({ cursor: 0, values: [] as unknown[], deps: new Map<number, readonly unknown[]>(), cleanups: new Map<number, () => void>(), pending: [] as (() => void)[] }));
+function memo<T>(make: () => T, deps: readonly unknown[]): T {
+  const i = hooks.cursor++, previous = hooks.deps.get(i);
+  if (!previous || previous.length !== deps.length || previous.some((v, j) => !Object.is(v, deps[j]))) {
+    hooks.values[i] = make();
+    hooks.deps.set(i, deps);
+  }
+  return hooks.values[i] as T;
+}
 vi.mock("react", async (original) => ({
   ...await original<typeof import("react")>(),
   useState: <T,>(initial: T) => {
     const i = hooks.cursor++;
     if (!(i in hooks.values)) hooks.values[i] = initial;
-    return [hooks.values[i] as T, (value: T) => { hooks.values[i] = value; }];
+    return [hooks.values[i] as T, (value: T | ((old: T) => T)) => {
+      hooks.values[i] = typeof value === "function" ? (value as (old: T) => T)(hooks.values[i] as T) : value;
+    }];
   },
   useRef: <T,>(value: T) => { const i = hooks.cursor++; return hooks.values[i] ??= { current: value }; },
-  useCallback: <T,>(callback: T, deps: readonly unknown[]) => {
-    const i = hooks.cursor++, previous = hooks.deps.get(i);
-    if (!previous || previous.some((v, j) => !Object.is(v, deps[j]))) { hooks.values[i] = callback; hooks.deps.set(i, deps); }
-    return hooks.values[i];
-  },
+  useMemo: memo,
+  useCallback: <T,>(callback: T, deps: readonly unknown[]) => memo(() => callback, deps),
   useEffect: (effect: () => void | (() => void), deps: readonly unknown[]) => {
     const i = hooks.cursor++, previous = hooks.deps.get(i);
     if (previous && previous.length === deps.length && previous.every((v, j) => Object.is(v, deps[j]))) return;
@@ -22,7 +30,7 @@ vi.mock("react", async (original) => ({
     hooks.pending.push(() => { hooks.cleanups.get(i)?.(); const cleanup = effect(); if (cleanup) hooks.cleanups.set(i, cleanup); });
   },
 }));
-const mocks = vi.hoisted(() => ({ invoke: vi.fn(), confirm: vi.fn(), navigate: vi.fn(), openOverlay: vi.fn(), create: vi.fn() }));
+const mocks = vi.hoisted(() => ({ invoke: vi.fn(), advanced: vi.fn(), confirm: vi.fn(), navigate: vi.fn(), openOverlay: vi.fn(), create: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: mocks.invoke }));
 vi.mock("../state/store", () => ({ getState: () => ({ session: { activeBrowser: 1 } }) }));
 vi.mock("../state/actions", () => ({ confirm: mocks.confirm, navigate: mocks.navigate, openOverlay: mocks.openOverlay }));
@@ -44,6 +52,7 @@ function render() {
 }
 const rows = () => elements(render()).filter((n) => n.props.className?.includes("gg-worktree-main"));
 const snapshot = (root: string) => ({ repository: root, token: root, worktrees: [{ path: root + "-linked", head: "abcd1234", branch: "feature", bare: false, locked: false, prunable: false }] });
+const worktreeState: WorktreeState = { branch: "feature", dirty: 0, conflicts: 0, ahead: 0, behind: 0, upstream: false };
 const flush = async () => { await Promise.resolve(); await Promise.resolve(); };
 function deferred<T>() {
   let resolve!: (value: T) => void, reject!: (error: Error) => void;
@@ -58,7 +67,12 @@ function key(name: string) {
 beforeEach(() => {
   vi.clearAllMocks(); hooks.cursor = 0; hooks.values = []; hooks.deps.clear(); hooks.cleanups.clear(); hooks.pending = [];
   path = "/repo-a"; vim = false;
-  mocks.invoke.mockImplementation((_command: string, args: { path: string }) => Promise.resolve(snapshot(args.path)));
+  mocks.advanced.mockReset().mockImplementation((path: string) => Promise.resolve(snapshot(path)));
+  mocks.invoke.mockImplementation((command: string, args: { path: string }) => {
+    if (command === "git_advanced") return mocks.advanced(args.path);
+    if (command === "git_worktree_state") return Promise.resolve(worktreeState);
+    throw new Error(`Unexpected command: ${command}`);
+  });
   mocks.confirm.mockResolvedValue(false);
 });
 afterEach(() => hooks.cleanups.forEach((cleanup) => cleanup()));
@@ -66,7 +80,7 @@ afterEach(() => hooks.cleanups.forEach((cleanup) => cleanup()));
 describe("worktree repository and keyboard boundaries", () => {
   it("hides previous repository rows immediately and rejects its late result", async () => {
     const late = deferred<ReturnType<typeof snapshot>>();
-    mocks.invoke.mockReturnValueOnce(late.promise);
+    mocks.advanced.mockReturnValueOnce(late.promise);
     render();
     path = "/repo-b";
     expect(rows()).toHaveLength(0);
@@ -79,12 +93,13 @@ describe("worktree repository and keyboard boundaries", () => {
   });
   it("does not retain already loaded rows while another repository loads", async () => {
     render(); await flush(); expect(rows()).toHaveLength(1);
-    const next = deferred<ReturnType<typeof snapshot>>(); mocks.invoke.mockReturnValueOnce(next.promise);
+    expect(mocks.invoke).toHaveBeenCalledWith("git_worktree_state", { path: "/repo-a-linked" });
+    const next = deferred<ReturnType<typeof snapshot>>(); mocks.advanced.mockReturnValueOnce(next.promise);
     path = "/repo-b"; expect(rows()).toHaveLength(0);
     next.resolve(snapshot(path)); await flush(); expect(rows()[0].props.title).toBe("/repo-b-linked");
   });
   it("ignores a late error from the previous repository", async () => {
-    const late = deferred<ReturnType<typeof snapshot>>(); mocks.invoke.mockReturnValueOnce(late.promise);
+    const late = deferred<ReturnType<typeof snapshot>>(); mocks.advanced.mockReturnValueOnce(late.promise);
     render(); path = "/repo-b"; render(); await flush();
     late.reject(new Error("old repository unavailable")); await flush();
     expect(JSON.stringify(render())).not.toContain("old repository unavailable");

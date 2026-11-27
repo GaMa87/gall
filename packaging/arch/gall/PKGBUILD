@@ -1,0 +1,101 @@
+# Maintainer: Matej Gajšek <37571659+GaMa87@users.noreply.github.com>
+#
+# Source package "gall" for Arch Linux and the Omarchy package repository (omacom/omarchy-pkgs).
+# Builds from the tagged release tarball on x86_64 and aarch64. The binary is built with
+# GALL_PACKAGE_MANAGED=1, so Gall never downloads self-updates: pacman / `omarchy update` own them.
+#
+# Bump: set pkgver (pkgrel=1), run `updpkgsums && makepkg --printsrcinfo > .SRCINFO`.
+pkgname=gall
+pkgver=0.2.2
+pkgrel=1
+pkgdesc="Keyboard-first file manager: Miller columns, dual pane, instant search, compare tool and Vim keys"
+arch=('x86_64' 'aarch64')
+url="https://github.com/GaMa87/gall"
+license=('MIT')
+depends=('cairo'
+         'dbus'
+         'gcc-libs'
+         'gdk-pixbuf2'
+         'glib2'
+         'glibc'
+         'gtk3'
+         'hicolor-icon-theme'
+         'libsoup3'
+         'wayland'
+         'webkit2gtk-4.1')
+makedepends=('cargo' 'nodejs' 'npm' 'pkgconf' 'patchelf' 'wayland-protocols')
+optdepends=('xdg-desktop-portal: use Gall as the open and save dialog of other programs'
+            'gvfs-mtp: phones and cameras (MTP) in the sidebar'
+            'gvfs-smb: Windows network shares'
+            'gvfs-nfs: NFS shares'
+            'gst-plugins-good: video and audio preview'
+            'gst-libav: more video formats in the preview'
+            'git: Git status in the file list'
+            'zoxide: frequently used folders in Quick Open'
+            'xdg-terminal-exec: open the default terminal'
+            'ttf-nerd-fonts-symbols: Nerd Font file icons')
+provides=("$pkgname")
+conflicts=("$pkgname-bin")
+options=('!lto')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('1d5ad789d9ea50e4544e3961de8d352be6668f9df07679ef736f0d4aa1118e5d')
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+  npm ci --no-audit --no-fund
+  npm ci --prefix ui --no-audit --no-fund
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  # Updates come from the package manager (see Settings > Updates).
+  export GALL_PACKAGE_MANAGED=1
+  npm --prefix ui run build
+  cargo build --release --frozen -p gall --features tauri/custom-protocol
+  # The FileChooser portal backend (Gall as the open / save dialog of other programs).
+  if [[ -f crates/gall-portal/Cargo.toml ]]; then
+    cargo build --release --frozen -p gall-portal
+  fi
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  export GALL_PACKAGE_MANAGED=1
+  cargo test --frozen -p gall-core --lib
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 target/release/gall "$pkgdir/usr/bin/gall"
+  if [[ -f crates/gall-portal/Cargo.toml ]]; then
+    install -Dm755 target/release/xdg-desktop-portal-gall "$pkgdir/usr/bin/xdg-desktop-portal-gall"
+    install -Dm644 packaging/linux/gall.portal "$pkgdir/usr/share/xdg-desktop-portal/portals/gall.portal"
+    install -Dm644 packaging/linux/org.freedesktop.impl.portal.desktop.gall.service "$pkgdir/usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.gall.service"
+  fi
+  install -Dm644 packaging/linux/gall.desktop "$pkgdir/usr/share/applications/gall.desktop"
+  # Render placeholders in older release archives; newer entries are already static.
+  sed -i -e '/^{{#if comment}}$/d' -e '/^{{\/if}}$/d' \
+    -e 's/^Name={{name}}$/Name=Gall/' \
+    -e 's/^Comment={{comment}}$/Comment=File manager with instant search and compare/' \
+    -e 's/^Exec={{exec}} /Exec=gall /' -e 's/^Icon={{icon}}$/Icon=gall/' \
+    "$pkgdir/usr/share/applications/gall.desktop"
+  install -Dm644 packaging/linux/org.gall.app.metainfo.xml "$pkgdir/usr/share/metainfo/org.gall.app.metainfo.xml"
+  # Leave shared FileManager1 activation to the desktop during the co-install pilot.
+  if [[ -f packaging/linux/omarchy-actions.json ]]; then
+    install -Dm644 packaging/linux/omarchy-actions.json "$pkgdir/usr/share/gall/actions.d/50-omarchy.json"
+  fi
+  install -Dm644 assets/icon.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/gall.svg"
+  for size in 32 64 128; do
+    install -Dm644 "src-tauri/icons/${size}x${size}.png" "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/gall.png"
+  done
+  # Marker read at run time too (belt and braces next to GALL_PACKAGE_MANAGED).
+  install -Dm644 /dev/null "$pkgdir/usr/share/gall/package-managed"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 THIRD-PARTY-NOTICES.md "$pkgdir/usr/share/licenses/$pkgname/THIRD-PARTY-NOTICES.md"
+}

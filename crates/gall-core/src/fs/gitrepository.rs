@@ -93,7 +93,7 @@ fn checked_work_path(root: &Path, file: &str) -> Result<std::path::PathBuf> {
         work.push(component);
         match work.symlink_metadata() {
             Ok(meta) if meta.is_symlink() => {
-                return Err(fail("Symlink conflicts require an external editor"))
+                return Err(fail("The text editor cannot follow symlinks. Choose a Git side or mark the working path resolved."))
             }
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
@@ -126,7 +126,7 @@ pub fn conflict(path: &Path, file: &str) -> Result<Conflict> {
         work.push(component);
         match work.symlink_metadata() {
             Ok(meta) if meta.is_symlink() => {
-                return Err(fail("Symlink conflicts require an external editor"))
+                return Err(fail("The text editor cannot follow symlinks. Choose a Git side or mark the working path resolved."))
             }
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
@@ -144,7 +144,7 @@ pub fn conflict(path: &Path, file: &str) -> Result<Conflict> {
         };
         if size > MAX_PREVIEW {
             return Err(fail(
-                "Conflict files larger than 1 MiB require an external editor",
+                "The text preview is limited to 1 MiB. Choose a Git side or mark the working file resolved.",
             ));
         }
         git(&p, &["cat-file", "blob", &spec])
@@ -165,7 +165,7 @@ pub fn conflict(path: &Path, file: &str) -> Result<Conflict> {
     }
     if bytes.len() as u64 > MAX_PREVIEW {
         return Err(fail(
-            "Conflict files larger than 1 MiB require an external editor",
+            "The text preview is limited to 1 MiB. Choose a Git side or mark the working file resolved.",
         ));
     }
     let result = String::from_utf8_lossy(&bytes).into_owned();
@@ -205,6 +205,14 @@ pub enum ResolveSide {
     Mark,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MergeMode {
+    NoFastForward,
+    FastForwardOnly,
+    Squash,
+}
+
 #[derive(Deserialize, Debug)]
 #[serde(
     tag = "action",
@@ -240,6 +248,20 @@ pub enum Request {
     },
     StashSave {
         message: String,
+        /// Staged changes stay in the index and the working files.
+        #[serde(default)]
+        keep_index: bool,
+        /// Only tracked files; new ones stay.
+        #[serde(default)]
+        tracked_only: bool,
+        /// Only these files.
+        #[serde(default)]
+        files: Vec<String>,
+    },
+    /// A branch at the commit the stash was made on, with the stash applied and removed.
+    StashBranch {
+        id: String,
+        name: String,
     },
     StashApply {
         id: String,
@@ -250,17 +272,35 @@ pub enum Request {
     StashDrop {
         id: String,
     },
+    StashRename {
+        id: String,
+        name: String,
+    },
     Merge {
         target: String,
     },
+    MergeWithMode {
+        target: String,
+        mode: MergeMode,
+    },
     Rebase {
         target: String,
+    },
+    /// Several commits as one operation, in the given order (oldest first). Git stops at a
+    /// conflict; continue goes on with the rest and abort takes all of them back.
+    CherryPickMany {
+        targets: Vec<String>,
     },
     CherryPick {
         target: String,
     },
     Revert {
         target: String,
+    },
+    IntegrateMerge {
+        target: String,
+        mainline: usize,
+        revert: bool,
     },
     Reset {
         target: String,
@@ -326,9 +366,10 @@ struct Prefetched {
 /// Starts what [`Prefetched`] holds for `request` in `path`.
 fn prefetch(path: &Path, request: &Request) -> Prefetched {
     let (target, untracked, tree, replay) = match request {
-        Request::Merge { target } => (target, false, false, false),
+        Request::Merge { target } | Request::MergeWithMode { target, .. } => {
+            (target, false, false, false)
+        }
         Request::Rebase { target } => (target, true, true, true),
-        Request::CherryPick { target } => (target, true, true, false),
         Request::Revert { target } => (target, true, false, false),
         Request::Reset { target, .. }
         | Request::CreateBranch { target, .. }
@@ -435,6 +476,86 @@ fn checked_text(value: String) -> Result<String> {
     } else {
         Ok(value)
     }
+}
+
+/// Check out one historical file into the index and working tree.
+pub fn checkout_commit_file(path: &Path, commit: &str, file: &str) -> Result<()> {
+    use super::gitinspect::{commit_id, relative_file};
+
+    relative_file(file)?;
+    let _busy = super::gitfacts::mutating();
+    let root = root(path)?;
+    let commit = commit_id(&root, commit)?;
+    let literal = format!(":(top,literal){file}");
+    let entry = git(&root, &["ls-tree", "-r", "-z", &commit, "--", &literal])?;
+    let historical_file = entry
+        .strip_suffix('\0')
+        .and_then(|entry| entry.split_once('\t'))
+        .is_some_and(|(info, name)| name == file && info.contains(" blob "));
+    if !historical_file {
+        return Err(fail(format!("The selected revision has no file at {file}")));
+    }
+
+    let collision = |name: &Path| {
+        fail(format!(
+            "Checking out {file} would replace local data at {}. Commit or stash tracked changes in Working Changes, or move the item aside in the file manager.",
+            name.display()
+        ))
+    };
+    let relative = Path::new(file);
+    let mut ancestors: Vec<_> = relative
+        .ancestors()
+        .take_while(|p| !p.as_os_str().is_empty())
+        .collect();
+    ancestors.reverse();
+    let mut occupied = false;
+    for name in ancestors {
+        match root.join(name).symlink_metadata() {
+            Ok(meta) if name == relative && !meta.is_dir() => occupied = true,
+            Ok(meta) if name != relative && meta.is_dir() => {}
+            Ok(_) => return Err(collision(name)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(fail(error.to_string())),
+        }
+    }
+
+    let status = git(
+        &root,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--no-renames",
+            "--untracked-files=all",
+            "--ignored=matching",
+            "--",
+            &literal,
+        ],
+    )?;
+    if !status.is_empty() {
+        return Err(collision(relative));
+    }
+    // These index flags can cause status to omit working-tree edits.
+    let index = git(&root, &["ls-files", "-v", "--stage", "-z", "--", &literal])?;
+    if (occupied && index.is_empty())
+        || fields(&index).into_iter().any(|entry| {
+            entry.starts_with("S ") || entry.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+        })
+    {
+        return Err(collision(relative));
+    }
+    super::gitadvanced::verify_selected_filtered_checkout_bytes(&root, &index, file)?;
+    git(
+        &root,
+        &[
+            "checkout",
+            "--no-recurse-submodules",
+            &commit,
+            "--",
+            &literal,
+        ],
+    )?;
+    Ok(())
 }
 
 fn git_path(path: &Path, name: &str) -> Result<PathBuf> {
@@ -612,14 +733,6 @@ fn status(path: &Path) -> Result<String> {
         return Ok(status);
     }
     checked_text(super::gitgraph::status_z(path)?)
-}
-
-/// The index as `ls-files --stage -z` lists it: `<mode> <object> <stage>\t<name>` records.
-fn index_listing(path: &Path) -> Result<String> {
-    if let Some(index) = seen(path, |seen| Some(seen.index.clone())) {
-        return Ok(index);
-    }
-    git(path, &["ls-files", "--stage", "-z"])
 }
 
 fn conflicts(path: &Path) -> Result<Vec<String>> {
@@ -1341,6 +1454,110 @@ fn commit_id(path: &Path, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// The most commits one cherry-pick takes; a longer list is a rebase or a merge.
+const MAX_PICKS: usize = 200;
+
+/// Checks the commits of one cherry-pick with one process for the commits and one for their
+/// files, whatever their number: full IDs, no repeats, no merges (Git would stop in the middle
+/// for a parent to choose), and no untracked file in the way of any of them.
+// The legacy spelling also works with Git versions predating --empty=keep.
+const KEEP_EMPTY_PICKS: &str = "--keep-redundant-commits";
+
+fn check_picks(path: &Path, targets: &[String]) -> Result<()> {
+    if targets.is_empty() || targets.len() > MAX_PICKS {
+        return Err(fail(format!(
+            "Select between 1 and {MAX_PICKS} commits to cherry-pick"
+        )));
+    }
+    let unique: BTreeSet<&str> = targets.iter().map(String::as_str).collect();
+    if unique.len() != targets.len() {
+        return Err(fail("A commit is selected twice"));
+    }
+    if targets.iter().any(|id| {
+        !matches!(id.len(), 40 | 64)
+            || !id
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+    }) {
+        return Err(fail("Select concrete commits before this operation"));
+    }
+    let (listed, touched, others) = std::thread::scope(|scope| {
+        let ids = || targets.iter().map(String::as_str);
+        let listed = scope.spawn(move || {
+            let mut args = vec!["rev-list", "--no-walk=unsorted", "--parents"];
+            args.extend(ids());
+            git(path, &args)
+        });
+        let touched = scope.spawn(move || {
+            let mut args = vec![
+                "log",
+                "--no-walk=unsorted",
+                "--format=",
+                "--name-only",
+                "--no-renames",
+                "--root",
+                "--ignore-submodules=none",
+                "--diff-filter=AMT",
+                "-z",
+            ];
+            args.extend(ids());
+            git(path, &args).and_then(checked_text)
+        });
+        let others = git(path, &["ls-files", "--others", "-z"]).and_then(checked_text);
+        (joined(listed), joined(touched), others)
+    });
+    let (listed, touched, others) = (listed??, touched??, others?);
+    let commits: Vec<Vec<&str>> = listed
+        .lines()
+        .map(|line| line.split_whitespace().collect())
+        .collect();
+    if commits.len() != targets.len()
+        || commits
+            .iter()
+            .zip(targets)
+            .any(|(commit, id)| commit.first() != Some(&id.as_str()))
+    {
+        return Err(fail("A selected object is not a commit"));
+    }
+    if let Some(merge) = commits.iter().find(|commit| commit.len() > 2) {
+        return Err(fail(format!(
+            "Commit {} is a merge. Select it by itself and choose a mainline parent",
+            &merge[0][..8]
+        )));
+    }
+    // Names with the folders above them, so a file in place of a folder is found too.
+    let fold = |name: &str| {
+        if cfg!(any(windows, target_os = "macos")) {
+            name.to_lowercase()
+        } else {
+            name.to_owned()
+        }
+    };
+    let touched: BTreeSet<String> = touched
+        .split_terminator('\0')
+        .filter(|name| !name.is_empty())
+        .map(fold)
+        .collect();
+    for other in others.split('\0').filter(|name| !name.is_empty()) {
+        let name = fold(other.trim_end_matches('/'));
+        let inside = format!("{name}/");
+        let blocked = touched.contains(&name)
+            || touched
+                .range(inside.clone()..)
+                .next()
+                .is_some_and(|file| file.starts_with(&inside))
+            || name
+                .match_indices('/')
+                .any(|(at, _)| touched.contains(&name[..at]));
+        if blocked {
+            return Err(fail(format!(
+                "Untracked or ignored file {other} would be overwritten; move or rename it first"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_name(path: &Path, name: &str, kind: &str) -> Result<()> {
     if let Some(problem) = name_problem(name) {
         return Err(fail(format!(
@@ -1431,65 +1648,116 @@ fn url(value: &str) -> Result<()> {
     Ok(())
 }
 
-/// For rebase and steps of an operation that is already running (continue, skip, abort,
-/// resolving a conflict). These support submodules; rebase commands explicitly disable
-/// recursion so that the submodule working folders stay untouched.
-fn control_guard(path: &Path) -> Result<()> {
-    worktree_guard_with(path, true)
-}
-
-fn worktree_guard(path: &Path) -> Result<()> {
-    worktree_guard_with(path, false)
-}
-
-fn worktree_guard_with(path: &Path, submodules_ok: bool) -> Result<()> {
-    if has_filters(path) {
-        return Err(fail(
-            "Worktree operations with content filters require the terminal",
-        ));
-    }
-    if !submodules_ok
-        && (path.join(".gitmodules").exists()
-            || index_listing(path)?
-                .split('\0')
-                .any(|record| record.starts_with("160000 ")))
-    {
-        return Err(fail(
-            "Worktree operations with submodules require the terminal",
-        ));
-    }
+fn require_head(path: &Path) -> Result<()> {
     if head(path).is_empty() {
         return Err(fail("Create the first commit before this operation"));
     }
     Ok(())
 }
 
-fn clean(path: &Path) -> Result<()> {
-    if !status(path)?.is_empty() {
-        return Err(fail("Commit or stash local changes before this operation"));
+const HARD_RESET_RECOVERY: &str = "Gall recovery before hard reset";
+
+/// Before a hard reset makes the submodules match the target: in every initialized submodule,
+/// nested ones included, keep its HEAD and its index and tracked edits as recovery references,
+/// then drop those edits so the checkout that follows cannot be refused by them. Untracked files
+/// stay, and a checkout that would overwrite one fails instead. One Git process from Gall:
+/// `foreach` visits the submodules itself.
+fn reset_submodule_edits(path: &Path) -> Result<()> {
+    let script = format!(
+        "keep() {{ git update-ref --no-deref --create-reflog -m '{HARD_RESET_RECOVERY}' \"refs/gall/recovery/$1\" \"$1\"; }} && \
+         head=$(git rev-parse -q --verify HEAD) && keep \"$head\" && \
+         saved=$(git stash create '{HARD_RESET_RECOVERY}') && \
+         {{ [ -z \"$saved\" ] || keep \"$saved\"; }} && \
+         git -c submodule.recurse=false reset -q --hard"
+    );
+    git(
+        path,
+        &[
+            "-c",
+            "submodule.recurse=false",
+            "submodule",
+            "foreach",
+            "--quiet",
+            "--recursive",
+            &script,
+        ],
+    )
+    .map_err(|e| {
+        fail(format!(
+            "The local edits of a submodule could not be saved, so nothing was reset: {e}"
+        ))
+    })?;
+    Ok(())
+}
+
+/// Check out in every initialized submodule, nested ones included, the commit the parent now
+/// records. A commit missing there is fetched, without prompting for credentials.
+fn update_submodules(path: &Path) -> Result<()> {
+    git(
+        path,
+        &[
+            "-c",
+            "submodule.recurse=false",
+            "submodule",
+            "update",
+            "--checkout",
+            "--recursive",
+        ],
+    )
+    .map_err(|e| {
+        fail(format!(
+            "The hard reset completed, but the submodules could not be checked out at its commits: {e}. Update them in Tools → Submodules"
+        ))
+    })?;
+    Ok(())
+}
+
+/// A staged gitlink is the one change Git's autostash cannot reliably restore
+/// without moving a submodule checkout. Check both index and HEAD modes to catch deletions.
+pub(super) fn protect_staged_gitlinks(path: &Path) -> Result<()> {
+    let changes = checked_text(git(
+        path,
+        &[
+            "diff",
+            "--cached",
+            "--raw",
+            "--no-renames",
+            "--ignore-submodules=none",
+            "-z",
+            "--",
+        ],
+    )?)?;
+    let mut records = changes.split_terminator('\0');
+    while let (Some(metadata), Some(file)) = (records.next(), records.next()) {
+        if metadata
+            .trim_start_matches(':')
+            .split_whitespace()
+            .take(2)
+            .any(|mode| mode == "160000")
+        {
+            return Err(fail(format!(
+                "Rebase cannot recover the staged submodule pointer at {file}. Commit or unstage it in Working Changes first."
+            )));
+        }
     }
     Ok(())
 }
 
-/// Give the user the paths that block rebase; the graph and Working Changes read
-/// the same status, including staged gitlinks for embedded repositories.
-fn rebase_clean(path: &Path) -> Result<()> {
-    let changes = status(path)?;
-    if changes.is_empty() {
+pub(super) fn verify_filtered_autostash(path: &Path) -> Result<()> {
+    if !has_filters(path) {
         return Ok(());
     }
-    let names: Vec<_> = super::gitgraph::status_entries(&changes)
-        .into_iter()
-        .take(5)
-        .map(|entry| format!("{:?}", entry.name))
-        .collect();
-    Err(fail(format!(
-        "Local changes block rebase: {}. Open Working Changes to review, commit, or unstage them. Unwanted untracked folders can be excluded locally without deleting them.",
-        names.join(", ")
-    )))
+    // Git will make its own autostash. This preflight also catches raw edits normalized
+    // away by the filter, which Git would otherwise treat as a clean checkout.
+    let recovery = git(path, &["stash", "create", "Gall rebase filter preflight"])?;
+    let tree = match recovery.trim() {
+        "" => "HEAD",
+        id => id,
+    };
+    super::gitadvanced::verify_filtered_recovery(path, tree, "Rebase")
 }
 
-fn protect_untracked(path: &Path, targets: &[&str], replay: Option<&str>) -> Result<()> {
+pub(super) fn protect_untracked(path: &Path, targets: &[&str], replay: Option<&str>) -> Result<()> {
     // What the token check already read (`SEEN` belongs to this thread, so it is looked up
     // before the workers start).
     let known_trees: Vec<Option<String>> = targets
@@ -1574,6 +1842,61 @@ fn protect_untracked(path: &Path, targets: &[&str], replay: Option<&str>) -> Res
             }
         }
     }
+    protect_touched_paths(&other, &touched)
+}
+
+/// Protect only paths that the two-tree checkout phase of reset --keep can change.
+pub(super) fn protect_reset_keep_paths(path: &Path, from: &str, target: &str) -> Result<()> {
+    let other = checked_text(git(path, &["ls-files", "--others", "-z"])?)?;
+    if other.is_empty() {
+        return Ok(());
+    }
+    let changes = checked_text(git(
+        path,
+        &[
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "--no-renames",
+            "--ignore-submodules=none",
+            "-r",
+            "-z",
+            from,
+            target,
+            "--",
+        ],
+    )?)?;
+    let touched = changes.split_terminator('\0').map(str::to_owned).collect();
+    protect_touched_paths(&other, &touched)
+}
+
+fn protect_integration_writes(path: &Path, before: &str, after: &str) -> Result<()> {
+    let others = match seen(path, |seen| seen.prefetched.others.clone()) {
+        Some(listing) => checked_text(listing)?,
+        None => checked_text(git(path, &["ls-files", "--others", "-z"])?)?,
+    };
+    if others.is_empty() {
+        return Ok(());
+    }
+    let names = checked_text(git(
+        path,
+        &[
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            "--ignore-submodules=none",
+            "--diff-filter=AMT",
+            before,
+            after,
+            "--",
+        ],
+    )?)?;
+    let touched = names.split_terminator('\0').map(str::to_owned).collect();
+    protect_touched_paths(&others, &touched)
+}
+
+fn protect_touched_paths(other: &str, touched: &BTreeSet<String>) -> Result<()> {
     for name in other.split('\0').filter(|name| !name.is_empty()) {
         let mut parent = name;
         let ancestor = loop {
@@ -1604,10 +1927,11 @@ fn no_operation(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn save_head(path: &Path) -> Result<()> {
+/// Keeps HEAD as a recovery reference and returns it (empty when there is none).
+fn save_head(path: &Path) -> Result<String> {
     let id = head(path);
     if id.is_empty() {
-        return Ok(());
+        return Ok(id);
     }
     git(
         path,
@@ -1618,14 +1942,18 @@ fn save_head(path: &Path) -> Result<()> {
             &id,
         ],
     )?;
-    Ok(())
+    Ok(id)
 }
 
-fn save_index_and_worktree(path: &Path, message: &str) -> Result<()> {
+fn save_index_and_worktree(path: &Path, message: &str, verify_filtered: bool) -> Result<()> {
     // `stash create` stores index and tracked working content without cleaning
     // the working tree or changing the user's stash stack.
     let id = git(path, &["stash", "create", message])?;
     let id = id.trim();
+    if verify_filtered {
+        let tree = if id.is_empty() { "HEAD" } else { id };
+        super::gitadvanced::verify_filtered_recovery(path, tree, "Hard reset")?;
+    }
     if !id.is_empty() {
         super::gitgraph::retain_recovery(path, id, message)?;
     }
@@ -1655,6 +1983,305 @@ fn drop_stash(path: &Path, id: &str) -> Result<String> {
     git(path, &["stash", "drop", &item.selector])
 }
 
+fn rename_stash(path: &Path, id: &str, name: &str) -> Result<String> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().any(char::is_control) {
+        return Err(fail("Enter a nonempty, single-line stash name"));
+    }
+    let stack = stashes(path)?;
+    let index = stack
+        .iter()
+        .position(|item| item.id == id)
+        .ok_or_else(|| fail("The selected stash no longer exists; refresh the stash list"))?;
+    let previous = &stack[index];
+    let branch = previous.message.split_once(": ").and_then(|(prefix, _)| {
+        prefix
+            .strip_prefix("On ")
+            .or_else(|| prefix.strip_prefix("WIP on "))
+    });
+    let label = branch.map_or_else(|| name.to_owned(), |branch| format!("On {branch}: {name}"));
+    if previous.message == label {
+        return Ok(String::new());
+    }
+    commit_id(path, id)?;
+    let renamed = super::gitrewrite::rewrite_commit_object(
+        path,
+        id,
+        &std::collections::HashMap::new(),
+        Some(&label),
+        None,
+    )?;
+    if renamed == id {
+        return Err(fail("The stash already contains that commit message"));
+    }
+    super::gitgraph::retain_commit(path, id, "Gall recovery before renaming stash")?;
+    git(path, &["stash", "store", "-m", &label, &renamed])?;
+    let current = stashes(path)?;
+    if current.len() != stack.len() + 1
+        || current.first().is_none_or(|item| item.id != renamed)
+        || current[1..]
+            .iter()
+            .zip(&stack)
+            .any(|(now, before)| now.id != before.id || now.message != before.message)
+    {
+        return Err(fail("The stash list changed while renaming. Both versions are retained; refresh the stash list"));
+    }
+    git(path, &["stash", "drop", &current[index + 1].selector])
+}
+
+fn abort_merge(path: &Path) -> Result<String> {
+    let others = checked_text(git(path, &["ls-files", "--others", "-z"])?)?;
+    if !others.is_empty() {
+        // Native merge abort resets the index to HEAD via reset --merge.
+        let changes = checked_text(git(
+            path,
+            &[
+                "diff",
+                "--cached",
+                "--name-only",
+                "--no-renames",
+                "--ignore-submodules=none",
+                "-z",
+                "HEAD",
+                "--",
+            ],
+        )?)?;
+        let touched = changes.split_terminator('\0').map(str::to_owned).collect();
+        protect_touched_paths(&others, &touched)?;
+        // An externally started merge may also reapply an autostash.
+        if let Ok(stash) = git(path, &["rev-parse", "-q", "--verify", "MERGE_AUTOSTASH"]) {
+            let stash = stash.trim();
+            protect_integration_writes(path, &format!("{stash}^"), stash)?;
+        }
+    }
+    git(path, &["-c", "submodule.recurse=false", "merge", "--abort"])
+}
+
+fn configured_git_filters(path: &Path) -> Option<bool> {
+    let config = checked_text(git(path, &["config", "--null", "--list"]).ok()?).ok()?;
+    Some(config.split_terminator('\0').any(|entry| {
+        entry
+            .split_once('\n')
+            .map_or(entry, |(key, _)| key)
+            .to_ascii_lowercase()
+            .starts_with("filter.")
+    }))
+}
+
+/// A newly staged attributes file can make byte-identical files appear modified. On the
+/// final rebase step, with no autostash or remaining commands, Git only commits the index
+/// and updates refs. Use the pre-commit attributes, but only after proving the
+/// apparently modified regular files still match their staged blobs byte for byte.
+fn attribute_only_rebase_source(path: &Path) -> Option<String> {
+    let todo =
+        std::fs::read_to_string(git_path(path, "rebase-merge/git-rebase-todo").ok()?).ok()?;
+    if !todo.trim().is_empty()
+        || git_path(path, "rebase-merge/autostash").ok()?.exists()
+        || git_path(path, "rebase-merge/update-refs").ok()?.exists()
+    {
+        return None;
+    }
+    // GIT_ATTR_SOURCE affects every tracked path, including paths outside the diff.
+    // An old attribute could otherwise run a configured clean/process filter there.
+    if configured_git_filters(path)? {
+        return None;
+    }
+    let staged = checked_text(
+        git(
+            path,
+            &[
+                "diff",
+                "--cached",
+                "--name-only",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                "-z",
+                "--",
+            ],
+        )
+        .ok()?,
+    )
+    .ok()?;
+    if !staged
+        .split_terminator('\0')
+        .any(|name| name == ".gitattributes" || name.ends_with("/.gitattributes"))
+    {
+        return None;
+    }
+    let source = git(path, &["rev-parse", "--verify", "HEAD^{commit}"])
+        .ok()?
+        .trim()
+        .to_owned();
+    let staged_before = git(
+        path,
+        &[
+            "diff",
+            "--cached",
+            "--raw",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "-z",
+            "--",
+        ],
+    )
+    .ok()?;
+    let names = checked_text(
+        git(
+            path,
+            &[
+                "diff",
+                "--name-only",
+                "-z",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                "--ignore-submodules=all",
+                "--",
+            ],
+        )
+        .ok()?,
+    )
+    .ok()?;
+    let files: Vec<_> = names.split_terminator('\0').collect();
+    if files.is_empty() || files.len() > 512 || names.len() > 100_000 {
+        return None;
+    }
+    // Batch the Git reads, keeping command lines short enough for Windows. Raw object
+    // hashes preserve binary bytes and work in both SHA-1 and SHA-256 repositories.
+    for batch in files.chunks(16) {
+        if batch.iter().any(|file| file.len() > 1000) {
+            return None;
+        }
+        // Do not invoke filters, follow symlinks, or let a changed mode pass as clean.
+        let mut attr_args = vec!["check-attr", "-z", "filter", "--"];
+        attr_args.extend(batch.iter().copied());
+        for attrs in [
+            git(path, &attr_args),
+            super::gitgraph::git_with_attr_source(path, &attr_args, &source),
+        ] {
+            let attrs = checked_text(attrs.ok()?).ok()?;
+            let parts: Vec<_> = attrs.split_terminator('\0').collect();
+            if parts.len() != batch.len() * 3
+                || parts.as_chunks::<3>().0.iter().any(|entry| {
+                    entry[1] != "filter" || !matches!(entry[2], "unspecified" | "unset")
+                })
+            {
+                return None;
+            }
+        }
+        for file in batch {
+            let work = checked_work_path(path, file).ok()?;
+            if !std::fs::symlink_metadata(work).ok()?.file_type().is_file() {
+                return None;
+            }
+        }
+        let mut hash_args = vec!["hash-object", "--no-filters", "--"];
+        hash_args.extend(batch.iter().copied());
+        let hashes = git(path, &hash_args).ok()?;
+        let hashes: Vec<_> = hashes.lines().collect();
+        if hashes.len() != batch.len() {
+            return None;
+        }
+        let literals: Vec<_> = batch
+            .iter()
+            .map(|file| format!(":(literal){file}"))
+            .collect();
+        let mut index_args = vec!["ls-files", "--stage", "-z", "--"];
+        index_args.extend(literals.iter().map(String::as_str));
+        let entries = checked_text(git(path, &index_args).ok()?).ok()?;
+        let mut indexed = std::collections::BTreeMap::new();
+        for record in entries.split_terminator('\0') {
+            let (meta, name) = record.split_once('\t')?;
+            let mut fields = meta.split_whitespace();
+            let mode = fields.next()?;
+            let oid = fields.next()?;
+            let stage = fields.next()?;
+            if !matches!(mode, "100644" | "100755")
+                || stage != "0"
+                || fields.next().is_some()
+                || indexed.insert(name, oid).is_some()
+            {
+                return None;
+            }
+        }
+        if batch
+            .iter()
+            .zip(hashes)
+            .any(|(file, hash)| indexed.get(file) != Some(&hash))
+        {
+            return None;
+        }
+    }
+    // This also proves this Git supports GIT_ATTR_SOURCE: otherwise the same diff remains dirty.
+    super::gitgraph::git_with_attr_source(
+        path,
+        &[
+            "-c",
+            "core.safecrlf=false",
+            "diff",
+            "--quiet",
+            "--no-textconv",
+            "--no-ext-diff",
+            "--no-renames",
+            "--ignore-submodules=dirty",
+            "--",
+        ],
+        &source,
+    )
+    .ok()?;
+    // An external Git client may have changed the operation while preflight ran.
+    if git(path, &["rev-parse", "--verify", "HEAD^{commit}"])
+        .ok()?
+        .trim()
+        != source
+        || git(
+            path,
+            &[
+                "diff",
+                "--cached",
+                "--raw",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                "-z",
+                "--",
+            ],
+        )
+        .ok()?
+            != staged_before
+        || !std::fs::read_to_string(git_path(path, "rebase-merge/git-rebase-todo").ok()?)
+            .ok()?
+            .trim()
+            .is_empty()
+        || git_path(path, "rebase-merge/autostash").ok()?.exists()
+        || git_path(path, "rebase-merge/update-refs").ok()?.exists()
+    {
+        return None;
+    }
+    Some(source)
+}
+
+/// Keep Git's reason visible first. The post-failure worktree can reflect partial progress,
+/// so the current paths are context, not necessarily the cause of that failure.
+fn rebase_failure_context(error: CoreError, files: &[&str]) -> CoreError {
+    let paths = files
+        .iter()
+        .take(20)
+        .map(|file| format!("{file:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = if files.len() > 20 {
+        format!(" (+{} more)", files.len() - 20)
+    } else {
+        String::new()
+    };
+    fail(format!(
+        "Git: {error}\n\nCurrent unstaged files: {paths}{more}. Review them in Working Changes."
+    ))
+}
+
 fn control(path: &Path, command: &str) -> Result<String> {
     // Continue, skip and abort change the repository through other modules, which the
     // local `git` does not see: from here on every question is asked again.
@@ -1662,6 +2289,14 @@ fn control(path: &Path, command: &str) -> Result<String> {
     let current = operation(path)?.ok_or_else(|| fail("There is no interrupted Git operation"))?;
     if command == "--continue" && !conflicts(path)?.is_empty() {
         return Err(fail("Resolve and stage all conflicts before continuing"));
+    }
+    // Finalizing a resolved merge commits the index without checking out any files.
+    if current == "merge" {
+        match command {
+            "--continue" => return git(path, &["-c", "core.editor=true", "commit", "--no-edit"]),
+            "--abort" => return abort_merge(path),
+            _ => return Err(fail("A merge cannot be skipped; continue or abort it")),
+        }
     }
     let mut targets = vec![head(path)];
     if command != "--abort" {
@@ -1679,12 +2314,7 @@ fn control(path: &Path, command: &str) -> Result<String> {
                 targets.push(id.to_owned());
             }
         }
-        if current == "merge" {
-            let id = git(path, &["rev-parse", "--verify", "ORIG_HEAD"])?;
-            commit_id(path, id.trim())?;
-            targets.push(id.trim().into());
-        }
-    } else if current != "merge" {
+    } else {
         for marker in ["rebase-merge/git-rebase-todo", "sequencer/todo"] {
             if let Ok(todo) = std::fs::read_to_string(git_path(path, marker)?) {
                 for line in todo.lines() {
@@ -1733,28 +2363,112 @@ fn control(path: &Path, command: &str) -> Result<String> {
     ) {
         return result;
     }
-    if current == "merge" {
-        return match command {
-            "--continue" => git(path, &["-c", "core.editor=true", "commit", "--no-edit"]),
-            "--abort" => git(path, &["merge", "--abort"]),
-            _ => Err(fail("A merge cannot be skipped; continue or abort it")),
-        };
+    let args = [
+        "-c",
+        "core.editor=true",
+        "-c",
+        "submodule.recurse=false",
+        &current,
+        command,
+    ];
+    // Decide before executing Git: retrying after a partial sequence could skip a new stop.
+    let source = if current == "rebase" && command == "--continue" {
+        attribute_only_rebase_source(path)
+    } else {
+        None
+    };
+    let result = match source {
+        Some(source) => super::gitgraph::git_with_attr_source(path, &args, &source),
+        None => git(path, &args),
+    };
+    match result {
+        Err(error) if current == "rebase" && command == "--continue" => {
+            // The operation may have stopped for another reason or after partial progress.
+            // Report the current unstaged paths without claiming they caused the error.
+            let names = git(
+                path,
+                &[
+                    "diff",
+                    "--name-only",
+                    "-z",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--ignore-submodules=dirty",
+                    "--",
+                ],
+            )
+            .ok()
+            .and_then(|value| checked_text(value).ok());
+            let files: Vec<_> = names
+                .as_deref()
+                .unwrap_or("")
+                .split_terminator('\0')
+                .collect();
+            if files.is_empty() {
+                return Err(error);
+            }
+            Err(rebase_failure_context(error, &files))
+        }
+        result => result,
     }
-    git(
-        path,
-        &[
-            "-c",
-            "core.editor=true",
-            "-c",
-            "submodule.recurse=false",
-            &current,
-            command,
-        ],
-    )
 }
 
 /// Execute one explicitly selected local action. Commits are unsigned, with hooks disabled.
+/// What the journal calls a request; None for one that does not move HEAD.
+fn journaled(request: &Request) -> Option<(super::gitjournal::Kind, String)> {
+    use super::gitjournal::Kind;
+    let short = |id: &str| id.get(..8).unwrap_or(id).to_owned();
+    Some(match request {
+        Request::Merge { target } | Request::MergeWithMode { target, .. } => {
+            (Kind::Merge, short(target))
+        }
+        Request::Rebase { target } => (Kind::Rebase, short(target)),
+        Request::CherryPick { target } => (Kind::CherryPick, short(target)),
+        Request::CherryPickMany { targets } => (
+            Kind::CherryPick,
+            match targets.as_slice() {
+                [one] => short(one),
+                all => format!("{} commits", all.len()),
+            },
+        ),
+        Request::IntegrateMerge { target, revert, .. } => (
+            if *revert {
+                Kind::Revert
+            } else {
+                Kind::CherryPick
+            },
+            short(target),
+        ),
+        Request::Revert { target } => (Kind::Revert, short(target)),
+        Request::Reset { target, mode } => (
+            match mode {
+                ResetMode::Soft => Kind::ResetSoft,
+                ResetMode::Mixed => Kind::ResetMixed,
+                ResetMode::Hard => Kind::ResetHard,
+            },
+            short(target),
+        ),
+        _ => return None,
+    })
+}
+
 pub fn execute(path: &Path, request: Request, expected: &str) -> Result<String> {
+    if matches!(request, Request::Continue | Request::Skip | Request::Abort) {
+        return super::gitjournal::around_control(path, || execute_now(path, request, expected));
+    }
+    let operation = journaled(&request);
+    super::gitjournal::around(path, operation, || execute_now(path, request, expected))
+}
+
+fn execute_now(path: &Path, request: Request, expected: &str) -> Result<String> {
+    let merge_flag = match &request {
+        Request::MergeWithMode { mode, .. } => Some(match mode {
+            MergeMode::NoFastForward => "--no-ff",
+            MergeMode::FastForwardOnly => "--ff-only",
+            MergeMode::Squash => "--squash",
+        }),
+        _ => None,
+    };
     let _busy = super::gitfacts::mutating();
     let p = root(path)?;
     if marker_exists(&p, super::gitfacts::markers(&p).as_ref(), "BISECT_START")? {
@@ -1789,6 +2503,7 @@ pub fn execute(path: &Path, request: Request, expected: &str) -> Result<String> 
             | Request::RemoveRemote { .. }
             | Request::SetRemoteUrl { .. }
             | Request::StashDrop { .. }
+            | Request::StashRename { .. }
     );
     let result = match request {
         Request::CreateBranch { name, target } => {
@@ -1878,40 +2593,126 @@ pub fn execute(path: &Path, request: Request, expected: &str) -> Result<String> 
             git(&p, &["remote", "set-url", "--", &name, &value])
         }
         Request::StashDrop { id } => drop_stash(&p, &id),
-        Request::StashSave { message } => {
-            worktree_guard(&p)?;
+        Request::StashRename { id, name } => rename_stash(&p, &id, &name),
+        Request::StashSave {
+            message,
+            keep_index,
+            tracked_only,
+            files,
+        } => {
+            require_head(&p)?;
             no_operation(&p)?;
-            if status(&p)?.is_empty() {
-                return Err(fail("There are no local changes to stash"));
+            let message = match message.trim() {
+                "" => "Gall workspace stash",
+                message => message,
+            };
+            let specs: Vec<String> = files
+                .iter()
+                .map(|file| {
+                    super::gitinspect::relative_file(file)?;
+                    Ok(format!(":(literal){file}"))
+                })
+                .collect::<Result<_>>()?;
+            if has_filters(&p) {
+                let paths: Vec<_> = specs.iter().map(String::as_str).collect();
+                super::gitadvanced::verify_filtered_stash_paths(&p, &paths, !tracked_only)?;
             }
+            let mut args = vec!["-c", "submodule.recurse=false", "stash", "push"];
+            if !tracked_only {
+                args.push("--include-untracked");
+            }
+            if keep_index {
+                args.push("--keep-index");
+            }
+            args.extend(["-m", message]);
+            if !specs.is_empty() {
+                args.push("--");
+                args.extend(specs.iter().map(String::as_str));
+            }
+            let output = git(&p, &args)?;
+            // `stash push` prints the no-op result in the C locale even though it exits 0.
+            if output.lines().next() == Some("No local changes to save") {
+                return Err(fail("There are no such local changes to stash"));
+            }
+            Ok(output)
+        }
+        Request::StashBranch { id, name } => {
+            require_head(&p)?;
+            no_operation(&p)?;
+            // Local changes do not block it, as with `git stash branch`: the switch refuses, without
+            // changing anything, when it would overwrite one, and the apply refuses the same way.
+            stash(&p, &id)?;
+            validate_name(&p, &name, "branch")?;
+            let base = super::gitstash::base(&p, &id)?;
+            protect_untracked(&p, &[&base, &id], None)?;
             git(
                 &p,
                 &[
+                    "-c",
+                    "submodule.recurse=false",
+                    "switch",
+                    "--no-overwrite-ignore",
+                    "-c",
+                    &name,
+                    &base,
+                ],
+            )?;
+            // It was made on this commit, so it fits. The stash is removed only once it is applied.
+            git(
+                &p,
+                &[
+                    "-c",
+                    "submodule.recurse=false",
                     "stash",
-                    "push",
-                    "--include-untracked",
-                    "-m",
-                    if message.trim().is_empty() {
-                        "Gall workspace stash"
-                    } else {
-                        &message
-                    },
+                    "apply",
+                    "--index",
+                    &id,
+                ],
+            )
+            .map_err(|e| {
+                fail(format!(
+                    "The branch was created, but the stash could not be applied and is kept: {e}"
+                ))
+            })?;
+            drop_stash(&p, &id).map_err(|e| {
+                fail(format!(
+                    "Stash applied, but its stack entry could not be removed: {e}"
+                ))
+            })
+        }
+        Request::StashApply { id } => {
+            require_head(&p)?;
+            no_operation(&p)?;
+            // Local changes do not block it: `stash apply` refuses, without changing anything,
+            // when it would overwrite one (lazygit lets Git decide as well).
+            stash(&p, &id)?;
+            git(
+                &p,
+                &[
+                    "-c",
+                    "submodule.recurse=false",
+                    "stash",
+                    "apply",
+                    "--index",
+                    &id,
                 ],
             )
         }
-        Request::StashApply { id } => {
-            worktree_guard(&p)?;
-            no_operation(&p)?;
-            clean(&p)?;
-            stash(&p, &id)?;
-            git(&p, &["stash", "apply", "--index", &id])
-        }
         Request::StashPop { id } => {
-            worktree_guard(&p)?;
+            require_head(&p)?;
             no_operation(&p)?;
-            clean(&p)?;
             stash(&p, &id)?;
-            let output = git(&p, &["stash", "apply", "--index", &id])?;
+            let output = git(
+                &p,
+                &[
+                    "-c",
+                    "submodule.recurse=false",
+                    "stash",
+                    "apply",
+                    "--index",
+                    &id,
+                ],
+            )?;
             drop_stash(&p, &id).map_err(|e| {
                 fail(format!(
                     "Stash applied, but its stack entry could not be removed: {e}"
@@ -1920,38 +2721,90 @@ pub fn execute(path: &Path, request: Request, expected: &str) -> Result<String> 
             Ok(output)
         }
         Request::Continue => {
-            control_guard(&p)?;
+            require_head(&p)?;
             control(&p, "--continue")
         }
         Request::Skip => {
-            control_guard(&p)?;
+            require_head(&p)?;
             control(&p, "--skip")
         }
         Request::Abort => {
-            control_guard(&p)?;
+            require_head(&p)?;
             control(&p, "--abort")
         }
         Request::Resolve { file, side } => {
-            control_guard(&p)?;
+            require_head(&p)?;
             if !conflicts(&p)?.contains(&file) {
                 return Err(fail("This file is no longer an unresolved conflict"));
             }
             let literal = format!(":(literal){file}");
             match side {
                 ResolveSide::Ours | ResolveSide::Theirs => {
-                    let stage = if matches!(side, ResolveSide::Ours) {
-                        "--ours"
+                    let (flag, chosen) = if matches!(side, ResolveSide::Ours) {
+                        ("--ours", "2")
                     } else {
-                        "--theirs"
+                        ("--theirs", "3")
                     };
-                    git(&p, &["restore", "--worktree", stage, "--", &literal])?;
+                    let index = git(&p, &["ls-files", "--unmerged", "-z", "--", &literal])?;
+                    let mut stages = index
+                        .split_terminator('\0')
+                        .filter_map(|record| {
+                            let (metadata, path) = record.split_once('\t')?;
+                            (path == file).then_some(metadata)
+                        })
+                        .peekable();
+                    if stages.peek().is_none() {
+                        return Err(fail("This file is no longer an unresolved conflict"));
+                    }
+                    let mut selected = None;
+                    let mut has_gitlink = false;
+                    for metadata in stages {
+                        let mut fields = metadata.split_whitespace();
+                        let mode = fields.next().unwrap_or_default();
+                        let id = fields.next().unwrap_or_default();
+                        has_gitlink |= mode == "160000";
+                        if fields.next() == Some(chosen) {
+                            selected = Some((mode, id));
+                        }
+                    }
+                    match selected {
+                        None if has_gitlink => {
+                            // The parent can stop tracking the path without removing a nested checkout.
+                            return git(&p, &["update-index", "--force-remove", "--", &file]);
+                        }
+                        None => return git(&p, &["rm", "-f", "--", &literal]),
+                        Some(("160000", id)) => {
+                            return git(
+                                &p,
+                                &[
+                                    "update-index",
+                                    "--add",
+                                    "--cacheinfo",
+                                    &format!("160000,{id},{file}"),
+                                ],
+                            );
+                        }
+                        Some(_) => {}
+                    }
+                    git(
+                        &p,
+                        &[
+                            "-c",
+                            "submodule.recurse=false",
+                            "restore",
+                            "--worktree",
+                            flag,
+                            "--",
+                            &literal,
+                        ],
+                    )?;
                     git(&p, &["add", "--", &literal])
                 }
                 ResolveSide::Mark => git(&p, &["add", "--all", "--", &literal]),
             }
         }
         Request::ResolveContent { file, content } => {
-            control_guard(&p)?;
+            require_head(&p)?;
             if !conflicts(&p)?.contains(&file) {
                 return Err(fail("This file is no longer an unresolved conflict"));
             }
@@ -1967,85 +2820,212 @@ pub fn execute(path: &Path, request: Request, expected: &str) -> Result<String> 
                 .map_err(|e| fail(format!("Cannot write the resolved file {file}: {e}")))?;
             git(&p, &["add", "--", &format!(":(literal){file}")])
         }
-        Request::Merge { target } => {
-            worktree_guard(&p)?;
+        Request::Merge { target } | Request::MergeWithMode { target, .. } => {
+            require_head(&p)?;
             no_operation(&p)?;
-            clean(&p)?;
+            // Local changes do not block a merge, as in Git and lazygit: Git itself refuses,
+            // without changing anything, only when the merge would overwrite one of them.
             commit_id(&p, &target)?;
             save_head(&p)?;
-            git(
-                &p,
-                &[
-                    "-c",
-                    "merge.autoStash=false",
-                    "merge",
-                    "--no-edit",
-                    "--no-overwrite-ignore",
-                    &target,
-                ],
-            )
+            super::gitprogress::report_phase("Merging", None);
+            let mut args = vec![
+                "-c",
+                "merge.autoStash=false",
+                "-c",
+                "submodule.recurse=false",
+                "merge",
+                "--no-edit",
+                "--no-overwrite-ignore",
+            ];
+            if super::gitprogress::is_active() {
+                args.push("--progress");
+            }
+            args.extend(merge_flag);
+            args.push(&target);
+            git(&p, &args)
         }
         Request::Rebase { target } => {
             // Rebase rewrites the superproject's gitlinks without checking out submodules.
             // Reuse the token's status rather than recursively scanning their folders.
-            control_guard(&p)?;
+            require_head(&p)?;
             no_operation(&p)?;
-            rebase_clean(&p)?;
+            if super::gitgraph::status_entries(&status(&p)?)
+                .iter()
+                .any(|entry| entry.code != "?? ")
+            {
+                protect_staged_gitlinks(&p)?;
+            }
             commit_id(&p, &target)?;
             protect_untracked(&p, &[&target], Some(&target))?;
+            verify_filtered_autostash(&p)?;
             save_head(&p)?;
+            super::gitprogress::report_phase("Rebasing", None);
             git(
                 &p,
                 &[
                     "-c",
                     "core.editor=true",
                     "-c",
-                    "rebase.autoStash=false",
-                    "-c",
                     "submodule.recurse=false",
+                    // Local changes are kept aside by Git and put back afterwards (lazygit does the
+                    // same); a conflict while putting them back leaves them in the stash, which
+                    // Git names in its message. The staged gitlink check keeps pointers out of it.
                     "rebase",
+                    "--autostash",
                     &target,
                 ],
             )
         }
-        Request::CherryPick { target } => {
-            worktree_guard(&p)?;
+        Request::CherryPickMany { targets } => {
+            require_head(&p)?;
             no_operation(&p)?;
-            clean(&p)?;
-            commit_id(&p, &target)?;
-            protect_untracked(&p, &[&target], None)?;
+            check_picks(&p, &targets)?;
+            // retain_detached keeps HEAD where it is.
+            let before = save_head(&p)?;
             retain_detached(&p)?;
-            git(&p, &["cherry-pick", &target])
+            super::gitprogress::report_phase(
+                "Cherry-picking",
+                Some(format!("{} commits", targets.len())),
+            );
+            let mut args = vec![
+                "-c",
+                "submodule.recurse=false",
+                "cherry-pick",
+                KEEP_EMPTY_PICKS,
+            ];
+            args.extend(targets.iter().map(String::as_str));
+            git(&p, &args).inspect_err(|_| {
+                // Git refuses a list (a staged change, a file it would overwrite) after it has already
+                // written its sequencer, which would show as an operation in progress that nothing
+                // can continue. With no pick made and no conflict, only that record is dropped: the
+                // index and the files stay as they were.
+                if head(&p) == before
+                    && !super::gitfacts::marker(&p, "CHERRY_PICK_HEAD")
+                        .is_some_and(|marker| marker.exists())
+                    && snapshot(&p).is_ok_and(|state| state.conflicts.is_empty())
+                {
+                    let _ = git(&p, &["cherry-pick", "--quit"]);
+                }
+            })
+        }
+        Request::CherryPick { target } => {
+            require_head(&p)?;
+            no_operation(&p)?;
+            check_picks(&p, std::slice::from_ref(&target))?;
+            retain_detached(&p)?;
+            git(
+                &p,
+                &[
+                    "-c",
+                    "submodule.recurse=false",
+                    "cherry-pick",
+                    KEEP_EMPTY_PICKS,
+                    &target,
+                ],
+            )
         }
         Request::Revert { target } => {
-            worktree_guard(&p)?;
+            require_head(&p)?;
             no_operation(&p)?;
-            clean(&p)?;
             commit_id(&p, &target)?;
-            let parents = git(&p, &["rev-list", "--parents", "-n", "1", &target])?;
-            let trees: Vec<_> = parents.split_whitespace().collect();
-            protect_untracked(&p, &trees, None)?;
+            let parents = git(&p, &["show", "-s", "--format=%P", &target])?;
+            let parents: Vec<_> = parents.split_whitespace().collect();
+            if let [parent] = parents.as_slice() {
+                protect_integration_writes(&p, &target, parent)?;
+            }
             retain_detached(&p)?;
-            git(&p, &["revert", "--no-edit", &target])
+            git(
+                &p,
+                &[
+                    "-c",
+                    "submodule.recurse=false",
+                    "revert",
+                    "--no-edit",
+                    &target,
+                ],
+            )
+        }
+        Request::IntegrateMerge {
+            target,
+            mainline,
+            revert,
+        } => {
+            require_head(&p)?;
+            no_operation(&p)?;
+            commit_id(&p, &target)?;
+            let listing = git(&p, &["show", "-s", "--format=%P", &target])?;
+            let parents: Vec<_> = listing.split_whitespace().collect();
+            if parents.len() < 2 || mainline == 0 || mainline > parents.len() {
+                return Err(fail(
+                    "Select an existing mainline parent of the merge commit",
+                ));
+            }
+            let parent = parents[mainline - 1];
+            let (before, after) = if revert {
+                (target.as_str(), parent)
+            } else {
+                (parent, target.as_str())
+            };
+            protect_integration_writes(&p, before, after)?;
+            retain_detached(&p)?;
+            let parent_number = mainline.to_string();
+            let mut args = vec![
+                "-c",
+                "submodule.recurse=false",
+                if revert { "revert" } else { "cherry-pick" },
+                "--no-edit",
+            ];
+            if !revert {
+                args.push(KEEP_EMPTY_PICKS);
+            }
+            args.extend(["-m", parent_number.as_str(), target.as_str()]);
+            git(&p, &args)
         }
         Request::Reset { target, mode } => {
-            worktree_guard(&p)?;
+            require_head(&p)?;
             no_operation(&p)?;
             commit_id(&p, &target)?;
             save_head(&p)?;
+            // Git itself never touches the submodules here, whatever `submodule.recurse` says:
+            // a hard reset checks them out below, after saving their edits for recovery.
+            let reset = |flag: &str| {
+                git(
+                    &p,
+                    &["-c", "submodule.recurse=false", "reset", flag, &target],
+                )
+            };
             match mode {
-                ResetMode::Soft => git(&p, &["reset", "--soft", &target]),
+                ResetMode::Soft => {
+                    super::gitprogress::report_phase("Resetting branch", None);
+                    reset("--soft")
+                }
                 ResetMode::Mixed => {
-                    save_index_and_worktree(&p, "Gall recovery before mixed reset")?;
-                    git(&p, &["reset", "--mixed", &target])
+                    super::gitprogress::report_phase("Saving recovery snapshot", None);
+                    save_index_and_worktree(&p, "Gall recovery before mixed reset", false)?;
+                    super::gitprogress::report_phase("Resetting index", None);
+                    reset("--mixed")
                 }
                 ResetMode::Hard => {
                     // A hard reset overwrites untracked or ignored files that the target
                     // commit tracks. Reject only those collisions: unrelated untracked and
                     // ignored files (build output, dependencies) are left alone by Git.
                     protect_untracked(&p, &[&target], None)?;
-                    save_index_and_worktree(&p, "Gall recovery before hard reset")?;
-                    git(&p, &["reset", "--hard", &target])
+                    super::gitprogress::report_phase("Saving recovery snapshot", None);
+                    save_index_and_worktree(&p, HARD_RESET_RECOVERY, true)?;
+                    // The result matches the target commit, submodules included. Only those
+                    // listed in `.gitmodules` are known to `git submodule`; an embedded
+                    // repository without an entry keeps its folder as it is.
+                    let submodules = p.join(".gitmodules").exists();
+                    if submodules {
+                        reset_submodule_edits(&p)?;
+                    }
+                    super::gitprogress::report_phase("Resetting working tree", None);
+                    let output = reset("--hard")?;
+                    if submodules || p.join(".gitmodules").exists() {
+                        super::gitprogress::report_phase("Updating submodules", None);
+                        update_submodules(&p)?;
+                    }
+                    Ok(output)
                 }
             }
         }
@@ -2079,6 +3059,201 @@ mod tests {
 
     fn act(path: &Path, request: Request) -> Result<String> {
         execute(path, request, &snapshot(path)?.token)
+    }
+
+    #[test]
+    fn checkout_commit_file_stages_only_the_selected_literal_path() {
+        let d = repository();
+        let p = d.path();
+        let name = "nested/ž [draft].txt";
+        std::fs::create_dir(p.join("nested")).unwrap();
+        std::fs::write(p.join(name), "old\n").unwrap();
+        let historical = commit(p, "historical", "original\n");
+        std::fs::write(p.join(name), "new\n").unwrap();
+        let current = commit(p, "current", "original\n");
+        std::fs::write(p.join("file.txt"), "unrelated local edit\n").unwrap();
+        std::fs::write(p.join("scratch"), "untracked\n").unwrap();
+
+        checkout_commit_file(p, &historical, name).unwrap();
+
+        assert_eq!(head(p), current);
+        assert_eq!(std::fs::read_to_string(p.join(name)).unwrap(), "old\n");
+        assert_eq!(git(p, &["show", &format!(":{name}")]).unwrap(), "old\n");
+        assert_eq!(
+            std::fs::read_to_string(p.join("file.txt")).unwrap(),
+            "unrelated local edit\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(p.join("scratch")).unwrap(),
+            "untracked\n"
+        );
+    }
+
+    #[test]
+    fn checkout_commit_file_preserves_staged_unstaged_and_hidden_edits() {
+        let d = repository();
+        let p = d.path();
+        let historical = commit(p, "historical", "old\n");
+        let current = commit(p, "current", "new\n");
+        let staged = || git(p, &["show", ":file.txt"]).unwrap();
+
+        std::fs::write(p.join("file.txt"), "local\n").unwrap();
+        let error = checkout_commit_file(p, &historical, "file.txt").unwrap_err();
+        assert!(error.to_string().contains("file.txt"));
+        assert_eq!(staged(), "new\n");
+        git(p, &["update-index", "--assume-unchanged", "file.txt"]).unwrap();
+        assert!(checkout_commit_file(p, &historical, "file.txt").is_err());
+        git(p, &["update-index", "--no-assume-unchanged", "file.txt"]).unwrap();
+        git(p, &["add", "--", "file.txt"]).unwrap();
+        assert!(checkout_commit_file(p, &historical, "file.txt").is_err());
+        assert_eq!(staged(), "local\n");
+        assert_eq!(head(p), current);
+        assert_eq!(
+            std::fs::read_to_string(p.join("file.txt")).unwrap(),
+            "local\n"
+        );
+    }
+
+    #[test]
+    fn checkout_commit_file_preserves_untracked_and_ignored_replacements() {
+        let d = repository();
+        let p = d.path();
+        let historical = commit(p, "historical", "old\n");
+        git(p, &["rm", "--", "file.txt"]).unwrap();
+        git(p, &["commit", "-qm", "delete file"]).unwrap();
+        std::fs::write(p.join("file.txt"), "local\n").unwrap();
+        assert!(checkout_commit_file(p, &historical, "file.txt").is_err());
+        std::fs::write(p.join(".gitignore"), "file.txt\n").unwrap();
+        assert!(checkout_commit_file(p, &historical, "file.txt").is_err());
+        assert_eq!(
+            std::fs::read_to_string(p.join("file.txt")).unwrap(),
+            "local\n"
+        );
+        assert!(git(p, &["ls-files", "--", "file.txt"]).unwrap().is_empty());
+
+        std::fs::remove_file(p.join("file.txt")).unwrap();
+        checkout_commit_file(p, &historical, "file.txt").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(p.join("file.txt")).unwrap(),
+            "old\n"
+        );
+    }
+
+    #[test]
+    fn cherry_pick_and_revert_merge_use_the_selected_mainline() {
+        let d = repository();
+        let p = d.path();
+        let base = commit(p, "base", "base\n");
+        git(p, &["switch", "-qc", "topic"]).unwrap();
+        std::fs::write(p.join("topic.txt"), "topic\n").unwrap();
+        git(p, &["add", "--", "topic.txt"]).unwrap();
+        git(p, &["commit", "-qm", "Topic"]).unwrap();
+        git(p, &["switch", "-q", "main"]).unwrap();
+        git(p, &["merge", "--no-ff", "-qm", "Merge topic", "topic"]).unwrap();
+        let merged = head(p);
+        git(p, &["switch", "-qc", "pick", &base]).unwrap();
+        let apply = |mainline, revert| {
+            act(
+                p,
+                Request::IntegrateMerge {
+                    target: merged.clone(),
+                    mainline,
+                    revert,
+                },
+            )
+        };
+        assert!(apply(3, false)
+            .unwrap_err()
+            .to_string()
+            .contains("mainline"));
+        assert_eq!(head(p), base);
+        std::fs::write(p.join("topic.txt"), "keep local\n").unwrap();
+        assert!(apply(1, false)
+            .unwrap_err()
+            .to_string()
+            .contains("topic.txt"));
+        assert_eq!(
+            std::fs::read_to_string(p.join("topic.txt")).unwrap(),
+            "keep local\n"
+        );
+        assert_eq!(head(p), base);
+        std::fs::remove_file(p.join("topic.txt")).unwrap();
+        apply(1, false).unwrap();
+        assert_eq!(git(p, &["show", "HEAD:topic.txt"]).unwrap(), "topic\n");
+        git(p, &["switch", "-q", "main"]).unwrap();
+        apply(1, true).unwrap();
+        assert!(!p.join("topic.txt").exists());
+        assert_eq!(git(p, &["rev-parse", "HEAD^"]).unwrap().trim(), merged);
+    }
+
+    #[test]
+    fn explicit_merge_modes_keep_git_ancestry_and_index_semantics() {
+        for mode in [
+            MergeMode::NoFastForward,
+            MergeMode::FastForwardOnly,
+            MergeMode::Squash,
+        ] {
+            let d = repository();
+            let p = d.path();
+            let base = commit(p, "base", "base\n");
+            git(p, &["switch", "-qc", "topic"]).unwrap();
+            let target = commit(p, "topic change", "topic\n");
+            git(p, &["switch", "-q", "main"]).unwrap();
+            std::fs::write(p.join("build.log"), "keep\n").unwrap();
+            act(
+                p,
+                Request::MergeWithMode {
+                    target: target.clone(),
+                    mode,
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(p.join("file.txt")).unwrap(),
+                "topic\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(p.join("build.log")).unwrap(),
+                "keep\n"
+            );
+            match mode {
+                MergeMode::FastForwardOnly => assert_eq!(head(p), target),
+                MergeMode::NoFastForward => {
+                    assert_eq!(
+                        git(p, &["show", "-s", "--format=%P", "HEAD"])
+                            .unwrap()
+                            .trim(),
+                        format!("{base} {target}")
+                    );
+                }
+                MergeMode::Squash => {
+                    assert_eq!(head(p), base);
+                    assert_eq!(git(p, &["show", ":file.txt"]).unwrap(), "topic\n");
+                    assert!(!p.join(".git/MERGE_HEAD").exists());
+                }
+            }
+        }
+        let d = repository();
+        let p = d.path();
+        commit(p, "base", "base\n");
+        git(p, &["switch", "-qc", "topic"]).unwrap();
+        let target = commit(p, "topic", "topic\n");
+        git(p, &["switch", "-q", "main"]).unwrap();
+        let original = commit(p, "different main", "main\n");
+        assert!(act(
+            p,
+            Request::MergeWithMode {
+                target,
+                mode: MergeMode::FastForwardOnly
+            }
+        )
+        .is_err());
+        assert_eq!(head(p), original);
+        assert_eq!(
+            std::fs::read_to_string(p.join("file.txt")).unwrap(),
+            "main\n"
+        );
+        assert!(!p.join(".git/MERGE_HEAD").exists());
     }
 
     #[test]
@@ -2790,6 +3965,9 @@ mod tests {
             p,
             Request::StashSave {
                 message: "my stash".into(),
+                keep_index: false,
+                tracked_only: false,
+                files: Vec::new(),
             },
         )
         .unwrap();
@@ -2817,6 +3995,9 @@ mod tests {
             p,
             Request::StashSave {
                 message: "second stash".into(),
+                keep_index: false,
+                tracked_only: false,
+                files: Vec::new(),
             },
         )
         .unwrap();
@@ -2848,6 +4029,168 @@ mod tests {
     }
 
     #[test]
+    fn stash_rename_preserves_all_stash_trees_and_worktree_bytes() {
+        let d = repository();
+        let p = d.path();
+        commit(p, "Base", "base\n");
+        std::fs::write(p.join("file.txt"), "staged stash\n").unwrap();
+        git(p, &["add", "--", "file.txt"]).unwrap();
+        std::fs::write(p.join("file.txt"), "working stash\n").unwrap();
+        std::fs::write(p.join("extra.txt"), "untracked stash\n").unwrap();
+        git(
+            p,
+            &["stash", "push", "--include-untracked", "-m", "old name"],
+        )
+        .unwrap();
+        let old = stashes(p).unwrap()[0].id.clone();
+        std::fs::write(p.join("file.txt"), "second stash\n").unwrap();
+        git(p, &["stash", "push", "-m", "second"]).unwrap();
+        let second = stashes(p).unwrap()[0].id.clone();
+        std::fs::write(p.join("file.txt"), "current unstaged\n").unwrap();
+
+        let rename = |name: &str| {
+            act(
+                p,
+                Request::StashRename {
+                    id: old.clone(),
+                    name: name.into(),
+                },
+            )
+        };
+        assert!(rename("bad\nname").is_err());
+        assert_eq!(stashes(p).unwrap()[1].id, old);
+        rename("new name").unwrap();
+        let list = stashes(p).unwrap();
+        assert_eq!(list.len(), 2);
+        assert!(list[0].message.ends_with("new name"));
+        assert_eq!(list[1].id, second);
+        let new = &list[0].id;
+        for tree in ["^{tree}", "^1^{tree}", "^2^{tree}", "^3^{tree}"] {
+            assert_eq!(
+                git(p, &["rev-parse", &format!("{new}{tree}")]).unwrap(),
+                git(p, &["rev-parse", &format!("{old}{tree}")]).unwrap()
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(p.join("file.txt")).unwrap(),
+            "current unstaged\n"
+        );
+        assert!(git(
+            p,
+            &["show-ref", "--verify", &format!("refs/gall/recovery/{old}")]
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn partial_stashes_leave_the_rest_and_a_stash_becomes_a_branch() {
+        let d = repository();
+        let p = d.path();
+        commit(p, "initial", "original\n");
+        let save = |keep_index, tracked_only, files: &[&str]| {
+            act(
+                p,
+                Request::StashSave {
+                    message: "part".into(),
+                    keep_index,
+                    tracked_only,
+                    files: files.iter().map(|f| f.to_string()).collect(),
+                },
+            )
+        };
+        let text = |file: &str| std::fs::read_to_string(p.join(file)).unwrap_or_default();
+        let write = |file: &str, text: &str| std::fs::write(p.join(file), text).unwrap();
+        let original = text("file.txt");
+        // Only the chosen files, also one whose name is a pattern and a new one.
+        write("[a].txt", "new\n");
+        write("a.txt", "other\n");
+        write("file.txt", "changed\n");
+        save(false, false, &["[a].txt"]).unwrap();
+        assert!(!p.join("[a].txt").exists());
+        assert_eq!(
+            (text("a.txt"), text("file.txt")),
+            ("other\n".into(), "changed\n".into())
+        );
+        // Nothing there any more, and nothing outside the repository.
+        assert!(save(false, false, &["[a].txt"]).is_err());
+        assert!(save(false, false, &["../x"]).is_err());
+        // New files stay.
+        save(false, true, &[]).unwrap();
+        assert_eq!(
+            (text("a.txt"), text("file.txt")),
+            ("other\n".into(), original.clone())
+        );
+        assert!(save(false, true, &[]).is_err());
+        assert_eq!(snapshot(p).unwrap().stashes.len(), 2);
+        // Staged changes stay staged.
+        write("file.txt", "staged\n");
+        git(p, &["add", "file.txt"]).unwrap();
+        write("file.txt", "unstaged\n");
+        save(true, false, &[]).unwrap();
+        assert_eq!(text("file.txt"), "staged\n");
+        assert_eq!(git(p, &["show", ":file.txt"]).unwrap(), "staged\n");
+        git(p, &["reset", "-q", "--hard"]).unwrap();
+        // A branch where the stash was made, although the current branch went on.
+        let id = snapshot(p).unwrap().stashes[0].id.clone();
+        let base = git(p, &["rev-parse", &format!("{id}^1")]).unwrap();
+        write("file.txt", "gone on\n");
+        git(p, &["commit", "-qam", "gone on"]).unwrap();
+        let branch = |name: &str| {
+            act(
+                p,
+                Request::StashBranch {
+                    id: id.clone(),
+                    name: name.into(),
+                },
+            )
+        };
+        write("file.txt", "dirty\n");
+        assert!(branch("from-stash").is_err());
+        git(p, &["reset", "-q", "--hard"]).unwrap();
+        assert!(branch("bad..name").is_err());
+        branch("from-stash").unwrap();
+        assert_eq!(git(p, &["rev-parse", "HEAD"]).unwrap(), base);
+        assert_eq!(text("file.txt"), "unstaged\n");
+        assert_eq!(git(p, &["show", ":file.txt"]).unwrap(), "staged\n");
+        assert!(!snapshot(p).unwrap().stashes.iter().any(|s| s.id == id));
+        assert!(git(p, &["rev-parse", &format!("refs/gall/recovery/{id}")]).is_ok());
+    }
+
+    #[test]
+    fn a_stash_branch_is_made_with_unrelated_local_changes() {
+        let d = repository();
+        let p = d.path();
+        let write = |file: &str, text: &str| std::fs::write(p.join(file), text).unwrap();
+        let text = |file: &str| std::fs::read_to_string(p.join(file)).unwrap();
+        write("a.txt", "a\n");
+        write("b.txt", "b\n");
+        commit(p, "one", "1\n");
+        write("a.txt", "a stashed\n");
+        git(p, &["stash", "push", "-q"]).unwrap();
+        let id = snapshot(p).unwrap().stashes[0].id.clone();
+        commit(p, "two", "2\n");
+        write("b.txt", "b local\n");
+        write("untracked.txt", "keep\n");
+        act(
+            p,
+            Request::StashBranch {
+                id: id.clone(),
+                name: "from-stash".into(),
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            git(p, &["branch", "--show-current"]).unwrap().trim(),
+            "from-stash"
+        );
+        assert_eq!(
+            (text("a.txt"), text("b.txt"), text("untracked.txt")),
+            ("a stashed\n".into(), "b local\n".into(), "keep\n".into())
+        );
+        assert!(snapshot(p).unwrap().stashes.is_empty());
+    }
+
+    #[test]
     fn conflicting_stash_pop_keeps_stack_entry() {
         let d = repository();
         let p = d.path();
@@ -2857,6 +4200,9 @@ mod tests {
             p,
             Request::StashSave {
                 message: "conflicting".into(),
+                keep_index: false,
+                tracked_only: false,
+                files: Vec::new(),
             },
         )
         .unwrap();
@@ -2876,6 +4222,184 @@ mod tests {
         git(p, &["switch", "-q", "main"]).unwrap();
         let main = commit(p, "main", "main\n");
         (main, other)
+    }
+
+    /// A final conflict where the replay adds attributes after CRLF bytes were indexed.
+    fn attribute_rebase() -> tempfile::TempDir {
+        let d = repository();
+        let p = d.path();
+        let exclude = p.join(".git/excludes-empty");
+        std::fs::write(&exclude, "").unwrap();
+        git(
+            p,
+            &["config", "core.excludesFile", exclude.to_str().unwrap()],
+        )
+        .unwrap();
+        std::fs::create_dir_all(p.join("nested")).unwrap();
+        std::fs::write(p.join("nested/č file.data"), b"first\r\nsecond\r\n").unwrap();
+        std::fs::write(p.join("file.txt"), "base\n").unwrap();
+        git(p, &["add", "--all"]).unwrap();
+        git(p, &["commit", "-qm", "base"]).unwrap();
+        git(p, &["switch", "-qc", "topic"]).unwrap();
+        std::fs::write(p.join(".gitattributes"), "*.data text eol=lf\n").unwrap();
+        std::fs::write(p.join("file.txt"), "topic\n").unwrap();
+        git(p, &["add", "--", ".gitattributes", "file.txt"]).unwrap();
+        git(p, &["commit", "-qm", "topic"]).unwrap();
+        git(p, &["switch", "-q", "main"]).unwrap();
+        std::fs::write(p.join("file.txt"), "main\n").unwrap();
+        git(p, &["commit", "-qam", "main"]).unwrap();
+        git(p, &["switch", "-q", "topic"]).unwrap();
+        assert!(git(p, &["rebase", "main"]).is_err());
+        std::fs::write(p.join("file.txt"), "resolved\n").unwrap();
+        git(p, &["add", "--", "file.txt"]).unwrap();
+        std::fs::write(p.join("nested/č file.data"), b"first\r\nsecond\r\n").unwrap();
+        // Coarse clocks, such as Windows' default tick, can keep the old mtime and
+        // let Git trust the index stat instead of rereading the file.
+        std::fs::File::options()
+            .write(true)
+            .open(p.join("nested/č file.data"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+            .unwrap();
+        std::fs::write(p.join("unrelated untracked"), b"keep\n").unwrap();
+        d
+    }
+
+    #[test]
+    fn final_rebase_continues_when_staged_attributes_only_make_identical_bytes_look_dirty() {
+        let d = attribute_rebase();
+        let p = d.path();
+        let source = head(p);
+        if configured_git_filters(p).unwrap_or(true) {
+            // A machine-wide Git LFS or other filter must disable this special path too.
+            assert!(attribute_only_rebase_source(p).is_none());
+            assert!(control(p, "--continue").is_err());
+            assert_eq!(
+                std::fs::read(p.join("nested/č file.data")).unwrap(),
+                b"first\r\nsecond\r\n"
+            );
+            return;
+        }
+        if super::super::gitgraph::git_with_attr_source(
+            p,
+            &[
+                "-c",
+                "core.safecrlf=false",
+                "diff",
+                "--quiet",
+                "--ignore-submodules=dirty",
+                "--",
+            ],
+            &source,
+        )
+        .is_err()
+        {
+            // Git before 2.41 ignores GIT_ATTR_SOURCE. It must not take the special path.
+            assert!(attribute_only_rebase_source(p).is_none());
+            assert!(control(p, "--continue").is_err());
+            assert_eq!(
+                std::fs::read(p.join("nested/č file.data")).unwrap(),
+                b"first\r\nsecond\r\n"
+            );
+            return;
+        }
+        assert!(attribute_only_rebase_source(p).is_some());
+        control(p, "--continue").unwrap();
+        assert_eq!(
+            git(p, &["branch", "--show-current"]).unwrap().trim(),
+            "topic"
+        );
+        assert_eq!(git(p, &["show", "HEAD:file.txt"]).unwrap(), "resolved\n");
+        assert_eq!(
+            std::fs::read(p.join("nested/č file.data")).unwrap(),
+            b"first\r\nsecond\r\n"
+        );
+        assert_eq!(
+            std::fs::read(p.join("unrelated untracked")).unwrap(),
+            b"keep\n"
+        );
+        assert!(operation(p).unwrap().is_none());
+    }
+
+    #[test]
+    fn rebase_error_keeps_the_actual_failure_and_describes_paths_as_context() {
+        let error =
+            rebase_failure_context(fail("Author identity is missing"), &["nested/č file.data"])
+                .to_string();
+        assert!(
+            error.starts_with("Git: Author identity is missing"),
+            "{error}"
+        );
+        assert!(
+            error.contains("Current unstaged files") && error.contains("Working Changes"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("prevent continuing") && !error.contains("stash"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn attribute_rebase_does_not_bypass_real_edits_or_pending_work() {
+        let d = attribute_rebase();
+        let p = d.path();
+        let source = head(p);
+        if configured_git_filters(p).unwrap_or(true) {
+            // A machine-wide Git LFS or other filter must disable this special path too.
+            assert!(attribute_only_rebase_source(p).is_none());
+            assert!(control(p, "--continue").is_err());
+            assert_eq!(
+                std::fs::read(p.join("nested/č file.data")).unwrap(),
+                b"first\r\nsecond\r\n"
+            );
+            return;
+        }
+        if super::super::gitgraph::git_with_attr_source(
+            p,
+            &[
+                "-c",
+                "core.safecrlf=false",
+                "diff",
+                "--quiet",
+                "--ignore-submodules=dirty",
+                "--",
+            ],
+            &source,
+        )
+        .is_err()
+        {
+            assert!(attribute_only_rebase_source(p).is_none());
+            return;
+        }
+        assert!(attribute_only_rebase_source(p).is_some());
+        let todo = p.join(".git/rebase-merge/git-rebase-todo");
+        std::fs::write(&todo, "exec false\n").unwrap();
+        assert!(attribute_only_rebase_source(p).is_none());
+        std::fs::write(&todo, "").unwrap();
+        for marker in ["autostash", "update-refs"] {
+            let file = p.join(".git/rebase-merge").join(marker);
+            std::fs::write(&file, "preserve\n").unwrap();
+            assert!(attribute_only_rebase_source(p).is_none());
+            std::fs::remove_file(file).unwrap();
+        }
+        git(p, &["config", "filter.example.clean", "cat"]).unwrap();
+        assert!(attribute_only_rebase_source(p).is_none());
+        git(p, &["config", "--unset", "filter.example.clean"]).unwrap();
+        std::fs::write(p.join("nested/č file.data"), b"real local edit\r\n").unwrap();
+        let staged = git(p, &["diff", "--cached", "--binary"]).unwrap();
+        assert!(attribute_only_rebase_source(p).is_none());
+        let error = control(p, "--continue").unwrap_err().to_string();
+        assert!(
+            error.contains("Working Changes") && error.contains("file.data"),
+            "{error}"
+        );
+        assert_eq!(git(p, &["diff", "--cached", "--binary"]).unwrap(), staged);
+        assert_eq!(
+            std::fs::read(p.join("nested/č file.data")).unwrap(),
+            b"real local edit\r\n"
+        );
+        assert!(operation(p).unwrap().is_some());
     }
 
     #[test]
@@ -2908,6 +4432,78 @@ mod tests {
         act(p, Request::Continue).unwrap();
         assert_eq!(git(p, &["show", "HEAD:file.txt"]).unwrap(), "both\nsides\n");
     }
+    #[test]
+    fn merge_abort_checks_only_paths_it_would_restore() {
+        for staged_deletion in [false, true] {
+            let d = repository();
+            let p = d.path();
+            std::fs::write(p.join("local"), "tracked before merge\n").unwrap();
+            let (main, other) = conflict(p);
+            assert!(act(p, Request::Merge { target: other }).is_err());
+            std::fs::remove_file(p.join("local")).unwrap();
+            if staged_deletion {
+                git(p, &["rm", "--cached", "--", "local"]).unwrap();
+            }
+            std::fs::create_dir(p.join("local")).unwrap();
+            std::fs::write(p.join(".git/info/exclude"), "*.tmp\n").unwrap();
+            std::fs::write(p.join("local/keep.tmp"), "private\n").unwrap();
+
+            let result = act(p, Request::Abort);
+            if staged_deletion {
+                assert!(result.unwrap_err().to_string().contains("local/keep.tmp"));
+                assert_eq!(snapshot(p).unwrap().operation.as_deref(), Some("merge"));
+            } else {
+                result.unwrap();
+                assert!(snapshot(p).unwrap().operation.is_none());
+            }
+            assert_eq!(head(p), main);
+            assert_eq!(
+                std::fs::read_to_string(p.join("local/keep.tmp")).unwrap(),
+                "private\n"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_continue_preserves_an_ignored_replacement_for_a_staged_deletion() {
+        let d = repository();
+        let p = d.path();
+        std::fs::write(p.join("local.tmp"), "old tracked bytes\n").unwrap();
+        let (main, other) = conflict(p);
+        assert!(act(
+            p,
+            Request::Merge {
+                target: other.clone()
+            }
+        )
+        .is_err());
+        act(
+            p,
+            Request::Resolve {
+                file: "file.txt".into(),
+                side: ResolveSide::Ours,
+            },
+        )
+        .unwrap();
+        git(p, &["rm", "--cached", "--", "local.tmp"]).unwrap();
+        std::fs::write(p.join(".git/info/exclude"), "*.tmp\n").unwrap();
+        std::fs::write(p.join("local.tmp"), "keep local bytes\n").unwrap();
+        act(p, Request::Continue).unwrap();
+
+        assert_eq!(
+            git(p, &["show", "-s", "--format=%P", "HEAD"])
+                .unwrap()
+                .trim(),
+            format!("{main} {other}")
+        );
+        assert!(git(p, &["cat-file", "-e", "HEAD:local.tmp"]).is_err());
+        assert_eq!(
+            std::fs::read_to_string(p.join("local.tmp")).unwrap(),
+            "keep local bytes\n"
+        );
+        assert!(snapshot(p).unwrap().operation.is_none());
+    }
+
     #[test]
     fn merge_conflict_resolve_continue_and_abort() {
         let d = repository();
@@ -3088,6 +4684,163 @@ mod tests {
         );
     }
 
+    /// `main` and a branch `topic` with three commits, of which the second conflicts with `main`.
+    fn picks(p: &Path) -> (String, Vec<String>) {
+        commit(p, "first", "first\n");
+        git(p, &["switch", "-qc", "topic"]).unwrap();
+        let add = |name: &str| {
+            std::fs::write(p.join(name), "new\n").unwrap();
+            git(p, &["add", "--all"]).unwrap();
+            git(p, &["commit", "-qm", name]).unwrap();
+            head(p)
+        };
+        let one = add("one.txt");
+        let two = commit(p, "two", "topic\n");
+        let three = add("three.txt");
+        git(p, &["switch", "-q", "main"]).unwrap();
+        (commit(p, "main", "main\n"), vec![one, two, three])
+    }
+
+    #[test]
+    fn many_picks_stop_at_a_conflict_and_continue_or_abort_as_one() {
+        for finish in [true, false] {
+            let d = repository();
+            let p = d.path();
+            let (main, targets) = picks(p);
+            let request = || Request::CherryPickMany {
+                targets: targets.clone(),
+            };
+            assert!(act(p, request()).is_err());
+            let state = snapshot(p).unwrap();
+            assert_eq!(state.operation.as_deref(), Some("cherry-pick"));
+            assert_eq!(state.conflicts, vec!["file.txt"]);
+            // The first commit is there, the third not yet.
+            assert!(p.join("one.txt").exists() && !p.join("three.txt").exists());
+            assert!(act(p, request()).is_err(), "no second operation meanwhile");
+            if finish {
+                act(
+                    p,
+                    Request::ResolveContent {
+                        file: "file.txt".into(),
+                        content: "both\n".into(),
+                    },
+                )
+                .unwrap();
+                act(p, Request::Continue).unwrap();
+                assert!(p.join("three.txt").exists());
+                let subjects = git(p, &["log", "--format=%s", "-4"]).unwrap();
+                assert_eq!(subjects, "three.txt\ntwo\none.txt\nmain\n");
+            } else {
+                act(p, Request::Abort).unwrap();
+                assert_eq!(head(p), main);
+                assert!(!p.join("one.txt").exists());
+            }
+            assert_eq!(snapshot(p).unwrap().operation, None);
+            // The state before the operation is kept for recovery.
+            git(
+                p,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    &format!("refs/gall/recovery/{main}"),
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn many_picks_run_with_an_unrelated_unstaged_change_and_stop_cleanly_with_a_staged_one() {
+        let d = repository();
+        let p = d.path();
+        let (main, targets) = picks(p);
+        // `one.txt` and `three.txt` do not touch `file.txt`.
+        let pair = vec![targets[0].clone(), targets[2].clone()];
+        let write = |text: &str| std::fs::write(p.join("file.txt"), text).unwrap();
+        let text = || std::fs::read_to_string(p.join("file.txt")).unwrap();
+        // A staged change: Git itself refuses a several-commit pick, as it does for lazygit, and
+        // nothing changes, no half-finished operation remains.
+        write("staged\n");
+        git(p, &["add", "file.txt"]).unwrap();
+        let error = act(
+            p,
+            Request::CherryPickMany {
+                targets: pair.clone(),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("local changes"), "{error}");
+        assert_eq!(head(p), main);
+        assert_eq!(text(), "staged\n");
+        assert_eq!(git(p, &["show", ":file.txt"]).unwrap(), "staged\n");
+        assert_eq!(snapshot(p).unwrap().operation, None);
+        // The same change, not staged, does not block it.
+        git(p, &["reset", "-q"]).unwrap();
+        act(p, Request::CherryPickMany { targets: pair }).unwrap_or_else(|e| panic!("{e}"));
+        assert!(p.join("one.txt").exists() && p.join("three.txt").exists());
+        assert_eq!(text(), "staged\n");
+        assert_eq!(snapshot(p).unwrap().operation, None);
+    }
+
+    #[test]
+    fn many_picks_keep_their_order_and_refuse_bad_lists_before_changing_anything() {
+        let d = repository();
+        let p = d.path();
+        let (main, targets) = picks(p);
+        let (one, three) = (targets[0].clone(), targets[2].clone());
+        let refuse = |targets: Vec<String>, expected: &str| {
+            let error = act(p, Request::CherryPickMany { targets })
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+            assert_eq!(head(p), main);
+            assert_eq!(snapshot(p).unwrap().operation, None);
+        };
+        refuse(vec![], "Select between");
+        refuse(vec![one.clone(), one.clone()], "twice");
+        refuse(vec!["HEAD".into()], "concrete");
+        refuse(vec!["0".repeat(40)], "");
+        // A merge among them would stop Git halfway.
+        git(p, &["switch", "-qc", "merged", &three]).unwrap();
+        git(
+            p,
+            &[
+                "merge", "-q", "--no-ff", "-m", "merge", "-s", "ours", "main",
+            ],
+        )
+        .unwrap();
+        let merge = head(p);
+        git(p, &["switch", "-q", "main"]).unwrap();
+        refuse(vec![one.clone(), merge], "is a merge");
+        // An ignored file in the way of the last of them.
+        std::fs::write(p.join(".git/info/exclude"), "three.txt\n").unwrap();
+        std::fs::write(p.join("three.txt"), "mine\n").unwrap();
+        refuse(vec![one.clone(), three.clone()], "three.txt");
+        assert_eq!(
+            std::fs::read_to_string(p.join("three.txt")).unwrap(),
+            "mine\n"
+        );
+        std::fs::remove_file(p.join("three.txt")).unwrap();
+        // A folder the user keeps there without knowing.
+        std::fs::create_dir(p.join("three.txt")).unwrap();
+        std::fs::write(p.join("three.txt").join("note"), "mine\n").unwrap();
+        refuse(vec![one.clone(), three.clone()], "three.txt");
+        std::fs::remove_dir_all(p.join("three.txt")).unwrap();
+
+        act(
+            p,
+            Request::CherryPickMany {
+                targets: vec![one, three],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            git(p, &["log", "--format=%s", "-3"]).unwrap(),
+            "three.txt\none.txt\nmain\n"
+        );
+    }
+
     #[test]
     fn cherry_pick_revert_and_rebase_leave_resumable_state() {
         let d = repository();
@@ -3118,6 +4871,301 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(p.join("file.txt")).unwrap(),
             "first\n"
+        );
+    }
+
+    /// What lazygit allows and Gall must too: untracked files that are not in `.gitignore` and
+    /// that an operation does not write never block it, and one it would overwrite is refused
+    /// with its content kept.
+    #[test]
+    fn untracked_files_block_no_operation_unless_it_would_overwrite_them() {
+        let d = repository();
+        let p = d.path();
+        commit(p, "one", "1\n");
+        git(p, &["checkout", "-q", "-b", "topic"]).unwrap();
+        std::fs::write(p.join("topic.txt"), "topic\n").unwrap();
+        git(p, &["add", "--all"]).unwrap();
+        git(p, &["commit", "-qm", "topic"]).unwrap();
+        let topic = head(p);
+        git(p, &["checkout", "-q", "main"]).unwrap();
+        std::fs::write(p.join("main.txt"), "main\n").unwrap();
+        git(p, &["add", "--all"]).unwrap();
+        git(p, &["commit", "-qm", "main"]).unwrap();
+        let main = head(p);
+        git(p, &["checkout", "-q", "topic"]).unwrap();
+        // Not ignored anywhere: a log, a build folder, a note with a space and a non-ASCII name.
+        std::fs::write(p.join("scratch.log"), "local\n").unwrap();
+        std::fs::create_dir(p.join("build")).unwrap();
+        std::fs::write(p.join("build").join("out.bin"), "local\n").unwrap();
+        std::fs::write(p.join("my notes č.txt"), "local\n").unwrap();
+        let kept = |p: &Path| {
+            assert_eq!(
+                std::fs::read_to_string(p.join("scratch.log")).unwrap(),
+                "local\n"
+            );
+            assert!(p.join("build").join("out.bin").exists());
+            assert!(p.join("my notes č.txt").exists());
+        };
+        let back = |p: &Path| {
+            git(p, &["reset", "-q", "--hard", &topic]).unwrap();
+        };
+
+        act(
+            p,
+            Request::Rebase {
+                target: main.clone(),
+            },
+        )
+        .unwrap();
+        assert!(p.join("main.txt").exists() && p.join("topic.txt").exists());
+        kept(p);
+        back(p);
+        act(
+            p,
+            Request::Merge {
+                target: main.clone(),
+            },
+        )
+        .unwrap();
+        assert!(p.join("main.txt").exists());
+        kept(p);
+        back(p);
+        act(
+            p,
+            Request::CherryPick {
+                target: main.clone(),
+            },
+        )
+        .unwrap();
+        assert!(p.join("main.txt").exists());
+        kept(p);
+        back(p);
+        act(
+            p,
+            Request::CherryPickMany {
+                targets: vec![main.clone()],
+            },
+        )
+        .unwrap();
+        kept(p);
+        back(p);
+        act(
+            p,
+            Request::Revert {
+                target: topic.clone(),
+            },
+        )
+        .unwrap();
+        assert!(!p.join("topic.txt").exists());
+        kept(p);
+        back(p);
+        std::fs::write(p.join("file.txt"), "stashed\n").unwrap();
+        git(p, &["stash", "push", "-q"]).unwrap();
+        let stash = git(p, &["rev-parse", "stash@{0}"]).unwrap();
+        act(
+            p,
+            Request::StashApply {
+                id: stash.trim().into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(p.join("file.txt")).unwrap(),
+            "stashed\n"
+        );
+        kept(p);
+        git(p, &["reset", "-q", "--hard", &topic]).unwrap();
+
+        // An untracked file at a path the operation writes is refused and keeps its content.
+        std::fs::write(p.join("main.txt"), "mine\n").unwrap();
+        for request in [
+            Request::Rebase {
+                target: main.clone(),
+            },
+            Request::Merge {
+                target: main.clone(),
+            },
+            Request::CherryPick {
+                target: main.clone(),
+            },
+            Request::CherryPickMany {
+                targets: vec![main.clone()],
+            },
+        ] {
+            assert!(act(p, request).is_err());
+            assert_eq!(
+                std::fs::read_to_string(p.join("main.txt")).unwrap(),
+                "mine\n"
+            );
+            assert_eq!(head(p), topic);
+            assert!(snapshot(p).unwrap().operation.is_none());
+        }
+    }
+
+    /// Tracked local changes: Git and lazygit run merge, cherry-pick and revert when the change does
+    /// not overlap, and lazygit rebases with `--autostash`. Gall must not refuse more than that, and
+    /// an overlapping change must stay where it is when the operation is refused.
+    #[test]
+    fn tracked_local_changes_block_an_operation_only_where_git_would() {
+        let d = repository();
+        let p = d.path();
+        let write = |file: &str, text: &str| std::fs::write(p.join(file), text).unwrap();
+        let text = |file: &str| std::fs::read_to_string(p.join(file)).unwrap();
+        write("mine.txt", "base\n");
+        commit(p, "one", "1\n");
+        git(p, &["checkout", "-q", "-b", "topic"]).unwrap();
+        write("topic.txt", "topic\n");
+        git(p, &["add", "--all"]).unwrap();
+        git(p, &["commit", "-qm", "topic"]).unwrap();
+        let topic = head(p);
+        git(p, &["checkout", "-q", "main"]).unwrap();
+        write("main.txt", "main\n");
+        git(p, &["add", "--all"]).unwrap();
+        git(p, &["commit", "-qm", "main"]).unwrap();
+        let main = head(p);
+        git(p, &["checkout", "-q", "topic"]).unwrap();
+        let back = |p: &Path| git(p, &["reset", "-q", "--keep", &topic]).unwrap();
+        // A change that no commit of the operation touches: staged in one run, unstaged in the other.
+        for staged in [false, true] {
+            write("mine.txt", "local edit\n");
+            if staged {
+                git(p, &["add", "mine.txt"]).unwrap();
+            }
+            for request in [
+                Request::Rebase {
+                    target: main.clone(),
+                },
+                Request::Merge {
+                    target: main.clone(),
+                },
+                Request::CherryPick {
+                    target: main.clone(),
+                },
+                Request::Revert {
+                    target: topic.clone(),
+                },
+            ] {
+                let name = format!("{request:?}");
+                act(p, request).unwrap_or_else(|e| panic!("{name} (staged: {staged}): {e}"));
+                assert_eq!(text("mine.txt"), "local edit\n", "{name}");
+                assert!(snapshot(p).unwrap().operation.is_none(), "{name}");
+                back(p);
+                assert_eq!(text("mine.txt"), "local edit\n", "{name}");
+            }
+            git(p, &["checkout", "-q", "--", "mine.txt"]).unwrap();
+            git(p, &["reset", "-q", "--", "mine.txt"]).unwrap();
+            git(p, &["checkout", "-q", "--", "mine.txt"]).unwrap();
+        }
+        // A change that the operation would overwrite: Git refuses and nothing moves.
+        git(p, &["checkout", "-q", "main"]).unwrap();
+        write("mine.txt", "main edit\n");
+        git(p, &["commit", "-qam", "main edits mine"]).unwrap();
+        let main = head(p);
+        git(p, &["checkout", "-q", "topic"]).unwrap();
+        write("mine.txt", "local edit\n");
+        for request in [
+            Request::Merge {
+                target: main.clone(),
+            },
+            Request::CherryPick {
+                target: main.clone(),
+            },
+        ] {
+            let name = format!("{request:?}");
+            assert!(act(p, request).is_err(), "{name}");
+            assert_eq!(text("mine.txt"), "local edit\n", "{name}");
+            assert_eq!(head(p), topic, "{name}");
+            assert!(snapshot(p).unwrap().operation.is_none(), "{name}");
+        }
+        // A rebase puts the change back on top of the new history; if it does not fit, Git keeps it in
+        // the stash. It is never lost.
+        let result = act(p, Request::Rebase { target: main });
+        let stashed = !snapshot(p).unwrap().stashes.is_empty();
+        assert!(
+            text("mine.txt").contains("local edit") || stashed,
+            "{result:?}"
+        );
+    }
+
+    /// Stash apply and pop with a local change in another file work as in Git; one that would
+    /// overwrite a changed file is refused, the change and the stash stay.
+    #[test]
+    fn stash_apply_and_pop_run_with_unrelated_local_changes() {
+        let d = repository();
+        let p = d.path();
+        let write = |file: &str, text: &str| std::fs::write(p.join(file), text).unwrap();
+        let text = |file: &str| std::fs::read_to_string(p.join(file)).unwrap();
+        write("a.txt", "a\n");
+        write("b.txt", "b\n");
+        commit(p, "one", "1\n");
+        write("a.txt", "a stashed\n");
+        git(p, &["stash", "push", "-q"]).unwrap();
+        write("b.txt", "b local\n");
+        let id = snapshot(p).unwrap().stashes[0].id.clone();
+        act(p, Request::StashApply { id: id.clone() }).unwrap_or_else(|e| panic!("apply: {e}"));
+        assert_eq!(
+            (text("a.txt"), text("b.txt")),
+            ("a stashed\n".into(), "b local\n".into())
+        );
+        git(p, &["checkout", "-q", "--", "a.txt"]).unwrap();
+        act(p, Request::StashPop { id }).unwrap_or_else(|e| panic!("pop: {e}"));
+        assert_eq!(
+            (text("a.txt"), text("b.txt")),
+            ("a stashed\n".into(), "b local\n".into())
+        );
+        assert!(snapshot(p).unwrap().stashes.is_empty());
+        // A stash that would overwrite a local edit: refused, nothing lost.
+        git(p, &["stash", "push", "-q", "--", "a.txt"]).unwrap();
+        write("a.txt", "a local\n");
+        let id = snapshot(p).unwrap().stashes[0].id.clone();
+        assert!(act(p, Request::StashPop { id }).is_err());
+        assert_eq!(text("a.txt"), "a local\n");
+        assert_eq!(snapshot(p).unwrap().stashes.len(), 1);
+    }
+
+    #[test]
+    fn stash_save_apply_and_pop_run_in_a_repository_with_submodules() {
+        let d = repository();
+        let p = d.path();
+        let _module = add_submodule(p);
+        commit(p, "base", "base\n");
+        git(p, &["config", "submodule.recurse", "true"]).unwrap();
+        let module_head = head(&p.join("sub"));
+        std::fs::write(p.join("file.txt"), "stashed\n").unwrap();
+        std::fs::write(p.join("new.txt"), "untracked\n").unwrap();
+        std::fs::write(p.join("sub/untracked.txt"), "keep\n").unwrap();
+        act(
+            p,
+            Request::StashSave {
+                message: "with a module".into(),
+                keep_index: false,
+                tracked_only: false,
+                files: vec![],
+            },
+        )
+        .unwrap_or_else(|e| panic!("save: {e}"));
+        assert_ne!(
+            std::fs::read_to_string(p.join("file.txt")).unwrap(),
+            "stashed\n"
+        );
+        let id = snapshot(p).unwrap().stashes[0].id.clone();
+        act(p, Request::StashApply { id: id.clone() }).unwrap_or_else(|e| panic!("apply: {e}"));
+        assert_eq!(
+            std::fs::read_to_string(p.join("file.txt")).unwrap(),
+            "stashed\n"
+        );
+        git(p, &["checkout", "-q", "--", "file.txt"]).unwrap();
+        std::fs::remove_file(p.join("new.txt")).unwrap();
+        act(p, Request::StashPop { id }).unwrap_or_else(|e| panic!("pop: {e}"));
+        assert!(snapshot(p).unwrap().stashes.is_empty());
+        assert_eq!(head(&p.join("sub")), module_head);
+        assert_eq!(
+            std::fs::read_to_string(p.join("sub/untracked.txt")).unwrap(),
+            "keep\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(p.join("new.txt")).unwrap(),
+            "untracked\n"
         );
     }
 
@@ -3229,10 +5277,13 @@ mod tests {
     }
 
     #[test]
-    fn rebase_with_submodules_rejects_staged_gitlinks_and_parent_edits() {
+    fn rebase_with_submodules_rejects_staged_gitlinks_and_keeps_parent_edits() {
         let d = repository();
         let p = d.path();
         let _module = add_submodule(p);
+        std::fs::write(p.join("notes.txt"), "notes\n").unwrap();
+        git(p, &["add", "--", "notes.txt"]).unwrap();
+        git(p, &["commit", "-qm", "notes"]).unwrap();
         let original = head(p);
         let target = commit(p, "target change", "target\n");
         git(p, &["reset", "-q", "--hard", &original]).unwrap();
@@ -3248,8 +5299,7 @@ mod tests {
         assert_eq!(head(p), original);
         assert_eq!(head(&p.join("sub")), moved);
         assert!(snapshot(p).unwrap().operation.is_none());
-        // Removing the last gitlink leaves no submodule entry in the index. The
-        // remaining .gitmodules must still make us check before moving HEAD.
+        // A staged removal is still a gitlink change even with no index entry.
         git(p, &["update-index", "--force-remove", "sub"]).unwrap();
         assert!(act(
             p,
@@ -3262,17 +5312,18 @@ mod tests {
         assert_eq!(head(&p.join("sub")), moved);
         assert!(snapshot(p).unwrap().operation.is_none());
         git(p, &["reset", "-q", "HEAD", "--", "sub"]).unwrap();
-        std::fs::write(p.join(".gitmodules"), "local parent edit\n").unwrap();
-        assert!(act(
+        std::fs::write(p.join("notes.txt"), "local parent edit\n").unwrap();
+        act(
             p,
             Request::Rebase {
-                target: target.clone()
-            }
+                target: target.clone(),
+            },
         )
-        .is_err());
-        assert_eq!(head(p), original);
+        .unwrap();
+        assert_eq!(head(p), target);
+        assert_eq!(head(&p.join("sub")), moved);
         assert_eq!(
-            std::fs::read_to_string(p.join(".gitmodules")).unwrap(),
+            std::fs::read_to_string(p.join("notes.txt")).unwrap(),
             "local parent edit\n"
         );
     }
@@ -3438,25 +5489,721 @@ mod tests {
         }
     }
 
+    /// Checks that the module's checkout and local files were left alone.
+    fn assert_module_kept(sub: &Path, module_head: &str) {
+        assert_eq!(head(sub), module_head);
+        assert_eq!(
+            std::fs::read_to_string(sub.join("file.txt")).unwrap(),
+            "local module edit\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(sub.join("untracked.txt")).unwrap(),
+            "keep\n"
+        );
+    }
+
     #[test]
-    fn literal_conflict_paths_and_refusal_of_unsupported_worktrees() {
+    fn hard_reset_checks_out_the_recorded_submodule_commits_and_keeps_their_edits_for_recovery() {
         let d = repository();
         let p = d.path();
-        let first = commit(p, "first", "first\n");
-        std::fs::write(p.join(".gitmodules"), "[submodule \"future\"]\n").unwrap();
-        assert!(snapshot(p).is_ok());
-        assert!(act(p, Request::StashSave { message: "".into() }).is_err());
-        std::fs::remove_file(p.join(".gitmodules")).unwrap();
-        git(p, &["config", "filter.test.clean", "cat"]).unwrap();
-        assert!(snapshot(p).is_ok());
-        assert!(act(
+        let _module = add_submodule(p);
+        let sub = p.join("sub");
+        let module_head = head(&sub);
+        // Another branch records a newer module commit and a parent change.
+        git(p, &["switch", "-qc", "other"]).unwrap();
+        commit(&sub, "module two", "module two\n");
+        let target_module = head(&sub);
+        git(p, &["add", "sub"]).unwrap();
+        git(p, &["commit", "-qm", "update module"]).unwrap();
+        let target = commit(p, "other change", "other\n");
+        git(p, &["switch", "-q", "main"]).unwrap();
+        git(&sub, &["checkout", "-q", &module_head]).unwrap();
+        let original = head(p);
+        git(p, &["config", "submodule.recurse", "true"]).unwrap();
+        std::fs::write(sub.join("file.txt"), "local module edit\n").unwrap();
+        std::fs::write(sub.join("untracked.txt"), "keep\n").unwrap();
+
+        for mode in [ResetMode::Soft, ResetMode::Mixed, ResetMode::Hard] {
+            git(
+                p,
+                &[
+                    "-c",
+                    "submodule.recurse=false",
+                    "reset",
+                    "-q",
+                    "--hard",
+                    &original,
+                ],
+            )
+            .unwrap();
+            let hard = matches!(mode, ResetMode::Hard);
+            act(
+                p,
+                Request::Reset {
+                    target: target.clone(),
+                    mode,
+                },
+            )
+            .unwrap();
+            assert_eq!(head(p), target);
+            assert_eq!(
+                git(p, &["branch", "--show-current"]).unwrap().trim(),
+                "main"
+            );
+            assert_eq!(
+                git(p, &["rev-parse", "HEAD:sub"]).unwrap().trim(),
+                target_module
+            );
+            if !hard {
+                // Soft and mixed resets leave every working folder alone.
+                assert_module_kept(&sub, &module_head);
+                continue;
+            }
+            // A hard reset makes everything match the target, the submodule included.
+            assert_eq!(
+                std::fs::read_to_string(p.join("file.txt")).unwrap(),
+                "other\n"
+            );
+            assert_eq!(head(&sub), target_module);
+            assert_eq!(
+                std::fs::read_to_string(sub.join("file.txt")).unwrap(),
+                "module two\n"
+            );
+            assert!(
+                git(&sub, &["status", "--porcelain", "--untracked-files=no"])
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(status(p).unwrap().is_empty());
+            // Untracked files are kept; the old checkout and the discarded edit are
+            // recovery references of the submodule.
+            assert_eq!(
+                std::fs::read_to_string(sub.join("untracked.txt")).unwrap(),
+                "keep\n"
+            );
+            let recovery = git(
+                &sub,
+                &[
+                    "for-each-ref",
+                    "--format=%(objectname)",
+                    "refs/gall/recovery/",
+                ],
+            )
+            .unwrap();
+            assert!(recovery.contains(&module_head), "{recovery}");
+            let edit = recovery
+                .lines()
+                .find(|id| *id != module_head && *id != target_module)
+                .expect("the discarded edit is kept");
+            assert_eq!(
+                git(&sub, &["show", &format!("{edit}:file.txt")]).unwrap(),
+                "local module edit\n"
+            );
+        }
+    }
+
+    #[test]
+    fn hard_reset_checks_out_nested_submodules_too() {
+        let configure = |repo: &Path| {
+            for (key, value) in [
+                ("core.autocrlf", "false"),
+                ("user.name", "Test"),
+                ("user.email", "test@example.com"),
+            ] {
+                git(repo, &["config", key, value]).unwrap();
+            }
+        };
+        let add = |repo: &Path, source: &Path, name: &str| {
+            git(
+                repo,
+                &[
+                    "-c",
+                    "protocol.file.allow=always",
+                    "submodule",
+                    "add",
+                    "-q",
+                    &source.to_string_lossy().replace('\\', "/"),
+                    name,
+                ],
+            )
+            .unwrap();
+            configure(&repo.join(name));
+            git(repo, &["commit", "-qm", "add submodule"]).unwrap();
+        };
+        let inner = repository();
+        commit(inner.path(), "inner one", "inner one\n");
+        let middle = repository();
+        commit(middle.path(), "middle one", "middle one\n");
+        add(middle.path(), inner.path(), "nested");
+        let d = repository();
+        let p = d.path();
+        add(p, middle.path(), "sub");
+        let sub = p.join("sub");
+        git(
+            &sub,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "update",
+                "-q",
+                "--init",
+            ],
+        )
+        .unwrap();
+        let nested = sub.join("nested");
+        configure(&nested);
+        let original = head(p);
+        let sub_old = head(&sub);
+        let nested_old = head(&nested);
+        // The target records a newer nested commit through a newer middle commit.
+        let nested_new = commit(&nested, "inner two", "inner two\n");
+        // The nested checkout is detached; `submodule update` fetches a commit no reference
+        // reaches, as one that only came from its remote would be.
+        git(&nested, &["branch", "inner-two"]).unwrap();
+        git(&sub, &["add", "nested"]).unwrap();
+        git(&sub, &["commit", "-qm", "update nested"]).unwrap();
+        git(p, &["add", "sub"]).unwrap();
+        git(p, &["commit", "-qm", "update sub"]).unwrap();
+        let target = head(p);
+        git(p, &["reset", "-q", "--hard", &original]).unwrap();
+        git(&sub, &["checkout", "-q", &sub_old]).unwrap();
+        git(&nested, &["checkout", "-q", &nested_old]).unwrap();
+        std::fs::write(nested.join("file.txt"), "nested edit\n").unwrap();
+
+        act(
             p,
             Request::Reset {
-                target: first,
-                mode: ResetMode::Soft
+                target,
+                mode: ResetMode::Hard,
+            },
+        )
+        .unwrap();
+        assert_eq!(head(&nested), nested_new);
+        assert_eq!(
+            std::fs::read_to_string(nested.join("file.txt")).unwrap(),
+            "inner two\n"
+        );
+        let recovery = git(
+            &nested,
+            &[
+                "for-each-ref",
+                "--format=%(objectname)",
+                "refs/gall/recovery/",
+            ],
+        )
+        .unwrap();
+        assert!(recovery.contains(&nested_old), "{recovery}");
+        assert!(recovery
+            .lines()
+            .any(|id| git(&nested, &["show", &format!("{id}:file.txt")])
+                .is_ok_and(|text| text == "nested edit\n")));
+    }
+
+    #[test]
+    fn hard_reset_refuses_to_overwrite_an_untracked_submodule_file() {
+        let d = repository();
+        let p = d.path();
+        let _module = add_submodule(p);
+        let sub = p.join("sub");
+        let module_head = head(&sub);
+        let original = head(p);
+        // The target records a module commit that adds `new.txt`.
+        std::fs::write(sub.join("new.txt"), "tracked\n").unwrap();
+        commit(&sub, "module two", "module two\n");
+        git(p, &["add", "sub"]).unwrap();
+        git(p, &["commit", "-qm", "update module"]).unwrap();
+        let target = head(p);
+        git(p, &["reset", "-q", "--hard", &original]).unwrap();
+        git(&sub, &["checkout", "-q", &module_head]).unwrap();
+        std::fs::write(sub.join("new.txt"), "my untracked file\n").unwrap();
+
+        let error = act(
+            p,
+            Request::Reset {
+                target: target.clone(),
+                mode: ResetMode::Hard,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("Tools → Submodules"), "{error}");
+        assert_eq!(head(p), target);
+        assert_eq!(head(&sub), module_head);
+        assert_eq!(
+            std::fs::read_to_string(sub.join("new.txt")).unwrap(),
+            "my untracked file\n"
+        );
+    }
+
+    #[test]
+    fn merge_cherry_pick_revert_and_abort_with_submodules_keep_the_module_checkout() {
+        let d = repository();
+        let p = d.path();
+        let _module = add_submodule(p);
+        let sub = p.join("sub");
+        let module_head = head(&sub);
+        git(p, &["switch", "-qc", "topic"]).unwrap();
+        std::fs::write(p.join("topic.txt"), "topic\n").unwrap();
+        git(p, &["add", "topic.txt"]).unwrap();
+        git(p, &["commit", "-qm", "topic"]).unwrap();
+        let topic = head(p);
+        git(p, &["switch", "-q", "main"]).unwrap();
+        commit(&sub, "module two", "module two\n");
+        let main_module = head(&sub);
+        git(p, &["add", "sub"]).unwrap();
+        git(p, &["commit", "-qm", "update module"]).unwrap();
+        let updated = head(p);
+        git(&sub, &["checkout", "-q", &module_head]).unwrap();
+        git(p, &["config", "submodule.recurse", "true"]).unwrap();
+        std::fs::write(sub.join("file.txt"), "local module edit\n").unwrap();
+        std::fs::write(sub.join("untracked.txt"), "keep\n").unwrap();
+
+        act(
+            p,
+            Request::Merge {
+                target: topic.clone(),
+            },
+        )
+        .unwrap();
+        assert!(p.join("topic.txt").exists());
+        assert_eq!(
+            git(p, &["rev-parse", "HEAD:sub"]).unwrap().trim(),
+            main_module
+        );
+        assert_module_kept(&sub, &module_head);
+
+        git(
+            p,
+            &[
+                "-c",
+                "submodule.recurse=false",
+                "reset",
+                "-q",
+                "--hard",
+                &updated,
+            ],
+        )
+        .unwrap();
+        act(
+            p,
+            Request::CherryPick {
+                target: topic.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(git(p, &["rev-parse", "HEAD^"]).unwrap().trim(), updated);
+        assert!(p.join("topic.txt").exists());
+        assert_module_kept(&sub, &module_head);
+
+        act(p, Request::Revert { target: updated }).unwrap();
+        assert_eq!(
+            git(p, &["rev-parse", "HEAD:sub"]).unwrap().trim(),
+            module_head
+        );
+        assert!(p.join("topic.txt").exists());
+        assert_module_kept(&sub, &module_head);
+
+        // A conflicting merge can be aborted without touching the module either.
+        let before = commit(p, "main side", "main side\n");
+        let switch = |args: &[&str]| {
+            let mut all = vec!["-c", "submodule.recurse=false", "switch", "-q"];
+            all.extend_from_slice(args);
+            git(p, &all).unwrap();
+        };
+        switch(&["-c", "side", "HEAD^"]);
+        let side = commit(p, "side", "side\n");
+        switch(&["main"]);
+        assert!(act(p, Request::Merge { target: side }).is_err());
+        assert_eq!(snapshot(p).unwrap().operation.as_deref(), Some("merge"));
+        act(p, Request::Abort).unwrap();
+        assert_eq!(head(p), before);
+        assert!(snapshot(p).unwrap().operation.is_none());
+        assert_module_kept(&sub, &module_head);
+    }
+
+    #[test]
+    fn merge_applies_smudge_and_refuses_overlapping_filtered_edits() {
+        let d = repository();
+        let p = d.path();
+        git(
+            p,
+            &[
+                "config",
+                "filter.roundtrip.clean",
+                "sed 's/working/repository/g'",
+            ],
+        )
+        .unwrap();
+        git(
+            p,
+            &[
+                "config",
+                "filter.roundtrip.smudge",
+                "sed 's/repository/working/g'",
+            ],
+        )
+        .unwrap();
+        std::fs::write(p.join(".gitattributes"), "file.txt filter=roundtrip\n").unwrap();
+        let base = commit(p, "base", "working base\n");
+        git(p, &["switch", "-qc", "topic"]).unwrap();
+        let topic = commit(p, "topic", "working topic\n");
+        git(p, &["switch", "-q", "main"]).unwrap();
+        std::fs::write(p.join("file.txt"), "working local\n").unwrap();
+        assert!(act(
+            p,
+            Request::Merge {
+                target: topic.clone()
             }
         )
         .is_err());
+        assert_eq!(head(p), base);
+        assert_eq!(
+            std::fs::read_to_string(p.join("file.txt")).unwrap(),
+            "working local\n"
+        );
+        assert!(snapshot(p).unwrap().operation.is_none());
+
+        git(p, &["restore", "--", "file.txt"]).unwrap();
+        std::fs::write(p.join("unrelated"), "keep\n").unwrap();
+        act(
+            p,
+            Request::Merge {
+                target: topic.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(head(p), topic);
+        assert_eq!(
+            std::fs::read_to_string(p.join("file.txt")).unwrap(),
+            "working topic\n"
+        );
+        assert_eq!(
+            git(p, &["show", "HEAD:file.txt"]).unwrap(),
+            "repository topic\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(p.join("unrelated")).unwrap(),
+            "keep\n"
+        );
+    }
+
+    #[test]
+    fn filtered_soft_and_mixed_resets_keep_working_bytes_and_are_undoable() {
+        for mode in [ResetMode::Soft, ResetMode::Mixed] {
+            let d = repository();
+            let p = d.path();
+            git(
+                p,
+                &[
+                    "config",
+                    "filter.roundtrip.clean",
+                    "sed 's/working/repository/g'",
+                ],
+            )
+            .unwrap();
+            git(
+                p,
+                &[
+                    "config",
+                    "filter.roundtrip.smudge",
+                    "sed 's/repository/working/g'",
+                ],
+            )
+            .unwrap();
+            std::fs::write(p.join(".gitattributes"), "file.txt filter=roundtrip\n").unwrap();
+            let first = commit(p, "first", "working first\n");
+            let second = commit(p, "second", "working second\n");
+            std::fs::write(p.join("file.txt"), "working staged\n").unwrap();
+            git(p, &["add", "--", "file.txt"]).unwrap();
+            std::fs::write(p.join("file.txt"), "working unstaged\n").unwrap();
+            let expected_index = if matches!(mode, ResetMode::Soft) {
+                "repository staged\n"
+            } else {
+                "repository first\n"
+            };
+            act(
+                p,
+                Request::Reset {
+                    target: first.clone(),
+                    mode,
+                },
+            )
+            .unwrap();
+            assert_eq!(head(p), first);
+            assert_eq!(git(p, &["show", ":file.txt"]).unwrap(), expected_index);
+            assert_eq!(
+                std::fs::read_to_string(p.join("file.txt")).unwrap(),
+                "working unstaged\n"
+            );
+
+            let journal = super::super::gitjournal::view(p).unwrap();
+            super::super::gitjournal::move_to(p, journal.applied - 1, journal.applied).unwrap();
+            assert_eq!(head(p), second);
+            assert_eq!(
+                git(p, &["show", ":file.txt"]).unwrap(),
+                "repository staged\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(p.join("file.txt")).unwrap(),
+                "working unstaged\n"
+            );
+        }
+    }
+
+    #[test]
+    fn filtered_hard_reset_checks_that_recovery_can_reproduce_raw_bytes() {
+        let d = repository();
+        let p = d.path();
+        git(
+            p,
+            &[
+                "config",
+                "filter.roundtrip.clean",
+                "sed 's/working/repository/g; s/ local-only$//'",
+            ],
+        )
+        .unwrap();
+        git(
+            p,
+            &[
+                "config",
+                "filter.roundtrip.smudge",
+                "sed 's/repository/working/g'",
+            ],
+        )
+        .unwrap();
+        std::fs::write(p.join(".gitattributes"), "file.txt filter=roundtrip\n").unwrap();
+        let first = commit(p, "first", "working first\n");
+        let second = commit(p, "second", "working second\n");
+        let reset = || {
+            act(
+                p,
+                Request::Reset {
+                    target: first.clone(),
+                    mode: ResetMode::Hard,
+                },
+            )
+        };
+
+        std::fs::write(p.join("file.txt"), "working second local-only\n").unwrap();
+        assert!(reset().unwrap_err().to_string().contains("file.txt"));
+        assert_eq!(head(p), second);
+        assert_eq!(
+            std::fs::read_to_string(p.join("file.txt")).unwrap(),
+            "working second local-only\n"
+        );
+
+        std::fs::write(p.join("file.txt"), "working recoverable\n").unwrap();
+        reset().unwrap();
+        assert_eq!(head(p), first);
+        assert_eq!(
+            std::fs::read_to_string(p.join("file.txt")).unwrap(),
+            "working first\n"
+        );
+        let journal = super::super::gitjournal::view(p).unwrap();
+        super::super::gitjournal::move_to(p, journal.applied - 1, journal.applied).unwrap();
+        assert_eq!(head(p), second);
+        assert_eq!(
+            std::fs::read_to_string(p.join("file.txt")).unwrap(),
+            "working recoverable\n"
+        );
+    }
+
+    #[test]
+    fn stash_filter_preflight_skips_an_unrelated_required_filter() {
+        let d = repository();
+        let p = d.path();
+        std::fs::write(p.join("other.txt"), "other\n").unwrap();
+        commit(p, "base", "base\n");
+        git(p, &["config", "filter.failing.clean", "false"]).unwrap();
+        git(p, &["config", "filter.failing.required", "true"]).unwrap();
+        std::fs::write(p.join(".git/info/attributes"), "other.txt filter=failing\n").unwrap();
+        std::fs::write(p.join("other.txt"), "unrelated local edit\n").unwrap();
+        std::fs::write(p.join("file.txt"), "selected local edit\n").unwrap();
+
+        super::super::gitadvanced::verify_filtered_stash_paths(p, &[":(literal)file.txt"], false)
+            .unwrap();
+        assert!(super::super::gitadvanced::verify_filtered_stash_paths(p, &[], false).is_err());
+        assert_eq!(
+            std::fs::read_to_string(p.join("other.txt")).unwrap(),
+            "unrelated local edit\n"
+        );
+    }
+
+    #[test]
+    fn filtered_stash_save_checks_only_selected_tracked_and_untracked_paths() {
+        let d = repository();
+        let p = d.path();
+        git(
+            p,
+            &[
+                "config",
+                "filter.roundtrip.clean",
+                "sed 's/working/repository/g; s/ local-only$//'",
+            ],
+        )
+        .unwrap();
+        git(
+            p,
+            &[
+                "config",
+                "filter.roundtrip.smudge",
+                "sed 's/repository/working/g'",
+            ],
+        )
+        .unwrap();
+        std::fs::write(p.join(".gitattributes"), "*.txt filter=roundtrip\n").unwrap();
+        std::fs::write(p.join("other.txt"), "working other\n").unwrap();
+        commit(p, "base", "working base\n");
+        std::fs::write(p.join("file.txt"), "working edited\n").unwrap();
+        std::fs::write(p.join("other.txt"), "working other local-only\n").unwrap();
+        std::fs::write(p.join("new.txt"), "working new local-only\n").unwrap();
+        let save = |files: &[&str], tracked_only| {
+            act(
+                p,
+                Request::StashSave {
+                    message: "filter test".into(),
+                    keep_index: false,
+                    tracked_only,
+                    files: files.iter().map(|file| (*file).to_owned()).collect(),
+                },
+            )
+        };
+
+        assert!(save(&[], true)
+            .unwrap_err()
+            .to_string()
+            .contains("other.txt"));
+        assert!(save(&["new.txt"], false)
+            .unwrap_err()
+            .to_string()
+            .contains("new.txt"));
+        assert!(snapshot(p).unwrap().stashes.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(p.join("new.txt")).unwrap(),
+            "working new local-only\n"
+        );
+        save(&["file.txt"], true).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(p.join("file.txt")).unwrap(),
+            "working base\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(p.join("other.txt")).unwrap(),
+            "working other local-only\n"
+        );
+        let first = snapshot(p).unwrap().stashes[0].id.clone();
+        act(p, Request::StashPop { id: first }).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(p.join("file.txt")).unwrap(),
+            "working edited\n"
+        );
+
+        std::fs::write(p.join("new.txt"), "working new\n").unwrap();
+        save(&["new.txt"], false).unwrap();
+        assert!(!p.join("new.txt").exists());
+        let second = snapshot(p).unwrap().stashes[0].id.clone();
+        act(p, Request::StashPop { id: second }).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(p.join("new.txt")).unwrap(),
+            "working new\n"
+        );
+    }
+
+    #[test]
+    fn filtered_stash_apply_pop_and_branch_keep_worktree_representation() {
+        for action in ["apply", "pop", "branch"] {
+            let d = repository();
+            let p = d.path();
+            git(
+                p,
+                &[
+                    "config",
+                    "filter.roundtrip.clean",
+                    "sed 's/working/repository/g'",
+                ],
+            )
+            .unwrap();
+            git(
+                p,
+                &[
+                    "config",
+                    "filter.roundtrip.smudge",
+                    "sed 's/repository/working/g'",
+                ],
+            )
+            .unwrap();
+            std::fs::write(p.join(".gitattributes"), "file.txt filter=roundtrip\n").unwrap();
+            let base = commit(p, "base", "working base\n");
+            std::fs::write(p.join("file.txt"), "working saved\n").unwrap();
+            git(p, &["add", "--", "file.txt"]).unwrap();
+            git(p, &["stash", "push", "-m", "filtered stash"]).unwrap();
+            let id = snapshot(p).unwrap().stashes[0].id.clone();
+            let request = || match action {
+                "apply" => Request::StashApply { id: id.clone() },
+                "pop" => Request::StashPop { id: id.clone() },
+                _ => Request::StashBranch {
+                    id: id.clone(),
+                    name: "restored".into(),
+                },
+            };
+            if action != "branch" {
+                std::fs::write(p.join("file.txt"), "working local\n").unwrap();
+                assert!(act(p, request()).is_err());
+                assert_eq!(
+                    std::fs::read_to_string(p.join("file.txt")).unwrap(),
+                    "working local\n"
+                );
+                assert_eq!(snapshot(p).unwrap().stashes[0].id, id);
+                git(p, &["restore", "--", "file.txt"]).unwrap();
+            }
+
+            std::fs::write(p.join("unrelated"), "keep\n").unwrap();
+            act(p, request()).unwrap();
+            assert_eq!(head(p), base);
+            assert_eq!(
+                git(p, &["show", ":file.txt"]).unwrap(),
+                "repository saved\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(p.join("file.txt")).unwrap(),
+                "working saved\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(p.join("unrelated")).unwrap(),
+                "keep\n"
+            );
+            assert_eq!(
+                snapshot(p).unwrap().stashes.len(),
+                usize::from(action == "apply")
+            );
+        }
+    }
+
+    #[test]
+    fn stash_works_with_gitmodules() {
+        let d = repository();
+        let p = d.path();
+        commit(p, "first", "first\n");
+        std::fs::write(p.join(".gitmodules"), "[submodule \"future\"]\n").unwrap();
+        assert!(snapshot(p).is_ok());
+        // A `.gitmodules` file does not stop a stash any more (Git and lazygit run it).
+        std::fs::write(p.join("file.txt"), "edited\n").unwrap();
+        act(
+            p,
+            Request::StashSave {
+                message: "".into(),
+                keep_index: false,
+                tracked_only: true,
+                files: Vec::new(),
+            },
+        )
+        .unwrap_or_else(|e| panic!("stash with .gitmodules: {e}"));
+        assert_eq!(
+            std::fs::read_to_string(p.join("file.txt")).unwrap(),
+            "first\n"
+        );
     }
 
     #[test]
@@ -3543,6 +6290,94 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn choosing_either_side_resolves_a_modify_delete_conflict() {
+        for (delete_on_current, choose_deletion) in [(false, false), (false, true), (true, true)] {
+            let d = repository();
+            let p = d.path();
+            commit(p, "base", "base\n");
+            git(p, &["switch", "-qc", "topic"]).unwrap();
+            if delete_on_current {
+                commit(p, "modified", "modified\n");
+            } else {
+                git(p, &["rm", "--", "file.txt"]).unwrap();
+                git(p, &["commit", "-qm", "deleted"]).unwrap();
+            }
+            git(p, &["switch", "-q", "main"]).unwrap();
+            if delete_on_current {
+                git(p, &["rm", "--", "file.txt"]).unwrap();
+                git(p, &["commit", "-qm", "deleted"]).unwrap();
+            } else {
+                commit(p, "modified", "modified\n");
+            }
+            assert!(git(p, &["merge", "topic"]).is_err());
+            let side = if delete_on_current == choose_deletion {
+                ResolveSide::Ours
+            } else {
+                ResolveSide::Theirs
+            };
+            std::fs::write(p.join("unrelated"), "keep\n").unwrap();
+            act(
+                p,
+                Request::Resolve {
+                    file: "file.txt".into(),
+                    side,
+                },
+            )
+            .unwrap();
+            assert!(conflicts(p).unwrap().is_empty());
+            assert_eq!(p.join("file.txt").exists(), !choose_deletion);
+            if !choose_deletion {
+                assert_eq!(
+                    std::fs::read_to_string(p.join("file.txt")).unwrap(),
+                    "modified\n"
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(p.join("unrelated")).unwrap(),
+                "keep\n"
+            );
+        }
+    }
+
+    #[test]
+    fn choosing_a_gitlink_stages_that_commit_without_changing_the_checkout() {
+        let d = repository();
+        let p = d.path();
+        let _module = add_submodule(p);
+        let sub = p.join("sub");
+        let module_base = head(&sub);
+        git(p, &["switch", "-qc", "topic"]).unwrap();
+        let theirs = commit(&sub, "topic module", "theirs\n");
+        git(p, &["add", "--", "sub"]).unwrap();
+        git(p, &["commit", "-qm", "topic pointer"]).unwrap();
+        git(p, &["switch", "-q", "main"]).unwrap();
+        git(&sub, &["switch", "--detach", &module_base]).unwrap();
+        let ours = commit(&sub, "main module", "ours\n");
+        git(p, &["add", "--", "sub"]).unwrap();
+        git(p, &["commit", "-qm", "main pointer"]).unwrap();
+
+        assert!(git(p, &["merge", "topic"]).is_err());
+        std::fs::write(sub.join("file.txt"), "local module edit\n").unwrap();
+        act(
+            p,
+            Request::Resolve {
+                file: "sub".into(),
+                side: ResolveSide::Theirs,
+            },
+        )
+        .unwrap();
+
+        assert!(conflicts(p).unwrap().is_empty());
+        assert_eq!(git(p, &["rev-parse", ":sub"]).unwrap().trim(), theirs);
+        assert_eq!(head(&sub), ours);
+        assert_eq!(
+            std::fs::read_to_string(sub.join("file.txt")).unwrap(),
+            "local module edit\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn conflict_preview_refuses_symlink_working_file() {
         let d = repository();
         let p = d.path();
@@ -3553,9 +6388,94 @@ mod tests {
         std::fs::remove_file(p.join("file.txt")).unwrap();
         std::os::unix::fs::symlink(outside.path(), p.join("file.txt")).unwrap();
         assert!(super::conflict(p, "file.txt").is_err());
+        act(
+            p,
+            Request::Resolve {
+                file: "file.txt".into(),
+                side: ResolveSide::Theirs,
+            },
+        )
+        .unwrap();
+        assert!(conflicts(p).unwrap().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(p.join("file.txt")).unwrap(),
+            "other\n"
+        );
         assert_eq!(
             std::fs::read_to_string(outside.path()).unwrap(),
             "private outside content"
+        );
+    }
+
+    #[test]
+    fn cherry_pick_keeps_empty_and_already_applied_commits() {
+        let d = repository();
+        let p = d.path();
+        let base = commit(p, "base", "base\n");
+        git(p, &["switch", "-qc", "topic"]).unwrap();
+        git(p, &["commit", "--allow-empty", "-qm", "marker"]).unwrap();
+        let marker = head(p);
+        let edit = commit(p, "edit", "edited\n");
+        git(p, &["switch", "-q", "main"]).unwrap();
+
+        act(
+            p,
+            Request::CherryPick {
+                target: marker.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(git(p, &["rev-parse", "HEAD^"]).unwrap().trim(), base);
+        act(
+            p,
+            Request::CherryPickMany {
+                targets: vec![marker, edit.clone()],
+            },
+        )
+        .unwrap();
+        let edited = head(p);
+        act(p, Request::CherryPick { target: edit }).unwrap();
+        assert_eq!(git(p, &["rev-parse", "HEAD^"]).unwrap().trim(), edited);
+        assert_eq!(
+            git(p, &["rev-parse", "HEAD^{tree}"]).unwrap(),
+            git(p, &["rev-parse", "HEAD^^{tree}"]).unwrap()
+        );
+        assert!(snapshot(p).unwrap().operation.is_none());
+    }
+
+    #[test]
+    fn cherry_pick_and_revert_ignore_an_unrelated_path_in_the_source_tree() {
+        let d = repository();
+        let p = d.path();
+        std::fs::write(p.join("untouched.tmp"), "tracked in historical trees\n").unwrap();
+        commit(p, "base", "base\n");
+        git(p, &["switch", "-qc", "topic"]).unwrap();
+        let topic = commit(p, "topic", "changed\n");
+        git(p, &["switch", "-q", "main"]).unwrap();
+        git(p, &["rm", "--", "untouched.tmp"]).unwrap();
+        git(p, &["commit", "-qm", "remove unrelated file"]).unwrap();
+        std::fs::write(p.join(".git/info/exclude"), "*.tmp\n").unwrap();
+        std::fs::write(p.join("untouched.tmp"), "ignored locally\n").unwrap();
+
+        act(
+            p,
+            Request::CherryPick {
+                target: topic.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(p.join("file.txt")).unwrap(),
+            "changed\n"
+        );
+        act(p, Request::Revert { target: topic }).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(p.join("file.txt")).unwrap(),
+            "base\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(p.join("untouched.tmp")).unwrap(),
+            "ignored locally\n"
         );
     }
 
@@ -3600,11 +6520,71 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn plain_rebase_restores_recoverable_filtered_edits() {
+        let d = repository();
+        let p = d.path();
+        git(
+            p,
+            &[
+                "config",
+                "filter.roundtrip.clean",
+                "sed 's/working/repository/g; s/ local-only$//'",
+            ],
+        )
+        .unwrap();
+        git(
+            p,
+            &[
+                "config",
+                "filter.roundtrip.smudge",
+                "sed 's/repository/working/g'",
+            ],
+        )
+        .unwrap();
+        std::fs::write(p.join(".gitattributes"), "file.txt filter=roundtrip\n").unwrap();
+        commit(p, "base", "working base\n");
+        git(p, &["switch", "-qc", "topic"]).unwrap();
+        std::fs::write(p.join("topic.txt"), "topic\n").unwrap();
+        let before = commit(p, "topic", "working base\n");
+        git(p, &["switch", "-q", "main"]).unwrap();
+        std::fs::write(p.join("main.txt"), "main\n").unwrap();
+        let target = commit(p, "main", "working base\n");
+        git(p, &["switch", "-q", "topic"]).unwrap();
+        let rebase = || {
+            act(
+                p,
+                Request::Rebase {
+                    target: target.clone(),
+                },
+            )
+        };
+
+        std::fs::write(p.join("file.txt"), "working base local-only\n").unwrap();
+        assert!(rebase().unwrap_err().to_string().contains("file.txt"));
+        assert_eq!(head(p), before);
+        assert!(snapshot(p).unwrap().operation.is_none());
+
+        std::fs::write(p.join("file.txt"), "working recoverable\n").unwrap();
+        rebase().unwrap();
+        assert_eq!(git(p, &["rev-parse", "HEAD^"]).unwrap().trim(), target);
+        assert_eq!(
+            std::fs::read_to_string(p.join("file.txt")).unwrap(),
+            "working recoverable\n"
+        );
+        assert!(p.join("main.txt").is_file() && p.join("topic.txt").is_file());
+    }
+
+    #[test]
     fn rebase_protects_ignored_paths_present_only_in_intermediate_commits() {
         let d = repository();
         let p = d.path();
         let first = commit(p, "first", "first\n");
-        let name = "[cached]\nversion.tmp";
+        // Windows file names cannot contain a newline.
+        let name = if cfg!(windows) {
+            "[cached] version.tmp"
+        } else {
+            "[cached]\nversion.tmp"
+        };
         std::fs::write(p.join(name), "intermediate\n").unwrap();
         git(p, &["add", "--all"]).unwrap();
         git(p, &["commit", "-qm", "temporary file"]).unwrap();

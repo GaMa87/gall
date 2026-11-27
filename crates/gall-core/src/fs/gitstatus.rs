@@ -48,6 +48,20 @@ pub struct GitStatus {
     pub entries: BTreeMap<String, GitState>,
     /// The folder itself is untracked or ignored: every item in it is.
     pub all: Option<GitState>,
+    /// The work tree is a linked worktree, not the main one.
+    pub linked: bool,
+}
+
+/// Whether the work tree `root` is a linked worktree: its `.git` is a file that names a folder
+/// in `worktrees` (that of a submodule names one in `modules`). Reads one small file.
+fn is_linked(root: &Path) -> bool {
+    std::fs::read_to_string(root.join(".git")).is_ok_and(|text| {
+        text.lines()
+            .next()
+            .and_then(|line| line.strip_prefix("gitdir:"))
+            .and_then(|dir| dir.trim().rsplit(['/', '\\']).nth(1))
+            .is_some_and(|parent| parent == "worktrees")
+    })
 }
 
 /// How long a status may take (a huge repository on a slow disk) before it is given up.
@@ -234,6 +248,7 @@ pub fn status(dir: &Path) -> Option<GitStatus> {
         })
     });
     (st.subject, st.containing_branches) = about;
+    st.linked = is_linked(&root);
     st.root = root;
     accept(&st.root);
     Some(st)
@@ -395,7 +410,7 @@ fn parse_untrusted(stderr: &str) -> Option<PathBuf> {
 pub fn trust(dir: &Path) -> Result<PathBuf, String> {
     let path = untrusted(dir).ok_or("Git does not refuse this folder")?;
     let global = |args: &[&str]| {
-        let mut cmd = Command::new(program());
+        let mut cmd = super::gitexec::plain(program());
         cmd.args(["config", "--global"])
             .args(args)
             .env("LC_ALL", "C")

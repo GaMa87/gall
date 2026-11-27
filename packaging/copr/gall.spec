@@ -47,12 +47,40 @@ rpm2cpio %{SOURCE0} | cpio --quiet -idm --no-absolute-filenames
 %install
 cp -a payload/usr %{buildroot}/usr
 chmod 755 %{buildroot}%{_bindir}/gall
+if [ -f "%{buildroot}%{_datadir}/applications/Gall.desktop" ] && [ ! -e "%{buildroot}%{_datadir}/applications/gall.desktop" ]; then
+  mv "%{buildroot}%{_datadir}/applications/Gall.desktop" "%{buildroot}%{_datadir}/applications/gall.desktop"
+fi
+if [ -f "%{buildroot}%{_datadir}/applications/gall.desktop" ]; then
+  sed -i 's/^Icon=.*/Icon=gall/' "%{buildroot}%{_datadir}/applications/gall.desktop"
+  if grep -q '^StartupWMClass=' "%{buildroot}%{_datadir}/applications/gall.desktop"; then
+    sed -i 's/^StartupWMClass=.*/StartupWMClass=gall/' "%{buildroot}%{_datadir}/applications/gall.desktop"
+  else
+    printf 'StartupWMClass=gall\n' >> "%{buildroot}%{_datadir}/applications/gall.desktop"
+  fi
+fi
 install -Dpm644 %{SOURCE1} %{buildroot}%{_licensedir}/%{name}/LICENSE
 
-%files
+: > packaged.files
+if [ -f "%{buildroot}%{_datadir}/icons/hicolor/scalable/apps/gall.svg" ]; then
+  echo '%{_datadir}/icons/hicolor/scalable/apps/gall.svg' >> packaged.files
+fi
+if [ -f "%{buildroot}%{_datadir}/dbus-1/services/org.gall.app.FileManager1.service" ]; then
+  echo '%{_datadir}/dbus-1/services/org.gall.app.FileManager1.service' >> packaged.files
+fi
+if [ -d "%{buildroot}%{_datadir}/gall" ]; then
+  echo '%dir %{_datadir}/gall' >> packaged.files
+fi
+if [ -d "%{buildroot}%{_datadir}/gall/actions.d" ]; then
+  echo '%dir %{_datadir}/gall/actions.d' >> packaged.files
+fi
+if [ -f "%{buildroot}%{_datadir}/gall/actions.d/50-omarchy.json" ]; then
+  echo '%{_datadir}/gall/actions.d/50-omarchy.json' >> packaged.files
+fi
+
+%files -f packaged.files
 %license %{_licensedir}/%{name}/LICENSE
 %{_bindir}/gall
-%{_datadir}/applications/Gall.desktop
+%{_datadir}/applications/gall.desktop
 %{_datadir}/icons/hicolor/32x32/apps/gall.png
 %{_datadir}/icons/hicolor/128x128/apps/gall.png
 %{_datadir}/icons/hicolor/256x256@2/apps/gall.png

@@ -22,6 +22,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// distribution only when `WSLENV` names it.
 const FORWARDED: &[&str] = &[
     "GIT_OPTIONAL_LOCKS",
+    "GIT_INDEX_FILE",
+    "GIT_ATTR_SOURCE",
+    "GIT_SEQUENCE_EDITOR",
+    "GIT_EDITOR",
     "GIT_TERMINAL_PROMPT",
     "GIT_NO_LAZY_FETCH",
     "GIT_ASKPASS",
@@ -94,25 +98,97 @@ pub fn started() -> u64 {
 /// The Git program for `dir`: `native` for ordinary folders, `git` inside the
 /// distribution for a repository in WSL. Add `-C` [`dir_arg`] and the arguments next.
 pub(super) fn command(dir: &Path, native: &Path) -> Command {
+    command_with_index(dir, native, None)
+}
+
+pub(super) fn command_with_index(dir: &Path, native: &Path, index: Option<&Path>) -> Command {
+    command_with_options(dir, native, index, None)
+}
+
+pub(super) fn command_with_options(
+    dir: &Path,
+    native: &Path,
+    index: Option<&Path>,
+    attr_source: Option<&str>,
+) -> Command {
     STARTED.fetch_add(1, Ordering::Relaxed);
+    let index = index.map(|index| path_arg(dir, index));
     #[cfg_attr(not(windows), allow(unused_mut))]
     let mut cmd = match place(dir) {
-        Some(w) => {
-            let mut c = Command::new(wsl::wsl_exe());
-            c.args(["-d", &w.distro, "--exec", "git"]);
-            // Tells `run` where this command belongs; not passed on to Git.
-            c.env(DISTRO_MARK, &w.distro);
-            c.env("WSLENV", std::env::var("WSLENV").unwrap_or_default());
-            c
+        Some(w) => wsl_git::<&str>(&w, &[]),
+        None if crate::util::hostspawn::in_flatpak() => {
+            return host_git(index.as_deref(), attr_source);
         }
         None => Command::new(native),
     };
+    if let Some(index) = index {
+        cmd.env("GIT_INDEX_FILE", index);
+    }
+    if let Some(source) = attr_source {
+        cmd.env("GIT_ATTR_SOURCE", source);
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
     cmd
+}
+
+/// `wsl.exe -d <distro> --exec <prefix…> git`. [`run`] expects an empty `prefix`.
+fn wsl_git<S: AsRef<std::ffi::OsStr>>(w: &WslPath, prefix: &[S]) -> Command {
+    let mut c = Command::new(wsl::wsl_exe());
+    c.args(["-d", &w.distro, "--exec"]).args(prefix).arg("git");
+    // Tells `run` and `forward_env` where this command belongs; not passed on to Git.
+    c.env(DISTRO_MARK, &w.distro);
+    c.env("WSLENV", std::env::var("WSLENV").unwrap_or_default());
+    c
+}
+
+/// A Git command for a repository in WSL with `prefix` (a wrapper such as `timeout`) run
+/// before `git` inside the distribution. None for other folders. Not for [`run`].
+#[cfg(windows)]
+pub(super) fn wsl_command<S: AsRef<std::ffi::OsStr>>(dir: &Path, prefix: &[S]) -> Option<Command> {
+    let w = place(dir)?;
+    STARTED.fetch_add(1, Ordering::Relaxed);
+    let mut cmd = wsl_git(&w, prefix);
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    Some(cmd)
+}
+
+/// Git on the host, for a Flatpak sandbox that has none of its own: `flatpak-spawn --host git`.
+/// The host process starts with the host's environment, so the variables every Gall Git command
+/// sets (no optional locks, no terminal prompt, untranslated messages that `gitstatus::untrusted`
+/// reads) go along as `--env`. Other variables a caller sets (credential helpers for network
+/// operations) do not reach the host Git.
+fn host_git(index: Option<&std::ffi::OsStr>, attr_source: Option<&str>) -> Command {
+    let index = index.map(std::ffi::OsStr::to_string_lossy);
+    let mut env = vec![
+        ("GIT_OPTIONAL_LOCKS", "0"),
+        ("GIT_TERMINAL_PROMPT", "0"),
+        ("LC_ALL", "C"),
+    ];
+    if let Some(index) = &index {
+        env.push(("GIT_INDEX_FILE", index.as_ref()));
+    }
+    if let Some(source) = attr_source {
+        env.push(("GIT_ATTR_SOURCE", source));
+    }
+    let wrapped = crate::util::hostspawn::wrap_argv_if(true, vec!["git".to_string()], None, &env);
+    let mut cmd = Command::new(&wrapped[0]);
+    cmd.args(&wrapped[1..]);
+    cmd
+}
+
+/// A Git command with no repository behind it (`git config --global`): the program as is, except in
+/// a Flatpak sandbox, where it is the host's Git.
+pub(super) fn plain(native: &Path) -> Command {
+    if crate::util::hostspawn::in_flatpak() {
+        host_git(None, None)
+    } else {
+        Command::new(native)
+    }
 }
 
 /// Prepares WSL forwarding after the caller has set the command's environment.
@@ -419,5 +495,61 @@ mod tests {
         // Another distribution is not reachable from this one.
         let other = Path::new(r"\\wsl.localhost\Debian\home\u\wt");
         assert_eq!(path_arg(d, other), other.as_os_str());
+    }
+}
+
+#[cfg(test)]
+mod flatpak_tests {
+    use super::*;
+
+    #[test]
+    fn flatpak_passes_the_pinned_attribute_source_to_the_host_git() {
+        let cmd = host_git(None, Some("0123456789abcdef"));
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let source = args
+            .iter()
+            .position(|arg| arg == "--env=GIT_ATTR_SOURCE=0123456789abcdef")
+            .unwrap();
+        let git = args.iter().position(|arg| arg == "git").unwrap();
+        assert!(source < git);
+        assert!(!host_git(None, None)
+            .get_args()
+            .any(|arg| arg.to_string_lossy().starts_with("--env=GIT_ATTR_SOURCE=")));
+    }
+
+    #[test]
+    fn git_in_a_flatpak_sandbox_runs_on_the_host_with_gall_s_environment() {
+        let cmd = host_git(None, None);
+        assert_eq!(cmd.get_program(), "flatpak-spawn");
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "--host",
+                "--env=GIT_OPTIONAL_LOCKS=0",
+                "--env=GIT_TERMINAL_PROMPT=0",
+                "--env=LC_ALL=C",
+                "git"
+            ]
+        );
+    }
+
+    #[test]
+    fn outside_a_sandbox_git_starts_as_before() {
+        // The suite does not run in a Flatpak sandbox; a repository's folder changes nothing.
+        if crate::util::hostspawn::in_flatpak() {
+            return;
+        }
+        let native = Path::new("/usr/bin/git");
+        for cmd in [command(Path::new("/tmp"), native), plain(native)] {
+            assert_eq!(cmd.get_program(), native.as_os_str());
+            assert_eq!(cmd.get_args().count(), 0);
+        }
     }
 }

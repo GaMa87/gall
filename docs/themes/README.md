@@ -120,6 +120,25 @@ Two details matter:
 | `--folder` | Fill of folder icons (the back panel is a darker shade of it); default: a pastel of `--accent` |
 | `--sm-cpu`, `--sm-gpu`, `--sm-mem` | System monitor rings |
 
+Text and syntax foregrounds are adjusted for contrast against the application's surfaces
+when a theme changes, including custom solid fills, multi-stop gradients and semitransparent
+layers on `--primary-gradient`, `--danger-bg`, `--btn-bg`, `--btn-bg-hover`, `--sel-gradient`,
+`--mark`, `--panel-bg`, `--bar-bg`, `--foot-bg` and `--well-bg`. Focus rings also keep at least
+3:1 contrast against panel surfaces, while the original palette remains in use for fills and
+borders.
+
+Some custom CSS patterns cannot be guaranteed automatically and are flagged in
+*Settings › Appearance › Custom theme*:
+- **Image backgrounds** (`url(...)`, `image-set(...)`, etc.) on themed surfaces, because a single
+  foreground cannot guarantee contrast over arbitrary image pixels.
+- **Opposing-luminance gradients** (for example black to white on one control), where no single
+  text colour reaches 4.5:1 across every stop.
+- **Direct foreground overrides and element-level CSS rules** (such as overriding `--primary-fg`
+  or `--danger-fg` to a low-contrast colour, or setting `color` / `opacity` on selectors outside
+  `:root`), because Gall does not run per-frame DOM scans or override arbitrary stylesheet rules.
+- **Translucent window backgrounds** (`--bg` with alpha < 1 or Glassy mode), whose final contrast
+  depends on what sits behind the window.
+
 ### Syntax colours (compare view, source previews)
 
 Set these on the root, as in block 2 above (themes that set them on `.diffv` colour only the compare view):
@@ -154,7 +173,7 @@ For a square look set all five to a small value, for example `2px`.
 
 Buttons, selections and bars are drawn from shared variables as well, so a theme can restyle
 them everywhere at once: `--btn-bg` and `--btn-bg-hover` (button fills), `--btn-shadow`,
-`--primary-gradient` (main action), `--accent-text` (accent used for text and icons, mixed
+`--primary-gradient` and `--primary-fg` (main action fill and text; set both together for contrast), `--danger-bg` and `--danger-fg` (destructive action fill and text), `--accent-text` (accent used for text and icons, mixed
 with the foreground so it stays readable), `--sel-gradient` and `--sel-bar` (selected item),
 `--row-hover`, `--bar-bg` (window headers and toolbars), `--foot-bg` (footers), `--well-bg`
 (track of segmented controls) and `--panel-bg` (dialogs).

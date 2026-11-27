@@ -10,35 +10,40 @@
  */
 export function layoutHistory(history: string) {
   const commits = history.trimEnd().split("\n").filter(Boolean).map((line) => {
-    const [id, parents, refs, subject, author, date] = line.split("\0");
-    return { id, parents: parents ? parents.split(" ") : [], refs: refs ? refs.split(", ") : [], subject, author, date };
+    const [id, parents, refs, subject, author, date, stash] = line.split("\0");
+    // A stash entry has a seventh field, its selector (`stash@{0}`), and one parent: the commit it was made on. Its
+    // lane is its own, so a commit of the same object (a branch that points at the stash commit) is a row of its own.
+    return { id, key: stash ? `stash:${stash}` : id, stash: stash || undefined, parents: parents ? parents.split(" ") : [], refs: refs ? refs.split(", ") : [], subject, author, date };
   });
-  type Track = { id: string; color: number; start: number; end: number; col: number; host?: Track };
-  type Edge = { from: number; to: number; color: number };
+  // `owner`: the row (by key) that last sent this lane on its way; the edges of the lane belong to it.
+  type Track = { id: string; color: number; start: number; end: number; col: number; host?: Track; owner: string };
+  type Edge = { from: number; to: number; color: number; owner: string };
   const tracks: Track[] = [];
   let nextColor = 0;
-  const newTrack = (id: string, start: number, host?: Track): Track => { const track = { id, color: nextColor++, start, end: Infinity, col: -1, host }; tracks.push(track); return track; };
+  const newTrack = (id: string, start: number, host?: Track, owner = ""): Track => { const track = { id, color: nextColor++, start, end: Infinity, col: -1, host, owner }; tracks.push(track); return track; };
 
   // Pass 1: follow the lanes without columns and record where each one starts and ends.
   let waiting: Track[] = [];
   const steps = commits.map((commit, row) => {
-    const mine = waiting.filter((track) => track.id === commit.id);
+    // Who owns each lane as it arrives at this row (before this row sends them on).
+    const before = new Map(waiting.map((track) => [track, track.owner] as const));
+    const mine = waiting.filter((track) => track.id === commit.key);
     const tip = mine.length === 0;
-    const own = tip ? newTrack(commit.id, row) : mine[0];
+    const own = tip ? newTrack(commit.key, row) : mine[0];
     if (tip) waiting.push(own);
     const joining = mine.slice(1);
     joining.forEach((track) => { track.end = row; });
     waiting = waiting.filter((track) => !joining.includes(track));
     const targets = commit.parents.map((parent, order) => {
-      if (order === 0) { own.id = parent; return own; }
+      if (order === 0) { own.id = parent; own.owner = commit.key; return own; }
       const existing = waiting.find((track) => track.id === parent);
       if (existing) return existing;
-      const created = newTrack(parent, row, own);
+      const created = newTrack(parent, row, own, commit.key);
       waiting.push(created);
       return created;
     });
     if (!commit.parents.length) { own.end = row; waiting = waiting.filter((track) => track !== own); }
-    return { own, tip, joining, targets };
+    return { own, tip, joining, targets, before };
   });
 
   // Pass 2: columns. Two lanes may share a column only if their rows do not overlap (a lane that ends
@@ -66,18 +71,67 @@ export function layoutHistory(history: string) {
   tracks.forEach((track) => byStart.set(track.start, [...(byStart.get(track.start) ?? []), track]));
   const live = new Set<Track>();
   return commits.map((commit, row) => {
-    const { own, tip, joining, targets } = steps[row];
+    const { own, tip, joining, targets, before } = steps[row];
     (byStart.get(row) ?? []).forEach((track) => live.add(track));
     const passing = [...live].filter((track) => track !== own && track.start < row && track.end > row);
+    // A lane that passes or joins belongs to the row that sent it on; one that leaves belongs to this row.
+    const sender = (track: Track) => before.get(track) ?? track.owner;
     const edges: Edge[] = [
-      ...passing.map((track) => ({ from: track.col, to: track.col, color: track.color })),
-      ...joining.map((track) => ({ from: track.col, to: own.col, color: track.color })),
-      ...targets.map((track) => ({ from: own.col, to: track.col, color: track.color })),
+      ...passing.map((track) => ({ from: track.col, to: track.col, color: track.color, owner: sender(track) })),
+      ...joining.map((track) => ({ from: track.col, to: own.col, color: track.color, owner: sender(track) })),
+      ...targets.map((track) => ({ from: own.col, to: track.col, color: track.color, owner: commit.key })),
     ].sort((a, b) => a.from - b.from);
     const width = Math.max(1, ...[...live].map((track) => track.col + 1));
     live.forEach((track) => { if (track.end <= row) live.delete(track); });
-    return { ...commit, lane: own.col, color: own.color, edges, tip, width };
+    // The row that sent the lane which arrives at this one (the line above the node); none for a tip.
+    const incoming = tip ? undefined : sender(own);
+    return { ...commit, lane: own.col, color: own.color, edges, tip, width, incoming };
   });
+}
+
+/**
+ * The commits of the loaded history that a branch tip reaches through parents, the tip and both sides of every merge
+ * included. A stash row is never part of it (it has no children and is nobody's parent), and a parent that is not
+ * loaded ends the walk there: only what is known from the loaded rows is returned. Keyed by commit id.
+ */
+export function reachableFrom(rows: { id: string; stash?: string; parents: string[] }[], tip: string): Set<string> {
+  const byId = new Map<string, string[]>();
+  for (const row of rows) if (!row.stash && !byId.has(row.id)) byId.set(row.id, row.parents);
+  const seen = new Set<string>();
+  const pending = [tip];
+  while (pending.length) {
+    const id = pending.pop()!;
+    const parents = byId.get(id);
+    if (seen.has(id) || !parents) continue;
+    seen.add(id);
+    pending.push(...parents);
+  }
+  return seen;
+}
+
+/** Whether a row or an edge keeps full emphasis under a branch focus: its row, or the row the edge belongs to, is reached. */
+export const inFocus = (reached: ReadonlySet<string>, key: string): boolean => reached.has(key);
+
+/** Several commits chosen in the list. `rows` is the list as shown, newest first. */
+export function rangeIds(rows: { id: string }[], from: string, to: string): string[] {
+  const a = rows.findIndex((row) => row.id === from), b = rows.findIndex((row) => row.id === to);
+  return a < 0 || b < 0 ? [] : rows.slice(Math.min(a, b), Math.max(a, b) + 1).map((row) => row.id);
+}
+export function toggleId(picked: ReadonlySet<string>, id: string): Set<string> {
+  const next = new Set(picked);
+  if (!next.delete(id)) next.add(id);
+  return next;
+}
+/** The choice after a refresh: commits that are no longer listed (dropped, rewritten) leave it. The same set when nothing left. */
+export function keepListed(picked: ReadonlySet<string>, rows: { id: string }[]): ReadonlySet<string> {
+  if (!picked.size) return picked;
+  const listed = new Set(rows.map((row) => row.id));
+  const kept = [...picked].filter((id) => listed.has(id));
+  return kept.length === picked.size ? picked : new Set(kept);
+}
+/** Chosen commits in the order they are applied: a parent before its child. */
+export function oldestFirst(rows: { id: string }[], picked: ReadonlySet<string>): string[] {
+  return rows.filter((row) => picked.has(row.id)).map((row) => row.id).reverse();
 }
 
 const LANE_X = 18;

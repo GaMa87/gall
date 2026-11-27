@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-#[cfg(any(windows, target_os = "linux", test))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos", test))]
 const MAX_MEDIA_BYTES: usize = gall_core::report_bundle::MAX_MEDIA_BYTES;
 const MAX_CAPTURE_PIXELS: u64 = 16_777_216;
 const CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -142,9 +142,36 @@ fn start_capture(
     sender: std::sync::mpsc::Sender<CaptureResult>,
     permit: Arc<CapturePermit>,
 ) -> Result<(), String> {
+    snapshot_webview(window, move |result| {
+        let _permit = permit;
+        let result = result.and_then(|surface| {
+            let surface = gdk::cairo::ImageSurface::try_from(surface)
+                .map_err(|_| "Gall capture did not return an image surface.")?;
+            let (width, height) = (surface.width(), surface.height());
+            check_dimensions(width as u32, height as u32)?;
+            let pixels = gdk::pixbuf_get_from_surface(&surface, 0, 0, width, height)
+                .ok_or("Cannot read Gall capture pixels.")?;
+            let png = pixels
+                .save_to_bufferv("png", &[])
+                .map_err(|e| format!("Cannot encode Gall capture: {e}"))?;
+            if png.len() > MAX_MEDIA_BYTES {
+                return Err("Capture exceeds the 8 MiB limit.".into());
+            }
+            Ok(png)
+        });
+        let _ = sender.send(result);
+    })
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn snapshot_webview(
+    window: &tauri::WebviewWindow,
+    callback: impl FnOnce(Result<gdk::cairo::Surface, String>) + Send + 'static,
+) -> Result<(), String> {
     use gdk::glib::object::ObjectType;
     use gdk::{cairo, gio, glib};
     use std::ffi::c_void;
+    type Callback = Box<dyn FnOnce(Result<cairo::Surface, String>) + Send>;
 
     // WebKitGTK is already linked by Tauri. Use its snapshot ABI through the
     // existing GTK dependencies rather than adding another WebKit crate.
@@ -176,13 +203,9 @@ fn start_capture(
         data: *mut c_void,
     ) {
         // SAFETY: WebKit invokes this once on its GTK thread, returning the boxed
-        // sender and ownership of either the native surface or the GError.
-        let (sender, _permit) = *unsafe {
-            Box::from_raw(
-                data.cast::<(std::sync::mpsc::Sender<CaptureResult>, Arc<CapturePermit>)>(),
-            )
-        };
-        let result = (|| -> CaptureResult {
+        // callback and ownership of either the native surface or the GError.
+        let callback = unsafe { Box::from_raw(data.cast::<Callback>()) };
+        let result = (|| {
             let mut error = std::ptr::null_mut();
             let surface =
                 unsafe { webkit_web_view_get_snapshot_finish(webview, result, &mut error) };
@@ -193,28 +216,15 @@ fn start_capture(
             if surface.is_null() {
                 return Err("Gall webview capture returned no image.".into());
             }
-            let surface = unsafe { cairo::Surface::from_raw_full(surface) }
-                .map_err(|e| format!("Cannot read Gall capture: {e}"))?;
-            let surface = cairo::ImageSurface::try_from(surface)
-                .map_err(|_| "Gall capture did not return an image surface.")?;
-            let (width, height) = (surface.width(), surface.height());
-            check_dimensions(width as u32, height as u32)?;
-            let pixels = gdk::pixbuf_get_from_surface(&surface, 0, 0, width, height)
-                .ok_or("Cannot read Gall capture pixels.")?;
-            let png = pixels
-                .save_to_bufferv("png", &[])
-                .map_err(|e| format!("Cannot encode Gall capture: {e}"))?;
-            if png.len() > MAX_MEDIA_BYTES {
-                return Err("Capture exceeds the 8 MiB limit.".into());
-            }
-            Ok(png)
+            unsafe { cairo::Surface::from_raw_full(surface) }
+                .map_err(|e| format!("Cannot read Gall capture: {e}"))
         })();
-        let _ = sender.send(result);
+        callback(result);
     }
 
     window
         .with_webview(move |webview| {
-            let sender = Box::into_raw(Box::new((sender, permit)));
+            let callback = Box::into_raw(Box::new(Box::new(callback) as Callback));
             // SAFETY: with_webview runs on GTK's owning thread. Region 0 is
             // WEBKIT_SNAPSHOT_REGION_VISIBLE; options 0 excludes selection.
             unsafe {
@@ -224,14 +234,86 @@ fn start_capture(
                     0,
                     std::ptr::null_mut(),
                     Some(completed),
-                    sender.cast(),
+                    callback.cast(),
                 );
             }
         })
         .map_err(|e| format!("Cannot access Gall's webview: {e}"))
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(target_os = "macos")]
+fn start_capture(
+    window: &tauri::WebviewWindow,
+    sender: std::sync::mpsc::Sender<CaptureResult>,
+    permit: Arc<CapturePermit>,
+) -> Result<(), String> {
+    use block2::RcBlock;
+    use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSImage};
+    use objc2_foundation::{NSDictionary, NSError};
+    use objc2_web_kit::WKWebView;
+    use std::sync::Mutex;
+
+    let state = Arc::new(Mutex::new(Some((sender, permit))));
+    let state_err = state.clone();
+
+    window
+        .with_webview(move |webview| {
+            let wk_ptr = webview.inner().cast::<WKWebView>();
+            if wk_ptr.is_null() {
+                if let Some((tx, _permit)) = state_err.lock().unwrap().take() {
+                    let _ = tx.send(Err("Gall's WKWebView handle is unavailable.".into()));
+                }
+                return;
+            }
+            let completion_state = state_err.clone();
+            let block = RcBlock::new(move |img_ptr: *mut NSImage, err_ptr: *mut NSError| {
+                let Some((tx, _permit)) = completion_state.lock().unwrap().take() else {
+                    return;
+                };
+                let result: CaptureResult = (|| {
+                    if !err_ptr.is_null() {
+                        // SAFETY: WebKit passes a valid NSError pointer when non-null.
+                        let err = unsafe { &*err_ptr };
+                        return Err(format!(
+                            "Gall webview capture failed: {}",
+                            err.localizedDescription()
+                        ));
+                    }
+                    if img_ptr.is_null() {
+                        return Err("Gall webview capture returned no image.".into());
+                    }
+                    // SAFETY: WebKit passes a valid NSImage pointer on success.
+                    let img = unsafe { &*img_ptr };
+                    let tiff = img
+                        .TIFFRepresentation()
+                        .ok_or_else(|| "Cannot read Gall capture image data.".to_string())?;
+                    let rep = NSBitmapImageRep::imageRepWithData(&tiff)
+                        .ok_or_else(|| "Cannot decode Gall capture bitmap.".to_string())?;
+                    let props = NSDictionary::new();
+                    // SAFETY: empty properties dictionary is valid for PNG encoding.
+                    let png_data = unsafe {
+                        rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &props)
+                    }
+                    .ok_or_else(|| "Cannot encode Gall capture as PNG.".to_string())?;
+                    let bytes = png_data.to_vec();
+                    if bytes.is_empty() || bytes.len() > MAX_MEDIA_BYTES {
+                        return Err("Capture exceeds the 8 MiB limit.".into());
+                    }
+                    Ok(bytes)
+                })();
+                let _ = tx.send(result);
+            });
+            // SAFETY: `with_webview` runs on the main thread owning the WKWebView; `wk_ptr` is
+            // non-null and valid for this call, and `block` is retained by WebKit until completion.
+            unsafe {
+                let wk = &*wk_ptr;
+                wk.takeSnapshotWithConfiguration_completionHandler(None, &block);
+            }
+        })
+        .map_err(|e| format!("Cannot access Gall's webview: {e}"))
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 fn start_capture(
     _window: &tauri::WebviewWindow,
     _sender: std::sync::mpsc::Sender<CaptureResult>,

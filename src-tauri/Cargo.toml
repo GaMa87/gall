@@ -6,7 +6,6 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 rust-version.workspace = true
 publish = false
 
@@ -16,6 +15,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+cc = "1"
+pkg-config = "0.3"
 
 [dependencies]
 gall-core = { path = "../crates/gall-core" }
@@ -33,17 +34,33 @@ image = { version = "0.25.10", default-features = false, features = ["png"] }
 dirs = "7.0.0"
 crossbeam-channel = "0.5.17"
 tauri-plugin-updater = "2"
+ctrlc = { version = "3", features = ["termination"] }
+tempfile = "3"
+sysinfo = { version = "0.40.1", default-features = false, features = ["system"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gdk = "0.18"
+gtk = "0.18"
+zbus = "5"
+notify = "8.2.1"
+notify-debouncer-full = "0.7.0"
+toml = "1"
+roxmltree = "0.20"
 
 [target.'cfg(windows)'.dependencies]
 # Paths of files dropped from other apps (WebView2 hands them to the host); the versions
 # Tauri's wry uses, so the types are the same.
 webview2-com = "0.39.1"
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage"] }
+# Also the drag of files out to other apps (Shell, Ole), done with the shell's own data
+# object: the `drag` crate crashes on WSL, network and long paths there.
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Threading", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_Storage_EnhancedStorage", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Ole", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_Shell_PropertiesSystem"] }
 
-[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
-# Dragging files out to other apps as real files (Explorer / Finder, mail): a web page's
-# drag carries only text. Linux's GTK drag already offers them as file URIs.
+[target.'cfg(target_os = "macos")'.dependencies]
+# Dragging files out to other apps as real files (Finder, mail): a web page's drag
+# carries only text. Linux's GTK drag already offers them as file URIs.
 drag = "2.1.1"
+block2 = "0.6.2"
+objc2 = "0.6.2"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSBitmapImageRep", "NSImage", "NSImageRep", "NSPasteboard", "NSPasteboardItem"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSData", "NSDictionary", "NSError", "NSString", "NSURL"] }
+objc2-web-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "WKSnapshotConfiguration", "WKWebView"] }

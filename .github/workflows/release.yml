@@ -29,6 +29,9 @@ jobs:
         include:
           - platform: ubuntu-22.04
             args: ''
+          # Linux aarch64 (Arch Linux ARM, Asahi, Raspberry Pi): native arm runner.
+          - platform: ubuntu-24.04-arm
+            args: ''
           - platform: windows-latest
             args: ''
           - platform: macos-latest
@@ -115,12 +118,77 @@ jobs:
         if: startsWith(matrix.platform, 'windows')
         shell: pwsh
         run: ./scripts/portable.ps1 -NoBuild
-      - name: Attach portable zip to the release
-        if: startsWith(matrix.platform, 'windows') && startsWith(github.ref, 'refs/tags/') && inputs.dry_run != true
+      - name: Build signed Linux self-update archive
+        if: startsWith(matrix.platform, 'ubuntu')
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          VERSION=$(node -e 'console.log(require("fs").readFileSync("Cargo.toml","utf8").match(/^version\s*=\s*"([^"]+)"/m)[1])')
+          STAGE=$(mktemp -d)
+          cp target/release/gall "$STAGE/gall"
+          chmod +x "$STAGE/gall"
+          npm run --silent tauri -- signer sign --app-version "$VERSION" "$STAGE/gall"
+          mkdir -p dist
+          case "$(uname -m)" in aarch64|arm64) LARCH=aarch64 ;; *) LARCH=x86_64 ;; esac
+          OUT="dist/Gall_${VERSION}_linux_${LARCH}_update.tar.gz"
+          tar -czf "$OUT" -C "$STAGE" gall gall.sig
+          npm run --silent tauri -- signer sign --app-version "$VERSION" "$OUT"
+          rm -rf "$STAGE"
+      - name: Build signed Windows self-update archive
+        if: startsWith(matrix.platform, 'windows')
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          $stage = Join-Path $env:RUNNER_TEMP "gall-win-update"
+          if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item target\release\gall.exe (Join-Path $stage "gall.exe")
+          npm run --silent tauri -- signer sign --app-version $ver (Join-Path $stage "gall.exe")
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $out = "dist\Gall_${ver}_windows_x64_update.zip"
+          if (Test-Path $out) { Remove-Item $out -Force }
+          Compress-Archive -Path (Join-Path $stage "gall.exe"), (Join-Path $stage "gall.exe.sig") -DestinationPath $out
+          npm run --silent tauri -- signer sign --app-version $ver $out
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Remove-Item $stage -Recurse -Force
+      - name: Build signed macOS self-update archive
+        if: startsWith(matrix.platform, 'macos')
+        shell: bash
+        env:
+          MATRIX_ARGS: ${{ matrix.args }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          VERSION=$(node -e 'console.log(require("fs").readFileSync("Cargo.toml","utf8").match(/^version\s*=\s*"([^"]+)"/m)[1])')
+          if [[ "$MATRIX_ARGS" == *aarch64* ]]; then ARCH=aarch64; else ARCH=x86_64; fi
+          TRIPLE="${ARCH}-apple-darwin"
+          APP="target/${TRIPLE}/release/bundle/macos/Gall.app"
+          STAGE=$(mktemp -d)
+          cp -a "$APP" "$STAGE/Gall.app"
+          BIN=$(find "$STAGE/Gall.app/Contents/MacOS" -maxdepth 1 -type f -perm +111 | head -1)
+          if [[ -z "$BIN" ]]; then echo "No executable in $STAGE/Gall.app/Contents/MacOS" >&2; exit 1; fi
+          # Keep gall.sig beside Gall.app so the bundle's _CodeSignature stays intact.
+          npm run --silent tauri -- signer sign --app-version "$VERSION" "$BIN"
+          mv "${BIN}.sig" "$STAGE/gall.sig"
+          mkdir -p dist
+          OUT="dist/Gall_${VERSION}_darwin_${ARCH}_update.tar.gz"
+          COPYFILE_DISABLE=1 tar -czf "$OUT" -C "$STAGE" Gall.app gall.sig
+          npm run --silent tauri -- signer sign --app-version "$VERSION" "$OUT"
+          rm -rf "$STAGE"
+      - name: Attach portable zip and update archives to the release
+        if: startsWith(github.ref, 'refs/tags/') && inputs.dry_run != true
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ github.ref_name }}" (Get-Item dist/*.zip).FullName --clobber
+        run: |
+          $files = Get-Item dist/*.zip, dist/*.tar.gz, dist/*.sig -ErrorAction SilentlyContinue
+          if ($files) { gh release upload "${{ github.ref_name }}" $files.FullName --clobber }
       - name: Keep the packages of a dry run as build artifacts
         if: inputs.dry_run == true
         uses: actions/upload-artifact@v7
@@ -129,28 +197,74 @@ jobs:
           path: |
             target/release/bundle/**
             target/*/release/bundle/**
+            dist/*_update.*
           if-no-files-found: error
       - name: Keep portable zip as a build artifact
         if: startsWith(matrix.platform, 'windows')
         uses: actions/upload-artifact@v7
         with:
           name: gall-windows-portable
-          path: dist/*.zip
+          path: dist/*-portable.zip
 
-  # SHA256SUMS for packagers (Scoop, winget, AUR, Homebrew) and for users who verify downloads.
+  # Augment latest.json with per-binary update targets and generate SHA256SUMS.
   checksums:
     needs: build
     if: startsWith(github.ref, 'refs/tags/') && inputs.dry_run != true
     runs-on: ubuntu-latest
     steps:
-      - name: Hash every release asset and attach SHA256SUMS
+      - name: Augment updater manifest and hash release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
         run: |
           mkdir assets && cd assets
-          gh release download "${{ github.ref_name }}" --pattern '*' --skip-existing
+          gh release download "$TAG" --pattern '*' --skip-existing
+          node <<'NODE'
+            const fs = require("fs");
+            const tag = process.env.TAG;
+            const repo = process.env.GH_REPO;
+            const manifest = JSON.parse(fs.readFileSync("latest.json", "utf8"));
+            const ver = (manifest.version || tag.replace(/^v/, "")).replace(/^v/, "");
+            const extras = {
+              "linux-x86_64-bin": `Gall_${ver}_linux_x86_64_update.tar.gz`,
+              "windows-x86_64-bin": `Gall_${ver}_windows_x64_update.zip`,
+              "darwin-aarch64-app": `Gall_${ver}_darwin_aarch64_update.tar.gz`,
+              "darwin-x86_64-app": `Gall_${ver}_darwin_x86_64_update.tar.gz`,
+            };
+            manifest.platforms = manifest.platforms || {};
+            // Optional targets: added when their signed archive was uploaded (older tags have none).
+            const optionalExtras = {
+              "linux-aarch64-bin": `Gall_${ver}_linux_aarch64_update.tar.gz`,
+            };
+            for (const [key, file] of Object.entries(optionalExtras)) {
+              if (fs.existsSync(file) && fs.existsSync(`${file}.sig`)) extras[key] = file;
+            }
+            for (const [key, file] of Object.entries(extras)) {
+              const sigFile = `${file}.sig`;
+              if (!fs.existsSync(file) || !fs.existsSync(sigFile)) {
+                throw new Error(`Missing update archive or signature: ${file}`);
+              }
+              const sig = fs.readFileSync(sigFile, "utf8").trim();
+              if (!sig) throw new Error(`Empty signature: ${sigFile}`);
+              manifest.platforms[key] = {
+                url: `https://github.com/${repo}/releases/download/${tag}/${file}`,
+                signature: sig,
+              };
+            }
+            for (const required of [
+              "windows-x86_64", "linux-x86_64", "darwin-aarch64", "darwin-x86_64",
+              "windows-x86_64-bin", "linux-x86_64-bin", "darwin-aarch64-app", "darwin-x86_64-app",
+            ]) {
+              const entry = manifest.platforms[required];
+              if (!entry || !entry.url || !entry.signature) {
+                throw new Error(`latest.json missing required target: ${required}`);
+              }
+            }
+            fs.writeFileSync("latest.json", JSON.stringify(manifest, null, 2) + "\n");
+          NODE
+          gh release upload "$TAG" latest.json --clobber
           rm -f SHA256SUMS
           sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
-          gh release upload "${{ github.ref_name }}" SHA256SUMS --clobber
+          gh release upload "$TAG" SHA256SUMS --clobber

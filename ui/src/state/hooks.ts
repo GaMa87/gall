@@ -4,6 +4,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { api } from "../api/ipc";
 import type { FileEntry, GitStatus, HiddenState, ResolvedPrefs, Settings } from "../api/types";
 import { archiveOf } from "../core/archive";
+import { createRafCoalescer } from "../core/resizeThrottle";
 import { onFolderChanged } from "./controllers";
 import { useStore } from "./store";
 
@@ -29,8 +30,8 @@ export interface DirState {
  * Lists a folder and keeps it fresh. While the folder is displayed it is
  * watched by the backend; changes trigger a (throttled during storms) reload.
  */
-export function useDirList(path: string | null, settings: Settings | null, dirsOnly = false): DirState {
-  const showHidden = settings?.showHidden ?? false;
+export function useDirList(path: string | null, settings: Settings | null, dirsOnly = false, showHiddenOverride?: boolean): DirState {
+  const showHidden = showHiddenOverride ?? settings?.showHidden ?? false;
   const hideTemp = settings?.hideTemp ?? false;
   const k = path ? key(path, dirsOnly, showHidden, hideTemp) : "";
   const [state, setState] = useState<{ entries: FileEntry[]; error: string | null; loading: boolean; k: string }>(() => ({
@@ -109,26 +110,68 @@ export function useTags(path: string | null, nonce: number): Map<string, number>
   return tags;
 }
 
-/** Observes an element's size. */
-export function useSize<T extends HTMLElement>(): [React.RefObject<T | null>, { w: number; h: number }] {
+export interface ElementSize {
+  w: number;
+  h: number;
+  scrollbarW: number;
+}
+
+/**
+ * Observes an element's size, coalesced to one update per animation frame and deduplicated
+ * on whole CSS pixels (plus vertical scrollbar width so callers avoid forced layout in render).
+ * Optional `shouldUpdate` lets list views ignore sub-threshold pixel changes; `syncKey` forces
+ * an exact re-measure when switching modes (e.g. list → grid).
+ */
+export function useSize<T extends HTMLElement>(
+  shouldUpdate?: (prev: ElementSize, next: ElementSize) => boolean,
+  syncKey?: unknown,
+): [React.RefObject<T | null>, ElementSize] {
   const ref = useRef<T | null>(null);
   const observed = useRef<T | null>(null);
   const ro = useRef<ResizeObserver | null>(null);
-  const [size, setSize] = useState({ w: 0, h: 0 });
+  const raf = useRef<ReturnType<typeof createRafCoalescer> | null>(null);
+  const shouldUpdateRef = useRef(shouldUpdate);
+  shouldUpdateRef.current = shouldUpdate;
+  const lastSyncKey = useRef(syncKey);
+  const [size, setSize] = useState<ElementSize>({ w: 0, h: 0, scrollbarW: 0 });
   // Re-check after every render: the element may appear later or be replaced.
   useLayoutEffect(() => {
     const el = ref.current;
-    if (el === observed.current) return;
+    const syncChanged = lastSyncKey.current !== syncKey;
+    lastSyncKey.current = syncKey;
+    if (el === observed.current) {
+      if (el && syncChanged) {
+        const next = { w: Math.round(el.clientWidth), h: Math.round(el.clientHeight), scrollbarW: Math.max(0, el.offsetWidth - el.clientWidth) };
+        setSize((prev) => (prev.w === next.w && prev.h === next.h && prev.scrollbarW === next.scrollbarW ? prev : next));
+      }
+      return;
+    }
     ro.current?.disconnect();
+    raf.current?.cancel();
     observed.current = el;
     if (!el) return;
-    ro.current = new ResizeObserver(([e]) => setSize({ w: e.contentRect.width, h: e.contentRect.height }));
+    const measure = (forceExact = false) => {
+      const next: ElementSize = {
+        w: Math.round(el.clientWidth),
+        h: Math.round(el.clientHeight),
+        scrollbarW: Math.max(0, el.offsetWidth - el.clientWidth),
+      };
+      setSize((prev) => {
+        if (prev.w === next.w && prev.h === next.h && prev.scrollbarW === next.scrollbarW) return prev;
+        if (!forceExact && shouldUpdateRef.current && !shouldUpdateRef.current(prev, next)) return prev;
+        return next;
+      });
+    };
+    const coalescer = createRafCoalescer(() => measure(false));
+    raf.current = coalescer;
+    ro.current = new ResizeObserver(() => coalescer.schedule());
     ro.current.observe(el);
-    setSize({ w: el.clientWidth, h: el.clientHeight });
+    measure(true);
   });
   useEffect(
     () => () => {
       ro.current?.disconnect();
+      raf.current?.cancel();
       // Forget the element too, so a re-run (React StrictMode remount) observes it again
       // instead of keeping the stale first-render size forever.
       observed.current = null;
@@ -136,6 +179,54 @@ export function useSize<T extends HTMLElement>(): [React.RefObject<T | null>, { 
     [],
   );
   return [ref, size];
+}
+
+/**
+ * Observes whether an element's width exceeds `threshold`, only updating React state
+ * when that boolean flips (avoiding per-pixel re-renders during live window resizes).
+ */
+export function useWidthAbove<T extends HTMLElement>(threshold: number): [React.RefObject<T | null>, boolean] {
+  const ref = useRef<T | null>(null);
+  const observed = useRef<T | null>(null);
+  const ro = useRef<ResizeObserver | null>(null);
+  const raf = useRef<ReturnType<typeof createRafCoalescer> | null>(null);
+  const thresholdRef = useRef(threshold);
+  thresholdRef.current = threshold;
+  const [above, setAbove] = useState(false);
+
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (el === observed.current) {
+      if (el) {
+        const next = el.clientWidth > thresholdRef.current;
+        setAbove((prev) => (prev === next ? prev : next));
+      }
+      return;
+    }
+    ro.current?.disconnect();
+    raf.current?.cancel();
+    observed.current = el;
+    if (!el) return;
+    const check = () => {
+      const next = el.clientWidth > thresholdRef.current;
+      setAbove((prev) => (prev === next ? prev : next));
+    };
+    const coalescer = createRafCoalescer(check);
+    raf.current = coalescer;
+    ro.current = new ResizeObserver(() => coalescer.schedule());
+    ro.current.observe(el);
+    check();
+  });
+
+  useEffect(
+    () => () => {
+      ro.current?.disconnect();
+      raf.current?.cancel();
+      observed.current = null;
+    },
+    [],
+  );
+  return [ref, above];
 }
 
 /** Global tick used to refresh tags/prefs after edits. */

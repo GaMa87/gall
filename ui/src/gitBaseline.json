@@ -1,0 +1,34 @@
+{
+  "steps": {
+    "1k": {"keys": 27, "typed": 15, "clicks": 0},
+    "1m": {"keys": 15, "typed": 15, "clicks": 6},
+    "2k": {"keys": 24, "typed": 16, "clicks": 0},
+    "2m": {"keys": 17, "typed": 16, "clicks": 9},
+    "3k": {"keys": 3, "typed": 0, "clicks": 0},
+    "3m": {"keys": 0, "typed": 0, "clicks": 3},
+    "4k": {"keys": 3, "typed": 0, "clicks": 1},
+    "4m": {"keys": 0, "typed": 0, "clicks": 3},
+    "5k": {"keys": 9, "typed": 0, "clicks": 0},
+    "5m": {"keys": 0, "typed": 0, "clicks": 7},
+    "6k": {"keys": 2, "typed": 0, "clicks": 0},
+    "6m": {"keys": 0, "typed": 0, "clicks": 3},
+    "7k": {"keys": 4, "typed": 0, "clicks": 0},
+    "7m": {"keys": 0, "typed": 0, "clicks": 4},
+    "8k": {"keys": 2, "typed": 0, "clicks": 0},
+    "8m": {"keys": 0, "typed": 0, "clicks": 3},
+    "9k": {"keys": 9, "typed": 0, "clicks": 0},
+    "9m": {"keys": 0, "typed": 0, "clicks": 5},
+    "10k": {"keys": 12, "typed": 0, "clicks": 2},
+    "10m": {"keys": 0, "typed": 0, "clicks": 4}
+  },
+  "latencyMs": {
+    "windows": {
+      "open to first graph paint, 200 commits": 94,
+      "open to first graph paint, 2000 commits": 98,
+      "key to selection in a list of 2000 commits": 48,
+      "key to the Git command palette on 2000 commits": 22,
+      "key to open Working Changes": 63,
+      "key to refreshed Working Changes (stage a file)": 143
+    }
+  }
+}

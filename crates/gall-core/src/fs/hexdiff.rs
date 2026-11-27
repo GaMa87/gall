@@ -32,6 +32,47 @@ pub struct HexDiff {
 /// 32-bit value is one difference, not four).
 pub const MERGE_GAP: u64 = 4;
 
+/// On Linux, jump past a shared sparse hole in both files (`SEEK_DATA`) so multi-GB sparse
+/// files compare in milliseconds without reading gigabytes of zero holes.
+#[cfg(target_os = "linux")]
+fn skip_shared_hole(a: &mut std::fs::File, b: &mut std::fs::File, pos: u64, short: u64) -> u64 {
+    use std::os::fd::AsRawFd;
+    const SEEK_DATA: libc::c_int = 3;
+    let Ok(off) = libc::off_t::try_from(pos) else {
+        return pos;
+    };
+    let next_data = |f: &std::fs::File| -> Option<u64> {
+        let r = unsafe { libc::lseek(f.as_raw_fd(), off, SEEK_DATA) };
+        if r >= 0 {
+            Some((r as u64).min(short))
+        } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENXIO) {
+            Some(short)
+        } else {
+            None
+        }
+    };
+    let (Some(da), Some(db)) = (next_data(a), next_data(b)) else {
+        let _ = a.seek(SeekFrom::Start(pos));
+        let _ = b.seek(SeekFrom::Start(pos));
+        return pos;
+    };
+    let target = da.min(db).min(short);
+    if target > pos
+        && a.seek(SeekFrom::Start(target)).is_ok()
+        && b.seek(SeekFrom::Start(target)).is_ok()
+    {
+        return target;
+    }
+    let _ = a.seek(SeekFrom::Start(pos));
+    let _ = b.seek(SeekFrom::Start(pos));
+    pos
+}
+
+#[cfg(not(target_os = "linux"))]
+fn skip_shared_hole(_a: &mut std::fs::File, _b: &mut std::fs::File, pos: u64, _short: u64) -> u64 {
+    pos
+}
+
 /// Compares `left` and `right` byte by byte. None when cancelled.
 pub fn compare(left: &Path, right: &Path, cancel: &AtomicBool) -> Result<Option<HexDiff>> {
     let mut a = super::open_regular(left).ctx("open", left)?;
@@ -41,29 +82,42 @@ pub fn compare(left: &Path, right: &Path, cancel: &AtomicBool) -> Result<Option<
         right_size: b.metadata().ctx("stat", right)?.len(),
         ..Default::default()
     };
+    let short = out.left_size.min(out.right_size);
     const CHUNK: usize = 1 << 20;
     let (mut ba, mut bb) = (vec![0u8; CHUNK], vec![0u8; CHUNK]);
     let mut pos = 0u64;
     let mut open: Option<(u64, u64)> = None; // the range being built
-    loop {
+    while pos < short {
         if cancel.load(Ordering::Relaxed) {
             return Ok(None);
+        }
+        let jumped = skip_shared_hole(&mut a, &mut b, pos, short);
+        if jumped > pos {
+            if let Some(r) = open.take() {
+                push(&mut out, r);
+            }
+            pos = jumped;
+            if pos >= short {
+                break;
+            }
         }
         let na = read_full(&mut a, &mut ba).ctx("read", left)?;
         let nb = read_full(&mut b, &mut bb).ctx("read", right)?;
         let n = na.min(nb);
-        for i in 0..n {
-            if ba[i] != bb[i] {
-                let at = pos + i as u64;
-                out.differing += 1;
-                open = match open {
-                    Some((s, e)) if at < e + MERGE_GAP => Some((s, at + 1)),
-                    Some(r) => {
-                        push(&mut out, r);
-                        Some((at, at + 1))
-                    }
-                    None => Some((at, at + 1)),
-                };
+        if ba[..n] != bb[..n] {
+            for i in 0..n {
+                if ba[i] != bb[i] {
+                    let at = pos + i as u64;
+                    out.differing += 1;
+                    open = match open {
+                        Some((s, e)) if at < e + MERGE_GAP => Some((s, at + 1)),
+                        Some(r) => {
+                            push(&mut out, r);
+                            Some((at, at + 1))
+                        }
+                        None => Some((at, at + 1)),
+                    };
+                }
             }
         }
         pos += n as u64;
@@ -204,5 +258,103 @@ mod tests {
         )
         .unwrap();
         assert!(r.is_none());
+    }
+
+    #[test]
+    fn an_insertion_shifts_every_byte_after_it_and_the_view_says_so_by_offset() {
+        // Bytes are compared at the same offset (like `cmp`): inserting one byte at the front makes every byte differ
+        // wherever it is not the same by chance, and the longer file has one byte with no counterpart.
+        let a: Vec<u8> = (0..64u8).collect();
+        let mut b = vec![0xffu8];
+        b.extend_from_slice(&a);
+        let r = diff(&a, &b);
+        assert_eq!((r.left_size, r.right_size), (64, 65));
+        assert_eq!(r.ranges, vec![(0, 65)]);
+        assert_eq!(r.differing, 65);
+    }
+
+    #[test]
+    fn empty_files_and_one_empty_side() {
+        assert!(diff(b"", b"").ranges.is_empty());
+        let r = diff(b"", b"abc");
+        assert_eq!((r.ranges.clone(), r.differing), (vec![(0, 3)], 3));
+        let r = diff(b"abc", b"");
+        assert_eq!((r.ranges, r.differing), (vec![(0, 3)], 3));
+    }
+
+    #[test]
+    fn sparse_files_with_distant_differences_are_streamed_without_keeping_them() {
+        // Two 8 MiB files that are zero everywhere but at three far-apart places: only the ranges are kept.
+        let d = tempfile::tempdir().unwrap();
+        let (pa, pb) = (d.path().join("a"), d.path().join("b"));
+        for p in [&pa, &pb] {
+            std::fs::File::create(p).unwrap().set_len(8 << 20).unwrap();
+        }
+        let poke = |p: &Path, at: u64, byte: u8| {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().write(true).open(p).unwrap();
+            f.seek(SeekFrom::Start(at)).unwrap();
+            f.write_all(&[byte]).unwrap();
+        };
+        poke(&pb, 0, 1);
+        poke(&pb, 4 << 20, 2);
+        poke(&pb, (8 << 20) - 1, 3);
+        let r = compare(&pa, &pb, &AtomicBool::new(false)).unwrap().unwrap();
+        assert_eq!(
+            r.ranges,
+            vec![(0, 1), (4 << 20, (4 << 20) + 1), ((8 << 20) - 1, 8 << 20)]
+        );
+        assert_eq!(r.differing, 3);
+        assert!(!r.truncated);
+    }
+
+    #[test]
+    fn a_window_at_zero_at_the_end_past_it_and_at_an_unsafe_offset() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("f");
+        std::fs::write(&p, b"0123456789").unwrap();
+        assert_eq!(read_at(&p, 0, 4).unwrap(), b"0123");
+        // Exactly at the end, and past it: nothing, not an error.
+        assert!(read_at(&p, 10, 4).unwrap().is_empty());
+        assert!(read_at(&p, 11, 4).unwrap().is_empty());
+        // An offset no file can have is an error or nothing, never a panic or a huge allocation.
+        assert!(read_at(&p, u64::MAX, 4).map_or(true, |bytes| bytes.is_empty()));
+        assert!(read_at(&p, i64::MAX as u64, 4).map_or(true, |bytes| bytes.is_empty()));
+        // A request for more than the most one read returns is cut, so a whole binary is never transferred at once.
+        let big = d.path().join("big");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_READ * 4)
+            .unwrap();
+        assert_eq!(read_at(&big, 0, u64::MAX).unwrap().len() as u64, MAX_READ);
+    }
+
+    #[test]
+    fn multi_gib_sparse_files_compare_via_hole_skipping() {
+        let d = tempfile::tempdir().unwrap();
+        let (pa, pb) = (d.path().join("a.bin"), d.path().join("b.bin"));
+        let size = 4u64 << 30; // 4 GiB sparse
+        for p in [&pa, &pb] {
+            std::fs::File::create(p).unwrap().set_len(size).unwrap();
+        }
+        let poke = |p: &Path, at: u64, bytes: &[u8]| {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().write(true).open(p).unwrap();
+            f.seek(SeekFrom::Start(at)).unwrap();
+            f.write_all(bytes).unwrap();
+        };
+        let tail_off = size - 16;
+        poke(&pa, 0, b"HEAD");
+        poke(&pb, 0, b"HEAX");
+        poke(&pa, tail_off, b"TAIL0000");
+        poke(&pb, tail_off, b"TAIL0001");
+
+        let r = compare(&pa, &pb, &AtomicBool::new(false)).unwrap().unwrap();
+        assert_eq!(r.left_size, size);
+        assert_eq!(r.right_size, size);
+        assert_eq!(r.ranges, vec![(3, 4), (tail_off + 7, tail_off + 8)]);
+        assert_eq!(r.differing, 2);
+        assert!(!r.truncated);
+        assert_eq!(read_at(&pb, tail_off, 8).unwrap(), b"TAIL0001");
     }
 }

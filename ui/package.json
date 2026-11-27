@@ -1,22 +1,24 @@
 {
   "name": "gall-ui",
   "private": true,
-  "version": "0.2.2",
+  "version": "0.3.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "tsc -b && node ../scripts/build-compare-wasm.mjs --optional && vite build",
+    "build:compare-wasm": "node ../scripts/build-compare-wasm.mjs",
     "test": "vitest run",
-    "typecheck": "tsc -b --noEmit"
+    "typecheck": "tsc -b --noEmit",
+    "i18n:sync": "node scripts/i18n-sync.mjs"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.12.4",
+    "@tauri-apps/api": "^2.12.5",
     "@tauri-apps/plugin-dialog": "^2.8.4",
-    "@tauri-apps/plugin-opener": "^2.7.2",
+    "@tauri-apps/plugin-opener": "^2.7.3",
     "@tauri-apps/plugin-updater": "^2.14.1",
-    "dompurify": "^3.4.17",
+    "dompurify": "^3.4.18",
     "markdown-it": "^15.0.3",
-    "pdfjs-dist": "^6.4.299",
+    "pdfjs-dist": "^6.5.438",
     "react": "^19.3.1",
     "react-dom": "^19.3.1"
   },
@@ -24,10 +26,10 @@
     "@types/markdown-it": "^14.2.0",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
-    "@vitejs/plugin-react": "^6.1.2",
+    "@vitejs/plugin-react": "^6.3.0",
     "typescript": "^7.0.2",
-    "vite": "^8.3.5",
-    "vitest": "^5.0.5"
+    "vite": "^8.3.8",
+    "vitest": "^5.1.1"
   },
   "description": "UI of Gall, an open-source Miller-column dual-pane file manager",
   "license": "MIT",

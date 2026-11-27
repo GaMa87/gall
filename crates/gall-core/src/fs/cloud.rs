@@ -88,19 +88,28 @@ fn push(out: &mut Vec<CloudFolder>, provider: &str, name: &str, path: PathBuf) {
     }
 }
 
+/// Canonical identity key for deduplicating cloud folders. Resolves symlinks and
+/// junctions so a home-folder alias (such as macOS `~/OneDrive` pointing to
+/// `~/Library/CloudStorage/OneDrive-Personal`) collapses onto its target without
+/// hiding distinct folders. Falls back to the raw path if canonicalization fails.
+fn dedupe_key(p: &str) -> String {
+    let resolved = std::fs::canonicalize(p)
+        .map(|c| c.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| p.to_string());
+    let trimmed = resolved.trim_end_matches(['/', '\\']);
+    if cfg!(windows) {
+        trimmed.to_lowercase()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Keeps the first entry per folder (sources are added best-first).
 fn dedupe(found: Vec<CloudFolder>) -> Vec<CloudFolder> {
-    let key = |p: &str| {
-        let p = p.trim_end_matches(['/', '\\']);
-        if cfg!(windows) {
-            p.to_lowercase()
-        } else {
-            p.to_string()
-        }
-    };
-    let mut out: Vec<CloudFolder> = Vec::new();
+    let mut seen = std::collections::HashSet::with_capacity(found.len());
+    let mut out = Vec::with_capacity(found.len());
     for f in found {
-        if !out.iter().any(|o| key(&o.path) == key(&f.path)) {
+        if seen.insert(dedupe_key(&f.path)) {
             out.push(f);
         }
     }
@@ -378,6 +387,68 @@ mod tests {
         let out = dedupe(vec![f("/h/OneDrive", "registry"), f("/h/OneDrive/", "env")]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name, "registry");
+    }
+
+    #[test]
+    fn dedupe_keeps_distinct_real_folders() {
+        let t = tempfile::tempdir().unwrap();
+        let personal = t.path().join("OneDrive-Personal");
+        let work = t.path().join("OneDrive-Contoso");
+        std::fs::create_dir(&personal).unwrap();
+        std::fs::create_dir(&work).unwrap();
+        let out = dedupe(vec![
+            CloudFolder {
+                provider: "onedrive".into(),
+                name: "OneDrive".into(),
+                path: personal.to_string_lossy().into_owned(),
+            },
+            CloudFolder {
+                provider: "onedrive".into(),
+                name: "OneDrive - Contoso".into(),
+                path: work.to_string_lossy().into_owned(),
+            },
+        ]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].name, "OneDrive");
+        assert_eq!(out[1].name, "OneDrive - Contoso");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dedupe_collapses_symlink_alias_without_hiding_distinct_folders() {
+        let t = tempfile::tempdir().unwrap();
+        let storage = t.path().join("Library/CloudStorage");
+        let target = storage.join("OneDrive-Personal");
+        let other = storage.join("OneDrive-Contoso");
+        let alias = t.path().join("OneDrive");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+
+        let target_str = target.to_string_lossy().into_owned();
+        let other_str = other.to_string_lossy().into_owned();
+        let alias_str = alias.to_string_lossy().into_owned();
+
+        let out = dedupe(vec![
+            CloudFolder {
+                provider: "onedrive".into(),
+                name: "OneDrive".into(),
+                path: target_str.clone(),
+            },
+            CloudFolder {
+                provider: "onedrive".into(),
+                name: "OneDrive - Contoso".into(),
+                path: other_str.clone(),
+            },
+            CloudFolder {
+                provider: "onedrive".into(),
+                name: "OneDrive".into(),
+                path: alias_str,
+            },
+        ]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].path, target_str);
+        assert_eq!(out[1].path, other_str);
     }
 
     #[test]

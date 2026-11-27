@@ -12,6 +12,7 @@ on:
       - "docs/screenshots/**"
       - "docs/social-preview.png"
       - "assets/icon.png"
+      - "assets/icon.svg"
       - ".github/workflows/pages.yml"
 
 permissions:
@@ -36,9 +37,9 @@ jobs:
       - name: Assemble the site
         run: |
           mkdir -p _site/screenshots
-          cp site/* _site/
-          cp assets/icon.png docs/social-preview.png _site/
-          cp docs/screenshots/main.png docs/screenshots/compare-excel.png _site/screenshots/
+          cp -R site/. _site/
+          cp assets/icon.png assets/icon.svg docs/social-preview.png _site/
+          cp docs/screenshots/*.png docs/screenshots/*.gif _site/screenshots/
       - uses: actions/configure-pages@v6
       - uses: actions/upload-pages-artifact@v5
         with:

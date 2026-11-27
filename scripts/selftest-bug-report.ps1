@@ -33,5 +33,6 @@ try {
     Write-Output "Artifacts: $root"
     if (!(Select-String -LiteralPath $report -Pattern "^0 failure" -Quiet)) { throw "Bug-report self-test failed. Artifacts: $root" }
 } finally {
-    foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name, $previous[$name], "Process") }
+    # Newer PowerShell sets an empty variable for a null value.
+    foreach ($name in $names) { if ($null -eq $previous[$name]) { Remove-Item -Path "Env:$name" -ErrorAction Ignore } else { Set-Item -Path "Env:$name" -Value $previous[$name] } }
 }

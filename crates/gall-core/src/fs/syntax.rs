@@ -82,6 +82,18 @@ pub fn knows(name: &str) -> bool {
     find(syntaxes(), name, "").is_some()
 }
 
+/// The extensions and whole names (lower case) that have a grammar.
+pub(crate) fn extensions() -> impl Iterator<Item = String> {
+    syntaxes()
+        .syntaxes()
+        .iter()
+        .filter(|s| s.name != "Plain Text")
+        .flat_map(|s| &s.file_extensions)
+        .map(|ext| ext.trim_start_matches('.').to_lowercase())
+        // Sections of manual pages; `lib.so.1` and `log.2` are none.
+        .filter(|ext| !ext.bytes().all(|b| b.is_ascii_digit()))
+}
+
 fn classify_name(s: &str) -> Cat {
     let has = |p: &str| s == p || s.starts_with(&format!("{p}."));
     if has("comment") || has("punctuation.definition.comment") {
@@ -350,16 +362,9 @@ mod tests {
         }
         let text = lines(&src);
         assert!(pieces(&text).len() > 2 || std::thread::available_parallelism().unwrap().get() < 2);
-        let ss = syntaxes();
-        let syntax = find(ss, "long.rs", "").unwrap();
-        let mut single = (ParseState::new(syntax), ScopeStack::new());
-        let later = Instant::now() + Duration::from_secs(600);
-        let expected = colour(&text, &mut single, ss, later);
-        let got = highlight("long.rs", &text).unwrap();
-        assert_eq!(got.lines.len(), expected.len());
-        for (n, (a, b)) in got.lines.iter().zip(&expected).enumerate() {
-            assert_eq!(a, b, "line {n}: {}", text[n]);
-        }
+        // Without the 5 s budget of `highlight`: a slow debug build on a busy machine
+        // would leave the last lines plain.
+        let got = assert_single_pass("long.rs", &text);
         // The comment really is one: the line inside it is not coloured as code.
         let inside = text.iter().position(|l| l == "struct NotCode;").unwrap();
         assert!(got.lines[inside].iter().all(|r| r.2 == Cat::Comment as u8));

@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 pub struct AppDirs {
     pub config: PathBuf,
     pub data: PathBuf,
+    /// Machine-local data (Windows `%LOCALAPPDATA%`, Unix `XDG_DATA_HOME`), used for
+    /// large executables such as in-app updates so they never roam across Windows profiles.
+    pub local_data: PathBuf,
     /// True when running from a folder with a `portable` marker.
     pub portable: bool,
 }
@@ -29,9 +32,13 @@ impl AppDirs {
         let data = dirs::data_dir()
             .unwrap_or_else(std::env::temp_dir)
             .join("gall");
+        let local_data = dirs::data_local_dir()
+            .map(|p| p.join("gall"))
+            .unwrap_or_else(|| data.clone());
         AppDirs {
             config,
             data,
+            local_data,
             portable: false,
         }
     }
@@ -40,6 +47,7 @@ impl AppDirs {
         AppDirs {
             config: root.to_path_buf(),
             data: root.to_path_buf(),
+            local_data: root.to_path_buf(),
             portable: false,
         }
     }
@@ -47,6 +55,11 @@ impl AppDirs {
     /// The webview's own data (localStorage, cache).
     pub fn webview(&self) -> PathBuf {
         self.data.join("WebView")
+    }
+
+    /// Staged and installed user-space updates.
+    pub fn updates(&self) -> PathBuf {
+        self.local_data.join("updates")
     }
 
     pub fn settings(&self) -> PathBuf {
@@ -61,11 +74,22 @@ impl AppDirs {
     pub fn session(&self) -> PathBuf {
         self.config.join("session.json")
     }
+    /// The opt-in configuration of the local explanation model (`compare_ai`); absent means off.
+    pub fn compare_ai(&self) -> PathBuf {
+        self.config.join("compare-ai.json")
+    }
+    /// The tabs of the comparison window (`storage::compare_session`).
+    pub fn compare_sessions(&self) -> PathBuf {
+        self.config.join("compare-sessions.json")
+    }
     pub fn templates(&self) -> PathBuf {
         self.config.join("templates")
     }
     pub fn themes(&self) -> PathBuf {
         self.config.join("themes")
+    }
+    pub fn actions(&self) -> PathBuf {
+        self.config.join("actions.d")
     }
     pub fn database(&self) -> PathBuf {
         self.data.join("gall.db")
@@ -89,5 +113,7 @@ mod tests {
         assert!(d.portable);
         assert_eq!(d.settings(), root.join("settings.json"));
         assert!(d.webview().starts_with(&root) && d.logs().starts_with(&root));
+        assert_eq!(d.updates(), root.join("updates"));
+        assert_eq!(AppDirs::at(&root).updates(), root.join("updates"));
     }
 }

@@ -14,15 +14,17 @@
 //   ("ask" — show a menu — is available as a default action only)
 import type React from "react";
 import { getState } from "./store";
-import { fail, named, notify, refreshUndo, showMenu, transfer } from "./actions";
+import { fail, named, notify, refreshUndo, showMenuAt, transfer } from "./actions";
 import { listen } from "@tauri-apps/api/event";
 import { api } from "../api/ipc";
 import { isInside } from "../core/path";
+import { platformLabel } from "../core/keymap";
 
 type Internal =
   | { kind: "files"; paths: string[] }
   | { kind: "tab"; b: number; idx: number }
-  | { kind: "fav"; g: number; i: number };
+  | { kind: "fav"; g: number; i: number }
+  | { kind: "workspace"; idx: number };
 
 export type HintKind = "move" | "copy" | "link" | "menu" | "compare" | "none";
 export interface DragHint {
@@ -45,7 +47,7 @@ let mods: Mods = { known: false, ctrl: false, shift: false, alt: false };
 let poll: number | null = null;
 
 // Last described drop target; lets the hint update when only a key changes.
-type EvMods = { ctrlKey: boolean; shiftKey: boolean; altKey: boolean };
+type EvMods = { ctrlKey: boolean; metaKey?: boolean; shiftKey: boolean; altKey: boolean };
 let target: { dest: string; n: number; srcs: string[]; ev: EvMods } | null = null;
 let pointer = { x: 0, y: 0 };
 let noopText: string | null = null;
@@ -80,11 +82,11 @@ function mountOf(p: string): string {
 }
 
 /** The action a drop performs right now, from held keys and the default setting. */
-export function currentAction(sources: string[], dest: string, ev?: { ctrlKey: boolean; shiftKey: boolean; altKey: boolean }): HintKind {
+export function currentAction(sources: string[], dest: string, ev?: { ctrlKey: boolean; metaKey?: boolean; shiftKey: boolean; altKey: boolean }): HintKind {
   // Use GDK state when available; otherwise fall back to the event flags.
   // The self-test sets __gallEventMods to drive modifiers through events.
   const useEvent = !mods.known || (globalThis as { __gallEventMods?: boolean }).__gallEventMods;
-  const m = useEvent ? { ctrl: !!ev?.ctrlKey, shift: !!ev?.shiftKey, alt: !!ev?.altKey } : mods;
+  const m = useEvent ? { ctrl: !!(ev?.ctrlKey || ev?.metaKey), shift: !!ev?.shiftKey, alt: !!ev?.altKey } : mods;
   if (m.alt) return "link";
   if (m.ctrl) return "copy";
   if (m.shift) return "move";
@@ -105,13 +107,13 @@ function describe(kind: HintKind, n: number, dest: string): { text: string; tip:
   const name = baseName(dest);
   switch (kind) {
     case "move":
-      return { text: `Move${items} to ${name}`, tip: "hold Ctrl = copy · Alt = link" };
+      return { text: `Move${items} to ${name}`, tip: platformLabel("hold Ctrl = copy · Alt = link") };
     case "copy":
-      return { text: `Copy${items} to ${name}`, tip: "hold Shift = move · Alt = link" };
+      return { text: `Copy${items} to ${name}`, tip: platformLabel("hold Shift = move · Alt = link") };
     case "link":
       return { text: `Link${items} in ${name}`, tip: "symbolic link" };
     case "menu":
-      return { text: `Choose action in ${name}`, tip: "hold Ctrl = copy · Shift = move · Alt = link" };
+      return { text: `Choose action in ${name}`, tip: platformLabel("hold Ctrl = copy · Shift = move · Alt = link") };
     default:
       return { text: name, tip: "" };
   }
@@ -156,6 +158,14 @@ function stopPolling() {
 
 let externalDrag = false;
 let raf = 0;
+const dragEndSubs = new Set<() => void>();
+
+export function subscribeDragEnd(cb: () => void) {
+  dragEndSubs.add(cb);
+  return () => {
+    dragEndSubs.delete(cb);
+  };
+}
 
 function endDrag() {
   current = null;
@@ -165,6 +175,7 @@ function endDrag() {
   compareDest = null;
   stopPolling();
   setHint(null);
+  dragEndSubs.forEach((cb) => cb());
 }
 
 if (typeof window !== "undefined") {
@@ -224,9 +235,10 @@ let nativeActive = false;
 export function startDrag(e: React.DragEvent, paths: string[]) {
   // Windows and macOS: the page's drag carries only text, which Explorer / Finder and
   // mail cannot take as files. The app starts a system drag of the files instead; drops
-  // inside Gall still see it as our own drag (`current`).
+  // inside Gall still see it as our own drag (`current`). Synthetic events (selftest)
+  // have no OS drag event behind them and stay on the HTML5 path.
   const platform = getState().info?.platform;
-  if (platform === "windows" || platform === "macos") {
+  if ((platform === "windows" || platform === "macos") && e.isTrusted) {
     e.preventDefault();
     current = { kind: "files", paths };
     nativeActive = true;
@@ -254,6 +266,14 @@ export function startTabDrag(e: React.DragEvent, b: number, idx: number, label: 
 
 export function startFavDrag(e: React.DragEvent, g: number, i: number, path: string) {
   begin(e, { kind: "fav", g, i }, path);
+}
+
+export function startWorkspaceDrag(e: React.DragEvent, idx: number, label: string) {
+  begin(e, { kind: "workspace", idx }, label);
+}
+
+export function draggedWorkspace(): { idx: number } | null {
+  return current?.kind === "workspace" ? { idx: current.idx } : null;
 }
 
 export function draggedTab(): { b: number; idx: number } | null {
@@ -303,7 +323,7 @@ export function onDragOverTarget(e: React.DragEvent, dest: string) {
   // the apps it goes to), and a drop with another effect would be refused: our hint shows
   // the real action, and the drop performs it.
   e.dataTransfer.dropEffect = kind === "move" && !nativeActive ? "move" : "copy";
-  target = { dest, n: own.length || 1, srcs: own, ev: { ctrlKey: e.ctrlKey, shiftKey: e.shiftKey, altKey: e.altKey } };
+  target = { dest, n: own.length || 1, srcs: own, ev: { ctrlKey: e.ctrlKey, metaKey: e.metaKey, shiftKey: e.shiftKey, altKey: e.altKey } };
   return true;
 }
 
@@ -338,7 +358,7 @@ export function dropInto(e: React.DragEvent, dest: string) {
   e.stopPropagation();
   // DataTransfer is only readable during the event: capture everything now.
   const paths = draggedPaths(e.dataTransfer).filter((p) => p !== dest);
-  const ev = { ctrlKey: e.ctrlKey, shiftKey: e.shiftKey, altKey: e.altKey };
+  const ev = { ctrlKey: e.ctrlKey, metaKey: e.metaKey, shiftKey: e.shiftKey, altKey: e.altKey };
   const at = { x: e.clientX, y: e.clientY };
   if (!paths.length) {
     // Windows: files from Explorer come without paths; WebView2 tells them to the host,
@@ -352,6 +372,22 @@ export function dropInto(e: React.DragEvent, dest: string) {
       wv.postMessageWithAdditionalObjects(`gall-drop:${id}`, files);
       // A drop that never gets its paths is forgotten.
       setTimeout(() => pendingDrops.delete(id), 10_000);
+      return;
+    }
+    // macOS: WKWebView can omit `text/uri-list` on drags from Finder; fall back to `NSDragPboard`.
+    if (getState().info?.platform === "macos") {
+      api.macosDragPaths()
+        .then((dragPaths) => {
+          const filtered = dragPaths.filter((p) => p !== dest);
+          if (filtered.length) {
+            performDrop(filtered, dest, ev, at);
+          } else {
+            notify("Cannot drop these items: the source gave no file paths. Extract them to a folder first, then drag them from there.", "warn");
+          }
+        })
+        .catch(() => {
+          notify("Cannot drop these items: the source gave no file paths. Extract them to a folder first, then drag them from there.", "warn");
+        });
       return;
     }
     api.uiLog("warn", `drop on ${dest}: no paths (types: ${Array.from(e.dataTransfer.types ?? []).join(",")})`).catch(() => {});
@@ -400,7 +436,7 @@ function performDrop(paths: string[], dest: string, ev: EvMods, at: { x: number;
       if (kind === "link") {
         linkInto(paths, dest);
       } else if (kind === "menu") {
-        showMenu(at.x, at.y, [
+        showMenuAt({ x: at.x, y: at.y }, [
           { label: `Move ${named(paths)} here`, run: () => transfer("move", paths, dest) },
           { label: `Copy ${named(paths)} here`, run: () => transfer("copy", paths, dest) },
           { label: paths.length === 1 ? "Create symbolic link here" : "Create symbolic links here", run: () => linkInto(paths, dest) },

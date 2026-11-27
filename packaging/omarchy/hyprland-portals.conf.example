@@ -1,0 +1,5 @@
+# Gall as the "Open file" / "Save as" dialog of other programs (Omarchy: hyprland-portals.conf).
+# `;gtk` keeps the GTK dialog as the fallback when Gall's backend is not running.
+[preferred]
+default=hyprland;gtk
+org.freedesktop.impl.portal.FileChooser=gall;gtk

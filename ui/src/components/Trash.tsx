@@ -2,6 +2,7 @@
 // Restore / Delete permanently / Empty trash. One window on every system: the Windows
 // Recycle Bin is not a folder Gall can list, and Linux's Trash/files has no restore.
 import { useEffect, useMemo, useRef, useState } from "react";
+import { tt } from "../i18n";
 import { api } from "../api/ipc";
 import type { TrashEntry } from "../api/types";
 import { formatDate, formatSize, formatTime } from "../core/format";
@@ -121,6 +122,9 @@ export function TrashWindow() {
 
   const gAt = useRef(0);
   const vimKeys = useStore((st) => st.settings?.vimKeys ?? false);
+  const info = useStore((st) => st.info);
+  const isMac = info?.platform === "macos";
+  const macFda = info?.macosFullDiskAccess;
   const goTo = (i: number) => {
     if (!rows[i]) return;
     setAnchor(i);
@@ -176,11 +180,25 @@ export function TrashWindow() {
       <div ref={winRef} className="modal search-win trash-win" onMouseDown={(e) => e.stopPropagation()} tabIndex={-1} onKeyDown={onKey}>
         <div className="shead">
           <Icon name="trash" size={17} />
-          <b>Trash</b>
+          <b>{tt("Trash")}</b>
           <span className="tw-sum">{items == null ? "" : items.length ? `${A.items(items.length)} · ${formatSize(total)}` : "empty"}</span>
-          <input ref={inputRef} type="text" placeholder="Filter by name or location" value={filter} onChange={(e) => setFilter(e.target.value)} />
-          <button className="icon-btn" title="Reload" onClick={() => load()}><Icon name="refresh" size={15} /></button>
+          <input ref={inputRef} type="text" placeholder={tt("Filter by name or location")} value={filter} onChange={(e) => setFilter(e.target.value)} />
+          <button className="icon-btn" title={tt("Reload")} onClick={() => load()}><Icon name="refresh" size={15} /></button>
         </div>
+        {isMac && (
+          <div className="fda-banner" role="note">
+            <span>
+              {macFda === false
+                ? tt("On macOS, Gall's Trash only shows items deleted from Gall. Items deleted in Finder or other apps live in ~/.Trash, which requires Full Disk Access.")
+                : tt("On macOS, Gall's Trash shows items deleted from Gall so Restore knows their original folders. Open ~/.Trash in Finder to see items deleted by other apps.")}
+            </span>
+            {macFda === false && (
+              <button className="btn sm" onClick={() => { api.openFullDiskAccessSettings().catch(A.fail); }}>
+                {tt("Full Disk Access…")}
+              </button>
+            )}
+          </div>
+        )}
         <div className="r tw-head">
           <span />
           {head("name", "Name")}
@@ -189,8 +207,8 @@ export function TrashWindow() {
           {head("size", "Size", "num")}
         </div>
         <div className="results">
-          {items == null && <div className="tw-empty">Reading the trash…</div>}
-          {items != null && !items.length && <div className="tw-empty"><Icon name="trash" size={40} /><span>The trash is empty</span></div>}
+          {items == null && <div className="tw-empty">{tt("Reading the trash…")}</div>}
+          {items != null && !items.length && <div className="tw-empty"><Icon name="trash" size={40} /><span>{tt("The trash is empty")}</span></div>}
           {items != null && items.length > 0 && !rows.length && <div className="tw-empty">Nothing matches “{filter}”</div>}
           {rows.map((r, i) => {
             const ms = r.deleted * 1000;
@@ -200,7 +218,7 @@ export function TrashWindow() {
                   e.preventDefault();
                   const list = sel.has(r.id) ? picked : [r];
                   if (!sel.has(r.id)) { setSel(new Set([r.id])); setAnchor(i); }
-                  A.showMenu(e.clientX, e.clientY, [
+                  A.showMenuFor(e, [
                     { label: list.length > 1 ? `Restore ${list.length} items` : "Restore", run: () => restore(list) },
                     { label: "Open original folder", run: () => { close(); A.navigate(A.activeBrowser(), r.originalParent); } },
                     { separator: true },
@@ -220,9 +238,9 @@ export function TrashWindow() {
           <button className="btn primary" disabled={!picked.length || busy} onClick={() => restore(picked)}>
             Restore{picked.length > 1 ? ` ${picked.length} items` : ""}
           </button>
-          <button className="btn" disabled={!picked.length || busy} title="Del" onClick={() => purge(picked)}>Delete permanently</button>
-          <span className="tw-hint">Enter restore · Del delete · Ctrl+A all</span>
-          <button className="btn danger" disabled={!items?.length || busy} onClick={empty}>Empty trash</button>
+          <button className="btn" disabled={!picked.length || busy} title="Del" onClick={() => purge(picked)}>{tt("Delete permanently")}</button>
+          <span className="tw-hint">{tt("Enter restore · Del delete · Ctrl+A all")}</span>
+          <button className="btn danger" disabled={!items?.length || busy} onClick={empty}>{tt("Empty trash")}</button>
         </div>
       </div>
     </div>

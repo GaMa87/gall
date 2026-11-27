@@ -1,26 +1,30 @@
 // Navigation pane: Miller columns (N-01…N-05) or breadcrumbs (N-04).
 import { useEffect, useMemo, useRef, useState } from "react";
+import { tt } from "../i18n";
 import type { FileEntry } from "../api/types";
 import { fitColumnWidths } from "../core/columns";
 import { quickFilterMatches } from "../core/filter";
 import { ancestors, basename, isInside } from "../core/path";
+import { worktreeColor } from "../core/gitWorktree";
 import { naturalCmp } from "../core/sort";
 import * as A from "../state/actions";
 import { dropInto, onDragOverTarget, startDrag } from "../state/dnd";
-import { useDirList } from "../state/hooks";
+import { useDirList, useSize } from "../state/hooks";
 import { useStore } from "../state/store";
 import { FileIcon, Icon } from "./Icon";
+import { platformLabel } from "../core/keymap";
 
 /** Breadcrumbs: every segment is clickable and a drop target. */
 export function Breadcrumbs({ b, path }: { b: number; path: string }) {
   const chain = ancestors(path);
   const [drop, setDrop] = useState<string | null>(null);
+  const worktree = useStore((s) => s.worktreeOf[b] ?? null);
   // A drive root (C:\, /) alone would only repeat the tab and the folder header: then the
   // bar keeps just its icon (it stays, so the list does not move up and down).
   const shown = chain.length > 1 ? chain : [];
   return (
     <div className="bcrumbs">
-      <button className="bc-icon" title={`${path}\nEdit path (Ctrl+L)`} onClick={() => A.openOverlay({ type: "pathEdit", b })}>
+      <button className="bc-icon" title={platformLabel(`${path}\nEdit path (Ctrl+L)`)} onClick={() => A.openOverlay({ type: "pathEdit", b })}>
         <Icon name="crumbs" size={14} />
       </button>
       {shown.map((p, i) => (
@@ -28,6 +32,7 @@ export function Breadcrumbs({ b, path }: { b: number; path: string }) {
           {i > 0 && <span className="sep">›</span>}
           <span
             className={`seg ${i === chain.length - 1 ? "last" : ""} ${drop === p ? "drop" : ""}`}
+            style={worktree === p ? { boxShadow: `inset 0 -2px ${worktreeColor(p)}` } : undefined}
             title={p}
             onClick={() => A.navigate(b, p)}
             onMouseDown={(e) => {
@@ -65,7 +70,8 @@ interface ColProps {
 /** One Miller column listing the sub-folders of `dir`. */
 function MillerColumn({ b, dir, onPath, width, isCurrent, onHover }: ColProps) {
   const settings = useStore((s) => s.settings);
-  const { entries } = useDirList(dir, settings, true);
+  const showHidden = useStore((s) => A.hiddenShown(s, b));
+  const { entries } = useDirList(dir, settings, true, showHidden);
   const [filter, setFilter] = useState("");
   const [drop, setDrop] = useState<string | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
@@ -101,7 +107,7 @@ function MillerColumn({ b, dir, onPath, width, isCurrent, onHover }: ColProps) {
       }}
       onContextMenu={(ev) => {
         ev.preventDefault();
-        A.showMenu(ev.clientX, ev.clientY, [
+        A.showMenuFor(ev, [
           { label: "Open", run: () => A.navigate(b, e.path) },
           { label: "Open in new tab", run: () => A.sessionCmd({ op: "newTab", b, path: e.path }) },
           { label: A.hasOtherTarget(b) ? "Open in other browser" : "Open in new tab", run: () => A.openInOther(b, e.path) },
@@ -153,7 +159,7 @@ function MillerColumn({ b, dir, onPath, width, isCurrent, onHover }: ColProps) {
         <div className="mcol-filter">
           <Icon name="search" size={12} />
           {filter}
-          <button className="icon-btn" title="Clear filter" onClick={() => setFilter("")}>×</button>
+          <button className="icon-btn" title={tt("Clear filter")} onClick={() => setFilter("")}>×</button>
         </div>
       )}
       <div className="mcol-list" ref={listRef}>{sorted.map(item)}</div>
@@ -189,7 +195,8 @@ function DrivesColumn({ b, path, width }: { b: number; path: string; width: numb
 export function MillerColumns({ b, path, width, includeCurrent, trailing }: {
   b: number;
   path: string;
-  width: number;
+  /** Optional explicit width; when omitted, measures its own `.nav-pane` container. */
+  width?: number;
   /** Show a column listing the current folder's sub-folders (Standard layout). */
   includeCurrent: boolean;
   /** Element rendered after the columns (Columns layout: the folder pane). */
@@ -199,25 +206,27 @@ export function MillerColumns({ b, path, width, includeCurrent, trailing }: {
   const home = useStore((s) => s.info?.home ?? "");
   const [hover, setHover] = useState<number | null>(null);
   const timer = useRef<number | null>(null);
+  const [scrollRef, navSize] = useSize<HTMLDivElement>();
+  const effectiveWidth = width ?? navSize.w;
   const full = ancestors(path);
   // Finder-style: inside the home folder, start at home (drives column still reaches /).
   const homeIdx = settings.columnsFromHome && home && home !== "/" && isInside(path, home) ? full.indexOf(home) : -1;
   const chain = homeIdx > 0 ? full.slice(homeIdx) : full;
   const cols = includeCurrent ? chain : chain.slice(0, -1);
   const drivesW = 64;
-  const trailingMin = trailing ? Math.max(320, width * 0.45) : 0;
+  const trailingMin = trailing ? Math.max(320, effectiveWidth * 0.45) : 0;
   // Each column draws a 1px right border (drives column included).
-  const avail = Math.max(0, width - drivesW - trailingMin - (cols.length + 1));
+  const avail = Math.max(0, effectiveWidth - drivesW - trailingMin - (cols.length + 1));
   const minW = settings.columnMinWidth;
   const maxW = settings.columnMaxWidth;
   const hovered = hover !== null && hover < cols.length && settings.columnHoverExpand ? hover : null;
   const widths = fitColumnWidths(cols.length, avail, minW, maxW, hovered);
-  const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    // Keep the newest columns visible.
-    if (scrollRef.current) scrollRef.current.scrollLeft = scrollRef.current.scrollWidth;
-  }, [path, width]);
+    // Keep the newest columns visible when the pane overflows horizontally.
+    const el = scrollRef.current;
+    if (el && el.scrollWidth > el.clientWidth) el.scrollLeft = el.scrollWidth;
+  }, [path, effectiveWidth, scrollRef]);
 
   return (
     <div className="nav-pane" ref={scrollRef} style={{ overflowX: "auto", flex: 1, borderBottom: trailing ? "none" : undefined }}>

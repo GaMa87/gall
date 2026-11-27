@@ -9,7 +9,7 @@
 //! as a `text/uri-list` already.)
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter};
 use webview2_com::Microsoft::Web::WebView2::Win32::{
     ICoreWebView2File, ICoreWebView2WebMessageReceivedEventArgs,
     ICoreWebView2WebMessageReceivedEventArgs2,
@@ -23,12 +23,10 @@ struct Dropped {
     paths: Vec<String>,
 }
 
-/// Listens for dropped files on the main window's webview.
-pub fn install(app: &AppHandle) {
-    let Some(win) = app.get_webview_window("main") else {
-        return;
-    };
+/// Listens for dropped files on a window's webview.
+pub fn install_for_window(app: &AppHandle, win: &tauri::WebviewWindow) {
     let h = app.clone();
+    let label = win.label().to_string();
     let res = win.with_webview(move |wv| {
         // SAFETY: COM calls on the webview's own (main) thread, as with_webview runs them.
         unsafe {
@@ -38,7 +36,7 @@ pub fn install(app: &AppHandle) {
             };
             let handler = WebMessageReceivedEventHandler::create(Box::new(move |_, args| {
                 if let Some(args) = args {
-                    on_message(&h, &args);
+                    on_message(&h, &label, &args);
                 }
                 Ok(())
             }));
@@ -54,7 +52,11 @@ pub fn install(app: &AppHandle) {
 }
 
 /// A "gall-drop:<id>" message with files attached: their paths go back to the UI.
-unsafe fn on_message(app: &AppHandle, args: &ICoreWebView2WebMessageReceivedEventArgs) {
+unsafe fn on_message(
+    app: &AppHandle,
+    label: &str,
+    args: &ICoreWebView2WebMessageReceivedEventArgs,
+) {
     let mut msg = PWSTR::null();
     if args.TryGetWebMessageAsString(&mut msg).is_err() {
         return; // not a string (Tauri's own messages are strings too, but not ours)
@@ -91,5 +93,5 @@ unsafe fn on_message(app: &AppHandle, args: &ICoreWebView2WebMessageReceivedEven
         }
     }
     log::info!("dropped files: {} path(s)", paths.len());
-    let _ = app.emit("external-drop", Dropped { id, paths });
+    let _ = app.emit_to(label, "external-drop", Dropped { id, paths });
 }

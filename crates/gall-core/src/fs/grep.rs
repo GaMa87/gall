@@ -4,6 +4,10 @@
 //! streams results per file. Matches carry UTF-16 ranges so the UI can
 //! highlight them directly.
 
+use super::search_filter::{
+    build_exclude_override, walk_hidden_matches, CountBudget, FilterConfig, FilterMatcher,
+    HiddenCount, ProbeMatch,
+};
 use grep_matcher::Matcher;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{sinks::Lossy, BinaryDetection, SearcherBuilder};
@@ -30,12 +34,15 @@ pub struct GrepOptions {
     pub regex: bool,
     /// Globs a file must match (empty = all), e.g. `*.rs, src/**`.
     pub include: Vec<String>,
-    /// Globs to skip, e.g. `*.min.js, vendor/`.
+    /// User-specified globs to skip, e.g. `*.min.js, vendor/` (always applied).
     pub exclude: Vec<String>,
+    /// Global default excluded folders/globs (e.g. `node_modules`, `target`);
+    /// skipped when `everything` is set and used to detect hidden matches.
+    pub default_exclude: Vec<String>,
     pub include_hidden: bool,
     pub respect_gitignore: bool,
-    /// Search everything: no `.gallignore`, no cache folders skipped (the caller
-    /// also leaves out the excluded-folders setting and `.gitignore`).
+    /// Search everything: no `.gallignore`, no `.gitignore`, no `default_exclude`,
+    /// no cache folders skipped (user `include`/`exclude` globs still apply).
     pub everything: bool,
     pub max_matches: usize,
     /// Files larger than this (bytes) are skipped.
@@ -50,6 +57,7 @@ impl Default for GrepOptions {
             regex: false,
             include: vec![],
             exclude: vec![],
+            default_exclude: vec![],
             include_hidden: false,
             respect_gitignore: true,
             everything: false,
@@ -74,6 +82,9 @@ pub struct LineMatch {
 pub struct FileMatches {
     pub path: String,
     pub matches: Vec<LineMatch>,
+    /// True when normal search filters would have hidden this file (shown under `everything`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -123,13 +134,14 @@ pub fn grep(
     }
     let matcher = build_matcher(pattern, opts)?;
 
+    let use_git = !opts.everything && opts.respect_gitignore;
     let mut wb = ignore::WalkBuilder::new(root);
     wb.hidden(!opts.include_hidden)
-        .git_ignore(opts.respect_gitignore)
-        .git_global(opts.respect_gitignore)
-        .git_exclude(opts.respect_gitignore)
-        .ignore(opts.respect_gitignore)
-        .parents(opts.respect_gitignore)
+        .git_ignore(use_git)
+        .git_global(use_git)
+        .git_exclude(use_git)
+        .ignore(use_git)
+        .parents(use_git)
         .follow_links(false)
         .filter_entry({
             // Network shares inside the folder are not searched (see `remote_mounts`).
@@ -156,7 +168,11 @@ pub fn grep(
             .filter(|g| !g.is_empty())
             .collect()
     };
-    let (inc, exc) = (globs(&opts.include), globs(&opts.exclude));
+    let inc = globs(&opts.include);
+    let mut exc = globs(&opts.exclude);
+    if !opts.everything {
+        exc.extend(globs(&opts.default_exclude));
+    }
     let include = if inc.is_empty() {
         None
     } else {
@@ -175,6 +191,18 @@ pub fn grep(
         wb.overrides(ob.build().map_err(|e| e.to_string())?);
     }
 
+    let filter_matcher = opts.everything.then(|| {
+        FilterMatcher::new(
+            root,
+            FilterConfig {
+                include_hidden: opts.include_hidden,
+                respect_gitignore: opts.respect_gitignore,
+                exclude: opts.default_exclude.clone(),
+                use_gallignore: true,
+            },
+        )
+    });
+
     let files = AtomicUsize::new(0);
     let matches = AtomicUsize::new(0);
     let searched = AtomicUsize::new(0);
@@ -192,6 +220,7 @@ pub fn grep(
         let (files, matches, searched, truncated) = (&files, &matches, &searched, &truncated);
         let cloud_only = &cloud_only;
         let include = &include;
+        let filter_matcher = &filter_matcher;
         Box::new(move |res| {
             use ignore::WalkState;
             if cancel.load(Ordering::Relaxed) || truncated.load(Ordering::Relaxed) {
@@ -245,9 +274,13 @@ pub fn grep(
             );
             if !found.is_empty() {
                 files.fetch_add(1, Ordering::Relaxed);
+                let hidden = filter_matcher
+                    .as_ref()
+                    .is_some_and(|m| m.is_path_hidden(entry.path(), false));
                 on_file(FileMatches {
                     path: entry.path().to_string_lossy().into_owned(),
                     matches: found,
+                    hidden,
                 });
             }
             WalkState::Continue
@@ -262,6 +295,103 @@ pub fn grep(
         truncated: truncated.into_inner(),
         elapsed_ms: t0.elapsed().as_millis() as u64,
     })
+}
+
+/// Maximum number of hidden files opened during background hidden-match counting.
+const MAX_HIDDEN_FILES_OPENED: usize = 400;
+
+/// Counts how many files hidden by normal search filters (`.gallignore`,
+/// `.gitignore`, `default_exclude`, `CACHEDIR.TAG`) contain a match for `pattern`,
+/// within `budget`. Honours binary detection, `max_filesize`, cloud-only skips,
+/// and user `include`/`exclude` globs; stops reading each file on its first match.
+pub fn count_hidden(
+    root: &Path,
+    pattern: &str,
+    opts: &GrepOptions,
+    budget: CountBudget,
+    cancel: &AtomicBool,
+) -> Result<HiddenCount, String> {
+    if pattern.is_empty() {
+        return Ok(HiddenCount::default());
+    }
+    let matcher = build_matcher(pattern, opts)?;
+    let inc: Vec<String> = opts
+        .include
+        .iter()
+        .flat_map(|g| g.split(','))
+        .map(|g| g.trim().to_string())
+        .filter(|g| !g.is_empty())
+        .collect();
+    let include = if inc.is_empty() {
+        None
+    } else {
+        let mut ob = ignore::overrides::OverrideBuilder::new(root);
+        for g in &inc {
+            ob.add(g).map_err(|e| format!("include '{g}': {e}"))?;
+        }
+        Some(ob.build().map_err(|e| e.to_string())?)
+    };
+    let user_exclude = build_exclude_override(root, &opts.exclude);
+    let filter = FilterConfig {
+        include_hidden: opts.include_hidden,
+        respect_gitignore: opts.respect_gitignore,
+        exclude: opts.default_exclude.clone(),
+        use_gallignore: true,
+    };
+    let mut searcher = SearcherBuilder::new()
+        .binary_detection(BinaryDetection::quit(b'\x00'))
+        .line_terminator(grep_matcher::LineTerminator::crlf())
+        .line_number(true)
+        .build();
+    let mut files_opened = 0usize;
+
+    let res = walk_hidden_matches(
+        root,
+        &filter,
+        user_exclude.as_ref(),
+        budget,
+        cancel,
+        |path, _name, is_dir| {
+            if is_dir {
+                return ProbeMatch::NoMatch;
+            }
+            if include
+                .as_ref()
+                .is_some_and(|patterns| !patterns.matched(path, false).is_whitelist())
+            {
+                return ProbeMatch::NoMatch;
+            }
+            let Ok(meta) = std::fs::symlink_metadata(path) else {
+                return ProbeMatch::NoMatch;
+            };
+            if !meta.is_file() || meta.len() > opts.max_filesize {
+                return ProbeMatch::NoMatch;
+            }
+            if cfg!(any(windows, target_os = "macos")) && super::entry::is_cloud_only(&meta) {
+                return ProbeMatch::NoMatch;
+            }
+            if files_opened >= MAX_HIDDEN_FILES_OPENED {
+                return ProbeMatch::BudgetExhausted;
+            }
+            files_opened += 1;
+            let mut matched = false;
+            let _ = searcher.search_path(
+                &matcher,
+                path,
+                Lossy(|_lnum, _line| {
+                    matched = true;
+                    // Stop after the first match in this file.
+                    Ok(false)
+                }),
+            );
+            if matched {
+                ProbeMatch::Matched
+            } else {
+                ProbeMatch::NoMatch
+            }
+        },
+    );
+    Ok(res)
 }
 
 /// Builds a [`LineMatch`], cutting very long lines to a window around the
@@ -536,5 +666,134 @@ mod tests {
         let d = tree();
         let c = read_context(&d.path().join("src/a.rs"), 2, 1, 1).unwrap();
         assert_eq!(c.iter().map(|x| x.0).collect::<Vec<_>>(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn hidden_count_and_everything_marking() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path();
+        for dir in [".git", "src", "gen", "dist", "node_modules/pkg"] {
+            std::fs::create_dir_all(p.join(dir)).unwrap();
+        }
+        std::fs::write(p.join("src/visible.rs"), "shared_token\n").unwrap();
+        std::fs::write(
+            p.join("gen/hidden_gen.rs"),
+            "shared_token\nonly_hidden_token\n",
+        )
+        .unwrap();
+        std::fs::write(p.join("dist/hidden_git.js"), "only_hidden_token\n").unwrap();
+        std::fs::write(p.join("node_modules/pkg/dep.js"), "only_hidden_token\n").unwrap();
+        // Binary hidden file containing the token must NOT be counted.
+        std::fs::write(p.join("gen/bin.dat"), b"only_hidden_token\x00\x01").unwrap();
+        std::fs::write(p.join(".gitignore"), "dist/\n").unwrap();
+        std::fs::write(p.join(".gallignore"), "/gen/\n").unwrap();
+
+        let base_opts = GrepOptions {
+            respect_gitignore: true,
+            default_exclude: vec!["node_modules".into()],
+            ..Default::default()
+        };
+        let cancel = AtomicBool::new(false);
+
+        // Zero visible + 3 hidden text files (binary file ignored).
+        let (vis, _) = run(p, "only_hidden_token", base_opts.clone());
+        assert!(vis.is_empty());
+        let hc = count_hidden(
+            p,
+            "only_hidden_token",
+            &base_opts,
+            CountBudget::grep_default(),
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(
+            hc,
+            HiddenCount {
+                count: 3,
+                capped: false
+            }
+        );
+
+        // User include filter is honoured during hidden count.
+        let rs_only = GrepOptions {
+            include: vec!["*.rs".into()],
+            ..base_opts.clone()
+        };
+        let hc = count_hidden(
+            p,
+            "only_hidden_token",
+            &rs_only,
+            CountBudget::grep_default(),
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(
+            hc,
+            HiddenCount {
+                count: 1,
+                capped: false
+            }
+        );
+
+        // Some visible (1) + 1 hidden.
+        let (vis, _) = run(p, "shared_token", base_opts.clone());
+        assert_eq!(vis.len(), 1);
+        let hc = count_hidden(
+            p,
+            "shared_token",
+            &base_opts,
+            CountBudget::grep_default(),
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(
+            hc,
+            HiddenCount {
+                count: 1,
+                capped: false
+            }
+        );
+
+        // Nothing hidden matches.
+        let hc = count_hidden(
+            p,
+            "absent_token_xyz",
+            &base_opts,
+            CountBudget::grep_default(),
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(
+            hc,
+            HiddenCount {
+                count: 0,
+                capped: false
+            }
+        );
+
+        // Alt+I (everything = true): returns both visible and hidden, marking only hidden files.
+        let all_opts = GrepOptions {
+            everything: true,
+            ..base_opts
+        };
+        let (all, _) = run(p, "shared_token", all_opts);
+        let tagged: Vec<(String, bool)> = all
+            .into_iter()
+            .map(|f| {
+                let name = Path::new(&f.path)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                (name, f.hidden)
+            })
+            .collect();
+        assert_eq!(
+            tagged,
+            vec![
+                ("hidden_gen.rs".to_string(), true),
+                ("visible.rs".to_string(), false),
+            ]
+        );
     }
 }

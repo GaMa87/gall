@@ -1,13 +1,17 @@
 // which-key popup for pending vim/leader sequences, and the "?" key sheet.
 import { useEffect, useMemo, useState } from "react";
+import { tt } from "../i18n";
 import { ACTION_LABELS, buildKeymap, keyboardProfile, KEYBOARD_PROFILES, type Action } from "../core/keymap";
-import type { Mark } from "../api/types";
+import type { ActionDef, Mark } from "../api/types";
+import { actionLabel } from "../core/actionsMenu";
+import type { Keyed } from "../core/actionsKeys";
 import { balanceColumns } from "../core/balance";
 import { tildify } from "../core/path";
-import { LEADER_KEYS, NORMAL_KEYS, PREVIOUS_MARK, resolve, shadowed, splitKeys, type KeyNode, type MarkOp } from "../core/vim";
+import { CUSTOM_ACTIONS_KEY, LEADER_KEYS, NORMAL_KEYS, PREVIOUS_MARK, resolve, shadowed, splitKeys, type KeyNode, type MarkOp } from "../core/vim";
 import * as A from "../state/actions";
 import { useStore } from "../state/store";
 import { ShortcutKeys, vimSteps, type KeySequence } from "./ShortcutKeys";
+import { platformLabel } from "../core/keymap";
 
 const DELAY_MS = 220;
 
@@ -28,6 +32,7 @@ export function WhichKey({ tree }: { tree: KeyNode }) {
   const r = resolve(tree, seq);
   if (r.kind !== "pending") return null;
   if (!shown) return <div className="wk-pending"><ShortcutKeys alternatives={[vimSteps(seq, leader)]} /></div>;
+  if (r.node.actions) return <ActionList seq={seq} leader={leader} label={r.node.label} />;
   if (r.node.mark) return <MarkList op={r.node.mark} seq={seq} leader={leader} label={r.node.label} marks={marks} home={home} />;
   const items = [...r.node.children!.entries()].sort(([a, x], [b, y]) => {
     const gx = !!x.children, gy = !!y.children;
@@ -37,21 +42,57 @@ export function WhichKey({ tree }: { tree: KeyNode }) {
   return (
     <div className="wk">
       <div className="wk-title">
-        <span className="wk-pressed">Pressed</span>
+        <span className="wk-pressed">{tt("Pressed")}</span>
         <ShortcutKeys alternatives={[vimSteps(seq, leader)]} />
         <span>{r.node.label.replace(/^\+/, "") || "keys"}</span>
-        <small>Choose the next key · Esc to cancel</small>
+        <small>{tt("Choose the next key · Esc to cancel")}</small>
       </div>
       <div className="wk-grid">
         {items.map(([k, n]) => (
           <div key={k} className={`wk-item ${n.children ? "group" : ""}`}>
             <ShortcutKeys alternatives={[vimSteps([k], leader)]} />
-            <span className="lbl">{n.label.replace(/^\+/, "")}</span>
+            <span className="lbl">{tt(n.label.replace(/^\+/, ""))}</span>
             {n.children && <span className="wk-more">more</span>}
           </div>
         ))}
       </div>
-      <div className="wk-hint">Release each step before pressing the next key.</div>
+      <div className="wk-hint">{tt("Release each step before pressing the next key.")}</div>
+    </div>
+  );
+}
+
+/** which-key for the custom-actions group: the actions.d actions that fit the selection, each with its key. */
+function ActionList({ seq, leader, label }: { seq: string[]; leader: string; label: string }) {
+  const [list, setList] = useState<{ items: Keyed<ActionDef>[]; count: number } | null>(null);
+  useEffect(() => {
+    let live = true;
+    setList(null);
+    A.leaderActions().then((l) => live && setList(l)).catch(() => live && setList({ items: [], count: 0 }));
+    return () => { live = false; };
+  }, []);
+  return (
+    <div className="wk wk-actions">
+      <div className="wk-title">
+        <span className="wk-pressed">{tt("Pressed")}</span>
+        <ShortcutKeys alternatives={[vimSteps(seq, leader)]} />
+        <span>{label.replace(/^\+/, "")}</span>
+        <small>{tt("Choose the next key · Esc to cancel")}</small>
+      </div>
+      {list === null ? (
+        <div className="wk-empty">{tt("Looking for actions…")}</div>
+      ) : list.items.length ? (
+        <div className="wk-grid">
+          {list.items.map(({ key, def }) => (
+            <div key={def.id} className="wk-item">
+              <ShortcutKeys alternatives={[[key]]} />
+              <span className="lbl">{actionLabel(def, list.count)}</span>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="wk-empty">{tt("No custom actions for this selection. Add some in the actions.d folder.")}</div>
+      )}
+      <div className="wk-hint">{tt("Release each step before pressing the next key.")}</div>
     </div>
   );
 }
@@ -72,7 +113,7 @@ function MarkList({ op, seq, leader, label, marks, home }: {
   return (
     <div className="wk wk-marks">
       <div className="wk-title">
-        <span className="wk-pressed">Pressed</span>
+        <span className="wk-pressed">{tt("Pressed")}</span>
         <ShortcutKeys alternatives={[vimSteps(seq, leader)]} />
         <span>{label}</span>
         <small>{hint} · Esc to cancel</small>
@@ -92,7 +133,7 @@ function MarkList({ op, seq, leader, label, marks, home }: {
       ) : (
         <div className="wk-empty">{op === "set" ? "No marks yet." : "No marks yet: m and a letter marks the current folder."}</div>
       )}
-      <div className="wk-hint">Marks are kept between sessions.</div>
+      <div className="wk-hint">{tt("Marks are kept between sessions.")}</div>
     </div>
   );
 }
@@ -144,7 +185,7 @@ export function KeyHelp() {
     const km = buildKeymap(settings.shortcuts, profile);
     const by = new Map<Action, KeySequence[]>();
     for (const [c, a] of km) if (!shadowed(c, { vim: settings.vimKeys, keymap: km, leader })) by.set(a, [...(by.get(a) ?? []), [c]]);
-    return [...by.entries()].map(([a, bindings]) => ({ bindings, label: ACTION_LABELS[a] }));
+    return [...by.entries()].map(([a, bindings]) => ({ bindings, label: tt(ACTION_LABELS[a]) }));
   }, [settings.shortcuts, settings.vimKeys, profile, leader]);
 
   const columnCount = useSheetColumns();
@@ -167,7 +208,11 @@ export function KeyHelp() {
   const hasLeader = !!leader;
   const vimRows = specRows(NORMAL_KEYS);
   const leaderSteps = leader === "Ctrl Ctrl" ? ["Ctrl", "Ctrl"] : vimSteps([leader]);
-  const leaderRows = specRows(LEADER_KEYS, leaderSteps);
+  // The custom-actions group has no fixed entries (they depend on the selection): one row explains it.
+  const leaderRows = [
+    ...specRows(LEADER_KEYS, leaderSteps),
+    { bindings: [[...leaderSteps, CUSTOM_ACTIONS_KEY]], label: "custom actions (actions.d) for the selection: press the number or letter shown" },
+  ];
 
   const sections = [
     settings.vimKeys && section("File list (vim)", vimRows),
@@ -252,11 +297,20 @@ export function KeyHelp() {
     section("Compare files", [
       { bindings: [["n"], ["]"], ["F8"]], label: "next change (text, table, hex)" },
       { bindings: [["Shift+n"], ["["], ["Shift+F8"]], label: "previous change" },
+      {
+        bindings: settings.vimKeys
+          ? [["Ctrl+Tab"], ["Ctrl+Shift+Tab"], ["Ctrl+PageDown"], ["Ctrl+PageUp"], ["g", "t"], ["g", "Shift+t"]]
+          : [["Ctrl+Tab"], ["Ctrl+Shift+Tab"], ["Ctrl+PageDown"], ["Ctrl+PageUp"]],
+        label: "next / previous comparison tab",
+      },
       { bindings: either("u"), label: "text: split / unified" },
       { bindings: either("Alt+ArrowRight", "Alt+ArrowLeft"), label: "text: copy the change to the right / left" },
       { bindings: either("Ctrl+S", "Ctrl+Z"), label: "text: save edits / undo an edit" },
       { bindings: [["w"], ["i"], ["e"], ["m"]], label: "text: ignore whitespace / case / line ends · minimal diff" },
       { bindings: [["t"]], label: "text: structural diff (reformatting is not a change) on / off" },
+      { bindings: [["Shift+e"]], label: "text: explain the changes with your local model (asked only on request)" },
+      { bindings: [["o"], ["Shift+h"]], label: "text: outline of modules and functions · show a collapsed generated file" },
+      { bindings: [["x"], ["Shift+x"], ["v"]], label: "text: next / previous moved block · find moved blocks with edits" },
       { bindings: [["z"], ["l"]], label: "text: fold unchanged · wrap lines" },
       { bindings: [["s"], ["r"], ["y"]], label: "text: swap sides · reload · copy patch" },
       { bindings: either("c"), label: "spreadsheet: only changes" },
@@ -281,7 +335,7 @@ export function KeyHelp() {
       { bindings: either("Ctrl+Enter"), label: "new folder: create and open it" },
       { bindings: either("Shift+Enter"), label: "new folder: create and move the selection inside" },
       { bindings: either("q"), label: "close any window except dialogs and notes (every profile)" },
-      { text: "hold Ctrl in a menu", label: "show the alternative item (Edit with…, Terminal with…, extract and trash)" },
+      { text: platformLabel("hold Ctrl in a menu"), label: "show the alternative item (Edit with…, Terminal with…, extract and trash)" },
       { bindings: either("c"), label: "item exists: cancel" },
       { bindings: either("s"), label: "item exists: skip" },
       { bindings: either("r"), label: "item exists: replace" },
@@ -319,19 +373,19 @@ export function KeyHelp() {
       <div className="kh" onMouseDown={(e) => e.stopPropagation()} tabIndex={-1}
         onKeyDown={(e) => { e.stopPropagation(); if (e.key === "Escape") A.openOverlay(null); }}>
         <div className="kh-head">
-          <h3>Keyboard</h3>
-          <input autoFocus value={q} placeholder="Filter shortcuts…" onChange={(e) => setQ(e.target.value)} />
+          <h3>{tt("Keyboard")}</h3>
+          <input autoFocus value={q} placeholder={tt("Filter shortcuts…")} onChange={(e) => setQ(e.target.value)} />
           <span className="pill on">{KEYBOARD_PROFILES[profile]}</span>
         </div>
-        <div className="kh-legend" aria-label="How to read shortcuts">
-          <div><span className="kh-legend-label">Together</span><ShortcutKeys alternatives={[["Ctrl+C"]]} /><small>Hold at the same time</small></div>
-          <div><span className="kh-legend-label">In order</span><ShortcutKeys alternatives={[["g", "g"]]} /><small>Release between steps</small></div>
-          <div><span className="kh-legend-label">Either one</span><ShortcutKeys alternatives={either("Ctrl+C", "Ctrl+Insert")} /><small>Choose one shortcut</small></div>
-          <div><span className="kh-legend-label">Letter shortcuts</span><small>Caps Lock is ignored; hold Shift for the shifted-letter shortcut.</small></div>
+        <div className="kh-legend" aria-label={tt("How to read shortcuts")}>
+          <div><span className="kh-legend-label">{tt("Together")}</span><ShortcutKeys alternatives={[["Ctrl+C"]]} /><small>{tt("Hold at the same time")}</small></div>
+          <div><span className="kh-legend-label">{tt("In order")}</span><ShortcutKeys alternatives={[["g", "g"]]} /><small>{tt("Release between steps")}</small></div>
+          <div><span className="kh-legend-label">{tt("Either one")}</span><ShortcutKeys alternatives={either("Ctrl+C", "Ctrl+Insert")} /><small>{tt("Choose one shortcut")}</small></div>
+          <div><span className="kh-legend-label">{tt("Letter shortcuts")}</span><small>{tt("Caps Lock is ignored; hold Shift for the shifted-letter shortcut.")}</small></div>
         </div>
         <div className="kh-scroll">
           {sections.length ? <div className="kh-cols">{columns.map((group) => <div className="kh-col" key={group[0]}>{group.map((i) => sections[i].el)}</div>)}</div>
-            : <div className="kh-empty" role="status"><b>No shortcuts match “{q}”</b><span>Try an action name or a key such as Ctrl+C.</span></div>}
+            : <div className="kh-empty" role="status"><b>No shortcuts match “{q}”</b><span>{tt("Try an action name or a key such as Ctrl+C.")}</span></div>}
         </div>
       </div>
     </div>

@@ -9,14 +9,14 @@
 .gg-sidebar { width: 260px; flex-shrink: 0; display: flex; flex-direction: column; border-right: 1px solid var(--border-soft); background: var(--bg); overflow: hidden; }
 .gg-side-tabs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 2px; padding: 5px; border-bottom: 1px solid var(--border-soft); }
 .gg-side-tabs button { font-size: 11px; padding: 5px; background: transparent; border: 0; }
-.gg-side-tabs button[aria-pressed=true] { background: var(--accent-soft); color: var(--accent-text); }
+.gg-side-tabs button[aria-pressed=true] { background: var(--accent-soft); color: var(--readable-accent-text, var(--accent-text)); }
 .gg-side-tools { display: flex; align-items: center; justify-content: space-between; font-size: 12px; padding: 10px; }
 .gg-side-tools button { padding: 0 7px; font-size: 15px; }
 .gg-side-list { flex: 1; overflow: auto; min-height: 0; }
-.gg-side-list h3 { font-size: 10px; text-transform: uppercase; color: var(--fg-dim); letter-spacing: .04em; margin: 12px 10px 6px; }
+.gg-side-list h3 { font-size: 10px; text-transform: uppercase; color: var(--readable-fg-dim, var(--fg-dim)); letter-spacing: .04em; margin: 12px 10px 6px; }
 .gg-side-row { display: flex; flex-direction: column; text-align: left; gap: 3px; width: 100%; border: 0; border-radius: 0; background: transparent; padding: 8px 12px; font-size: 12px; }
 .gg-side-row span, .gg-side-row small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
-.gg-side-row small { color: var(--fg-dim); font-size: 10px; }
+.gg-side-row small { color: var(--readable-fg-dim, var(--fg-dim)); font-size: 10px; }
 .gg-side-row.selected { background: var(--sel); box-shadow: inset 2px 0 var(--accent); }
 .gg-side-row:hover { background: var(--accent-soft); }
 .gg-main { display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 0; overflow: hidden; }
@@ -27,15 +27,17 @@
 .gg-conflicting .git-graph-lines { flex-basis: 18%; min-height: 80px; }
 .gg-main > .git-commit-details, .gg-main > .git-advanced, .gg-main > .git-rebase { flex: 1; min-height: 150px; }
 .gg-main > .gg-empty { flex: 1; }
-.gg-empty { margin: 0; padding: 12px; color: var(--fg-dim); font-size: 12px; }
-.gg-error { color: var(--danger, #e16e6e); padding: 9px 16px; border-bottom: 1px solid var(--border-soft); max-height: 90px; overflow: auto; white-space: pre-wrap; font-size: 12px; }
-.gg-read-only { padding: 8px 14px; font-size: 11px; color: var(--fg-dim); }
+.gg-empty { margin: 0; padding: 12px; color: var(--readable-fg-dim, var(--fg-dim)); font-size: 12px; }
+.gg-error > p { margin: 0; }
+.gg-error > button { display: none; }
+.gg-error { color: var(--readable-danger, var(--danger, #e16e6e)); padding: 9px 16px; border-bottom: 1px solid var(--border-soft); max-height: 90px; overflow: auto; white-space: pre-wrap; font-size: 12px; }
+.gg-read-only { padding: 8px 14px; font-size: 11px; color: var(--readable-fg-dim, var(--fg-dim)); }
 .gg-operation { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 8px 14px; background: var(--accent-soft); font-size: 12px; border-bottom: 1px solid var(--border-soft); }
-.gg-operation strong { color: var(--accent-text); }
+.gg-operation strong { color: var(--readable-accent-text, var(--accent-text)); }
 .gg-operation span { margin-right: auto; }
 .gg-operation button { font-size: 11px; }
 .gg-operation .gg-applying { margin-right: 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.git-graph-lines .gg-load-more { display: block; width: calc(100% - 24px); margin: 8px 12px; text-align: center; padding: 8px; font-size: 12px; font-weight: 600; color: var(--accent-text); background: var(--accent-soft); border: 1px solid var(--accent-ring); }
+.git-graph-lines .gg-load-more { display: block; width: calc(100% - 24px); margin: 8px 12px; text-align: center; padding: 8px; font-size: 12px; font-weight: 600; color: var(--readable-accent-text, var(--accent-text)); background: var(--accent-soft); border: 1px solid var(--accent-ring); }
 .git-graph-lines .gg-load-more:hover:not(:disabled) { border-color: var(--accent-text); }
 .git-graph-lines .gg-load-more:disabled { opacity: 0.6; }
 .gg-conflict { min-height: 0; flex: 1; display: flex; flex-direction: column; border-top: 1px solid var(--border-soft); }
@@ -43,20 +45,20 @@
 .gg-conflict .gg-working-title > div { display: flex; gap: 6px; flex-wrap: wrap; }
 .gg-conflict button { font-size: 11px; }
 .gg-conflict-commit { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; padding: 6px 14px; background: var(--accent-soft); border-bottom: 1px solid var(--border-soft); font-size: 12px; }
-.gg-conflict-commit > span { color: var(--accent-text); font-weight: 600; }
+.gg-conflict-commit > span { color: var(--readable-accent-text, var(--accent-text)); font-weight: 600; }
 .gg-conflict-commit strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .gg-conflict-commit small { opacity: 0.7; margin-left: auto; }
 .gg-conflict-sides { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); grid-template-rows: repeat(2,minmax(0,1fr)); min-height: 0; flex: 1; }
 .gg-conflict-sides section { min-width: 0; min-height: 0; display: flex; flex-direction: column; border: 1px solid var(--border-soft); }
-.gg-conflict-sides h3 { font-size: 11px; padding: 7px 10px; margin: 0; color: var(--fg-dim); }
+.gg-conflict-sides h3 { font-size: 11px; padding: 7px 10px; margin: 0; color: var(--readable-fg-dim, var(--fg-dim)); }
 .gg-conflict-sides pre { flex: 1; min-height: 0; overflow: auto; margin: 0; padding: 8px 10px; font-size: 12px; }
 .gg-output { border-top: 1px solid var(--border-soft); font-size: 11px; max-height: 140px; overflow: auto; }
 .gg-output summary { padding: 5px 14px; cursor: pointer; }
 .gg-output summary button { float: right; padding: 0 5px; border: 0; background: transparent; }
 .gg-output pre { margin: 0; padding: 8px 14px; white-space: pre-wrap; }
-.gg-key-help { position: absolute; z-index: 6; right: 12px; top: 70px; bottom: 45px; width: min(400px, calc(100% - 24px)); background: var(--bg-2); border: 1px solid var(--border); box-shadow: var(--shadow); border-radius: 8px; overflow: auto; padding: 12px; }
+.gg-key-help { position: absolute; z-index: 6; right: 12px; top: 70px; bottom: 45px; width: min(400px, calc(100% - 24px)); background: var(--bg-2); border: 1px solid var(--border); box-shadow: var(--shadow); border-radius: var(--radius); overflow: auto; padding: 12px; }
 .gg-key-help > div { display: flex; justify-content: space-between; align-items: center; }
-.gg-key-help p { font-size: 11px; color: var(--fg-dim); margin: 8px 0; }
+.gg-key-help p { font-size: 11px; color: var(--readable-fg-dim, var(--fg-dim)); margin: 8px 0; }
 .gg-key-help > button { display: flex; align-items: center; gap: 12px; width: 100%; padding: 8px; text-align: left; border: 0; background: transparent; font-size: 12px; }
 .gg-key-help kbd { min-width: 40px; text-align: center; }
 @media (max-width: 1050px) { .gg-sidebar { width: 180px; } .gg-workspace .gg-toolbar select { width: 135px; } .gg-workspace header { padding: 12px 16px; } }
@@ -67,85 +69,106 @@
 .gg-lanes circle { stroke-width: 2.4; fill: var(--bg-2); filter: none; transition: r .12s ease; }
 .gg-lanes circle[r="6"] { fill: currentColor; }
 .gg-lanes circle.gg-working-dot { fill: var(--bg-2); filter: none; stroke-dasharray: 2.4 2.4; }
-.gg-color-0 { color: var(--accent); }.gg-color-1 { color: #b48af5; }.gg-color-2 { color: #50bba1; }.gg-color-3 { color: #e5a255; }.gg-color-4 { color: #dc779e; }.gg-color-5 { color: #73b5d8; }
+.gg-color-0 { color: var(--accent-text, var(--accent)); }.gg-color-1 { color: var(--readable-graph-b48af5, #b48af5); }.gg-color-2 { color: var(--readable-graph-50bba1, #50bba1); }.gg-color-3 { color: var(--readable-graph-e5a255, #e5a255); }.gg-color-4 { color: var(--readable-graph-dc779e, #dc779e); }.gg-color-5 { color: var(--readable-graph-73b5d8, #73b5d8); }
 .gg-lanes circle[class*="gg-color"] { stroke: currentColor; }
 .git-graph-lines .gg-row { position: relative; transition: background .12s ease; border-bottom-color: color-mix(in srgb, var(--border-soft) 30%, transparent); }
 .git-graph-lines .gg-row:hover { background: var(--row-hover); }
-.git-graph-lines .gg-row.selected { background: var(--sel-gradient); box-shadow: var(--sel-bar); }
-.gg-columns { letter-spacing: .08em; font-size: 10px; text-transform: uppercase; color: var(--fg-dim); }
-.gg-hash { justify-self: start; font-size: 11px; opacity: .8; padding: 1px 8px; border-radius: var(--radius-sm); background: color-mix(in srgb, var(--fg) 6%, transparent); }
+.git-graph-lines .gg-row.selected { background: var(--sel-gradient); color: var(--readable-sel-fg, var(--readable-fg, var(--fg))); box-shadow: var(--sel-bar); }
+.git-graph-lines .gg-row.selected .gg-muted, .git-graph-lines .gg-row.selected .gg-hash { color: var(--readable-sel-dim, var(--readable-fg-dim, var(--fg-dim))); }
+.gg-columns { letter-spacing: .08em; font-size: 10px; text-transform: uppercase; color: var(--readable-fg-dim, var(--fg-dim)); }
+.gg-hash { justify-self: start; font-size: 11px; color: var(--readable-fg-dim, var(--fg-dim)); padding: 1px 8px; border-radius: var(--radius-sm); background: color-mix(in srgb, var(--fg) 6%, transparent); }
 .gg-message { gap: 6px; }
-.gg-badge { display: inline-flex; align-items: center; gap: 4px; border-radius: var(--radius-pill); padding: 1px 9px; font-size: 10.5px; font-weight: 600; letter-spacing: .01em; border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent); background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--accent-text); transition: transform .12s ease, box-shadow .12s ease; }
+.gg-badge { display: inline-flex; align-items: center; gap: 4px; border-radius: var(--radius-pill); padding: 1px 9px; font-size: 10.5px; font-weight: 600; letter-spacing: .01em; border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent); background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--readable-accent-text, var(--accent-text)); transition: transform .12s ease, box-shadow .12s ease; }
 .gg-badge:hover { border-color: color-mix(in srgb, var(--accent) 60%, transparent); }
-.gg-badge.head { background: var(--primary-gradient); color: #fff; border-color: transparent; box-shadow: 0 1px 3px rgb(0 0 0 / 25%); }
-.gg-badge.current { background: color-mix(in srgb, var(--accent) 22%, transparent); border-color: var(--accent); }
-.gg-badge.remote { color: #8f9bb3; border-color: color-mix(in srgb, #8f9bb3 35%, transparent); background: color-mix(in srgb, #8f9bb3 10%, transparent); font-weight: 500; }
-.gg-badge.tag { color: #e5a255; border-color: color-mix(in srgb, #e5a255 40%, transparent); background: color-mix(in srgb, #e5a255 12%, transparent); }
-.gg-badge.saved { color: var(--fg-dim); border-style: dashed; background: transparent; font-weight: 500; }
+.gg-row:has(.gg-ref-overflow:hover), .gg-row:focus-visible:has(.gg-ref-overflow) { z-index: 4; }
+.gg-row:has(.gg-ref-overflow:hover) .gg-message, .gg-row:focus-visible:has(.gg-ref-overflow) .gg-message { overflow: visible; }
+.gg-ref-overflow { position: relative; display: inline-flex; }
+.gg-ref-overflow-list { display: none; position: absolute; z-index: 5; top: 100%; left: 0; padding: 4px; background: var(--bg-2); gap: 4px; flex-direction: column; }
+.gg-ref-overflow:hover .gg-ref-overflow-list, .gg-row:focus-visible .gg-ref-overflow-list { display: flex; }
+.gg-ref-cloud { color: var(--readable-graph-8f9bb3, #8f9bb3); font-size: 13px; }
+.gg-ref-details { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.gg-row:focus-visible .gg-ref-details { position: static; width: auto; height: auto; clip-path: none; margin-left: 4px; }
+.gg-badge.head { background: var(--primary-gradient); color: var(--primary-fg); border-color: transparent; box-shadow: 0 1px 3px rgb(0 0 0 / 25%); }
+.gg-badge.current { background: color-mix(in srgb, var(--accent) 22%, transparent); border-color: var(--accent-text, var(--accent)); }
+.gg-badge.remote { color: var(--readable-graph-8f9bb3, #8f9bb3); border-color: color-mix(in srgb, #8f9bb3 35%, transparent); background: color-mix(in srgb, #8f9bb3 10%, transparent); font-weight: 500; }
+.gg-badge.tag { color: var(--readable-graph-e5a255, #e5a255); border-color: color-mix(in srgb, #e5a255 40%, transparent); background: color-mix(in srgb, #e5a255 12%, transparent); }
+.gg-badge.saved { color: var(--readable-fg-dim, var(--fg-dim)); border-style: dashed; background: transparent; font-weight: 500; }
 .gg-workspace .gg-toolbar { border-bottom: 1px solid var(--border-soft); background: var(--bar-bg); }
 .gg-workspace .gg-toolbar button:hover:not(:disabled) { border-color: var(--accent-ring); background: var(--accent-soft); }
-.gg-search:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.gg-search:focus { outline: none; border-color: var(--accent-text, var(--accent)); box-shadow: 0 0 0 3px var(--accent-soft); }
 .gg-sidebar { background: linear-gradient(180deg, color-mix(in srgb, var(--bg) 85%, var(--bg-2)), var(--bg)); }
 .gg-side-tabs { background: var(--well-bg); border-radius: var(--radius-lg); margin: 8px; padding: 3px; border-bottom: 0; }
+.gg-side-tabs button.gg-drop { outline: 2px dashed var(--accent); outline-offset: -2px; }
+.git-graph-lines .gg-row.picked:not(.selected) { background: color-mix(in srgb, var(--accent) 16%, transparent); }
+.git-graph-lines .gg-row.picked { box-shadow: inset 3px 0 0 var(--accent); }
+/* No taller than the line it stands in: the header must not move when commits are chosen. */
+.gg-picked { display: inline-flex; align-items: center; gap: 5px; margin-block: -3px; margin-inline-start: 8px; padding: 0 4px 0 9px; line-height: 1.4; vertical-align: baseline; border-radius: 999px; background: var(--accent-soft); color: var(--readable-accent-text, var(--accent-text)); font-weight: 600; }
+.git-graph header .gg-picked button { border: 0; min-width: 0; min-height: 0; height: auto; padding: 0 4px; font-size: 10px; line-height: 1.4; box-shadow: none; background: transparent; color: inherit; cursor: pointer; border-radius: 999px; }
+.gg-row mark { padding: 0 1px; border-radius: 2px; background: color-mix(in srgb, var(--warn, #e9b44c) 45%, transparent); color: var(--readable-fg, var(--fg)); }
+.gg-found { display: inline-flex; align-items: center; gap: 6px; }
+.gg-hint { border: 0; padding: 0 3px; margin-inline-end: 5px; background: transparent; color: inherit; font: inherit; border-radius: var(--radius); cursor: pointer; }
+.gg-hint b { color: var(--readable-fg, var(--fg)); font-weight: 600; }
+.gg-hint:hover:not(:disabled) { background: var(--accent-soft); color: var(--readable-accent-text, var(--accent-text)); }
 .gg-side-tabs button { border-radius: var(--radius); transition: background .12s ease, color .12s ease; }
-.gg-side-tabs button[aria-pressed=true] { background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent-ring); font-weight: 600; }
+.gg-side-tabs button[aria-pressed=true] { background: var(--accent-soft); box-shadow: inset 0 0 0 var(--hair, 1px) var(--accent-ring); font-weight: 600; }
 .gg-side-list h3 { letter-spacing: .1em; }
 .gg-side-row { border-radius: var(--radius); margin: 1px 6px; width: calc(100% - 12px); transition: background .12s ease; }
-.gg-side-row.selected { background: var(--sel-gradient); box-shadow: var(--sel-bar); border-radius: 4px var(--radius) var(--radius) 4px; }
+.gg-side-row.selected { background: var(--sel-gradient); color: var(--readable-sel-fg, var(--readable-fg, var(--fg))); box-shadow: var(--sel-bar); border-radius: 4px var(--radius) var(--radius) 4px; }
+.gg-side-row.selected small { color: var(--readable-sel-dim, var(--readable-fg-dim, var(--fg-dim))); }
 .gg-operation { background: linear-gradient(90deg, color-mix(in srgb, var(--accent) 22%, transparent), color-mix(in srgb, var(--accent) 6%, transparent)); border-bottom: 1px solid var(--accent-ring); }
 .gg-conflict-commit { background: linear-gradient(90deg, color-mix(in srgb, var(--accent) 18%, transparent), transparent); border-left: 3px solid var(--accent); }
 .gg-conflict-commit code { padding: 1px 7px; border-radius: var(--radius-sm); background: color-mix(in srgb, var(--fg) 8%, transparent); }
 .gg-working-title { border-bottom: 1px solid var(--border-soft); }
 .gg-key-help { border-radius: var(--radius-lg); }
-.git-graph footer { opacity: .75; background: var(--foot-bg); }
+.git-graph footer { opacity: 1; color: var(--readable-fg-dim, var(--fg-dim)); background: var(--foot-bg); }
 
 /* Explicitly styled buttons: native buttons render differently per platform once any property is overridden. */
 .gg-workspace .gg-toolbar button, .gg-operation button, .gg-conflict button, .gg-working-title button, .gg-workspace > header button, .gg-side-tools button, .gg-output summary button,
 .gm-actions button, .gm-bar button, .git-commit-details button, .git-changes button:not(.gc-file), .gc-tools button {
-  appearance: none; cursor: pointer; color: var(--fg); background: var(--btn-bg);
+  appearance: none; cursor: pointer; color: var(--readable-btn-fg, var(--readable-fg, var(--fg))); background: var(--btn-bg);
   border: 1px solid var(--border); border-radius: var(--radius); padding: 5px 12px; line-height: 1.3;
   box-shadow: var(--btn-shadow);
   transition: background .14s ease, border-color .14s ease, box-shadow .14s ease, transform .08s ease;
 }
 .gg-workspace .gg-toolbar button:hover:not(:disabled), .gg-operation button:hover:not(:disabled), .gg-conflict button:hover:not(:disabled), .gg-working-title button:hover:not(:disabled), .gg-workspace > header button:hover:not(:disabled),.gg-side-tools button:hover:not(:disabled),
 .gm-actions button:hover:not(:disabled), .gm-bar button:hover:not(:disabled), .git-commit-details button:hover:not(:disabled), .git-changes button:not(.gc-file):hover:not(:disabled), .gc-tools button:hover:not(:disabled) {
-  background: var(--btn-bg-hover); border-color: var(--accent-ring); box-shadow: var(--btn-shadow-hover);
+  background: var(--btn-bg-hover); color: var(--readable-btn-hover-fg, var(--readable-fg, var(--fg))); border-color: var(--accent-ring); box-shadow: var(--btn-shadow-hover);
 }
 .gg-workspace .gg-toolbar button:active:not(:disabled), .gg-operation button:active:not(:disabled), .gg-conflict button:active:not(:disabled), .gm-actions button:active:not(:disabled), .gc-tools button:active:not(:disabled) { transform: translateY(1px); }
-.gg-workspace .gg-toolbar button:disabled, .gg-operation button:disabled, .gg-conflict button:disabled, .gg-working-title button:disabled, .gm-actions button:disabled, .gc-tools button:disabled, .gm-bar button:disabled { opacity: .45; cursor: default; box-shadow: none; }
-.gg-workspace .gg-toolbar button:focus-visible, .gg-operation button:focus-visible, .gg-conflict button:focus-visible, .gm-actions button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.gm-actions button.gm-confirm:not(:disabled), .gg-operation button:first-of-type:not(:disabled) { background: var(--primary-gradient); color: #fff; border-color: transparent; font-weight: 600; }
+.gg-workspace .gg-toolbar button:disabled, .gg-operation button:disabled, .gg-conflict button:disabled, .gg-working-title button:disabled, .gm-actions button:disabled, .gc-tools button:disabled, .gm-bar button:disabled { opacity: .55; cursor: default; box-shadow: none; }
+.gg-workspace .gg-toolbar button:focus-visible, .gg-operation button:focus-visible, .gg-conflict button:focus-visible, .gm-actions button:focus-visible { outline: 2px solid var(--readable-focus, var(--accent)); outline-offset: 2px; }
+.gm-actions button.gm-confirm:not(:disabled), .gm-actions button.gm-confirm:hover:not(:disabled), .gg-operation button:first-of-type:not(:disabled), .gg-operation button:first-of-type:hover:not(:disabled) { background: var(--primary-gradient); color: var(--primary-fg); border-color: var(--accent-ring); font-weight: 600; }
 .gg-output summary button { padding: 0 7px; border-radius: var(--radius-sm); }
 .gg-side-row.current { font-weight: 700; }
-.gg-side-row.current small { color: var(--accent-text); }
-.gg-current-pill { margin-left: 8px; padding: 1px 8px; border-radius: var(--radius-pill); font-size: 9.5px; font-style: normal; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: #fff; background: var(--primary-gradient); box-shadow: none; }
+.gg-side-row.current small { color: var(--readable-accent-text, var(--accent-text)); }
+.gg-current-pill { margin-inline: 4px; padding: 1px 8px; border-radius: var(--radius-pill); font-size: 9.5px; font-style: normal; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--primary-fg); background: var(--primary-gradient); box-shadow: none; }
 
 /* Local and remote branches (and tags) are told apart at a glance: a coloured header chip and row bar per group. */
 .gg-ref-group + .gg-ref-group { margin-top: 14px; padding-top: 4px; border-top: 1px solid var(--border); }
 .gg-ref-group h3 { display: flex; align-items: center; gap: 8px; }
-.gg-ref-group h3::before { content: ""; width: 8px; height: 8px; border-radius: 2px; background: var(--accent); }
-.gg-ref-group h3 span { margin-left: auto; font-size: 10px; font-weight: 600; padding: 0 6px; border-radius: var(--radius-pill); background: var(--accent-soft); color: var(--accent-text); }
+.gg-ref-group h3::before { content: ""; width: 8px; height: 8px; border-radius: var(--radius-xs); background: var(--accent); }
+.gg-ref-group h3 span { margin-left: auto; font-size: 10px; font-weight: 600; padding: 0 6px; border-radius: var(--radius-pill); background: var(--accent-soft); color: var(--readable-accent-text, var(--accent-text)); }
 .gg-group-remote h3::before, .gg-group-remoteTag h3::before { background: #73b5d8; border-radius: 50%; }
-.gg-group-remote h3 span, .gg-group-remoteTag h3 span { background: color-mix(in srgb, #73b5d8 18%, transparent); color: #73b5d8; }
+.gg-group-remote h3 span, .gg-group-remoteTag h3 span { background: color-mix(in srgb, #73b5d8 18%, transparent); color: var(--readable-graph-73b5d8, #73b5d8); }
 /* :where() keeps these at the lowest specificity, so hover and selection (orange) always win over the group tint. */
 .gg-side-row:where(.gg-row-branch, .gg-row-tag) { box-shadow: inset 2px 0 color-mix(in srgb, var(--accent) 55%, transparent); }
 .gg-side-row:where(.gg-row-remote, .gg-row-remoteTag) { box-shadow: inset 2px 0 color-mix(in srgb, #73b5d8 55%, transparent); background: color-mix(in srgb, #73b5d8 5%, transparent); }
 .gg-hidden-note { font-size: 11px; padding: 6px 12px; }
-.gg-side-list .gg-link { display: inline; padding: 0; border: 0; background: transparent; font: inherit; color: var(--accent-text); text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
-.gg-side-list .gg-link:hover { color: var(--accent); }
+.gg-side-list .gg-link { display: inline; padding: 0; border: 0; background: transparent; font: inherit; color: var(--readable-accent-text, var(--accent-text)); text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
+.gg-side-list .gg-link:hover { color: var(--accent-text, var(--accent)); }
 .gg-synced { margin-left: 8px; font-size: 12px; font-weight: 700; font-style: normal; color: var(--success, #62c48a); }
-.gg-local-only { margin-left: 8px; padding: 0 6px; border-radius: var(--radius-pill); font-size: 10px; font-weight: 600; font-style: normal; white-space: nowrap; color: var(--fg-dim); border: 1px dashed var(--border); }
-.gg-gone { margin-left: 8px; padding: 0 6px; border-radius: var(--radius-pill); font-size: 10px; font-weight: 700; font-style: normal; white-space: nowrap; color: var(--danger, #e16e6e); border: 1px solid color-mix(in srgb, var(--danger, #e16e6e) 45%, transparent); background: color-mix(in srgb, var(--danger, #e16e6e) 12%, transparent); }
-.gg-track { margin-left: 8px; padding: 0 6px; border-radius: var(--radius-pill); font-size: 10.5px; font-weight: 700; font-style: normal; color: var(--fg); background: color-mix(in srgb, var(--accent) 14%, transparent); border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent); white-space: nowrap; }
+.gg-local-only { margin-left: 8px; padding: 0 6px; border-radius: var(--radius-pill); font-size: 10px; font-weight: 600; font-style: normal; white-space: nowrap; color: var(--readable-fg-dim, var(--fg-dim)); border: 1px dashed var(--border); }
+.gg-gone { margin-left: 8px; padding: 0 6px; border-radius: var(--radius-pill); font-size: 10px; font-weight: 700; font-style: normal; white-space: nowrap; color: var(--readable-danger, var(--danger, #e16e6e)); border: 1px solid color-mix(in srgb, var(--danger, #e16e6e) 45%, transparent); background: color-mix(in srgb, var(--danger, #e16e6e) 12%, transparent); }
+.gg-track { margin-left: 8px; padding: 0 6px; border-radius: var(--radius-pill); font-size: 10.5px; font-weight: 700; font-style: normal; color: var(--readable-fg, var(--fg)); background: color-mix(in srgb, var(--accent) 14%, transparent); border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent); white-space: nowrap; }
 .gg-subtitle .gg-track { margin-left: 6px; }
-.gg-side-tabs .gg-conflicts-tab { grid-column: 1 / -1; background: color-mix(in srgb, var(--danger, #e16e6e) 18%, transparent); color: var(--danger, #e16e6e); font-weight: 700; box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--danger, #e16e6e) 55%, transparent); }
-.gg-side-tabs .gg-conflicts-tab[aria-pressed=true] { background: color-mix(in srgb, var(--danger, #e16e6e) 28%, transparent); color: var(--danger, #e16e6e); }
+.gg-side-tabs .gg-conflicts-tab { grid-column: 1 / -1; background: color-mix(in srgb, var(--danger, #e16e6e) 18%, transparent); color: var(--readable-danger, var(--danger, #e16e6e)); font-weight: 700; box-shadow: inset 0 0 0 var(--hair, 1px) color-mix(in srgb, var(--danger, #e16e6e) 55%, transparent); }
+.gg-side-tabs .gg-conflicts-tab[aria-pressed=true] { background: color-mix(in srgb, var(--danger, #e16e6e) 28%, transparent); color: var(--readable-danger, var(--danger, #e16e6e)); }
 
 /* Row action button: the same menu as a right-click, shown where the pointer or selection is. */
-.gg-row-more { display: grid; place-items: center; justify-self: center; width: 22px; height: 22px; border-radius: var(--radius-sm); color: var(--fg-dim); font-size: 16px; line-height: 1; cursor: pointer; opacity: 0; }
+.gg-row-more { display: grid; place-items: center; justify-self: center; width: 22px; height: 22px; border-radius: var(--radius-sm); color: var(--readable-fg-dim, var(--fg-dim)); font-size: 16px; line-height: 1; cursor: pointer; opacity: 0; }
 .gg-row:hover .gg-row-more, .gg-row.selected .gg-row-more, .gg-row:focus-visible .gg-row-more,
 .gg-side-row:hover .gg-row-more, .gg-side-row.selected .gg-row-more, .gg-side-row:focus-visible .gg-row-more { opacity: 1; }
-.gg-row-more:hover { background: var(--accent-soft); color: var(--fg); }
+.gg-row-more:hover { background: var(--accent-soft); color: var(--readable-fg, var(--fg)); }
 .gg-side-row { position: relative; }
 .gg-side-row .gg-row-more { position: absolute; top: 6px; right: 6px; overflow: visible; }
 
@@ -156,18 +179,141 @@
 
 /* Which panel has keyboard focus: an accent outline on it, a named chip in the footer, and a muted selection elsewhere. */
 .gg-focus-sidebar .gg-sidebar,
-.gg-focus-history .git-graph-lines,
 .gg-focus-details .git-commit-details,
 .gg-focus-changes .gg-working-details,
 .gg-focus-tools .git-advanced { outline: 2px solid color-mix(in srgb, var(--accent) 80%, transparent); outline-offset: -2px; }
+/* The commit list scrolls: an inset outline lay under its sticky column header and rows and showed only beside them.
+   A border sits outside the scrolled content and stays whole; it is always there, so focus does not shift the list. */
+.git-graph-lines { border: var(--pane-frame, 2px) solid transparent; }
+.gg-focus-history .git-graph-lines { border-color: color-mix(in srgb, var(--accent) 80%, transparent); }
 .git-graph:not(.gg-focus-history) .git-graph-lines .gg-row.selected,
 .git-graph:not(.gg-focus-sidebar) .gg-side-row.selected { background: color-mix(in srgb, var(--fg) 8%, transparent); box-shadow: inset 3px 0 color-mix(in srgb, var(--fg) 35%, transparent); }
-.gg-panel-name { display: inline-block; margin-right: 10px; padding: 1px 9px; border-radius: var(--radius-pill); background: var(--accent-soft); color: var(--accent-text); font-weight: 600; letter-spacing: .02em; }
+.gg-panel-name { display: inline-block; margin-right: 10px; padding: 1px 9px; border-radius: var(--radius-pill); background: var(--accent-soft); color: var(--readable-accent-text, var(--accent-text)); font-weight: 600; letter-spacing: .02em; }
 
 /* Worktrees tab: one row per worktree; Open and Remove show on hover, focus or selection. */
+.gg-forecast { flex: none; margin-left: 8px; padding: 0 6px; border-radius: 999px; border: 1px solid var(--warn, #d9a441); color: var(--readable-warn, var(--warn, #d9a441)); font-size: 10px; white-space: nowrap; }
+.gg-ghost { display: flex; align-items: center; gap: 10px; padding: 2px 12px; opacity: .6; border-bottom: 1px dashed var(--border); font-style: italic; font-size: 12px; }
+.gg-ghost svg { flex: none; fill: none; stroke: var(--accent); stroke-width: 2; stroke-dasharray: 3 2; }
+.gg-ghost span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gg-ghost small { flex: none; }
+.gg-ghost.conflict small { color: var(--readable-warn, var(--warn, #d9a441)); }
 .gg-worktree-item { position: relative; }
+.gg-worktree-item.compare-first { outline: 1px dashed var(--accent); outline-offset: -1px; }
 .gg-worktree-main { text-align: left; }
 .gg-worktree-actions { position: absolute; top: 6px; right: 8px; display: none; gap: 4px; }
 .gg-worktree-item:hover .gg-worktree-actions, .gg-worktree-item:focus-within .gg-worktree-actions { display: flex; }
 .gg-worktree-actions button { padding: 2px 8px; font-size: 10px; }
-.gg-worktree-error { color: var(--danger, #e16e6e); white-space: pre-wrap; }
+.gg-worktree-error { color: var(--readable-danger, var(--danger, #e16e6e)); white-space: pre-wrap; }
+
+
+/* History and toolbar controls sit on the workspace surface in Omarchy themes. */
+:root.omarchy-controls .gg-workspace {
+  --btn-bg: transparent;
+  --btn-bg-hover: var(--row-hover);
+  --btn-shadow: none;
+  --btn-shadow-hover: none;
+}
+:root.omarchy-controls .gg-workspace :is(.gg-toolbar, header, .gg-side-tools) button,
+:root.omarchy-controls .gg-workspace :is(.gg-toolbar, header, .gg-side-tools) button:hover:not(:disabled),
+:root.omarchy-controls .git-graph-lines .gg-row,
+:root.omarchy-controls .git-graph-lines .gg-row:hover:not(:disabled) {
+  color: var(--om-control-quiet-text);
+}
+:root.omarchy-controls .git-graph-lines .gg-row:disabled { outline: none; }
+:root.omarchy-controls .gg-workspace :is(.gg-badge.head, .gg-current-pill) {
+  color: var(--om-control-primary-text);
+}
+
+/* WN-63: nothing in the toolbar, sidebar or tools is cut or covered at 200 %, in a 640 px window or in a long language.
+   Sidebar tabs wrap instead of sharing three fixed columns, so `Stashes` and `Worktrees` keep their whole name. */
+.gg-side-tabs { display: flex; flex-wrap: wrap; }
+.gg-side-tabs button { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+.gg-side-tabs .gg-conflicts-tab { flex-basis: 100%; }
+/* A row's name and its pills wrap instead of being clipped; the right edge stays free for the ⋯ button. */
+.gg-side-row > span:first-child { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; white-space: normal; overflow-wrap: anywhere; padding-inline-end: 28px; }
+.gg-side-row > span:first-child :is(.gg-current-pill, .gg-track, .gg-gone, .gg-local-only, .gg-synced, .gg-ref-status) { min-width: 0; max-width: 100%; box-sizing: border-box; overflow: visible; white-space: normal; text-align: center; margin: 0; }
+/* The chevron of a select sits 10 px from its right edge: keep the text clear of it and wide enough for the longest label. */
+.gg-workspace .gg-toolbar select { padding-inline-end: 28px; width: 196px; }
+/* The corner where the two scrollbars of a list meet has the colour of the surface, not the white of the platform. */
+.git-graph *::-webkit-scrollbar-corner { background: var(--bg-2); }
+@media (max-width: 700px) { .gg-sidebar { width: 168px; } }
+@media (max-width: 800px) { .ga-tabs { flex-wrap: wrap; } }
+/* In a low window (a 640 px wide window is about 440 px high at the sizes the self-test uses) the chrome is compact and the
+   commit list shrinks to a strip while the tools have focus, so the tools keep their tabs and some content; whatever still
+   does not fit scrolls in the main column instead of being cut. */
+.gg-main { overflow-y: auto; }
+@media (max-height: 560px) {
+  .git-graph.gg-workspace > header { padding-block: 6px; }
+  .gg-workspace > header .gg-header-actions button { padding-block: 2px; }
+  .gg-with-details.gg-focus-tools .git-graph-lines { flex: 0 0 32px; min-height: 32px; }
+  .gg-main > .git-advanced { min-height: 190px; }
+  .ga-header { padding: 4px 12px; }
+  .ga-tabs { padding: 4px 12px; gap: 3px; }
+  .ga-tabs button { padding: 3px 6px; }
+  /* An error and an operation bar can fill a window this low: the sidebar scrolls as a whole, so its tabs stay reachable. */
+  .gg-sidebar { overflow-y: auto; }
+  .gg-sidebar .gg-side-list { flex: 1 0 auto; min-height: 120px; }
+  .gg-error { display: flex; gap: 8px; align-items: flex-start; padding: 4px 12px; }
+  .gg-error > button { display: block; flex: none; padding: 0 6px; }
+  .gg-error > p { flex: 1; min-width: 0; }
+  .gg-error:not(.open) { overflow: hidden; }
+  .gg-error:not(.open) > p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .gg-operation { flex-wrap: nowrap; padding: 4px 12px; white-space: nowrap; overflow-x: auto; }
+  .gg-operation > button { flex: none; padding-block: 2px; }
+  .gg-operation > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .gg-operation .gg-applying { flex: 1 1 0; }
+  .gg-side-tabs { margin: 4px; }
+  .gg-side-tabs button { padding: 3px 5px; }
+}
+
+/* Drag and drop: the branch under the pointer that would receive the dragged commits or branch. */
+.gg-side-row.gg-drop-target, .gg-badge.gg-drop-target, .gg-row.gg-drop-target { outline: 2px dashed var(--accent); outline-offset: -2px; background: color-mix(in srgb, var(--accent) 22%, transparent); }
+
+/* Keep the name to two lines while allowing status indicators to wrap independently. */
+.gg-side-row .gg-name { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; min-width: 0; white-space: normal; overflow-wrap: anywhere; }
+/* The ⚠ controls are buttons beside a row's button, never inside it. */
+.gg-side-item { display: flex; align-items: center; gap: 4px; }
+.gg-side-item > .gg-side-row { flex: 1 1 auto; min-width: 0; width: auto; margin-right: 0; }
+.gg-warn { flex: none; margin: 0 8px 0 0; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--warn, #d9a441); background: transparent; color: var(--readable-warn, var(--warn, #d9a441)); font-size: 11px; font-weight: 700; line-height: 1.5; white-space: nowrap; cursor: pointer; }
+.gg-warn:hover, .gg-warn:focus-visible { background: color-mix(in srgb, var(--warn, #d9a441) 18%, transparent); }
+.gg-warn:focus-visible { outline: 2px solid var(--accent-ring, var(--accent)); outline-offset: 1px; }
+.gg-side-active .gg-warn { flex: 1 1 auto; margin: 4px 6px; text-align: left; border-radius: var(--radius); padding: 6px 10px; }
+
+/* Tag and stash markers in the history. */
+.gg-tag-name { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.gg-row:focus-visible .gg-tag-name { position: static; width: auto; height: auto; clip-path: none; color: var(--readable-graph-e5a255, #e5a255); }
+.gg-tag-node rect { fill: var(--bg-2); stroke: #e5a255; stroke-width: 1.5; }
+.gg-tag-local rect { fill: #e5a255; }
+.gg-tag-both path { fill: #e5a255; stroke: none; pointer-events: none; }
+.gg-tag-unknown rect { stroke-dasharray: 2 2; }
+.gg-tag-node text { fill: #e5a255; font: 700 10px var(--mono); pointer-events: none; }
+.gg-tag-local text { fill: var(--bg-2); }
+.gg-tag-both text { paint-order: stroke; stroke: var(--bg-2); stroke-width: 1.5px; }
+.gg-lanes rect.gg-stash-node { fill: currentColor; stroke: currentColor; stroke-width: 2; }
+.gg-badge.stash { border-style: dashed; font-family: var(--mono); }
+.gg-row.gg-stash-row .gg-message > span:last-child { font-style: italic; }
+
+/* Visual branch focus: what the focused tip does not reach is dimmed. The row itself keeps full strength so a lane that
+   belongs to a reached commit stays bright where it passes a dimmed row; only the content, nodes and own edges dim. */
+.gg-row.gg-dim > :not(.gg-lanes) { opacity: 0.25; }
+.gg-row.gg-dim.selected > :not(.gg-lanes) { opacity: 1; }
+.gg-lanes .gg-dim-edge { opacity: 0.25; }
+.gg-row.gg-dim.selected .gg-lanes .gg-dim-edge { opacity: 0.6; }
+/* The focused branch in the sidebar: a persistent marker that is neither the selection nor "Current". */
+.gg-side-row.gg-focused { outline: 1px dashed var(--accent-ring, var(--accent)); outline-offset: -2px; }
+.gg-side-row .gg-ref-status {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-inline: 5px;
+  vertical-align: middle;
+  color: var(--accent-text, var(--accent));
+}
+.gg-side-row .gg-ref-status svg { width: 15px; height: 15px; }
+.gg-side-row .gg-ref-highlighted { color: var(--accent-text, var(--accent)); }
+.gg-unfocus { margin-right: 6px; }
+
+.git-graph-lines .gg-row.gg-ref-arrival { animation: gg-ref-arrival .55s ease-out; }
+@keyframes gg-ref-arrival { 0%, 25% { background: color-mix(in srgb, var(--accent) 18%, var(--bg)); } 100% { background: transparent; } }
+
+:root.omarchy-controls .gg-operation button:first-of-type:hover:not(:disabled) { color: var(--primary-fg); }

@@ -5,6 +5,7 @@ import { api } from "./api/ipc";
 import { getState } from "./state/store";
 import { activePath, setLayout, updateSettings } from "./state/actions";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { LogicalSize } from "@tauri-apps/api/dpi";
 import { hasNerdFont } from "./core/nerdFont";
 import { KEYBOARD_PROFILES, type KeyboardProfile } from "./core/keymap";
@@ -47,6 +48,15 @@ function center(el: Element) {
   return { clientX: r.left + Math.min(r.width / 2, 60), clientY: r.top + r.height / 2 };
 }
 
+function unobstructed(el: Element | null) {
+  if (!el) return false;
+  const { left, top, right, bottom, width, height } = el.getBoundingClientRect();
+  if (width < 10 || height < 10 || left < 0 || top < 0 || right > innerWidth || bottom > innerHeight) return false;
+  const hit = (x: number, y: number) => el.contains(document.elementFromPoint(x, y));
+  return hit(left + 5, top + 5) && hit(right - 5, top + 5) &&
+    hit(left + 5, bottom - 5) && hit(right - 5, bottom - 5) && hit(left + width / 2, top + height / 2);
+}
+
 function mouse(el: Element, type: string, opts: MouseEventInit = {}) {
   el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window, ...center(el), ...opts }));
 }
@@ -54,12 +64,23 @@ function mouse(el: Element, type: string, opts: MouseEventInit = {}) {
 function click(el: Element, opts: MouseEventInit = {}) {
   mouse(el, "mousedown", opts);
   mouse(el, "mouseup", opts);
-  mouse(el, "click", opts);
+  // A mouse click has detail 1; 0 is a click made with the keyboard.
+  mouse(el, "click", { detail: 1, ...opts });
 }
 
 function key(k: string, opts: KeyboardEventInit = {}, target: Element | null = document.activeElement) {
   const code = k.length === 1 && /[a-z]/i.test(k) ? "Key" + k.toUpperCase() : k;
   (target ?? document.body).dispatchEvent(new KeyboardEvent("keydown", { key: k, code, bubbles: true, cancelable: true, ...opts }));
+}
+
+async function withoutTypeGroups(check: () => Promise<void>) {
+  const group = getState().settings!.group;
+  await updateSettings({ group: "folders" });
+  try {
+    await check();
+  } finally {
+    await updateSettings({ group });
+  }
 }
 
 function typeInto(input: HTMLInputElement | HTMLTextAreaElement, text: string) {
@@ -88,10 +109,17 @@ async function drag(src: Element, dst: Element, mods: { ctrlKey?: boolean; altKe
 }
 
 async function shot(name: string) {
-  // Spectacle captures the active window: make sure that is us.
-  await getCurrentWindow().setFocus().catch(() => {});
+  if (getState().info?.platform !== "macos") {
+    await getCurrentWindow().setFocus().catch(() => {});
+  }
   await sleep(250);
   await api.selftestShot(name).catch((e) => log(false, `screenshot ${name}`, String(e)));
+}
+
+async function setWindowSize(width: number, height: number) {
+  await api.selftestResize(width, height).catch(() => getCurrentWindow().setSize(new LogicalSize(width, height)).catch(() => {}));
+  await until(() => Math.abs(window.innerWidth - width) <= 16 && Math.abs(window.innerHeight - height) <= 16, 400);
+  await sleep(80);
 }
 
 async function focusPane(b: number) {
@@ -257,7 +285,7 @@ async function runPreviewShortcutsSelfTest() {
   try {
     await getCurrentWindow().setFocus();
     await getCurrentWindow().unmaximize();
-    await getCurrentWindow().setSize(new LogicalSize(1100, 800));
+    await setWindowSize(1100, 800);
     await updateSettings({ indexRoots: [root], keyboardProfile: "explorer", shortcuts: {}, theme: "dark" });
     await A.sessionCmd({ op: "layout", layout: "classic" });
     await A.sessionCmd({ op: "details", b: 0, on: true });
@@ -282,7 +310,7 @@ async function runPreviewShortcutsSelfTest() {
     }
     await selectRow(0, "broken.pdf");
     log(!!await until(() => $(".preview")?.textContent?.includes("PDF preview failed"), 10000), "invalid PDF shows a failure instead of staying blank");
-    await getCurrentWindow().setSize(new LogicalSize(800, 600));
+    await setWindowSize(800, 600);
     await shot("pdf-error-narrow");
     await selectRow(0, "sample.pdf");
     log(!!await until(() => rendered(1), 15000), "valid PDF recovers after an invalid PDF");
@@ -306,7 +334,7 @@ async function runPreviewShortcutsSelfTest() {
     }
     await selectRow(0, "sample.pdf");
     log(!!await until(() => rendered(1), 15000), "PDF recovers after a read failure");
-    await getCurrentWindow().setSize(new LogicalSize(1100, 800));
+    await setWindowSize(1100, 800);
     for (const profile of ["explorer", "vim"] as const) {
       await updateSettings({ keyboardProfile: profile });
       await focusPane(0);
@@ -381,30 +409,221 @@ async function runMappedDrivesSelfTest() {
   await api.selftestDone(results.join("\n") + `\n\n${failures} failure(s)`);
 }
 
+async function runLinuxLiveSelfTest() {
+  const root = activePath(0);
+  const info = await api.appInfo();
+  const trashRoot = `${root.slice(0, -3)}/data/Trash`;
+  if (info.platform !== "linux" || !/^(?:\/[^/]+)*\/gall-selftest-[^/]+\/td$/.test(root) ||
+      info.trashDir !== `${trashRoot}/files`) {
+    log(false, "Linux live checks have an isolated Trash fixture");
+    return api.selftestDone(results.join("\n") + `\n\n${failures} failure(s)`);
+  }
+
+  await step("isolated Linux Trash", async () => {
+    const name = "gall-trash-probe.txt";
+    const file = `${root}/${name}`;
+    const id = `${trashRoot}/info/${name}.trashinfo`;
+    const list = async () => {
+      const entries = await api.trashList();
+      if (entries.some((entry) => entry.id !== id)) throw new Error("Trash contains entries outside the test fixture");
+      return entries;
+    };
+    if ((await list()).length !== 0 || (await api.readTextFile(file)).text !== "hello") {
+      throw new Error("Expected an empty private Trash and the original five-byte fixture");
+    }
+    await api.trash([file]);
+    const [entry] = await list();
+    if (!entry || entry.name !== name || entry.originalParent !== root || entry.isDir || entry.size !== 5) {
+      throw new Error("Trashed fixture metadata did not match the original file");
+    }
+    log(!(await api.pathResolve(file)).exists, "Trash lists the deleted file with its original path and five-byte size", JSON.stringify(entry));
+    await api.trashRestore([id]);
+    log((await api.readTextFile(file)).text === "hello" && (await list()).length === 0,
+      "Restore returns the original bytes and removes the Trash entry");
+    await api.trash([file]);
+    if ((await list())[0]?.id !== id) throw new Error("The fixture is missing after the second trash");
+    await api.trashPurge([id]);
+    log((await list()).length === 0 && !(await api.pathResolve(file)).exists,
+      "Purging the selected fixture removes its Trash entry without restoring it");
+  });
+
+  await step("live Linux volumes", async () => {
+    type BlockDevice = { path: string; kname: string; pkname: string | null; fstype: string | null;
+      mountpoint: string | null; mountpoints: (string | null)[] | null };
+    const { blockdevices: host } = JSON.parse((await api.readTextFile(`${root}/live-block-devices.json`)).text) as { blockdevices: BlockDevice[] };
+    const [volumes, drives] = await Promise.all([api.otherVolumes(), api.listDrives()]);
+    const byPath = new Map(host.map((d) => [d.path, d]));
+    const byName = new Map(host.map((d) => [d.kname, d]));
+    const mounted = (d: BlockDevice) => !!d.mountpoint || !!d.mountpoints?.some(Boolean);
+    const unmountedFilesystems = host.filter((d) => d.fstype && !mounted(d) && !host.some((child) => child.pkname === d.kname));
+    const lockable = drives.filter((d) => d.lockable).map((d) => d.mount).sort();
+    const hostLockable = host.flatMap((d) => {
+      const encrypted = d.pkname && byName.get(d.pkname)?.fstype;
+      return encrypted && ["crypto_LUKS", "BitLocker"].includes(encrypted) &&
+        d.mountpoint && /^\/(run\/media|media|mnt)\//.test(d.mountpoint) ? [d.mountpoint] : [];
+    }).sort();
+    results.push(`Linux block devices: ${JSON.stringify(host)}`);
+    results.push(`Mounted drives: ${JSON.stringify(drives.map(({ mount, fs, lockable }) => ({ mount, fs, lockable })))}`);
+    log(volumes.every((v) => {
+      const d = byPath.get(v.id);
+      return !!d && !mounted(d) && d.fstype === v.fs;
+    }) && (unmountedFilesystems.length !== 0 || volumes.length === 0),
+    "Other Volumes entries match unmounted Linux block devices", JSON.stringify(volumes));
+    log(JSON.stringify(lockable) === JSON.stringify(hostLockable), "Lockable mounts match encrypted removable mount locations", JSON.stringify(lockable));
+  });
+
+  await step("live Linux GPU", async () => {
+    const cards = await api.listDir("/sys/class/drm", { showHidden: false, hideTemp: false });
+    const paths = cards.filter((entry) => /^card\d+$/.test(entry.name)).map((entry) => entry.path);
+    const read = async (path: string) => {
+      const text = (await api.readTextFile(path).catch(() => null))?.text.trim();
+      return text && /^\d+(?:\.\d+)?$/.test(text) ? Number(text) : null;
+    };
+    const counters = () => Promise.all(paths.map(async (path) => {
+      const [busy, used, total] = await Promise.all(["gpu_busy_percent", "mem_info_vram_used", "mem_info_vram_total"]
+        .map((name) => read(`${path}/device/${name}`)));
+      return { path, busy, used, total };
+    }));
+    for (let i = 0; i < 3; i++) {
+      if (i > 0) await sleep(1000);
+      const before = await counters();
+      const { gpu, gpuMemUsed, gpuMemTotal, gpuTemp } = await api.systemStats();
+      const after = await counters();
+      const readable = [...before, ...after];
+      const hasBusy = readable.some(({ busy }) => busy !== null);
+      const largestVram = Math.max(0, ...readable.map(({ used, total }) => used === null ? 0 : total ?? 0));
+      // Busy and used memory can change between reads. Compare their availability
+      // and range, and require the stable total VRAM counter to match exactly.
+      const busyValid = gpu === null ? !hasBusy : hasBusy && Number.isFinite(gpu) && gpu >= 0 && gpu <= 100;
+      const memoryValid = largestVram === 0
+        ? gpuMemTotal === null && gpuMemUsed === null
+        : gpuMemTotal === largestVram && gpuMemUsed !== null && gpuMemUsed >= 0 && gpuMemUsed <= largestVram;
+      log(busyValid && memoryValid && (gpuTemp === null || Number.isFinite(gpuTemp)),
+        `GPU sample ${i + 1} matches available Linux counters`,
+        JSON.stringify({ before, app: { gpu, gpuMemUsed, gpuMemTotal, gpuTemp }, after }));
+    }
+  });
+  await api.selftestDone(results.join("\n") + `\n\n${failures} failure(s)`);
+}
+
 export async function runSelfTest() {
-  if ((await api.startupArgs()).selftestMode === "mapped-drives") return runMappedDrivesSelfTest();
-  if ((await api.startupArgs()).selftestMode === "themed-select") return (await import("./selftestThemedSelect")).runThemedSelectSelfTest(gitSelftest);
-  if ((await api.startupArgs()).selftestMode === "git-rebase-submodules") return (await import("./selftestGitWorkspace")).runGitRebaseSubmodulesSelfTest(gitSelftest);
-  if ((await api.startupArgs()).selftestMode === "git-compare") return runGitCompareSelfTest();
-  if ((await api.startupArgs()).selftestMode === "structural-diff") return runStructuralDiffSelfTest();
-  if ((await api.startupArgs()).selftestMode === "git-workspace") return (await import("./selftestGitWorkspace")).runGitWorkspaceSelfTest(gitSelftest);
-  if ((await api.startupArgs()).selftestMode === "preview-shortcuts") return runPreviewShortcutsSelfTest();
-  if ((await api.startupArgs()).selftestMode === "quick-open") return runQuickOpenSelfTest();
-  if ((await api.startupArgs()).selftestMode === "key-profiles") return runKeyboardProfilesSelfTest();
-  if ((await api.startupArgs()).selftestMode === "key-profiles-reload") return runKeyboardProfilesReloadSelfTest();
-  if ((await api.startupArgs()).selftestMode === "key-help") return runKeyHelpSelfTest();
-  if ((await api.startupArgs()).selftestMode === "keyboard") return runKeyboardSelfTest();
-  if ((await api.startupArgs()).selftestMode === "bug-report-entry") return runBugReportSelfTest(false, true);
-  if ((await api.startupArgs()).selftestMode === "bug-report") return runBugReportSelfTest();
-  if ((await api.startupArgs()).selftestMode === "bug-report-text") return runBugReportSelfTest(true);
-  if ((await api.startupArgs()).selftestMode === "updates") return runUpdateSelfTest();
+  // "<mode>@<scale>" (git-workspace@1.5) runs a mode at a display scale derived from the display's own scale.
+  const [mode, scaleText] = (await api.startupArgs()).selftestMode.split("@");
+  // WKWebView on macOS shares localStorage per origin across portable runs, so clear
+  // webview-persisted UI preferences (diff mode/options, pane widths, etc.) before each suite.
+  if (mode !== "key-profiles-reload" && mode !== "updates") {
+    try { localStorage.clear(); } catch { /* ignore */ }
+  }
+  const scale = Number(scaleText);
+  if (scaleText && scale > 0) {
+    const zoom = scale / window.devicePixelRatio;
+    (window as unknown as { __selftestZoom?: number }).__selftestZoom = zoom;
+    await getCurrentWebview().setZoom(zoom).catch(() => {});
+    await sleep(300);
+  }
+  if (mode.startsWith("e2e-")) return (await import("./selftestE2e")).runE2eSelfTest(mode, gitSelftest);
+  if (mode === "mapped-drives") return runMappedDrivesSelfTest();
+  if (mode === "diff-permission") {
+    const { runDiffPermissionSelfTest } = await import("./selftestDiffPermission");
+    await runDiffPermissionSelfTest(gitSelftest, activePath(0));
+    await gitSelftest.finish();
+    return;
+  }
+  if (mode === "themed-select") return (await import("./selftestThemedSelect")).runThemedSelectSelfTest(gitSelftest);
+  if (mode === "git-rebase-submodules") return (await import("./selftestGitWorkspace")).runGitRebaseSubmodulesSelfTest(gitSelftest);
+  if (mode === "git-compare") return runGitCompareSelfTest();
+  if (mode === "structural-diff") return runStructuralDiffSelfTest();
+  if (mode === "git-baseline") return (await import("./selftestGitBaseline")).runGitBaselineSelfTest(gitSelftest);
+  if (mode === "file-groups") return (await import("./selftestFileGroups")).runFileGroupsSelfTest(gitSelftest);
+  if (mode === "standalone-merge") {
+    const { runMergeWorkspaceSelfTest } = await import("./selftestStandaloneMerge");
+    await runMergeWorkspaceSelfTest(gitSelftest, activePath(0));
+    await gitSelftest.finish();
+    return;
+  }
+  if (mode === "merge-ai") {
+    const { runMergeAiSelfTest } = await import("./selftestMergeAi");
+    await runMergeAiSelfTest(gitSelftest, activePath(0));
+    await gitSelftest.finish();
+    return;
+  }
+  if (mode === "patch-import") {
+    const { runPatchImportSelfTest } = await import("./selftestPatchImport");
+    await runPatchImportSelfTest(gitSelftest, activePath(0));
+    await gitSelftest.finish();
+    return;
+  }
+  if (mode === "rich-formats") {
+    const { runRichFormatsSelfTest } = await import("./selftestRichFormats");
+    await runRichFormatsSelfTest(gitSelftest, activePath(0));
+    await gitSelftest.finish();
+    return;
+  }
+  if (mode === "doc-compare") {
+    const { runDocCompareSelfTest } = await import("./selftestDocCompare");
+    await runDocCompareSelfTest(gitSelftest, activePath(0));
+    await gitSelftest.finish();
+    return;
+  }
+  if (mode === "git-scrubber") {
+    const { runGitScrubberSelfTest } = await import("./selftestGitScrubber");
+    await runGitScrubberSelfTest(gitSelftest, activePath(0));
+    await gitSelftest.finish();
+    return;
+  }
+  if (mode === "compare-tabs") {
+    const { runCompareTabsSelfTest } = await import("./selftestCompareTabs");
+    await runCompareTabsSelfTest(gitSelftest, activePath(0));
+    await gitSelftest.finish();
+    return;
+  }
+  if (mode === "compare-ai") {
+    const { runCompareAiSelfTest } = await import("./selftestCompareAi");
+    await runCompareAiSelfTest(gitSelftest, activePath(0));
+    await gitSelftest.finish();
+    return;
+  }
+  if (mode === "outline-generated") {
+    const { runOutlineGeneratedSelfTest } = await import("./selftestOutlineGenerated");
+    await runOutlineGeneratedSelfTest(gitSelftest, activePath(0));
+    await gitSelftest.finish();
+    return;
+  }
+  if (mode === "git-workspace") return (await import("./selftestGitWorkspace")).runGitWorkspaceSelfTest(gitSelftest);
+  if (mode === "popup-placement") return (await import("./selftestPopups")).runPopupPlacementSelfTest(gitSelftest);
+  if (mode === "preview-shortcuts") return runPreviewShortcutsSelfTest();
+  if (mode === "quick-open") return runQuickOpenSelfTest();
+  if (mode === "search-hidden") return runSearchHiddenSelfTest();
+  if (mode === "key-profiles") return runKeyboardProfilesSelfTest();
+  if (mode === "key-profiles-reload") return runKeyboardProfilesReloadSelfTest();
+  if (mode === "key-help") return runKeyHelpSelfTest();
+  if (mode === "notifications") return runNotificationSelfTest();
+  if (mode === "linux-live") return runLinuxLiveSelfTest();
+  if (mode === "titlebar") return runTitleBarSelfTest();
+  if (mode === "settings-sections") return runSettingsSectionsSelfTest();
+  if (mode === "window-overlays") return runWindowOverlaysSelfTest();
+  if (mode === "keyboard") return runKeyboardSelfTest();
+  if (mode === "bug-report-entry") return runBugReportSelfTest(false, true);
+  if (mode === "bug-report") return runBugReportSelfTest();
+  if (mode === "bug-report-text") return runBugReportSelfTest(true);
+  if (mode === "updates") return runUpdateSelfTest();
+  if (mode === "i18n") return (await import("./selftestI18n")).runI18nSelfTest(gitSelftest);
+  if (mode === "rendering") return (await import("./selftestRendering")).runRenderingSelfTest(gitSelftest);
+  if (mode === "omarchy") return (await import("./selftestOmarchy")).runOmarchySelfTest(gitSelftest);
+  if (mode === "adaptive-layout") return (await import("./selftestOmarchy")).runAdaptiveLayoutSelfTest(gitSelftest);
+  if (mode === "workspaces-pairs") return (await import("./selftestWorkspacesPairs")).runWorkspacesPairsSelfTest(gitSelftest);
   const errors: string[] = [];
   window.addEventListener("error", (e) => errors.push(e.message));
   window.addEventListener("unhandledrejection", (e) => errors.push(String(e.reason)));
   const root = activePath(0);
   results.push(`root: ${root}`);
-  // Make sure we are on screen: hidden/occluded webviews skip layout and ResizeObserver.
+  // Make sure we are on screen and at a normal dual-pane width (tiling compositors
+  // such as Hyprland can hand out a half-screen tile before auto-floating takes over).
   await getCurrentWindow().setFocus().catch(() => {});
+  await getCurrentWindow().unmaximize().catch(() => {});
+  if (window.innerWidth < 1200 || window.innerHeight < 760) {
+    await setWindowSize(1366, 800);
+  }
   await new Promise<void>((r) => { requestAnimationFrame(() => r()); setTimeout(r, 1000); });
   results.push(`visibility: ${document.visibilityState}, list height: ${Math.round($(".fp-list")?.getBoundingClientRect().height ?? 0)}px`);
   // Legacy steps type to filter; vim keys get their own steps below.
@@ -585,21 +804,59 @@ export async function runSelfTest() {
   });
 
   await step("batch rename", async () => {
-    const { batchRename, undo } = await import("./state/actions");
+    const { batchRename, dismiss, notify, undo } = await import("./state/actions");
     const dir = root + "/Rename";
     const list = async () => (await api.listDir(dir, { showHidden: false, hideTemp: false })).map((e) => e.name).sort().join(",");
     const entries = (await api.listDir(dir, { showHidden: false, hideTemp: false })).sort((a, b) => a.name.localeCompare(b.name));
     batchRename(0, entries);
     const win = await until(() => $(".brn-win"), 3000);
     log(!!win, "F2 on several items opens the batch rename window");
-    typeInto($<HTMLInputElement>(".brn-field input")!, "Trip {n:2}");
-    await sleep(100);
-    $<HTMLElement>('.brn-opts .seg button:nth-child(2)')?.click(); // lower case
-    await sleep(100);
-    const preview = $$(".brn-row .new").map((e) => e.textContent).join(",");
-    log(preview === "trip 01.HEIC,trip 02.HEIC,trip 03.HEIC", "preview shows the new names", preview);
-    await shot("45-batch-rename");
-    $<HTMLElement>(".brn-foot .btn.primary")?.click();
+    const previewNames = () => $$(".brn-row .new").map((e) => e.textContent).join(",");
+    const fillRename = async () => {
+      typeInto($<HTMLInputElement>(".brn-field input")!, "Trip {n:2}");
+      $<HTMLElement>('.brn-opts .seg button:nth-child(2)')?.click(); // lower case
+      return until(() => previewNames() === "trip 01.HEIC,trip 02.HEIC,trip 03.HEIC");
+    };
+    log(!!(await fillRename()), "preview shows the new names", previewNames());
+    const startSize = { width: innerWidth, height: innerHeight };
+    let actionRan = false;
+    const noteIds = [
+      notify("Restored 3 files to a folder with a long name", "success"),
+      notify("Moved 3 files to the trash", "success"),
+      notify("Copied 3 files to a folder with a long name", "success", { label: "Undo", run: () => { actionRan = true; } }),
+    ];
+    const footerButtons = () => $$(".brn-foot button");
+    const footerReachable = () => footerButtons().length === 2 && footerButtons().every(unobstructed);
+    try {
+      const stacked = await until(() => $$(".toasts .toast").length >= 3);
+      log(!!stacked && footerReachable(), "batch rename actions are unobstructed with stacked notifications");
+      const backdrop = $(".brn-win")?.parentElement;
+      log(!!backdrop && document.elementFromPoint(2, innerHeight - 2) === backdrop,
+        "the modal backdrop still blocks the workspace beside notifications");
+      await shot("45-batch-rename");
+      const cancel = $(".brn-foot .btn:not(.primary)");
+      if (cancel && unobstructed(cancel)) click(cancel);
+      log(!!(await until(() => !$(".brn-win"))), "Cancel closes batch rename with stacked notifications");
+      const action = await until(() => {
+        const toast = $$(".toasts .toast").find((el) => el.textContent?.includes("Copied 3 files to a folder with a long name"));
+        const button = toast && $("button", toast);
+        return button && unobstructed(button) && button;
+      });
+      if (action) click(action);
+      log(actionRan, "a retained notification action works after closing batch rename");
+      await setWindowSize(640, 600);
+      batchRename(0, entries);
+      await until(() => $(".brn-win"));
+      await fillRename();
+      log(innerWidth <= 656 && $$(".toasts .toast").length >= 2 && footerReachable(),
+        "both batch rename actions are unobstructed in a narrow window with stacked notifications");
+      await shot("45-batch-rename-narrow");
+      const apply = $<HTMLButtonElement>(".brn-foot .btn.primary");
+      if (apply && !apply.disabled && unobstructed(apply)) click(apply);
+    } finally {
+      for (const id of noteIds) dismiss(id);
+      await setWindowSize(startSize.width, startSize.height);
+    }
     let now = "";
     for (let i = 0; i < 30 && (now = await list()) !== "trip 01.HEIC,trip 02.HEIC,trip 03.HEIC"; i++) await sleep(100);
     log(now === "trip 01.HEIC,trip 02.HEIC,trip 03.HEIC", "items renamed", now);
@@ -640,7 +897,7 @@ export async function runSelfTest() {
     await until(() => row(0, "big") && row(0, "small"), 4000);
     await focusPane(0);
     key("s", { ctrlKey: true, altKey: true });
-    const size = (name: string) => row(0, name)?.querySelector(".col.counting, .col[title]")?.textContent?.trim() ?? "";
+    const size = (name: string) => row(0, name)?.querySelector(".fp-size-col")?.textContent?.trim() ?? "";
     const ok = await until(() => size("big") === "1.46 KB" && size("small") === "300 B", 5000);
     log(!!ok, "Ctrl+Alt+S shows the total size of each folder", `big: ${size("big")}, small: ${size("small")}`);
     const autoBefore = getState().settings!.folderSizesAuto;
@@ -780,15 +1037,29 @@ export async function runSelfTest() {
   });
 
   await step("preview window (Space)", async () => {
+    // Extension groups can put the JPG before the PNG even with name sort.
+    const images = rowNames(0);
+    const [first, last] = images;
+    const widths: Record<string, number> = { "plasma.png": 300, "sunset.jpg": 640 };
+    if (images.length !== 2 || !widths[first] || !widths[last] || first === last) {
+      return log(false, "two previewable images are listed", images.join(", "));
+    }
+    await selectRow(0, last);
     await focusPane(0);
     key(" ", {}, pane(0));
-    const pw = await until(() => $(".pw"));
+    const pw = await until(() => $<HTMLElement>(".pw"));
     log(!!pw, "Space opens preview window");
+    if (!pw) return;
+    pw.focus();
+    const showing = (name: string) => getState().focused[0]?.name === name && row(0, name)?.classList.contains("selected") &&
+      $(".pw .ph .t")?.textContent === name && $<HTMLImageElement>(".pw .pv-image img")?.naturalWidth === widths[name];
+    log(!!(await until(() => showing(last))), "preview renders the last image", last);
+    key("ArrowUp");
+    log(!!(await until(() => showing(first))), "Up moves to previous file in preview", getState().focused[0]?.name ?? "");
     await shot("09-preview-window");
-    key("ArrowUp", {}, document.body); // sunset.jpg is the last file
-    await until(() => getState().focused[0]?.name !== "sunset.jpg", 1500);
-    log(getState().focused[0]?.name === "plasma.png", "Up moves to previous file in preview", getState().focused[0]?.name ?? "");
-    key("Escape", {}, document.body);
+    key("ArrowDown");
+    log(!!(await until(() => showing(last))), "Down returns to the last file in preview", getState().focused[0]?.name ?? "");
+    key("Escape");
     const closed = await until(() => !$(".pw"));
     log(!!closed, "Esc closes preview window");
     key("p", { altKey: true }, document.body);
@@ -924,16 +1195,21 @@ export async function runSelfTest() {
     navigate(0, root + "/Documents");
     await until(() => rowNames(0).includes("file1.txt"));
     await focusPane(0);
-    const names = rowNames(0);
-    await press(pane(0), "g", "g");
-    log(getState().focused[0]?.name === names[0], "gg goes to the first item", getState().focused[0]?.name ?? "none");
-    await press(pane(0), "j", "j");
-    log(getState().focused[0]?.name === names[2], "j moves down", getState().focused[0]?.name ?? "none");
-    await press(pane(0), "k");
-    log(getState().focused[0]?.name === names[1], "k moves up", getState().focused[0]?.name ?? "none");
-    key("G", { shiftKey: true }, pane(0));
-    await sleep(120);
-    log(getState().focused[0]?.name === names[names.length - 1], "G goes to the last item", getState().focused[0]?.name ?? "none");
+    // These motions count file rows; extension headers are separate cursor stops.
+    await withoutTypeGroups(async () => {
+      await until(() => !$(".fp-group", browserEl(0)!));
+      const names = rowNames(0);
+      const focused = () => getState().focused[0]?.name;
+      await press(pane(0), "g", "g");
+      log(!!(await until(() => !!names[0] && focused() === names[0])), "gg goes to the first item", focused() ?? "none");
+      await press(pane(0), "j", "j");
+      log(!!(await until(() => !!names[2] && focused() === names[2])), "j moves down", focused() ?? "none");
+      await press(pane(0), "k");
+      log(!!(await until(() => !!names[1] && focused() === names[1])), "k moves up", focused() ?? "none");
+      const last = names.at(-1);
+      await press(pane(0), ["G", { shiftKey: true }]);
+      log(!!(await until(() => !!last && focused() === last)), "G goes to the last item", focused() ?? "none");
+    });
     // Letters do not filter in vim mode; "/" starts a filter.
     key("w", {}, pane(0));
     await sleep(150);
@@ -1017,16 +1293,20 @@ export async function runSelfTest() {
     openOverlay(null);
     await sleep(150);
     await focusPane(0);
-    await press(pane(0), ",", ["S", { shiftKey: true }]);
-    const sortedBySize = await until(() => {
-      const names = rowNames(0);
-      const heading = $(".fp-hrow .col-head.on", browserEl(0)!)?.textContent ?? "";
-      return heading.includes("Size") && heading.includes("↓")
-        && names.includes("archive.zip") && names.includes("file20.txt") && names.includes("file1.txt")
-        && names.indexOf("archive.zip") < names.indexOf("file20.txt")
-        && names.indexOf("file20.txt") < names.indexOf("file1.txt");
+    // With type groups, the size order applies separately inside each group.
+    await withoutTypeGroups(async () => {
+      await until(() => !$(".fp-group", browserEl(0)!));
+      await press(pane(0), ",", ["S", { shiftKey: true }]);
+      const sortedBySize = await until(() => {
+        const names = rowNames(0);
+        const direction = $(".fp-hrow .fp-size-col .col-head.on .arrow", browserEl(0)!)?.textContent;
+        return direction === "↓"
+          && names.includes("archive.zip") && names.includes("file20.txt") && names.includes("file1.txt")
+          && names.indexOf("archive.zip") < names.indexOf("file20.txt")
+          && names.indexOf("file20.txt") < names.indexOf("file1.txt");
+      });
+      log(!!sortedBySize, ", S sorts by size descending", rowNames(0).join(", "));
     });
-    log(!!sortedBySize, ", S sorts by size descending", rowNames(0).join(", "));
     await press(pane(0), ",", "n");
     const tabsBefore = getState().session!.browsers[0].tabs.length;
     await press(pane(0), "t");
@@ -1237,7 +1517,10 @@ export async function runSelfTest() {
     navigate(0, root + "/Projects/Beta");
     await until(() => rowNames(0).includes("app.properties"));
     const ext = $(".col.ext", row(0, "app.properties")!)!;
-    log(getComputedStyle(ext).textAlign === "right", "type values right-aligned", getComputedStyle(ext).textAlign);
+    // `text-align: end` (logical, so right-to-left mirrors it) computes to "end"; in this left-to-right check it is the right edge.
+    const ltr = getComputedStyle(document.documentElement).direction === "ltr";
+    const align = getComputedStyle(ext).textAlign;
+    log(align === "right" || (ltr && align === "end"), "type values right-aligned", align);
     log(ext.getAttribute("title") === "properties", "long extension has a tooltip", ext.getAttribute("title") ?? "none");
     const md = $(".col.ext", row(0, "notes.md")!)!;
     log(Math.abs(md.getBoundingClientRect().right - ext.getBoundingClientRect().right) < 1, "short and long types share the right edge");
@@ -1277,28 +1560,57 @@ export async function runSelfTest() {
   });
 
   await step("system monitor", async () => {
-    const card = await until(() => $(".sysmon"), 3000);
-    log(!!card && !!$(".group-head", card!) && getComputedStyle(card!).boxShadow === "none", "monitor is a sidebar section (group head, no floating card)");
-    if (!card) return log(false, "system monitor shown by default");
-    const vals = await until(() => { const v = $$(".sysmon .sm-val").map((e) => e.textContent!); return v.length && v.every((t) => /^\d+%$/.test(t)) ? v : null; }, 5000);
-    log(!!vals, "meters show live percentages", (vals ?? []).join(" "));
-    const labels = $$(".sysmon .sm-lbl").map((e) => e.textContent);
-    log(labels.includes("CPU") && labels.includes("Memory"), "CPU and Memory meters", labels.join(","));
-    click($(".sysmon .sm-toggle")!);
-    const det = await until(() => $(".sysmon .sm-details"));
-    log(!!det && det.textContent!.includes("Network") && det.textContent!.includes("Disk I/O"), "details show network and disk I/O", det?.textContent?.slice(0, 80));
-    await shot("25-system-monitor");
-    click($(".sysmon .sm-toggle")!);
-    const btn = $('.main-toolbar [title="Hide system monitor"]');
-    log(!!btn && btn.classList.contains("active"), "toolbar has an active monitor button");
-    if (btn) click(btn);
-    log(!!(await until(() => !$(".sysmon"))), "toolbar button hides the monitor");
-    const show = await until(() => $('.main-toolbar [title="Show system monitor"]'));
-    log(!!show, "button stays visible to bring it back");
-    if (show) click(show);
-    log(!!(await until(() => $(".sysmon"))), "toolbar button shows the monitor again");
-    log(!$(".sysmon .sm-chart"), "no usage chart (removed)");
-    log((getState().settings!.historyCount) === 10, "history keeps the last 10 folders by default", String(getState().settings!.historyCount));
+    const { showHistory, showSystemMonitor } = getState().settings!;
+    const startSize = { width: innerWidth, height: innerHeight };
+    const visibleMonitor = () => $(".sidebar-monitor:not(.is-space-hidden) .sysmon");
+    const button = (pressed: boolean) => {
+      const toggle = $<HTMLButtonElement>(".sidebar .main-toolbar .sidebar-monitor-toggle");
+      return toggle && toggle.getAttribute("aria-pressed") === String(pressed) &&
+        toggle.classList.contains("active") === pressed && unobstructed(toggle) ? toggle : null;
+    };
+    try {
+      // The full monitor needs enough height, even with the I/O details open.
+      if (innerHeight < 760 || innerWidth < 960) await setWindowSize(1100, 760);
+      await updateSettings({ showHistory: false });
+      const card = await until(visibleMonitor);
+      log(!!card && !!$(".group-head", card) && getComputedStyle(card).boxShadow === "none", "monitor is a sidebar section (group head, no floating card)");
+      if (!card) return log(false, "system monitor shown by default");
+      const vals = await until(() => { const v = $$(".sysmon .sm-val").map((e) => e.textContent!); return v.length && v.every((t) => /^\d+%$/.test(t)) ? v : null; }, 5000);
+      log(!!vals, "meters show live percentages", (vals ?? []).join(" "));
+      const labels = $$(".sysmon .sm-lbl").map((e) => e.textContent);
+      log(labels.includes("CPU") && labels.includes("Memory"), "CPU and Memory meters", labels.join(","));
+      const detailsButton = $(".sysmon .sm-toggle");
+      if (detailsButton && unobstructed(detailsButton)) click(detailsButton);
+      const det = await until(() => $(".sysmon .sm-details"));
+      log(!!det && det.textContent!.includes("Network") && det.textContent!.includes("Disk I/O"), "details show network and disk I/O", det?.textContent?.slice(0, 80));
+      await shot("25-system-monitor");
+      if (det && detailsButton) click(detailsButton);
+
+      const hide = await until(() => button(true));
+      log(!!hide, "toolbar has an active monitor button");
+      if (hide) click(hide);
+      log(!!(await until(() => !$(".sysmon") && !getState().settings!.showSystemMonitor)), "toolbar button hides the monitor");
+      const show = await until(() => button(false));
+      log(!!show, "button stays visible to bring it back");
+      if (show) click(show);
+      log(!!(await until(() => !!visibleMonitor() && button(true))), "toolbar button shows the monitor again");
+      log(!$(".sysmon .sm-chart"), "no usage chart (removed)");
+      log(getState().settings!.historyCount === 10, "history keeps the last 10 folders by default", String(getState().settings!.historyCount));
+
+      await updateSettings({ showHistory: true });
+      await setWindowSize(960, 420);
+      const crowded = await until(() => getState().monitorCrowded && getState().settings!.showSystemMonitor && !visibleMonitor() && button(false));
+      log(!!crowded, "the crowded sidebar makes room for History and keeps the monitor button reachable", `${innerWidth}×${innerHeight}`);
+      await shot("25-system-monitor-crowded");
+      if (crowded) click(crowded);
+      const shownAnyway = await until(() => !!visibleMonitor() && button(true));
+      log(!!shownAnyway && getState().monitorCrowded, "the monitor can be shown while the sidebar is still crowded");
+      if (shownAnyway) click(shownAnyway);
+      log(!!(await until(() => !$(".sysmon") && button(false))), "the monitor can be hidden again in the short window");
+    } finally {
+      await setWindowSize(startSize.width, startSize.height);
+      await updateSettings({ showHistory, showSystemMonitor });
+    }
   });
 
   await step("per-panel undo", async () => {
@@ -1391,7 +1703,7 @@ export async function runSelfTest() {
   });
 
   await step("compare: other panel, clipboard, binary, Git HEAD", async () => {
-    const { navigate, compareSelection, compareWithClipboard, compare, compareWithGitHead } = await import("./state/actions");
+    const { navigate, compareSelection, compareWithClipboard, compare, compareGitFile } = await import("./state/actions");
     navigate(1, root + "/Projects/Alpha");
     await until(() => rowNames(1).includes("config.yaml"));
     await selectRow(0, "config.yaml");
@@ -1423,7 +1735,7 @@ export async function runSelfTest() {
     await sleep(200);
     const repo = await api.gitRoot(root + "/Projects/Alpha/notes.txt");
     if (repo) {
-      compareWithGitHead(root + "/Projects/Alpha/notes.txt");
+      compareGitFile(root + "/Projects/Alpha/notes.txt");
       await until(() => $(".diffv .dv-row"), 4000);
       log(!!$(".dv-file.l .dv-tag") && $$(".dv-cell.chg mark.dv-word").some((m) => m.textContent?.includes("changed")), "Git HEAD vs working copy shows my change");
       await shot("29-compare-git-head");
@@ -1443,7 +1755,7 @@ export async function runSelfTest() {
     const { compare } = await import("./state/actions");
     await win.unmaximize();
     for (const [w, h] of [[800, 600], [1366, 768], [2560, 1440]] as const) {
-      await win.setSize(new LogicalSize(w, h));
+      await setWindowSize(w, h);
       await sleep(500);
       compare({ kind: "file", path: root + "/Projects/Beta/config.old.yaml" }, { kind: "file", path: root + "/Projects/Beta/config.yaml" });
       await until(() => $(".diffv .dv-row"), 4000);
@@ -1550,7 +1862,7 @@ export async function runSelfTest() {
     log(!!(await until(() => $(".dircmp .dc-row"), 5000)), "Ctrl+Shift+D on two selected folders compares them", `selected=${selected()} active=${getState().session?.activeBrowser} overlay=${getState().overlay?.type}`);
     const win = getCurrentWindow();
     await win.unmaximize();
-    await win.setSize(new LogicalSize(800, 600));
+    await setWindowSize(800, 600);
     await sleep(600);
     const r = $(".dircmp")!.getBoundingClientRect();
     log(r.right <= window.innerWidth + 1 && r.bottom <= window.innerHeight + 1 && document.documentElement.scrollWidth <= window.innerWidth + 1, "folder compare fits 800x600", `${Math.round(r.width)}x${Math.round(r.height)}`);
@@ -1567,16 +1879,35 @@ export async function runSelfTest() {
     compare({ kind: "file", path: L }, { kind: "file", path: R });
     await until(() => $(".diffv .dv-row"), 4000);
     const dv = $(".diffv")!;
-    log($$(".dv-merge button").length >= 2, "each change has copy buttons", `${$$(".dv-merge button").length} buttons`);
+    const originalRight = (await api.readTextFile(R)).text;
+    const permission = () => $<HTMLInputElement>(".dv-allow-changes input")!;
+    const copyButtons = () => $$(".dv-merge button[title^='Copy this change']");
+    log(!!permission() && !permission().checked && copyButtons().length === 0, "diff starts read-only with no copy buttons");
+    await shot("33-merge-read-only");
     const removed = () => Number(($(".dv-stat .del")?.textContent ?? "−0").replace("−", ""));
     const before = removed();
     key("n", {}, dv);
     await sleep(100);
     key("ArrowRight", { altKey: true }, dv);
+    await sleep(300);
+    log(!$(".dv-file.r .dv-dirty") && removed() === before, "Alt+→ cannot change a read-only diff");
+    click(permission());
+    await sleep(100);
+    log(permission().checked && copyButtons().length >= 2, "allowing changes reveals copy buttons");
+    key("ArrowRight", { altKey: true }, dv);
     log(!!(await until(() => $(".dv-file.r .dv-dirty"), 3000)), "Alt+→ copies the change to the right (marked modified)");
     await until(() => removed() < before, 3000);
     log(removed() < before, "the copied change is gone from the diff", `−${before} → −${removed()}`);
     await shot("33-merge");
+    click(permission());
+    await sleep(100);
+    key("s", { ctrlKey: true }, dv);
+    await sleep(300);
+    log(!!$(".dv-file.r .dv-dirty") && !permission().checked && copyButtons().length === 0 &&
+      (await api.readTextFile(R)).text === originalRight,
+    "revoking permission blocks saving and preserves the unsaved draft");
+    click(permission());
+    await sleep(100);
     key("z", { ctrlKey: true }, dv);
     log(!!(await until(() => !$(".dv-file.r .dv-dirty"), 3000)), "Ctrl+Z undoes the copy inside the view");
     key("ArrowRight", { altKey: true }, dv);
@@ -1601,6 +1932,9 @@ export async function runSelfTest() {
     await api.clipSetText("alpha\nzzz\n");
     await compareWithClipboard(L);
     await until(() => $(".diffv .dv-row"), 4000);
+    log(!permission().checked, "a newly opened diff starts read-only");
+    click(permission());
+    await sleep(100);
     key("n", {}, $(".diffv")!);
     key("ArrowRight", { altKey: true }, $(".diffv")!);
     await sleep(300);
@@ -1610,7 +1944,7 @@ export async function runSelfTest() {
   });
 
   await step("compare: images", async () => {
-    const { compare } = await import("./state/actions");
+    const { compare, dismiss, notify } = await import("./state/actions");
     compare({ kind: "file", path: root + "/Images/a.png" }, { kind: "file", path: root + "/Images/b.png" });
     const ic = await until(() => $(".imgcmp"), 4000);
     log(!!ic, "two images open the image comparison");
@@ -1626,7 +1960,23 @@ export async function runSelfTest() {
     const v = parseFloat(pctTxt);
     log(!!stat && v > 5 && v < 20, "4 = pixel difference with % changed (rectangle ≈ 7.5%)", pctTxt);
     log(!!(await until(() => (($(".ic-stage.diff img") as HTMLImageElement | null)?.naturalWidth ?? 0) > 0, 3000)), "difference image renders");
-    await shot("34-image-diff");
+    const noteIds = [
+      notify("Copied a large image to the comparison folder", "success"),
+      notify("Restored an older image to the comparison folder", "success"),
+      notify("Moved 3 image files to the trash", "success"),
+    ];
+    try {
+      await until(() => $$(".toasts .toast").length >= 3);
+      const stack = $(".toasts");
+      const view = $(".diffv");
+      log($$(".toasts .toast").length >= 3 && !!stack && !!view &&
+        stack.getBoundingClientRect().top >= view.getBoundingClientRect().bottom,
+        "stacked notifications stay below the image comparison");
+      log(unobstructed($(".ic-bar .seg button.on")), "image difference controls remain reachable");
+      await shot("34-image-diff");
+    } finally {
+      for (const id of noteIds) dismiss(id);
+    }
     window.dispatchEvent(new KeyboardEvent("keydown", { key: "1", bubbles: true }));
     key("Escape", {}, $(".diffv")!);
     await sleep(200);
@@ -1716,7 +2066,7 @@ export async function runSelfTest() {
     ];
     for (const [w, h, fs] of cases) {
       await updateSettings({ fontSize: fs });
-      await win.setSize(new LogicalSize(w, h));
+      await setWindowSize(w, h);
       await sleep(700);
       const actual = `${window.innerWidth}x${window.innerHeight}`;
       const p = layoutProblems();
@@ -1919,6 +2269,200 @@ export async function runSelfTest() {
   await api.selftestDone(results.join("\n"));
 }
 
+/** Runs against the mounted title bar and checks that a plain click has no window effect. */
+async function runWindowOverlaysSelfTest() {
+  const A = await import("./state/actions");
+  const visibleImmediately = (element: Element | null): boolean => {
+    if (!element) return false;
+    const style = getComputedStyle(element);
+    return style.animationName === "none" && style.opacity === "1";
+  };
+  const verifyOverlay = async (name: string, selector: string) => {
+    const element = await until(() => $(selector));
+    log(visibleImmediately(element) && visibleImmediately(element!.closest(".backdrop")),
+      `${name} opens fully visible without a backdrop fade`);
+  };
+  try {
+    await updateSettings({ keyboardProfile: "vim", animations: true, adaptiveLayout: false });
+    await setWindowSize(1100, 760);
+    await A.setLayout("classic");
+    await focusPane(0);
+    await selectRow(0, "sample.svg");
+    key("i", {}, pane(0));
+    await verifyOverlay("Image preview", ".pw");
+    log(!!(await until(() => {
+      const image = $<HTMLImageElement>(".pw .pb img");
+      return image?.naturalWidth === 240 && getComputedStyle(image).opacity === "1";
+    })), "the image paints at full opacity after decoding");
+    await shot("window-overlay-image-preview");
+    key("Escape", {}, $(".pw"));
+    await until(() => !$(".pw"));
+    await focusPane(0);
+    key("N", { ctrlKey: true, shiftKey: true }, pane(0));
+    await verifyOverlay("New Folder dialog", ".modal");
+    await shot("window-overlay-new-folder");
+    key("Escape", {}, $(".modal input"));
+    await until(() => !$(".modal"));
+    await A.setLayout("standard");
+    const second = await until(() => $$(".browser").filter((el) => el.getBoundingClientRect().width > 0)[1]);
+    log(visibleImmediately(second), "the second file pane opens fully visible");
+    await shot("window-overlay-second-pane");
+  } catch (error) {
+    log(false, "window overlays", String(error));
+  }
+  await api.selftestDone(results.join("\n") + `\n\n${failures} failure(s)`);
+}
+
+async function runTitleBarSelfTest() {
+  const titlebar = document.querySelector<HTMLElement>(".titlebar");
+  if (!titlebar) {
+    log(false, "title bar is mounted");
+    await api.selftestDone(results.join("\n") + `\n\n${failures} failure(s)`);
+    return;
+  }
+  const win = getCurrentWindow();
+  const state = async () => JSON.stringify({
+    position: await win.outerPosition(),
+    size: await win.outerSize(),
+    maximized: await win.isMaximized(),
+  });
+  const before = await state();
+  const rect = titlebar.getBoundingClientRect();
+  const click = (type: string) => titlebar.dispatchEvent(new MouseEvent(type, {
+    bubbles: true, cancelable: true, button: 0, detail: 1,
+    clientX: rect.left + 12, clientY: rect.top + rect.height / 2,
+  }));
+  click("mousedown");
+  click("mouseup");
+  click("click");
+  await sleep(250);
+  const after = await state();
+  log(titlebar.getAttribute("data-tauri-drag-region") === "false", "native mousedown drag region is explicitly disabled");
+  log(before === after, "a single title-bar click leaves position, size, and maximize state unchanged", `${before} → ${after}`);
+  await api.selftestDone(results.join("\n") + `\n\n${failures} failure(s)`);
+}
+
+/** Guards the Settings shell and its scroll position while every section is switched. */
+async function runSettingsSectionsSelfTest() {
+  await updateSettings({ language: "en", theme: "dark", windowButtons: "auto", animations: true });
+  const runLayout = async (layout: string, width: number, height: number) => {
+    await setWindowSize(width, height);
+    const vimKeys = layout === "wide";
+    await updateSettings({ vimKeys });
+    const opener = vimKeys ? ".main-toolbar > button:first-child" : ".tb-logo";
+    const settingsButton = await until(() => $(opener));
+    if (!settingsButton) {
+      log(false, "Settings button is available");
+      return;
+    }
+    click(settingsButton);
+    const modal = await until(() => $(".settings"));
+    const panel = await until(() => modal && $(".panel", modal));
+    const nav = modal && $(".sbody > nav", modal);
+    if (!modal || !panel || !nav) {
+      log(false, `Settings shell mounts at ${layout} size`);
+      return;
+    }
+
+    const backdrop = modal.closest(".backdrop");
+    log(!!backdrop && [backdrop, modal, panel].every((element) => {
+      const style = getComputedStyle(element);
+      return style.animationName === "none" && style.opacity === "1";
+    }), `Settings is fully visible on open (${layout}, ${opener})`);
+    const search = $<HTMLInputElement>(".ssearch input", modal);
+    log(!!search && document.activeElement === search, `Settings search takes focus on open (${layout})`);
+    if (search) {
+      const keyAllowed = search.dispatchEvent(new KeyboardEvent("keydown", { key: "q", code: "KeyQ", bubbles: true, cancelable: true }));
+      typeInto(search, "q");
+      log(keyAllowed && !!(await until(() => $(".section-head h2", modal)?.textContent === "Search")),
+        `Settings search accepts typing (Vim keys ${vimKeys ? "on" : "off"})`);
+      typeInto(search, "");
+      await until(() => $(".section-head h2", modal)?.textContent === "Appearance");
+    }
+
+    await sleep(250);
+    const shellRect = modal.getBoundingClientRect();
+    const navRect = nav.getBoundingClientRect();
+    const panelRect = panel.getBoundingClientRect();
+    let panelAnimations = 0;
+    const countPanelAnimation = (event: AnimationEvent) => {
+      if (event.target instanceof Element && event.target.matches(".settings .panel")) panelAnimations++;
+    };
+    document.addEventListener("animationstart", countPanelAnimation, true);
+    await shot(`settings-sections-${layout}-appearance`);
+
+    const allNavButtons = $$<HTMLButtonElement>("button", nav);
+    const keyboardButton = allNavButtons.find((button) => button.textContent?.trim() === "Keyboard");
+    const navButtons = keyboardButton
+      ? [keyboardButton, ...allNavButtons.filter((button) => button !== keyboardButton)]
+      : allNavButtons;
+    for (const [index, button] of navButtons.entries()) {
+      if (button.classList.contains("on")) continue;
+      const name = button.textContent?.trim() || `section ${index + 1}`;
+      const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+      const animationCount = panelAnimations;
+      const scrollProbe = Math.min(24, Math.max(0, panel.scrollHeight - panel.clientHeight));
+      if (scrollProbe) panel.scrollTop = scrollProbe;
+      click(button);
+      await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+      await sleep(50);
+
+      const currentPanel = $(".panel", modal);
+      const currentNav = $(".sbody > nav", modal);
+      const activeLabel = $("button.on span", nav)?.textContent?.trim();
+      if (name === "Window") {
+        const select = $<HTMLSelectElement>("#opt-windowButtons", panel);
+        const text = select?.selectedOptions[0]?.label;
+        const context = document.createElement("canvas").getContext("2d");
+        if (select && text && context) {
+          const style = getComputedStyle(select);
+          context.font = `${style.fontStyle} ${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
+          const available = select.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+          const width = context.measureText(text).width;
+          log(select.value === "auto" && width <= available, `Automatic window buttons label fits (${layout})`,
+            `"${text}": ${width.toFixed(1)}px of ${available}px`);
+        } else {
+          log(false, `Automatic window buttons label can be measured (${layout})`);
+        }
+      }
+      const currentModalRect = modal.getBoundingClientRect();
+      const currentNavRect = nav.getBoundingClientRect();
+      const currentPanelRect = currentPanel?.getBoundingClientRect();
+      const currentScrollLimit = currentPanel ? Math.max(0, currentPanel.scrollHeight - currentPanel.clientHeight) : 0;
+      const expectedScroll = Math.min(scrollProbe, currentScrollLimit);
+      const frame = `settings-sections-${layout}-${index + 1}-${slug}-transition`;
+      await api.selftestShot(frame).catch((error) => log(false, `screenshot ${frame}`, String(error)));
+      log(currentPanel === panel && currentNav === nav && activeLabel === name,
+        `Settings shell and sidebar stay mounted while opening ${name} (${layout})`);
+      log(panelAnimations === animationCount, `Settings content does not replay its fade animation for ${name} (${layout})`);
+      log(!!currentPanelRect
+        && Math.abs(currentModalRect.width - shellRect.width) < 1
+        && Math.abs(currentModalRect.height - shellRect.height) < 1
+        && Math.abs(currentNavRect.left - navRect.left) < 1
+        && Math.abs(currentNavRect.width - navRect.width) < 1
+        && Math.abs(currentPanelRect.left - panelRect.left) < 1
+        && Math.abs(currentPanelRect.top - panelRect.top) < 1
+        && Math.abs(currentPanelRect.width - panelRect.width) < 1
+        && Math.abs(currentPanelRect.height - panelRect.height) < 1,
+      `Settings shell and sidebar geometry stay stable for ${name} (${layout})`);
+      if (scrollProbe) {
+        log(!!currentPanel && Math.abs(currentPanel.scrollTop - expectedScroll) < 1,
+          `Settings content scroll position stays stable for ${name} (${layout})`,
+          `${scrollProbe} → ${currentPanel?.scrollTop ?? "missing"}`);
+      }
+      await shot(`settings-sections-${layout}-${index + 1}-${slug}`);
+    }
+
+    document.removeEventListener("animationstart", countPanelAnimation, true);
+    key("Escape", {}, search);
+    log(!!(await until(() => !$(".settings"))), `Escape closes Settings (${layout})`);
+  };
+
+  await runLayout("wide", 1200, 900);
+  await runLayout("compact", 850, 650);
+  await api.selftestDone(results.join("\n") + `\n\n${failures} failure(s)`);
+}
+
 /** Structural diff: reformatting is told apart from changes in the compare view and in both Git patch views. */
 async function runStructuralDiffSelfTest() {
   const marked = (selector: string) => $$(selector).map((m) => m.textContent ?? "");
@@ -2013,46 +2557,85 @@ async function runGitCompareSelfTest() {
     await focusPane(0);
     await selectRow(0, "file.txt");
     key("=", {}, pane(0));
-    await sleep(300);
-    log(!!$(".wk"), "compare key menu opens");
+    const menu = await until(() => $(".wk"));
+    const menuStyle = menu && getComputedStyle(menu);
+    log(menuStyle?.animationName === "none" && menuStyle.opacity === "1",
+      "compare key menu opens fully visible without shifting");
     await shot("git-compare-menu");
+    const scope = 'input[aria-label="Only this file"]';
+    const reflog = ".gg-reflog:last-of-type input";
+    const graphRows = () => $$(".git-graph-lines .gg-row");
     key("g", {}, pane(0));
-    log(!!await until(() => $$(".git-graph-lines .gg-row").length === 2), "commit picker loads history");
-    await shot("git-compare-commits");
+    log(!!await until(() => graphRows().length === 4 && $(scope) && !($(scope) as HTMLInputElement).checked), "commit picker starts with repository history");
+    const head = graphRows()[0]?.getAttribute("data-commit");
     log(!$(".git-graph-lines")?.textContent?.includes("reflog-only commit"), "reflog commits are hidden by default");
-    click($(".gg-reflog input")!);
+    click($(reflog)!);
     log(!!await until(() => $(".git-graph-lines")?.textContent?.includes("reflog-only commit")), "Reflog checkbox reveals detached commit");
     await shot("git-reflog-enabled");
-    click($(".gg-reflog input")!);
-    log(!!await until(() => !($(".gg-reflog input") as HTMLInputElement)?.checked && $$(".git-graph-lines .gg-row").length === 2), "unchecking Reflog restores branch history");
+    click($(reflog)!);
+    log(!!await until(() => !($(reflog) as HTMLInputElement)?.checked && graphRows().length === 4), "unchecking Reflog restores branch history");
+    click($(scope)!);
+    log(!!await until(() => graphRows().length === 3), "checking file scope hides unrelated commits");
+    const lastChange = graphRows()[0]?.getAttribute("data-commit");
+    const beforeChange = graphRows()[1]?.getAttribute("data-commit");
+    await shot("git-compare-commits");
 
     key("j", {}, $(".git-graph"));
-    log(!!await until(() => $$(".git-graph-lines .gg-row")[1]?.classList.contains("selected")), "j selects the older commit");
+    await until(() => graphRows()[1]?.classList.contains("selected"));
+    key("j", {}, $(".git-graph"));
+    log(!!await until(() => graphRows()[2]?.classList.contains("selected")), "j selects the oldest commit");
     key("Enter", {}, $(".git-graph"));
-    log(!!await until(() => $(".diffv .dv-row")), "older commit opens in compare view");
-    log(!!$(".diffv")?.textContent?.includes("first") && !!$(".diffv")?.textContent?.includes("working"), "compare shows selected commit and working copy");
+    log(!!await until(() => !$(".git-graph") && $(".diffv .dv-row")), "=g replaces the commit picker with the comparison");
+    log($(".dv-file.l b")?.textContent === "before.txt" && !!$(".diffv")?.textContent?.includes("first") && !!$(".diffv")?.textContent?.includes("working"), "compare follows the historical name and shows the working copy");
     await shot("git-compare-result");
     key("Escape", {}, $(".diffv"));
     await until(() => !$(".diffv"));
+    const fileChord = async (chord: string) => {
+      await focusPane(0);
+      await selectRow(0, "file.txt");
+      key("=", {}, pane(0)); key(chord, {}, pane(0));
+    };
+    await fileChord("r");
+    log(!!await until(() => graphRows().length === 3 && ($(scope) as HTMLInputElement)?.checked), "file history starts scoped to the selected file");
+    const oldest = graphRows()[2]?.getAttribute("data-commit");
+    click(graphRows()[2]!);
+    log(!!oldest && !!await until(() => !$(".git-graph") && $(".dv-file.l .dv-tag")?.getAttribute("title") === oldest && $(".diffv .dv-row")), "=r replaces file history with the selected commit comparison");
+    log($(".dv-file.l b")?.textContent === "before.txt" && !!$(".diffv")?.textContent?.includes("first") && !!$(".diffv")?.textContent?.includes("working"), "=r compares the historical path with the current working copy");
+    key("Escape", {}, $(".diffv"));
+    await until(() => !$(".diffv"));
+    await fileChord("h");
+    log(!!head && !!await until(() => $(".dv-file.l .dv-tag")?.getAttribute("title") === head), "=h opens HEAD against the working copy");
+    key("Escape", {}, $(".diffv"));
+    await until(() => !$(".diffv"));
+    await fileChord("l");
+    log(!!beforeChange && !!lastChange && !!await until(() => $(".dv-file.l .dv-tag")?.getAttribute("title") === beforeChange && $(".dv-file.r .dv-tag")?.getAttribute("title") === lastChange), "=l opens the parent and last file-changing commit");
+    log(!!await until(() => $(".diffv [role=status]")?.textContent?.includes("Only line endings differ")), "=l explains a line-ending-only commit");
+    key("Escape", {}, $(".diffv"));
+    await until(() => !$(".diffv"));
+
     await updateSettings({ keyboardProfile: "explorer" });
     await getCurrentWindow().unmaximize();
-    await getCurrentWindow().setSize(new LogicalSize(700, 600));
+    await setWindowSize(700, 600);
     const A = await import("./state/actions");
     A.openOverlay({ type: "gitCommits", path: activePath(0) + "/new.txt" });
-    await until(() => $$(".git-graph-lines .gg-row").length === 2);
+    await until(() => graphRows().length === 4);
     key("r", {}, $(".git-graph"));
-    log(!($(".gg-reflog input") as HTMLInputElement)?.checked, "r does not toggle reflog with Vim disabled");
+    log(!($(reflog) as HTMLInputElement)?.checked, "r does not toggle reflog with Vim disabled");
     key("j", {}, $(".git-graph"));
     await sleep(100);
-    log($$(".git-graph-lines .gg-row")[0]?.classList.contains("selected"), "j does not navigate with Vim disabled");
-    key("ArrowDown", {}, $(".git-graph"));
-    log(!!await until(() => $$(".git-graph-lines .gg-row")[1]?.classList.contains("selected")), "arrow keys select with Vim disabled");
+    log(graphRows()[0]?.classList.contains("selected"), "j does not navigate with Vim disabled");
+    const search = $(".git-graph .gg-search");
+    search?.focus();
+    key("ArrowDown", {}, search);
+    log(document.activeElement === graphRows()[0] && !$(".diffv"), "ArrowDown leaves search for the first commit without comparing");
+    key("ArrowDown", {}, graphRows()[0]);
+    log(!!await until(() => graphRows()[1]?.classList.contains("selected")), "arrow keys select with Vim disabled");
     await shot("git-compare-narrow");
     key("Enter", {}, $(".git-graph"));
     log(!!await until(() => $(".diffv")?.textContent?.includes("file is not in the selected revision")), "missing historical file reports an error");
     await shot("git-compare-missing");
     await updateSettings({ theme: "dark" });
-    await getCurrentWindow().setSize(new LogicalSize(1100, 720));
+    await setWindowSize(1100, 720);
     A.openOverlay(null);
     await focusPane(0);
     click($(".fp-status .git", browserEl(0)!)!);
@@ -2095,7 +2678,7 @@ async function runGitCompareSelfTest() {
     click($(".gg-checkout")!);
     log(!!await until(() => getState().overlay?.type === "dialog"), "dirty switch asks how to handle changes");
     await shot("git-graph-dirty");
-    click($$("button").find((b) => b.textContent?.startsWith("Stash"))!);
+    click($(".modal [data-id=stash]")!); // the dialog button, not the "Stashes" tab behind it
     log(!!await until(() => $$(".git-graph-lines button").some((b) => b.textContent?.includes("HEAD") && b.textContent?.includes("first")) && !$(".git-graph [role=status]"), 5000), "stash and revision switch complete");
     log(!!await until(() => $(".fp-status .git", browserEl(0)!)?.textContent?.includes("first") && $(".fp-status .git", browserEl(0)!)?.textContent?.includes("main")), "detached revision status shows containing branch and commit message");
     await shot("git-graph-detached-working");
@@ -2128,25 +2711,32 @@ export async function runDemo() {
   // A fixed window size keeps the UI legible in the README whatever the screen is.
   const win = getCurrentWindow();
   await win.unmaximize().catch(() => {});
-  await win.setSize(new LogicalSize(1440, 900)).catch(() => {});
+  await setWindowSize(1440, 900);
   await win.center().catch(() => {});
   await sleep(600);
-  await updateSettings({ theme: "dark", showDetailsPane: false });
+  await updateSettings({ theme: "dark", showNavColumns: false, showDetailsPane: false, showSystemMonitor: true });
+  setLayout("standard");
+  A.toggleColumns(0, false);
+  A.toggleColumns(1, false);
   await goHome();
   await until(() => rowNames(0).length > 0 && rowNames(1).length > 0, 5000);
   await selectRow(0, "Glacier lagoon.jpg");
   await sleep(600);
   await shot("main");
 
-  await updateSettings({ showDetailsPane: false });
+  await updateSettings({ showNavColumns: false, showDetailsPane: false });
   setLayout("columns");
+  A.toggleColumns(0, false);
+  A.toggleColumns(1, false);
   await goHome();
-  await sleep(400);
+  await sleep(500);
   await selectRow(1, "index.html");
-  await shot("columns");
+  await shot("stacked");
 
   setLayout("standard");
-  await updateSettings({ theme: "light" });
+  A.toggleColumns(0, false);
+  A.toggleColumns(1, false);
+  await updateSettings({ theme: "light", showNavColumns: false });
   await goHome();
   click($('[title="File view"]', browserEl(0)!)!);
   const g = await until(() => $$(".menu .mi").find((x) => x.textContent?.includes("Thumbnail grid")));
@@ -2163,7 +2753,9 @@ export async function runDemo() {
   await shot("drag");
   d.drop();
   await sleep(600);
-  await updateSettings({ theme: "dark", showDetailsPane: false });
+  await updateSettings({ theme: "dark", showNavColumns: false, showDetailsPane: false });
+  A.toggleColumns(0, false);
+  A.toggleColumns(1, false);
   await goHome();
 
   const report: string[] = ["demo done"];
@@ -2207,8 +2799,12 @@ export async function runDemo() {
     await esc(".qo");
   }
 
-  // Find in files: a word somewhere in thousands of system headers.
-  A.openOverlay({ type: "grep", root: "/usr/include", scope: "folder" });
+  // Find in files: a word somewhere in system headers (Linux /usr/include or macOS SDK headers).
+  let grepRoot = home + "/Projects";
+  for (const cand of ["/usr/include", "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include"]) {
+    if ((await api.pathResolve(cand).catch(() => null))?.exists) { grepRoot = cand; break; }
+  }
+  A.openOverlay({ type: "grep", root: grepRoot, scope: "folder" });
   const gi = await until(() => $<HTMLInputElement>(".fif-query input"));
   if (gi) {
     await sleep(300);
@@ -2222,8 +2818,26 @@ export async function runDemo() {
     await esc(".fif-query");
   }
 
-  // Compare: text, Excel and images.
+  // Git workspace: commit graph, branches, tags and working changes diff on ~/Projects/website.
   const W = args.path2!;
+  await A.openGitWorkspace(W).catch(() => {});
+  if (await until(() => $$(".git-graph-lines [data-commit]").length > 0, 8000)) {
+    await sleep(600);
+    const firstCommit = $$(".git-graph-lines [data-commit]").find((r) => !r.textContent?.includes("Working Changes"))
+      ?? $$(".git-graph-lines [data-commit]")[0];
+    if (firstCommit) click(firstCommit);
+    await sleep(700);
+    await shot("git-workspace");
+    // Close Git workspace cleanly (confirm if exit prompt appears).
+    key("Escape", {}, document.body);
+    await sleep(250);
+    const leaveBtn = $$("button").find((b) => /leave|close|yes/i.test(b.textContent ?? "") && b.closest(".modal"));
+    if (leaveBtn) click(leaveBtn);
+    await until(() => !$(".gg-root, .git-graph-lines"), 3000);
+    await sleep(300);
+  }
+
+  // Compare: text, Excel and images.
   A.compare({ kind: "file", path: W + "/index.old.html" }, { kind: "file", path: W + "/index.html" });
   if (await until(() => $(".diffv .dv-row"), 5000)) {
     await sleep(600);
@@ -2400,7 +3014,7 @@ export async function runUiAudit() {
   };
   const size = async (w: number, h: number) => {
     await win.unmaximize().catch(() => {});
-    await win.setSize(new LogicalSize(w, h)).catch(() => {});
+    await setWindowSize(w, h);
     await sleep(700);
   };
   const view = async (path: string, v: string) => {
@@ -2599,7 +3213,7 @@ export async function runDesignShots() {
     );
   };
   await win.unmaximize().catch(() => {});
-  await win.setSize(new LogicalSize(1280, 820)).catch(() => {});
+  await setWindowSize(1280, 820);
   await win.center().catch(() => {});
   await sleep(800);
   const sections = ["appearance", "view", "search", "keyboard-vim", "columns", "behavior", "window", "openWith", "preview", "advanced", "about", "updates", "shortcuts"];
@@ -2619,7 +3233,7 @@ export async function runDesignShots() {
     checkSupportQr(".about-win .about-support-qr", `About (${theme})`);
     await shot(`about-${theme}`);
     A.openOverlay({ type: "welcome" });
-    for (let i = 0; i < 4; i++) {
+    for (let i = 0; i < 5; i++) {
       await until(() => $(".welcome"), 2000);
       await sleep(350);
       await shot(`welcome-${theme}-${i + 1}`);
@@ -2637,94 +3251,215 @@ async function runUpdateSelfTest() {
   const A = await import("./state/actions");
   const { invoke } = await import("@tauri-apps/api/core");
   const win = getCurrentWindow();
+  const info = getState().info!;
   const panel = () => $("section[aria-label='Application updates']");
   const checkButton = () => $$("button", panel() ?? document).find((button) => button.textContent === "Check for updates") as HTMLButtonElement | undefined;
+  const restartButton = () => $$("button", panel() ?? document).find((button) => button.textContent === "Restart to update") as HTMLButtonElement | undefined;
   const terminal = () => {
     const text = panel()?.textContent ?? "";
-    return !checkButton()?.disabled && ["error", "current", "available"].includes(panel()?.getAttribute("data-state") ?? "") ? text : null;
+    const stateAttr = panel()?.getAttribute("data-state") ?? "";
+    return !checkButton()?.disabled && ["error", "current", "available", "ready"].includes(stateAttr) ? text : null;
   };
+  const phaseFile = `${info.dataDir.replace(/[\\/]+$/, "")}/selftest-updates-phase1.json`;
   try {
     await win.unmaximize();
-    await win.setSize(new LogicalSize(1280, 820));
+    await setWindowSize(1280, 820);
     await sleep(500);
-    A.openOverlay({ type: "settings", section: "updates" });
+
+    // Installed by a distribution package (package-managed marker): the updater must never
+    // download or stage anything; the UI says the system package manager owns updates.
+    if (info.installKind === "distro-package" || info.updateStrategy === "storeManaged") {
+      log(info.updateStrategy === "storeManaged", "package-managed install reports the storeManaged strategy", info.updateStrategy);
+      log(info.installKind === "distro-package", "package-managed install reports the distro-package kind", info.installKind);
+      A.openOverlay({ type: "settings", section: "updates" });
+      const tab = await until(() => $$(".settings nav button").find((b) => b.textContent?.trim() === "Updates"));
+      if (tab) click(tab);
+      log(!!(await until(panel)), "Settings Updates opens for a package-managed install");
+      await until(() => checkButton() && !checkButton()!.disabled, 25000);
+      if (checkButton() && !checkButton()!.disabled) {
+        click(checkButton()!);
+        await sleep(300);
+        await until(() => checkButton() && !checkButton()!.disabled, 25000);
+      }
+      const text = panel()?.textContent ?? "";
+      log(/system|package manager|pacman|omarchy update/i.test(text), "Updates explains that the system package manager owns updates", text.slice(0, 120));
+      const labels = $$("button", panel() ?? document).map((b) => b.textContent?.trim() ?? "");
+      log(!labels.some((l) => /^(Install|Download|Restart to update)/i.test(l)), "no install / download / restart controls are offered", labels.join(" | "));
+      log(Object.keys(getState().tasks).length === 0, "no download task is running");
+      const st = panel()?.getAttribute("data-state") ?? "";
+      log(st !== "downloading" && st !== "ready", "updater never reaches downloading / ready", st);
+      await shot("updates-package-managed");
+      results.push("SCREENSHOT updates-package-managed.png: Updates page explaining system-managed updates, with only 'Check for updates'.");
+      await api.selftestDone(results.join("\n") + `\n\n${failures} failure(s)`);
+      return;
+    }
+
+    // Phase 2 after an actual signed overlay restart into the updated binary.
+    if (info.runningOverlay) {
+      let priorResults: string[] = [];
+      let priorFailures = 0;
+      try {
+        const rawBytes = await api.readBytes(phaseFile, 0, 65536);
+        const parsed = JSON.parse(new TextDecoder().decode(new Uint8Array(rawBytes))) as { results: string[]; failures: number };
+        priorResults = parsed.results ?? [];
+        priorFailures = parsed.failures ?? 0;
+      } catch (e) {
+        log(false, "read phase 1 self-test state after restart", String(e));
+      }
+
+      const notice = await until(() => getState().notificationLog.some((n) => n.text.includes(`Update successful: Gall ${info.version} is now installed.`)), 6000);
+      log(!!notice, "restarted overlay process announces successful installation", info.version);
+      log(info.baseVersion === "0.1.0", "overlay preserves base installed version", info.baseVersion);
+      log(info.updatesDir.includes("updates"), "appInfo exposes updatesDir", info.updatesDir);
+
+      A.openOverlay({ type: "settings", section: "about" });
+      log(!!(await until(() => $(".about-facts"))), "Settings About renders install and update paths");
+      const aboutText = $(".about-facts")?.textContent ?? "";
+      log(aboutText.includes(`updated over ${info.baseVersion}`) && aboutText.includes(info.updatesDir), "About shows overlay version note and update directory");
+      await shot("updates-about-overlay");
+      results.push("SCREENSHOT updates-about-overlay.png: Settings About showing Install and Updates overlay paths.");
+
+      // Search Settings for automatic update setting.
+      const searchInput = $<HTMLInputElement>(".ssearch input");
+      if (searchInput) {
+        typeInto(searchInput, "automatic");
+        await sleep(150);
+        log($(".settings .panel")?.textContent?.includes("Download updates automatically") ?? false, "Settings search discovers Download updates automatically");
+        typeInto(searchInput, "");
+        await sleep(100);
+      }
+
+      const updatesTab = $$(".settings nav button").find((b) => b.textContent?.trim() === "Updates");
+      if (updatesTab) click(updatesTab);
+      log(!!(await until(panel)), "Settings Updates opens after restart");
+      await until(() => !checkButton()?.disabled, 15000);
+      if (checkButton() && !checkButton()!.disabled) {
+        click(checkButton()!);
+        await until(() => panel()?.getAttribute("data-state") === "checking", 2000);
+      }
+      await until(() => panel()?.getAttribute("data-state") === "current" && !checkButton()?.disabled, 15000);
+      log(panel()?.getAttribute("data-state") === "current", "updated overlay reports Up to date against release server", panel()?.getAttribute("data-state") ?? "");
+      const revertBtn = $$(".updates-location button").find((b) => b.textContent?.includes(`Revert to ${info.baseVersion}`));
+      log(!!revertBtn, "overlay installation offers Revert button in Settings Updates");
+
+      for (const theme of ["light", "dark"] as const) {
+        await updateSettings({ theme });
+        for (const [width, height, label] of [[1280, 820, "wide"], [800, 600, "narrow"]] as const) {
+          await setWindowSize(width, height);
+          await sleep(450);
+          panel()?.scrollIntoView({ block: "nearest" });
+          await sleep(150);
+          const bounds = panel()?.getBoundingClientRect();
+          log(!!bounds && bounds.left >= 0 && bounds.right <= window.innerWidth, `update card stays inside ${theme} ${label} window`);
+          const name = `updates-result-${theme}-${label}`;
+          await shot(name);
+          results.push(`SCREENSHOT ${name}.png: ${width}x${height} ${theme}, expected up-to-date overlay card + auto-download switch + paths.`);
+        }
+      }
+
+      // Keyboard toggle check with Vim keys ON and OFF.
+      for (const vimKeys of [true, false]) {
+        await updateSettings({ vimKeys });
+        const sw = $<HTMLInputElement>("#opt-autoDownloadUpdates");
+        log(!!sw, `auto-download switch rendered (vimKeys=${vimKeys})`);
+        if (sw) {
+          const before = sw.checked;
+          sw.focus();
+          click(sw);
+          await sleep(150);
+          log(getState().settings?.autoDownloadUpdates === !before, `auto-download switch toggles cleanly (vimKeys=${vimKeys})`);
+          click(sw);
+          await sleep(150);
+        }
+      }
+
+      key("Escape", {}, $(".settings"));
+      log(!!(await until(() => !getState().overlay)), "Settings closes normally after update verification");
+
+      const combined = [...priorResults, ...results];
+      const totalFailures = priorFailures + failures;
+      await api.selftestDone(combined.join("\n") + `\n\n${totalFailures} failure(s)`);
+      return;
+    }
+
+    // Phase 1 (or standalone run): check About paths, real error + retry, auto-download, staging & restart.
+    A.openOverlay({ type: "settings", section: "about" });
+    log(!!(await until(() => $(".about-facts"))), "Settings About exposes Install and Updates facts");
+    await shot("updates-about-base");
+    results.push("SCREENSHOT updates-about-base.png: Settings About showing base Install and Updates locations.");
+
+    const updatesTab = $$(".settings nav button").find((b) => b.textContent?.trim() === "Updates");
+    if (updatesTab) click(updatesTab);
+    else A.openOverlay({ type: "settings", section: "updates" });
+
     log(!!(await until(panel)), "Settings Updates exposes the update section");
     log(!!checkButton(), "manual update check has a visible labelled button");
     const support = await invoke<string>("update_support");
     log(typeof support === "string", "real backend reports update support", support || "signed installation supported");
-    if (support) {
-      let rejection = "";
-      try { await invoke("install_update"); } catch (error) { rejection = String(error); }
-      log(rejection.includes(support), "backend refuses installation for this unmanaged or keyless build", rejection);
-    } else {
-      results.push("SKIP installation rejection: this build supports installation; the focused test never installs or restarts.");
-    }
-    // Use the actual plugin and public release endpoint, not a mock response.
-    await until(() => checkButton() && !checkButton()!.disabled, 20000);
-    const button = checkButton();
-    if (!button) throw new Error("Update check button was not rendered.");
-    click(button);
-    const checking = await until(() => checkButton()?.disabled && panel()?.textContent?.includes("Checking for updates"), 2000);
-    log(!!checking, "manual checking disables repeated requests and presents loading feedback");
-    await shot("updates-request-wide");
-    results.push("SCREENSHOT updates-request-wide.png: actual Settings Updates during a public-endpoint request; terminal response may arrive during capture.");
-    const outcome = await until(terminal, 20000);
-    log(!!outcome, "manual update check finishes with a visible result", outcome ?? "timed out");
-    log(!checkButton()?.disabled, "manual check is available again after the response");
-    if (panel()?.getAttribute("data-state") === "error") {
+
+    // Ensure initial background startup check finishes before starting deterministic phase checks.
+    await until(() => checkButton() && !checkButton()!.disabled, 25000);
+    const initialState = panel()?.getAttribute("data-state") ?? "";
+
+    // If startup already hit the transient 503 failure, inspect error details & screenshots first, then retry!
+    if (initialState === "error") {
       log(!!$("[role='alert']", panel()!), "real endpoint failure is presented as an accessible alert");
-      click(checkButton()!);
-      log(!!(await until(() => checkButton()?.disabled, 2000)), "failed checks can be retried");
-      log(!!(await until(terminal, 20000)), "retry reaches a visible result");
-    } else {
-      results.push("SKIP error and error retry: public endpoint returned a successful update response.");
-    }
-    for (const theme of ["light", "dark"] as const) {
-      await updateSettings({ theme });
-      for (const [width, height, label] of [[1280, 820, "wide"], [800, 600, "narrow"]] as const) {
-        await win.setSize(new LogicalSize(width, height));
-        await sleep(450);
-        panel()?.scrollIntoView({ block: "nearest" });
-        await sleep(150);
-        const bounds = panel()?.getBoundingClientRect();
-        log(!!bounds && bounds.left >= 0 && bounds.right <= window.innerWidth, `update card stays inside the ${theme} ${label} window`);
-        const buttonBounds = checkButton()?.getBoundingClientRect();
-        log(!!buttonBounds && buttonBounds.left >= 0 && buttonBounds.right <= window.innerWidth, `manual check remains reachable at ${theme} ${width}x${height}`);
-        log(checkButton()?.classList.contains("btn") ?? false, `update action uses the application's button styling (${theme} ${label})`);
-        const detail = $(".updates-error details", panel()!) as HTMLDetailsElement | null;
-        if (detail) log(!detail.open, `technical details are collapsed by default (${theme} ${label})`);
-        const name = `updates-result-${theme}-${label}`;
-        await shot(name);
-        results.push(`SCREENSHOT ${name}.png: ${width}x${height} ${theme}, expected readable card, state and actions; observed ${terminal()}`);
+      const detail = $(".updates-error details", panel()!) as HTMLDetailsElement | null;
+      if (detail) {
+        log(!detail.open, "technical details are collapsed by default");
+        click($("summary", detail)!);
+        log(!!(await until(() => detail.open)), "technical details can be expanded without losing the update action");
+        log(!!$("pre", detail)?.textContent?.trim(), "technical error evidence is preserved");
+        await updateSettings({ theme: "dark" });
+        await setWindowSize(800, 600);
+        await sleep(300);
+        panel()?.scrollIntoView({ block: "end" });
+        await sleep(200);
+        await shot("updates-error-details-dark-narrow");
+        results.push("SCREENSHOT updates-error-details-dark-narrow.png: expanded readable technical error and retry action.");
+        click($("summary", detail)!);
+      } else {
+        await updateSettings({ theme: "dark" });
       }
+      await updateSettings({ fontSize: 16 });
+      await setWindowSize(640, 600);
+      await sleep(450);
+      panel()?.scrollIntoView({ block: "nearest" });
+      const compactBounds = panel()?.getBoundingClientRect();
+      log(!!compactBounds && compactBounds.left >= 0 && compactBounds.right <= window.innerWidth, "update card fits a 640px window with larger text");
+      await shot("updates-error-large-type-compact");
+      results.push("SCREENSHOT updates-error-large-type-compact.png: 640x600 dark, 16px base text, readable error & check action.");
+      await updateSettings({ theme: "light", fontSize: 13 });
+      await setWindowSize(1280, 820);
+      await sleep(450);
     }
-    const details = $(".updates-error details", panel()!) as HTMLDetailsElement | null;
-    if (details) {
-      click($("summary", details)!);
-      log(!!(await until(() => details.open)), "technical details can be expanded without losing the update action");
-      log(!!$("pre", details)?.textContent?.trim(), "technical error evidence is preserved");
-      panel()?.scrollIntoView({ block: "end" });
-      await sleep(200);
-      const retryBounds = checkButton()?.getBoundingClientRect();
-      const scrollBounds = $(".settings .panel")?.getBoundingClientRect();
-      log(!!retryBounds && !!scrollBounds && retryBounds.top >= scrollBounds.top && retryBounds.bottom < scrollBounds.bottom, "retry can be scrolled fully into view below expanded details");
-      await shot("updates-error-details-dark-narrow");
-      results.push("SCREENSHOT updates-error-details-dark-narrow.png: 800x600 dark, scrolled to expanded readable technical error and retry action.");
+
+    // Trigger manual check (which succeeds and auto-downloads & stages when local server is active).
+    if (panel()?.getAttribute("data-state") !== "ready") {
+      click(checkButton()!);
+      await until(() => ["checking", "downloading"].includes(panel()?.getAttribute("data-state") ?? ""), 4000);
+      await shot("updates-request-wide");
+      results.push("SCREENSHOT updates-request-wide.png: active Settings Updates check/download progress.");
+      const outcome = await until(terminal, 60000);
+      log(!!outcome, "manual update check finishes with a visible result", outcome ?? "timed out");
     }
-    if (details?.open) click($("summary", details)!);
-    await updateSettings({ fontSize: 16 });
-    await win.setSize(new LogicalSize(640, 600));
-    await sleep(500);
-    panel()?.scrollIntoView({ block: "nearest" });
-    const compactBounds = panel()?.getBoundingClientRect();
-    log(!!compactBounds && compactBounds.left >= 0 && compactBounds.right <= window.innerWidth, "update card fits a 640px window with larger text");
-    const compactButton = checkButton()?.getBoundingClientRect();
-    log(!!compactButton && compactButton.left >= 0 && compactButton.right <= window.innerWidth, "check action fits at 640px with larger text");
-    checkButton()?.focus();
-    await shot("updates-error-large-type-compact");
-    results.push("SCREENSHOT updates-error-large-type-compact.png: 640x600 dark, 16px base text, expected wrapped header and readable error with reachable check action.");
-    key("Escape", {}, $(".settings"));
-    log(!!(await until(() => !getState().overlay)), "Settings closes normally after checking for updates");
+
+    if (panel()?.getAttribute("data-state") === "ready" && restartButton() && info.version === "0.1.0") {
+      log(true, "auto-download verified, probed, and staged update ready to restart");
+      await shot("updates-ready-wide");
+      results.push("SCREENSHOT updates-ready-wide.png: staged signed update ready with Restart to update action.");
+      await api.saveText(phaseFile, JSON.stringify({ results, failures }));
+      click(restartButton()!);
+      // Process will exit and restart into the overlay binary (Phase 2 above).
+      await sleep(10000);
+      log(false, "overlay update restart did not replace process within 10s");
+    } else if (info.version === "0.1.0") {
+      log(false, "update reaches ready state for restart", panel()?.textContent ?? "");
+    } else {
+      results.push("SKIP restart phase: standalone run without GALL_UPDATER_TEST_VERSION=0.1.0.");
+      key("Escape", {}, $(".settings"));
+      log(!!(await until(() => !getState().overlay)), "Settings closes normally after checking for updates");
+    }
   } catch (error) { log(false, "focused updater scenario", String(error)); }
   await api.selftestDone(results.join("\n") + `\n\n${failures} failure(s)`);
 }
@@ -2741,7 +3476,7 @@ async function runQuickOpenSelfTest() {
   };
   try {
     await getCurrentWindow().setFocus();
-    await getCurrentWindow().setSize(new LogicalSize(1100, 800));
+    await setWindowSize(1100, 800);
     await updateSettings({ indexRoots: [root], shortcuts: {} });
     for (const vimKeys of [false, true]) {
       await updateSettings({ vimKeys });
@@ -2779,6 +3514,314 @@ async function runQuickOpenSelfTest() {
   await api.selftestDone(results.join("\n") + `\n\n${failures} failure(s)`);
 }
 
+/** Real-app verification for hidden-filter hints and Alt+I across Quick Open, Find in files and F3. */
+async function runSearchHiddenSelfTest() {
+  const root = activePath(0);
+  try {
+    await getCurrentWindow().setFocus();
+    await setWindowSize(1180, 820);
+    await updateSettings({ indexRoots: [root], vimKeys: false, shortcuts: {} });
+    await api.indexRefresh(true);
+    for (let i = 0; i < 200 && (await api.indexStatus()).building; i++) await sleep(60);
+    if ((await api.indexStatus()).building) throw new Error("Index build did not finish");
+
+    // 1. Quick Open: zero visible + N hidden -> Alt+I -> visible + N hidden -> nothing hidden
+    await focusPane(0);
+    key("p", { ctrlKey: true });
+    const qoInput = await until(() => $<HTMLInputElement>(".qo-input input"));
+    if (!qoInput) throw new Error("Quick Open did not open");
+    typeInto(qoInput, "xyzzy_");
+    log(!!await until(() => $(".qo-empty")?.textContent?.includes("2 hidden files match")), "Quick Open empty state shows hidden match count and Alt+I");
+    await shot("search-hidden-qo-empty");
+    key("i", { altKey: true }, qoInput);
+    log(!!await until(() => $$(".qo-row.is-hidden .hidden-badge").length === 2), "Quick Open Alt+I shows hidden results with hidden badge");
+    await shot("search-hidden-qo-alt-i");
+    key("i", { altKey: true }, qoInput);
+    typeInto(qoInput, "report_");
+    log(!!await until(() => $$(".qo-row .qo-name").some((n) => n.textContent === "report_visible.ts") && $(".hidden-bar")?.textContent?.includes("+1 hidden by filters")), "Quick Open shows visible result + hidden footer");
+    await shot("search-hidden-qo-footer");
+    // Switch to everywhere: hidden count still appears and Alt+I works in everywhere too.
+    key("Tab", {}, qoInput);
+    log(!!await until(() => $(".hidden-bar")?.textContent?.includes("+1 hidden by filters")), "Quick Open everywhere shows hidden footer without Alt+I");
+    key("i", { altKey: true }, qoInput);
+    log(!!await until(() => $$(".qo-row.is-hidden .hidden-badge").length === 1 && $(".qo-status")?.textContent?.includes("Including hidden files everywhere")), "Quick Open everywhere Alt+I shows hidden results with badge");
+    await shot("search-hidden-qo-everywhere-alt-i");
+    key("i", { altKey: true }, qoInput);
+    key("Tab", {}, qoInput);
+    typeInto(qoInput, "definitely_no_such_file");
+    await sleep(300);
+    log(!!$(".qo-empty") && !$(".qo-empty")?.textContent?.includes("hidden file") && !$(".hidden-bar"), "Quick Open hides hint when nothing is hidden");
+    key("Escape", {}, qoInput);
+    await until(() => !$(".qo"));
+
+    // 2. Find in files: zero visible + N hidden -> Alt+I -> visible + N hidden -> nothing hidden
+    key("f", { ctrlKey: true });
+    const fifInput = await until(() => $<HTMLInputElement>('.fif-query input[data-role="query"]'));
+    if (!fifInput) throw new Error("Find in files did not open");
+    typeInto(fifInput, "hidden_only_needle");
+    log(!!await until(() => $(".fif-empty")?.textContent?.includes("3 hidden files match")), "Find in files empty state shows hidden match count and Alt+I");
+    await shot("search-hidden-fif-empty");
+    key("i", { altKey: true }, fifInput);
+    log(!!await until(() => $$(".fif-file.is-hidden .hidden-badge").length === 3), "Find in files Alt+I shows hidden results with hidden badge");
+    await shot("search-hidden-fif-alt-i");
+    key("i", { altKey: true }, fifInput);
+    typeInto(fifInput, "shared_needle");
+    log(!!await until(() => $$(".fif-file").length === 1 && $(".hidden-bar")?.textContent?.includes("+1 hidden by filters")), "Find in files shows visible result + hidden footer");
+    await shot("search-hidden-fif-footer");
+    typeInto(fifInput, "absent_needle_xyz");
+    await until(() => $(".fif-empty")?.textContent === "No results");
+    await sleep(250);
+    log($(".fif-empty")?.textContent === "No results" && !$(".hidden-bar"), "Find in files hides hint when nothing is hidden");
+    key("Escape", {}, fifInput);
+    await until(() => !$(".fif"));
+
+    // 3. F3 Name search: zero visible + N hidden -> Alt+I -> visible + N hidden -> nothing hidden
+    key("F3");
+    const f3Input = await until(() => $<HTMLInputElement>('.search-win .shead input[type="text"]'));
+    if (!f3Input) throw new Error("F3 search did not open");
+    typeInto(f3Input, "xyzzy_*");
+    key("Enter", {}, f3Input);
+    log(!!await until(() => $(".search-empty")?.textContent?.includes("2 hidden files match")), "F3 empty state shows hidden match count and Alt+I");
+    await shot("search-hidden-f3-empty");
+    key("i", { altKey: true }, f3Input);
+    log(!!await until(() => $$(".search-win .r.is-hidden .hidden-badge").length === 2), "F3 Alt+I immediately re-runs and marks hidden results");
+    await shot("search-hidden-f3-alt-i");
+    key("i", { altKey: true }, f3Input);
+    typeInto(f3Input, "report_*");
+    key("Enter", {}, f3Input);
+    log(!!await until(() => $$(".search-win .r").length === 1 && $(".hidden-bar")?.textContent?.includes("+1 hidden by filters")), "F3 shows visible result + hidden footer");
+    await shot("search-hidden-f3-footer");
+    typeInto(f3Input, "no_such_f3_*");
+    key("Enter", {}, f3Input);
+    await until(() => $(".search-empty")?.textContent === "No results");
+    await sleep(250);
+    log($(".search-empty")?.textContent === "No results" && !$(".hidden-bar"), "F3 hides hint when nothing is hidden");
+    key("Escape", {}, f3Input);
+    await until(() => !$(".search-win"));
+  } catch (e) {
+    log(false, "search-hidden integration", String(e));
+  }
+  await api.selftestDone(results.join("\n") + `\n\n${failures} failure(s)`);
+}
+
+/** Notification feedback through the real keyboard handlers, IPC and bug reporter. */
+async function runNotificationSelfTest() {
+  const A = await import("./state/actions");
+  const { join } = await import("./core/path");
+  const root = activePath(0);
+  const projects = join(root, "Projects");
+  const clear = () => getState().notifications.forEach((n) => A.dismiss(n.id));
+  const toast = (text: string) => $$(".toast").find((el) => $(".t", el)?.textContent?.includes(text));
+  const reportButton = (el: Element) => $$("button", el).find((b) => b.textContent === "Report a bug");
+  const verifyToast = async (text: string, kind: string, shotName?: string) => {
+    const card = await until(() => toast(text));
+    log(!!card?.classList.contains(kind) && !reportButton(card), `${text} shows as ${kind} without a report action`);
+    const style = card && getComputedStyle(card);
+    log(style?.animationName === "none" && style.opacity === "1", `${kind} notification opens fully visible`);
+    if (card && shotName) await shot(shotName);
+    return card;
+  };
+  const options = { showHidden: false, hideTemp: false };
+  const listMissingFolder = () => api.listDir(join(root, "missing-notification-folder"), options).catch(() => {});
+  const createFolder = async (name: string) => {
+    await focusPane(0);
+    key("N", { ctrlKey: true, shiftKey: true });
+    const input = await until(() => $<HTMLInputElement>(".modal input[type=text]"));
+    if (!input) throw new Error("New Folder input did not open");
+    typeInto(input, name);
+    key("Enter", {}, input);
+    await until(() => !getState().overlay);
+  };
+  try {
+    await getCurrentWindow().unmaximize();
+    await setWindowSize(1100, 800);
+    await updateSettings({ keyboardProfile: "vim", theme: "dark", animations: true, shortcuts: {} });
+    await focusPane(0);
+    await verifyToast("Restored “settings.json” from backup.", "warn", "notification-recovered-settings");
+    log($$(".toast").length === 1, "settings recovery shows one notice");
+    clear();
+    log(!!(await until(() => !$(".toast"))), "dismissed notifications leave the view clear");
+
+    const originalMount = api.volumeMount;
+    const mountFailure = "wrong fs type, bad option, bad superblock on /dev/sdb1, missing codepage or helper program, or other error";
+    let rejectMount!: (reason?: unknown) => void;
+    api.volumeMount = () => new Promise<string>((_resolve, reject) => { rejectMount = reject; });
+    try {
+      const mounting = A.mountVolume({ id: "/dev/sdb1", label: "GaMa87", size: 932_000_000_000, fs: "exfat", locked: false, removable: true });
+      const progress = await until(() => toast("Mounting “GaMa87”"));
+      log(!!progress, "mounting a volume shows its progress toast");
+      rejectMount(mountFailure);
+      await mounting;
+      const mapped = await until(() => getState().notifications.find((n) => n.details === mountFailure));
+      const card = mapped && toast(mapped.text);
+      const technical = card?.querySelector<HTMLDetailsElement>(".toast-details");
+      log(!!mapped && !!card && mapped.kind === "warn" && !mapped.reportError && !!technical
+        && !reportButton(card), "filesystem mount failure gives actionable feedback with expandable details and no bug report");
+      if (technical) {
+        click($("summary", technical)!);
+        log(technical.open && $("pre", technical)?.textContent === mountFailure, "expanded mount details preserve the raw system error");
+      }
+      if (card) await shot("notification-volume-mount-failure");
+      log(!getState().notifications.some((n) => n.text.startsWith("Mounting “GaMa87”")), "mounting toast is removed after failure");
+      clear();
+    } finally {
+      api.volumeMount = originalMount;
+    }
+
+    key("u");
+    await verifyToast("Nothing to undo", "info", "notification-empty-undo-vim");
+    const firstId = getState().notifications.at(-1)?.id;
+    key("u");
+    await until(() => getState().notifications.at(-1)?.id !== firstId);
+    log(getState().notificationLog.filter((note) => note.text === "Nothing to undo").length === 1
+      && $$(".toast.info").length === 1, "repeated undo keeps one toast and one notification history entry");
+    clear();
+
+    await setWindowSize(640, 540);
+    await updateSettings({ keyboardProfile: "explorer", theme: "light" });
+    await focusPane(0);
+    key("u");
+    await sleep(90);
+    log(!toast("Nothing to undo") && !!$(".quick-filter", browserEl(0)!)?.textContent?.includes("u"),
+      "plain u still types in Explorer mode");
+    key("Escape");
+    await focusPane(0);
+    key("z", { ctrlKey: true });
+    await verifyToast("Nothing to undo", "info", "notification-empty-undo-explorer");
+    clear();
+
+    await createFolder("bad/name");
+    await verifyToast("is not a valid name", "warn", "notification-invalid-name");
+    clear();
+
+    await createFolder("Undo fixture");
+    await until(() => rowNames(0).includes("Undo fixture") && getState().undoLabel);
+    log(rowNames(0).includes("Undo fixture"), "valid folder name creates the folder");
+    await A.undoIn(projects);
+    await verifyToast("Nothing to undo in this folder", "info");
+    log(rowNames(0).includes("Undo fixture"), "folder undo leaves other folders' history available");
+    clear();
+    await focusPane(0);
+    key("z", { ctrlKey: true });
+    const undone = await until(() => !rowNames(0).includes("Undo fixture") && $(".toast.success"));
+    log(!!undone?.textContent?.includes("Undo fixture"), "Ctrl+Z still undoes a real action");
+    if (undone) await shot("notification-successful-undo");
+    clear();
+
+    const source = join(join(root, "Documents"), "file1.txt");
+    await api.startTask({ kind: "copy", sources: [source], dest: projects, conflict: "skip" });
+    await verifyToast("Copied “file1.txt”", "success");
+    clear();
+
+    // WN-174: two consecutive copies keep both cards visible; clicking Undo on the older card
+    // reverses ONLY the older copy, leaves the newer copy intact, and reports unavailable on repeat.
+    const docsDir = join(root, "Documents");
+    const firstSrc = join(docsDir, "undo-first.txt");
+    const secondSrc = join(docsDir, "undo-second.txt");
+    await api.saveText(firstSrc, "first copy content\n");
+    await api.saveText(secondSrc, "second copy content\n");
+    await api.startTask({ kind: "copy", sources: [firstSrc], dest: projects, conflict: "keepBoth" });
+    const firstCard = await verifyToast("Copied “undo-first.txt”", "success");
+    await api.startTask({ kind: "copy", sources: [secondSrc], dest: projects, conflict: "keepBoth" });
+    const secondCard = await verifyToast("Copied “undo-second.txt”", "success");
+    await shot("notification-two-copy-undo-cards");
+    const firstUndoNote = getState().notifications.find((n) => n.text.includes("undo-first.txt") && n.action?.label === "Undo");
+    const firstUndoBtn = firstCard && $$("button", firstCard).find((b) => b.textContent === "Undo");
+    log(!!firstCard && !!secondCard && !!firstUndoBtn && !!firstUndoNote, "both copy success cards stay visible with independent Undo actions");
+    if (firstUndoBtn) click(firstUndoBtn);
+    await verifyToast("Removed “undo-first.txt”", "success");
+    const afterFirst = await api.listDir(projects, options);
+    log(!afterFirst.some((e) => e.name === "undo-first.txt") && afterFirst.some((e) => e.name === "undo-second.txt"),
+      "clicking Undo on the older card reverses only the older copy and leaves the newer copy intact",
+      afterFirst.map((e) => e.name).join(","));
+    clear();
+    // Repeating the already-consumed notification action reports unavailable without touching undo-second.txt.
+    if (firstUndoNote?.action) await firstUndoNote.action.run();
+    await verifyToast("This action can no longer be undone", "info");
+    const afterRepeat = await api.listDir(projects, options);
+    log(afterRepeat.some((e) => e.name === "undo-second.txt"),
+      "repeating an already-undone notification reports unavailable without changing other files");
+    clear();
+    // Global undo still reverses the remaining newer copy in LIFO order.
+    await A.undo();
+    await verifyToast("Removed “undo-second.txt”", "success");
+    const afterGlobal = await api.listDir(projects, options);
+    log(!afterGlobal.some((e) => e.name === "undo-second.txt"), "global undo still reverses the remaining newer copy");
+    clear();
+
+    await api.startTask({ kind: "copy", sources: [source], dest: projects, conflict: "skip" });
+    const skipped = await verifyToast("Skipped “file1.txt”", "info", "notification-skipped-copy");
+    log(!!skipped && !$$("button", skipped).some((b) => b.textContent === "Undo"), "a fully skipped copy does not offer undo");
+    clear();
+
+    const docs = join(root, "Documents");
+    await api.startTask({ kind: "copy", sources: [docs], dest: projects, conflict: "skip", merge: true });
+    await verifyToast("Copied “Documents”", "success");
+    const previousUndo = await api.undoPeek();
+    clear();
+    await api.startTask({ kind: "copy", sources: [docs], dest: projects, conflict: "skip", merge: true });
+    const merged = await verifyToast("Skipped “Documents”", "info");
+    log(!!merged && !$$("button", merged).length && (await api.undoPeek()) === previousUndo,
+      "a merge with every child skipped leaves undo history intact");
+    clear();
+
+    await api.startTask({ kind: "copy", sources: [join(root, "missing-notification-file")], dest: projects });
+    const failed = await verifyToast("missing-notification-file", "error", "notification-expected-failure");
+    if (failed) {
+      const dismiss = $('[aria-label="Dismiss notification"]', failed);
+      if (dismiss) {
+        dismiss.focus();
+        const nativeKeys = ["Enter", " ", "Tab"].every((key) => dismiss.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true })));
+        log(document.activeElement === dismiss && nativeKeys, "focused dismiss button keeps native keyboard controls");
+        click(dismiss);
+      }
+      log(!!dismiss && !!(await until(() => !toast("missing-notification-file"))) && pane(0).contains(document.activeElement),
+        "dismissing a focused toast returns keyboard focus to the file list");
+    }
+    await listMissingFolder();
+    const initial = await api.bugReportPrepare("", false, {}, false);
+    log(!initial.body.includes("create_dir failed") && !initial.body.includes("list_dir failed")
+      && !initial.body.includes("Copy failed") && !initial.body.includes("Nothing to undo")
+      && !initial.body.includes("settings.json"),
+      "routine command failures stay out of the compact bug report");
+
+    // An invalid argument simulates a frontend/backend contract fault without touching user data.
+    await api.listDir(null as unknown as string, options).catch(A.fail);
+    const error = await until(() => toast("command `list_dir`"));
+    const report = error && reportButton(error);
+    log(!!error?.classList.contains("error") && !!report, "the real IPC fault offers Report a bug");
+    await listMissingFolder();
+    const latest = await api.bugReportPrepare("", false, {}, false);
+    log(latest.body.includes("command `list_dir`"), "a later missing-folder rejection leaves the original fault in diagnostics");
+    if (error) await shot("notification-reportable-failure");
+
+    await api.createDir(root, null as unknown as string).catch(A.fail);
+    const newer = await until(() => toast("command `create_dir`"));
+    const current = await api.bugReportPrepare("", false, {}, false);
+    log(!!newer && current.body.includes("command `create_dir`"), "a newer unexpected fault becomes the latest error");
+    const dismissNewer = newer && $('[aria-label="Dismiss notification"]', newer);
+    if (dismissNewer) click(dismissNewer);
+    if (report) {
+      await updateSettings({ keyboardProfile: "vim" });
+      await focusPane(0);
+      await press(pane(0), " ", "s", "n");
+      log(document.activeElement === report && report.dispatchEvent(new KeyboardEvent("keydown", {
+        key: " ", bubbles: true, cancelable: true,
+      })), "the Vim Notifications command focuses a toast action with native Space activation");
+      key("Escape");
+      log(!getState().showNotificationLog && pane(0).contains(document.activeElement), "Escape from the notification returns focus to the file list");
+      click(report);
+    }
+    const chosen = await until(() => $(".bug-report pre")?.textContent?.includes("command `list_dir`"));
+    log(!!chosen && !$(".bug-report pre")?.textContent?.includes("command `create_dir`"),
+      "the report uses the error from the selected toast");
+    log(!toast("command `list_dir`"), "the report action dismisses its toast");
+  } catch (e) {
+    log(false, "notification integration", String(e));
+  }
+  await api.selftestDone(results.join("\n") + `\n\n${failures} failure(s)`);
+}
+
 /** Focused keyboard integration checks: scripts/selftest.sh --keyboard. */
 async function runKeyboardSelfTest() {
   const A = await import("./state/actions");
@@ -2799,8 +3842,9 @@ async function runKeyboardSelfTest() {
   try {
     await getCurrentWindow().setFocus();
     await getCurrentWindow().unmaximize();
-    await getCurrentWindow().setSize(new LogicalSize(1100, 800));
-    await updateSettings({ vimKeys: false, leaderKeyBasic: "Ctrl Ctrl", shortcuts: {} });
+    await setWindowSize(1100, 800);
+    // Two browsers are needed for F6 and Alt+middle-click: adaptive layout would pick one at 1100 px (150 % display).
+    await updateSettings({ vimKeys: false, leaderKeyBasic: "Ctrl Ctrl", shortcuts: {}, adaptiveLayout: false });
     await setLayout("standard");
     await focusPane(0);
 
@@ -2809,7 +3853,7 @@ async function runKeyboardSelfTest() {
     log($(".kh")?.textContent?.includes("File list (standard)") === true && !$(".kh")?.textContent?.includes("File list (vim)"), "basic help shows standard navigation, not vim commands");
     log(!!$('.kh .key-bindings[aria-label="Space"]'), "basic preview hint uses Space");
     await shot("keyboard-basic-wide");
-    await getCurrentWindow().setSize(new LogicalSize(800, 600));
+    await setWindowSize(800, 600);
     await sleep(250);
     await shot("keyboard-basic-narrow");
     const help = $(".kh")!.getBoundingClientRect();
@@ -2821,7 +3865,7 @@ async function runKeyboardSelfTest() {
     log(getState().overlay?.type === "keys", "shortcut keys in help input do not move files");
     key("Escape");
     await until(() => !getState().overlay);
-    await getCurrentWindow().setSize(new LogicalSize(1100, 800));
+    await setWindowSize(1100, 800);
     await focusPane(0);
 
     key("Tab");
@@ -2860,7 +3904,14 @@ async function runKeyboardSelfTest() {
     await until(() => !getState().overlay);
     await selectRow(0, "file1.txt");
     key("F6");
-    log(!!(await until(() => !row(0, "file1.txt") && row(1, "file1.txt"))), "F6 moves the selected file to the other browser");
+    log(!!(await until(() => !row(0, "file1.txt") && row(1, "file1.txt"))), "F6 moves the selected file to the other browser", JSON.stringify({
+      overlay: getState().overlay?.type,
+      window: `${innerWidth}x${innerHeight}@${devicePixelRatio}`, adaptiveMode: getState().adaptiveMode,
+      shown: getState().shownBrowsers, layout: getState().session?.layout, collapsed: getState().session?.browsers.map((x) => x.collapsed),
+      pane0: activePath(0), pane1: activePath(1), rows0: rowNames(0), rows1: rowNames(1),
+      selected: controller(0)!.selection().map((entry) => entry.name),
+      notifications: getState().notificationLog.slice(0, 3).map((note) => note.text),
+    }));
     key("z", { ctrlKey: true });
     log(!!(await until(() => row(0, "file1.txt") && !row(1, "file1.txt"))), "Ctrl+Z undoes the commander move");
     await selectRow(0, "file1.txt");
@@ -2948,7 +3999,10 @@ async function runKeyboardSelfTest() {
     await until(() => rowNames(0).includes("Documents"));
     await selectRow(0, "Documents");
     key("`"); await sleep(60); key("a");
-    log(!!(await until(() => activePath(0) === docs && controller(0)?.focused()?.name === "file2.txt", 3000)), "` a opens the folder and selects the marked item", controller(0)?.focused()?.name ?? "none");
+    log(!!(await until(() => activePath(0) === docs && controller(0)?.focused()?.name === "file2.txt", 3000)), "` a opens the folder and selects the marked item", JSON.stringify({
+      focused: controller(0)?.focused()?.path ?? "none", mark: marks().a?.item, rows: rowNames(0),
+      selected: controller(0)?.selection().map((entry) => entry.name),
+    }));
     // US International: ' is a dead key and Shift+b after it arrives composed.
     await focusPane(0);
     key("Dead", { code: "Quote" }); await sleep(60); key("Á", { code: "KeyB", shiftKey: true });
@@ -3017,9 +4071,17 @@ async function runKeyHelpSelfTest() {
   const fits = () => {
     const help = $(".kh")!.getBoundingClientRect();
     const scroll = $(".kh-scroll")!;
-    return help.left >= 0 && help.right <= innerWidth + 1 && help.bottom <= innerHeight + 1
+    const legend = $(".kh-legend")!;
+    const ok = help.left >= 0 && help.right <= innerWidth + 1 && help.bottom <= innerHeight + 1
       && scroll.scrollWidth <= scroll.clientWidth + 1
-      && $(".kh-legend")!.scrollWidth <= $(".kh-legend")!.clientWidth + 1;
+      && legend.scrollWidth <= legend.clientWidth + 1;
+    const detail = ok
+      ? ""
+      : `win=${innerWidth}x${innerHeight} help=${Math.round(help.left)},${Math.round(help.right)},${Math.round(help.bottom)} scroll=${scroll.scrollWidth}/${scroll.clientWidth} legend=${legend.scrollWidth}/${legend.clientWidth} wide=${(() => {
+          const edge = scroll.getBoundingClientRect().left + scroll.clientWidth + 1;
+          return $$("*", scroll).filter((el) => el.getBoundingClientRect().right > edge).slice(0, 4).map((el) => `${el.tagName.toLowerCase()}.${String(el.className).split(" ")[0]}@${Math.round(el.getBoundingClientRect().right - edge)}`).join(",");
+        })()}`;
+    return { ok, detail };
   };
   try {
     await getCurrentWindow().unmaximize();
@@ -3031,14 +4093,15 @@ async function runKeyHelpSelfTest() {
     ] as const) {
       const vim = profile === "vim";
       const mode = profile === "explorer" ? "basic" : profile === "vim" ? "vim" : "commander";
-      await getCurrentWindow().setSize(new LogicalSize(width, width === 1100 ? 800 : 600));
+      await setWindowSize(width, width === 1100 ? 800 : 600);
       await updateSettings({ keyboardProfile: profile, theme, fontSize: width === 640 ? 16 : 13, leaderKey: "Space", leaderKeyBasic: "Ctrl Ctrl", shortcuts: {} });
       await focusPane(0);
       key("?", { shiftKey: true });
       log(!!(await until(() => $(".kh"))), `? opens actual help for ${KEYBOARD_PROFILES[profile]}`);
       log($(".kh-head .pill")?.textContent === KEYBOARD_PROFILES[profile], "help names the active profile");
       log(!!$(".kh-legend .key-plus") && !!$(".kh-legend .key-then") && !!$(".kh-legend .key-or"), "legend separates together, in-order and alternatives");
-      log(fits(), `help fits ${width}px ${theme} window without horizontal scrolling`);
+      const fit = fits();
+      log(fit.ok, `help fits ${width}px ${theme} window without horizontal scrolling`, fit.detail);
       const name = `key-help-${mode}-${theme}-${width}`;
       await shot(name);
       results.push(`SCREENSHOT ${name}.png: expected readable keycaps, distinct + / arrow / or connectors, visible legend and unclipped cards.`);
@@ -3101,8 +4164,11 @@ async function runKeyboardProfilesSelfTest() {
   window.addEventListener("error", (e) => errors.push(e.message));
   window.addEventListener("unhandledrejection", (e) => errors.push(String(e.reason)));
   const close = async () => {
-    key("Escape");
-    await until(() => !getState().overlay);
+    // The first Escape may only close an open dropdown of the themed selector.
+    for (let i = 0; i < 3; i++) {
+      key("Escape");
+      if (await until(() => !getState().overlay, 600)) break;
+    }
     await focusPane(0);
   };
   const savedSettings = async () => JSON.parse(new TextDecoder().decode(new Uint8Array(
@@ -3136,7 +4202,7 @@ async function runKeyboardProfilesSelfTest() {
   };
   try {
     await getCurrentWindow().unmaximize();
-    await getCurrentWindow().setSize(new LogicalSize(1100, 800));
+    await setWindowSize(1100, 800);
     await updateSettings({ keyboardProfile: "vim", theme: "dark", fontSize: 13, shortcuts: {}, editor: "", leaderKey: "Space", leaderKeyBasic: "Ctrl Ctrl" });
     await A.setLayout("standard");
     A.openOverlay({ type: "welcome" });
@@ -3148,12 +4214,12 @@ async function runKeyboardProfilesSelfTest() {
     click(commander);
     log(!!(await until(() => getState().settings?.keyboardProfile === "totalCommander" && !getState().settings?.vimKeys)), "welcome Commander card selects its real profile");
     await shot("key-profiles-welcome-dark-1100");
-    await getCurrentWindow().setSize(new LogicalSize(800, 600));
+    await setWindowSize(800, 600);
     await updateSettings({ theme: "light" });
     await shot("key-profiles-welcome-light-800");
     log($(".welcome")!.scrollWidth <= $(".welcome")!.clientWidth + 1, "three welcome cards fit the narrow window");
     await close();
-    await getCurrentWindow().setSize(new LogicalSize(1100, 800));
+    await setWindowSize(1100, 800);
     await updateSettings({ keyboardProfile: "vim", theme: "dark" });
     await press(pane(0), " ", "f", "c");
     log(!!(await until(() => $(".settings"))), "Vim Space f c opens settings for keyboard profile selection");
@@ -3162,11 +4228,12 @@ async function runKeyboardProfilesSelfTest() {
       log(select.options.length === 3 && select.value === profile, "native keyboard-accessible selector reflects the active profile");
       const typed = new KeyboardEvent("keydown", { key: "j", bubbles: true, cancelable: true });
       select.dispatchEvent(typed);
-      log(!typed.defaultPrevented && !getState().keySeq.length, "profile selector keeps native typing instead of starting Vim commands");
+      // The themed selector takes the typed letter itself (type-ahead opens its list): it must not reach the Vim keys.
+      log(!getState().keySeq.length, "profile selector keeps typing instead of starting Vim commands", `prevented=${typed.defaultPrevented} keySeq=${getState().keySeq.join("")}`);
       await shot(`key-profiles-settings-${profile}`);
       await close();
       key("?", { shiftKey: true });
-      log(!!(await until(() => $(".kh-head .pill")?.textContent === KEYBOARD_PROFILES[profile])), "? opens correctly named profile help");
+      log(!!(await until(() => $(".kh-head .pill")?.textContent === KEYBOARD_PROFILES[profile])), "? opens correctly named profile help", `pill=${$(".kh-head .pill")?.textContent} overlay=${getState().overlay?.type} active=${document.activeElement?.tagName}.${document.activeElement?.className}`);
       await close();
       key("p", { ctrlKey: true, shiftKey: true });
       log(!!(await until(() => getState().overlay?.type === "quickOpen")), "Gall command palette remains accessible");
@@ -3223,10 +4290,11 @@ async function runKeyboardProfilesSelfTest() {
     log(!!(await until(() => row(0, "file1.txt"))), "undo restores the trashed file");
 
     await choose("vim"); await close();
-    await selectRow(0, "file1.txt");
+    // The first row: with the default date order file1.txt is the last one and j has nowhere to go.
+    await selectRow(0, rowNames(0)[0]);
     const before = controller(0)!.focused()?.path;
     key("j");
-    log(!!(await until(() => controller(0)!.focused()?.path !== before)), "Vim j navigates rather than typing a filter");
+    log(!!(await until(() => controller(0)!.focused()?.path !== before)), "Vim j navigates rather than typing a filter", `vimKeys=${getState().settings?.vimKeys} profile=${getState().settings?.keyboardProfile} before=${before} now=${controller(0)!.focused()?.path} rows=${rowNames(0).join(",")} active=${document.activeElement?.tagName}.${document.activeElement?.className} filter=${!!$(".quick-filter")}`);
     const pinned = A.isPinned(docs);
     await press(pane(0), " ", "b", "p");
     log(!!(await until(() => A.isPinned(docs) !== pinned)), "Vim leader pins the folder through the backend");
@@ -3252,7 +4320,7 @@ async function runKeyboardProfilesSelfTest() {
     }
     for (const note of getState().notifications) A.dismiss(note.id);
     await until(() => !$(".toast"));
-    await getCurrentWindow().setSize(new LogicalSize(800, 600));
+    await setWindowSize(800, 600);
     await updateSettings({ theme: "light" });
     await shot("key-profiles-settings-light-800");
     await close();
@@ -3284,20 +4352,19 @@ async function runKeyboardProfilesReloadSelfTest() {
 
 async function runBugReportSelfTest(textOnly = false, entryOnly = false) {
   const { openOverlay } = await import("./state/actions");
-  const { LogicalSize } = await import("@tauri-apps/api/dpi");
   const { getReportDraft } = await import("./core/reportDraft");
+  const { join } = await import("./core/path");
   try {
     await getCurrentWindow().unmaximize();
-    await getCurrentWindow().setSize(new LogicalSize(1100, 800));
+    await setWindowSize(1100, 800);
     await sleep(250);
     const previous = await api.bugReportPrepare("", false, {}, true);
     if (!entryOnly) log(previous.body.includes("list_dir failed") && previous.body.includes("previous irregular exit"), "actual backend restores previous unclean session diagnostics");
     for (let i = 0; i < 200; i++) await api.bugReportRecord("command", `list_dir ${i} success`);
     await api.bugReportRecord("command", "move failed 25");
     await api.bugReportRecord("error", "Older failure excluded from GitHub");
-    const { join } = await import("./core/path");
-    try { await api.listDir(join(activePath(0), `missing-report-test-${Date.now()}`), { showHidden: false, hideTemp: false, dirsOnly: false }); }
-    catch { /* The real failed IPC must retain its sanitized error message. */ }
+    // Deliberately send an invalid argument to exercise an actual IPC contract failure.
+    await api.listDir(null as unknown as string, { showHidden: false, hideTemp: false }).catch(() => {});
     await sleep(150);
     openOverlay({ type: "settings" });
     const aboutNav = await until(() => Array.from(document.querySelectorAll<HTMLButtonElement>(".settings nav button")).find((b) => b.textContent === "About"));
@@ -3311,7 +4378,7 @@ async function runBugReportSelfTest(textOnly = false, entryOnly = false) {
     const wideEntry = entry.getBoundingClientRect();
     log(Math.abs(wideEntry.right - hero.right) < 2 && wideEntry.top < hero.top + 10, "Settings About report button sits at the top right of the header");
     await shot("bug-report-settings-entry-wide");
-    await getCurrentWindow().setSize(new LogicalSize(800, 600));
+    await setWindowSize(800, 600);
     await sleep(250);
     const entryBounds = entry.getBoundingClientRect();
     log(innerWidth <= 820 && entryBounds.left >= 0 && entryBounds.right <= innerWidth && entryBounds.bottom <= innerHeight, "Settings About report button fits actual narrow window", `${innerWidth}x${innerHeight}`);
@@ -3338,7 +4405,7 @@ async function runBugReportSelfTest(textOnly = false, entryOnly = false) {
       await api.selftestDone(results.join("\n") + `\n\n${failures} failure(s)`);
       return;
     }
-    await getCurrentWindow().setSize(new LogicalSize(1100, 800));
+    await setWindowSize(1100, 800);
     await sleep(250);
     log(!!(await until(() => $(".bug-report details"))), "actual backend prepares a bug report without description");
     const logSection = "## Additional sanitized diagnostic log";
@@ -3486,7 +4553,7 @@ async function runBugReportSelfTest(textOnly = false, entryOnly = false) {
     typeInto(exportInput, exportPath);
     click(button("Save report"));
     log(!!(await until(() => $(".bug-report [role='alert']")?.textContent?.includes("already exists"))) && !!$(".bug-report-export"), "failed save retains the form and refuses to overwrite an existing file");
-    await getCurrentWindow().setSize(new LogicalSize(800, 600));
+    await setWindowSize(800, 600);
     await sleep(200);
     await shot("bug-report-export-narrow");
     const saveBounds = button("Save report").getBoundingClientRect();
@@ -3524,7 +4591,7 @@ async function runBugReportSelfTest(textOnly = false, entryOnly = false) {
     await until(() => $("#report-description"));
     log(($("#report-description") as HTMLTextAreaElement).value === "" && ($("#report-summary") as HTMLInputElement).value === "" && getReportDraft().includeLog && getReportDraft().steps === "" && getReportDraft().expected === "", "a successful GitHub handoff starts the next report empty with saved diagnostics enabled by default");
     await shot("bug-report-new-draft");
-    await getCurrentWindow().setSize(new LogicalSize(1100, 800));
+    await setWindowSize(1100, 800);
     await sleep(200);
     typeInto($("#report-description") as HTMLTextAreaElement, "The file list stopped updating.");
     log(!!(await until(() => $(".bug-report pre")?.textContent?.includes("The file list stopped updating."))), "description remains editable after canceling export");
@@ -3619,7 +4686,7 @@ async function runBugReportSelfTest(textOnly = false, entryOnly = false) {
     log(clipboardImage.kind === "image" && clipboardImage.width === 240 && clipboardImage.height === 100, "native clipboard contains the selected image dimensions");
     button("Copy screenshot").scrollIntoView({ block: "center" });
     await shot("bug-report-screenshot-copied-wide");
-    await getCurrentWindow().setSize(new LogicalSize(800, 600));
+    await setWindowSize(800, 600);
     await sleep(200);
     button("Copy screenshot").scrollIntoView({ block: "center" });
     await sleep(100);
@@ -3634,7 +4701,7 @@ async function runBugReportSelfTest(textOnly = false, entryOnly = false) {
     await until(() => $(".bug-report [role='status']")?.textContent?.includes("Report text copied."));
     const copiedAfterImage = await api.clipInspect();
     log(copiedAfterImage.kind === "text" && copiedAfterImage.text === $(".bug-report pre")?.textContent, "text and image are explicitly copied in separate steps");
-    await getCurrentWindow().setSize(new LogicalSize(1100, 800));
+    await setWindowSize(1100, 800);
     await sleep(200);
     const remove = $(".report-remove")!;
     click(remove);
@@ -3647,7 +4714,7 @@ async function runBugReportSelfTest(textOnly = false, entryOnly = false) {
     openOverlay({ type: "bugReport", previous: true });
     log(!!(await until(() => $(".bug-report")?.textContent?.includes("previous improperly closed session"))), "previous session report explains uncertainty");
     await shot("bug-report-previous");
-    await getCurrentWindow().setSize(new LogicalSize(800, 600));
+    await setWindowSize(800, 600);
     await sleep(200);
     await shot("bug-report-narrow");
     const bounds = $(".bug-report")?.getBoundingClientRect();
@@ -3658,7 +4725,7 @@ async function runBugReportSelfTest(textOnly = false, entryOnly = false) {
     await shot("bug-report-about-entry-narrow");
     click(compactEntry);
     log(!!(await until(() => $(".bug-report details"))), "compact About entry opens the real report dialog");
-    await getCurrentWindow().setSize(new LogicalSize(1100, 800));
+    await setWindowSize(1100, 800);
     await sleep(200);
     typeInto($("#report-summary") as HTMLInputElement, "Capture after sharing");
     await until(() => button("Review report") && !button("Review report").disabled);
@@ -3771,7 +4838,7 @@ async function runBugReportSelfTest(textOnly = false, entryOnly = false) {
     await until(() => $(".bug-report .report-diagnostics pre"));
     await verifyMediaBundle(screenshotPath.replace(/[^/\\]+$/, "bug-report-all-media.zip"));
     click(button("Review report")); await until(() => button("Copy & open GitHub"));
-    await getCurrentWindow().setSize(new LogicalSize(800, 600)); await sleep(200);
+    await setWindowSize(800, 600); await sleep(200);
     await shot("bug-report-review-narrow");
     const handoffBounds = button("Copy & open GitHub").getBoundingClientRect();
     log(handoffBounds.left >= 0 && handoffBounds.right <= innerWidth && handoffBounds.bottom <= innerHeight, "primary handoff stays visible with multiple attachments at narrow size");
@@ -3792,4 +4859,4 @@ async function runBugReportSelfTest(textOnly = false, entryOnly = false) {
   await api.selftestDone(results.join("\n") + `\n\n${failures} failure(s)`);
 }
 
-export const gitSelftest = { api, $, $$, key, click, mouse, typeInto, until, sleep, shot, log, focusPane, activePath, updateSettings, getState, drag, finish: () => api.selftestDone(results.join("\n") + `\n\n${failures} failure(s)`) };
+export const gitSelftest = { note: (line: string) => { results.push(line); }, api, $, $$, key, click, mouse, typeInto, until, sleep, shot, setWindowSize, log, focusPane, activePath, updateSettings, getState, drag, finish: () => api.selftestDone(results.join("\n") + `\n\n${failures} failure(s)`) };

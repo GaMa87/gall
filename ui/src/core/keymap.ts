@@ -21,9 +21,9 @@ export function keyboardSettings(s: Settings, patch: Partial<Settings> = {}): Se
 export type Action =
   | "open" | "openWith" | "parent" | "back" | "forward" | "editPath" | "copyPath" | "copyFolderPath"
   | "rename" | "copyToOther" | "moveToOther" | "duplicate" | "delete" | "deletePermanent" | "properties"
-  | "tag" | "longNames" | "newFile" | "newFolder" | "newNote" | "newTab" | "reopenTab" | "closeTab"
+  | "tag" | "longNames" | "newFile" | "newFolder" | "newNote" | "newWindow" | "newTab" | "reopenTab" | "closeTab"
   | "nextTab" | "prevTab" | "focusOther" | "copy" | "cut" | "paste" | "pasteAsLinks" | "preview"
-  | "selectAll" | "toggleSelect" | "refresh" | "toggleHidden" | "toggleColumns" | "toggleSidebar"
+  | "selectAll" | "toggleSelect" | "refresh" | "toggleHidden" | "toggleHiddenAll" | "toggleColumns" | "toggleSidebar"
   | "togglePreviewPane" | "swapBrowsers" | "notifications" | "search" | "terminal" | "terminalWith" | "edit" | "editWith" | "openWithSettings" | "undo" | "reloadTheme"
   | "settings" | "layoutNext" | "tabFromClipboard" | "contextMenu"
   | "quickOpen" | "commandPalette" | "grepFolder" | "grepRoot" | "keyHelp" | "togglePin"
@@ -31,13 +31,19 @@ export type Action =
   | "cursorDown" | "cursorUp" | "cursorTop" | "cursorBottom" | "halfPageDown" | "halfPageUp"
   | "enter" | "filter" | "selectDown" | "goHome" | "goRoot"
   | "tab1" | "tab2" | "tab3" | "tab4" | "tab5" | "tab6" | "tab7" | "tab8" | "tab9"
+  | "workspace1" | "workspace2" | "workspace3" | "workspace4" | "workspace5"
+  | "workspace6" | "workspace7" | "workspace8" | "workspace9"
+  | "workspaceNew" | "workspaceNext" | "workspacePrev" | "workspaceClose" | "workspaceRename"
+  | "pairToggle" | "pairCycleMode" | "pairFlowSend" | "pairFlowFlip" | "gravityAccept" | "gravityDismiss"
   | "focusLeft" | "focusRight"
   | "sortName" | "sortNameDesc" | "sortSize" | "sortSizeDesc" | "sortModified" | "sortModifiedDesc"
   | "sortExt" | "sortExtDesc" | "sortCreated" | "sortCreatedDesc"
-  | "gitGraph" | "compare" | "compareClipboard" | "compareGitHead" | "compareGitCommit" | "compareFolders"
+  | "gitGraph" | "gitFileHistory" | "worktrees" | "compare" | "compareClipboard" | "compareGitHead" | "compareGitLastChange" | "compareGitCommit" | "compareFolders" | "mergeFiles" | "applyPatch" | "favoritesImport"
   // Archives and the rest of the context menu (vim / leader keys; no chords by default)
   | "extractHere" | "extractToFolder" | "extractToOther" | "compressZip" | "compressAs"
-  | "reveal" | "viewNext" | "toggleFoldersOnTop" | "visualMode" | "folderSizes";
+  | "reveal" | "viewNext" | "toggleFoldersOnTop" | "visualMode" | "folderSizes"
+  // Grouping of the list by type
+  | "groupNext" | "groupOrderNext" | "groupToggle" | "groupCollapseAll" | "groupExpandAll";
 
 export const DEFAULT_KEYMAP: Record<Action, string[]> = {
   open: ["Enter"],
@@ -60,6 +66,8 @@ export const DEFAULT_KEYMAP: Record<Action, string[]> = {
   newFile: ["Ctrl+N"],
   newFolder: ["Ctrl+Shift+N"],
   newNote: ["Alt+N"],
+  // Ctrl+Shift+N stays "New folder" in every profile (Nautilus / Explorer habit).
+  newWindow: ["Ctrl+Alt+N"],
   newTab: ["Ctrl+T"],
   reopenTab: ["Ctrl+Shift+T"],
   tabFromClipboard: ["Ctrl+Shift+Alt+T"],
@@ -76,6 +84,7 @@ export const DEFAULT_KEYMAP: Record<Action, string[]> = {
   toggleSelect: ["Ctrl+Space"],
   refresh: ["F5", "Ctrl+R"],
   toggleHidden: ["Ctrl+H"],
+  toggleHiddenAll: ["Ctrl+.", "Ctrl+Shift+H"],
   toggleColumns: ["`"],
   toggleSidebar: ["Alt+S"],
   togglePreviewPane: ["Alt+P"],
@@ -101,13 +110,20 @@ export const DEFAULT_KEYMAP: Record<Action, string[]> = {
   goHome: [],
   goRoot: [],
   tab1: [], tab2: [], tab3: [], tab4: [], tab5: [], tab6: [], tab7: [], tab8: [], tab9: [],
+  workspace1: ["Alt+1"], workspace2: ["Alt+2"], workspace3: ["Alt+3"], workspace4: ["Alt+4"],
+  workspace5: ["Alt+5"], workspace6: ["Alt+6"], workspace7: ["Alt+7"], workspace8: ["Alt+8"], workspace9: ["Alt+9"],
+  workspaceNew: ["Ctrl+Shift+Alt+N"], workspaceNext: ["Ctrl+Alt+PageDown"], workspacePrev: ["Ctrl+Alt+PageUp"],
+  workspaceClose: ["Ctrl+Shift+Alt+W"], workspaceRename: [],
+  pairToggle: ["Ctrl+Alt+P"], pairCycleMode: ["Ctrl+Alt+M"], pairFlowSend: ["Ctrl+Shift+Enter"], pairFlowFlip: [],
+  gravityAccept: ["Alt+G"], gravityDismiss: [],
   focusLeft: [], focusRight: [],
   sortName: ["Ctrl+F3"], sortNameDesc: [], sortSize: ["Ctrl+F6"], sortSizeDesc: [], sortModified: ["Ctrl+F5"], sortModifiedDesc: [],
   sortExt: ["Ctrl+F4"], sortExtDesc: [], sortCreated: [], sortCreatedDesc: [],
-  gitGraph: [], compare: ["Ctrl+Shift+D"], compareClipboard: [], compareGitHead: [], compareGitCommit: [], compareFolders: ["Ctrl+Alt+D"],
+  gitGraph: [], gitFileHistory: [], worktrees: ["Ctrl+Alt+W"], compare: ["Ctrl+Shift+D"], compareClipboard: [], compareGitHead: [], compareGitLastChange: [], compareGitCommit: [], applyPatch: [], mergeFiles: [], compareFolders: ["Ctrl+Alt+D"], favoritesImport: [],
   extractHere: [], extractToFolder: [], extractToOther: [], compressZip: [], compressAs: [],
   reveal: [], viewNext: [], toggleFoldersOnTop: [], visualMode: [],
   folderSizes: ["Ctrl+Alt+S"],
+  groupNext: ["Ctrl+F7"], groupOrderNext: [], groupToggle: [], groupCollapseAll: [], groupExpandAll: [],
   terminal: ["F10"],
   terminalWith: ["Ctrl+F10"],
   edit: ["F4", "Ctrl+Alt+E"],
@@ -149,11 +165,12 @@ export const ACTION_LABELS: Record<Action, string> = {
   rename: "Rename", copyToOther: "Copy to other browser", moveToOther: "Move to other browser",
   duplicate: "Duplicate", delete: "Move to trash", deletePermanent: "Delete permanently",
   properties: "Properties", tag: "Colour tag", longNames: "Show long names", newFile: "New file from template",
-  newFolder: "New folder", newNote: "New note", newTab: "New tab", reopenTab: "Reopen closed tab",
+  newFolder: "New folder", newNote: "New note", newWindow: "New window (this folder)", newTab: "New tab", reopenTab: "Reopen closed tab",
   tabFromClipboard: "New tab from clipboard path", closeTab: "Close tab", nextTab: "Next tab",
   prevTab: "Previous tab", focusOther: "Focus other browser", copy: "Copy", cut: "Cut", paste: "Paste",
   pasteAsLinks: "Paste as links", preview: "Preview window", selectAll: "Select all",
   toggleSelect: "Toggle selection", refresh: "Refresh", toggleHidden: "Show hidden files",
+  toggleHiddenAll: "Show hidden files (both browsers)",
   toggleColumns: "Toggle columns / breadcrumbs", toggleSidebar: "Toggle sidebar",
   togglePreviewPane: "Toggle details pane (this browser)", swapBrowsers: "Swap folders of the two browsers", notifications: "Notifications",
   terminal: "Terminal here", terminalWith: "Terminal here with…", edit: "Edit in editor", editWith: "Edit with…", openWithSettings: "Default programs (Settings › Open with)", undo: "Undo", reloadTheme: "Reload theme", settings: "Settings",
@@ -167,6 +184,14 @@ export const ACTION_LABELS: Record<Action, string> = {
   selectDown: "Toggle selection and move down", goHome: "Go to home folder", goRoot: "Go to file system root",
   tab1: "Go to tab 1", tab2: "Go to tab 2", tab3: "Go to tab 3", tab4: "Go to tab 4", tab5: "Go to tab 5",
   tab6: "Go to tab 6", tab7: "Go to tab 7", tab8: "Go to tab 8", tab9: "Go to tab 9",
+  workspace1: "Switch to workspace 1", workspace2: "Switch to workspace 2", workspace3: "Switch to workspace 3",
+  workspace4: "Switch to workspace 4", workspace5: "Switch to workspace 5", workspace6: "Switch to workspace 6",
+  workspace7: "Switch to workspace 7", workspace8: "Switch to workspace 8", workspace9: "Switch to workspace 9",
+  workspaceNew: "New workspace", workspaceNext: "Next workspace", workspacePrev: "Previous workspace",
+  workspaceClose: "Close workspace", workspaceRename: "Rename workspace",
+  pairToggle: "Pair / unpair active tabs", pairCycleMode: "Cycle tab pair mode (Linked / Tandem / Flow)",
+  pairFlowSend: "Send selection across Flow bridge", pairFlowFlip: "Reverse Flow bridge direction",
+  gravityAccept: "Open & pair suggested ghost tab", gravityDismiss: "Dismiss ghost tab suggestion",
   focusLeft: "Focus left browser", focusRight: "Focus right browser",
   sortName: "Sort by name", sortNameDesc: "Sort by name, descending", sortSize: "Sort by size",
   sortSizeDesc: "Sort by size, largest first", sortModified: "Sort by date modified, oldest first",
@@ -174,14 +199,22 @@ export const ACTION_LABELS: Record<Action, string> = {
   sortCreated: "Sort by date created, oldest first", sortCreatedDesc: "Sort by date created, newest first",
   compare: "Compare files (two selected, or with the other panel)", compareClipboard: "Compare file with clipboard",
   compareGitHead: "Compare file with Git HEAD (my changes)",
+  compareGitLastChange: "Show the last Git change to this file",
   compareGitCommit: "Compare file with a Git commit",
   gitGraph: "Open Git graph",
+  gitFileHistory: "Open file history",
+  worktrees: "Switch worktree…",
   compareFolders: "Compare the folders of both panels (sync)",
+  mergeFiles: "Merge three files (base, local, remote) into a result",
+  applyPatch: "Apply a patch (unified, context or normal) to the files of a folder",
+  favoritesImport: "Import favorites…",
   extractHere: "Extract here", extractToFolder: "Extract each archive to its own folder",
   extractToOther: "Extract to other browser", compressZip: "Compress to .zip", compressAs: "Compress: name and format…",
   reveal: "Show in system file manager", viewNext: "Next view (details, names, icons…)",
   toggleFoldersOnTop: "Folders on top", visualMode: "Visual mode (motions extend the selection)",
   folderSizes: "Calculate folder sizes (selected, else all here)",
+  groupNext: "Next grouping (none, folders first, type…)", groupOrderNext: "Next order of the groups",
+  groupToggle: "Collapse / expand the group", groupCollapseAll: "Collapse all groups", groupExpandAll: "Expand all groups",
 };
 
 type KeyLike = { key: string; code?: string; ctrlKey: boolean; metaKey: boolean; altKey: boolean; shiftKey?: boolean; getModifierState?: (k: "AltGraph") => boolean };
@@ -234,7 +267,9 @@ export function chordOf(ev: KeyLike & { shiftKey: boolean }): string {
   let key = e.key;
   if (key === " ") key = "Space";
   // With Alt held, e.key may be a composed character; fall back to the physical key.
+  // For digits, preserve ASCII punctuation composed via Option on EU Mac layouts (e.g. Option+5 → "[").
   if (e.altKey && e.code && /^Key[A-Z]$/.test(e.code)) key = e.code.slice(3);
+  else if (e.altKey && e.code && /^Digit[0-9]$/.test(e.code) && !/^[\x20-\x7e]$/.test(key)) key = e.code.slice(5);
   if (key.length === 1) key = key.toUpperCase();
   const mods: string[] = [];
   if (e.ctrlKey || e.metaKey) mods.push("Ctrl");

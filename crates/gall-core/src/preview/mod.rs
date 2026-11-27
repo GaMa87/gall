@@ -100,6 +100,85 @@ const TEXT: &[&str] = &[
     "service",
 ];
 
+/// What people call documents among the types above, with their older relatives.
+const DOCUMENT: &[&str] = &[
+    "txt",
+    "md",
+    "markdown",
+    "rst",
+    "adoc",
+    "org",
+    "log",
+    "tex",
+    "nfo",
+    "srt",
+    "vtt",
+    "pdf",
+    "doc",
+    "docx",
+    "odt",
+    "rtf",
+    "ppt",
+    "pptx",
+    "odp",
+    "epub",
+    "csv",
+    "tsv",
+    "tab",
+    "xls",
+    "xlsx",
+    "xlsm",
+    "xlsb",
+    "ods",
+    "2do",
+    "2dx",
+    "readme",
+    "license",
+    "changelog",
+];
+
+/// Kinds of files for grouping, from the tables of the preview, by extension (without one, by
+/// the whole name: `Makefile`). Everything that is in no table is "other".
+fn kinds() -> &'static std::collections::HashMap<String, &'static str> {
+    static KINDS: std::sync::OnceLock<std::collections::HashMap<String, &'static str>> =
+        std::sync::OnceLock::new();
+    KINDS.get_or_init(|| {
+        let mut kinds = std::collections::HashMap::new();
+        for (kind, table) in [
+            ("document", DOCUMENT),
+            ("image", IMAGE),
+            ("video", VIDEO),
+            ("audio", AUDIO),
+            ("archive", ARCHIVE),
+            ("archive", crate::fs::archive::EXTENSIONS),
+            ("archive", &["rar"]),
+            ("other", &["stl"]),
+            ("code", TEXT),
+        ] {
+            for ext in table {
+                kinds.entry(ext.to_string()).or_insert(kind);
+            }
+        }
+        for ext in crate::fs::syntax::extensions() {
+            kinds.entry(ext).or_insert("code");
+        }
+        kinds
+    })
+}
+
+/// `image`, `document`, `audio`, `video`, `archive`, `code` or `other`.
+pub fn kind_group(name: &str, ext: &str) -> &'static str {
+    let found = if ext.is_empty() {
+        // A file called "png" is no image.
+        kinds()
+            .get(name.trim_start_matches('.').to_lowercase().as_str())
+            .filter(|kind| matches!(**kind, "code" | "document"))
+    } else {
+        kinds().get(ext)
+    };
+    found.copied().unwrap_or("other")
+}
+
 pub fn classify(entry: &FileEntry) -> PreviewKind {
     if entry.is_dir {
         return PreviewKind::Folder;
@@ -356,6 +435,27 @@ pub fn excerpt(path: &Path, lines: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The UI groups by the same table, which it reads from `kinds.json`. After a change of the
+    /// tables: `GALL_WRITE_KINDS=1 cargo test -p gall-core --lib the_ui_has_the_same_kinds`.
+    #[test]
+    fn the_ui_has_the_same_kinds() {
+        let file =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ui/src/core/kinds.json");
+        let mut table = std::collections::BTreeMap::<&str, Vec<&str>>::new();
+        for (ext, kind) in kinds() {
+            table.entry(kind).or_default().push(ext);
+        }
+        table.remove("other");
+        table.values_mut().for_each(|list| list.sort_unstable());
+        if std::env::var_os("GALL_WRITE_KINDS").is_some() {
+            let text = serde_json::to_string(&table).unwrap().replace("],", "],\n");
+            std::fs::write(&file, text + "\n").unwrap();
+        }
+        let text = std::fs::read_to_string(&file).unwrap();
+        let ui: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(ui, serde_json::to_value(&table).unwrap());
+    }
     use std::io::Write;
 
     #[test]

@@ -1,6 +1,10 @@
 //! Recursive wildcard search (Q-01). Streaming and cancellable.
 
 use super::entry::FileEntry;
+use super::search_filter::{
+    walk_hidden_matches, CountBudget, FilterConfig, FilterMatcher, HiddenCount, ProbeMatch,
+};
+use serde::Serialize;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -103,6 +107,70 @@ impl Default for SearchOptions {
             everything: false,
         }
     }
+}
+
+/// One name-search hit, optionally marked when normal search filters would hide it
+/// (shown because `Alt+I` / "search everything" is enabled).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchHit {
+    #[serde(flatten)]
+    pub entry: FileEntry,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
+}
+
+/// Like [`search`], returning [`SearchHit`]s. When `opts.everything` is set and
+/// `normal_filter` is given, each hit is annotated with whether normal filters
+/// would have hidden it.
+pub fn search_annotated(
+    root: &Path,
+    pattern: &str,
+    opts: SearchOptions,
+    normal_filter: Option<&FilterConfig>,
+    cancel: &AtomicBool,
+    mut on_hit: impl FnMut(SearchHit),
+) -> usize {
+    let matcher = if opts.everything {
+        normal_filter.map(|cfg| FilterMatcher::new(root, cfg.clone()))
+    } else {
+        None
+    };
+    search(root, pattern, opts, cancel, |entry| {
+        let hidden = matcher
+            .as_ref()
+            .is_some_and(|m| m.is_path_hidden(Path::new(&entry.path), entry.is_dir));
+        on_hit(SearchHit { entry, hidden });
+    })
+}
+
+/// Counts entries hidden by `filter` under `root` whose names match `pattern`,
+/// within `budget`. Returns zero when `pattern` is empty or cancelled.
+pub fn count_hidden(
+    root: &Path,
+    pattern: &str,
+    filter: &FilterConfig,
+    budget: CountBudget,
+    cancel: &AtomicBool,
+) -> HiddenCount {
+    if pattern.trim().is_empty() {
+        return HiddenCount::default();
+    }
+    let wc = Wildcard::new(pattern);
+    walk_hidden_matches(
+        root,
+        filter,
+        None,
+        budget,
+        cancel,
+        |_path, name, _is_dir| {
+            if wc.matches(name) {
+                ProbeMatch::Matched
+            } else {
+                ProbeMatch::NoMatch
+            }
+        },
+    )
 }
 
 /// Walks `root` and calls `on_hit` for each match. Returns the number of hits.
@@ -479,5 +547,118 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(all.len(), 5, "{all:?}");
+    }
+
+    #[test]
+    fn hidden_count_and_annotated_search_cover_all_filter_states() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path();
+        for dir in [".git", "src", "gen", "out", "node_modules/pkg"] {
+            std::fs::create_dir_all(p.join(dir)).unwrap();
+        }
+        std::fs::write(p.join("src/report.ts"), "").unwrap();
+        std::fs::write(p.join("gen/report_gen.ts"), "").unwrap();
+        std::fs::write(p.join("out/secret_only.ts"), "").unwrap();
+        std::fs::write(p.join("node_modules/pkg/secret_only2.ts"), "").unwrap();
+        std::fs::write(p.join(".gitignore"), "out/\n").unwrap();
+        std::fs::write(p.join(".gallignore"), "/gen/\n").unwrap();
+
+        let filter = FilterConfig {
+            include_hidden: false,
+            respect_gitignore: true,
+            exclude: vec!["node_modules".into()],
+            use_gallignore: true,
+        };
+        let cancel = AtomicBool::new(false);
+
+        // Zero visible + 2 hidden (one .gitignore, one node_modules).
+        let mut vis = vec![];
+        search(
+            p,
+            "secret_only*",
+            SearchOptions {
+                respect_gitignore: true,
+                exclude: vec!["node_modules".into()],
+                ..Default::default()
+            },
+            &cancel,
+            |e| vis.push(e.name),
+        );
+        assert!(vis.is_empty());
+        let hc = count_hidden(
+            p,
+            "secret_only*",
+            &filter,
+            CountBudget::name_default(),
+            &cancel,
+        );
+        assert_eq!(
+            hc,
+            HiddenCount {
+                count: 2,
+                capped: false
+            }
+        );
+
+        // Some visible (1) + 1 hidden (.gallignore).
+        let mut vis = vec![];
+        search(
+            p,
+            "report*",
+            SearchOptions {
+                respect_gitignore: true,
+                exclude: vec!["node_modules".into()],
+                ..Default::default()
+            },
+            &cancel,
+            |e| vis.push(e.name),
+        );
+        assert_eq!(vis, ["report.ts"]);
+        let hc = count_hidden(p, "report*", &filter, CountBudget::name_default(), &cancel);
+        assert_eq!(
+            hc,
+            HiddenCount {
+                count: 1,
+                capped: false
+            }
+        );
+
+        // Nothing hidden matches.
+        let hc = count_hidden(
+            p,
+            "no_such_name",
+            &filter,
+            CountBudget::name_default(),
+            &cancel,
+        );
+        assert_eq!(
+            hc,
+            HiddenCount {
+                count: 0,
+                capped: false
+            }
+        );
+
+        // Alt+I (everything = true): returns both visible and hidden, marking only hidden ones.
+        let mut hits = vec![];
+        search_annotated(
+            p,
+            "report*",
+            SearchOptions {
+                everything: true,
+                ..Default::default()
+            },
+            Some(&filter),
+            &cancel,
+            |h| hits.push((h.entry.name, h.hidden)),
+        );
+        hits.sort();
+        assert_eq!(
+            hits,
+            vec![
+                ("report.ts".to_string(), false),
+                ("report_gen.ts".to_string(), true),
+            ]
+        );
     }
 }

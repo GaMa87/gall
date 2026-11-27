@@ -11,17 +11,36 @@ channel you are working on, so work is not done twice.
 ## In-app updates
 
 Updater-enabled builds check the latest stable GitHub release at startup and from
-**Settings → Updates → Check for updates**. Signed in-app installation targets
-Windows installers, Linux AppImage and macOS application bundles. Portable Windows
-ZIPs and Linux system packages instead need a manual upgrade: download a new ZIP,
-or use the package manager that installed Gall. Settings live in the user profile, so replacing
-application files keeps them (preserve `UserData` only if a `portable` marker is used). Do not replace a package-managed installation with an
-AppImage or Windows installer through the updater.
+**Settings → Updates → Check for updates**. By default, Gall downloads, verifies
+(Minisign signature and signed version check), extracts, probes (`--gall-update-probe`),
+and stages updates in the background, then prompts to **Restart to update** (toggleable
+under **Settings → Updates → Download updates automatically**).
 
-Release signing setup, publication and the required real upgrade checks are in
+Gall uses a hybrid strategy so every non-store installation updates inside the app
+without external installer prompts or privilege elevation:
+
+- **In-place replacement:** writable installs (Windows portable ZIP with or without a
+  `portable` marker, per-user NSIS, writable AppImage, writable local binary, and
+  writable non-translocated macOS `Gall.app`) swap atomically beside the running binary.
+- **Signed user-space overlay + startup bootstrapper:** read-only or package-managed
+  installs (Linux `.rpm`/`.deb`/COPR/AUR `gall-bin` under `/usr`, Windows `.msi` in `Program Files`,
+  per-machine NSIS, Scoop under `\scoop\apps\gall\`, read-only AppImage, and read-only
+  or translocated macOS `Gall.app`) keep system files untouched for `rpm`/`dpkg`/MSI
+  verification; the base binary re-verifies and hands off to `<updates>/versions/<ver>/`
+  with automatic two-strike rollback and a **Revert to \<base\>** option in **Settings → Updates**.
+- **Store-managed builds:** Flatpak (`/.flatpak-info`) and Snap (`$SNAP`) delegate updates
+  to their store.
+- **Source-built distro packages:** the Arch / Omarchy package `gall` (see
+  [Arch Linux, Omarchy and aarch64](#arch-linux-omarchy-and-aarch64)) is built with
+  `GALL_PACKAGE_MANAGED=1`, so Gall never downloads self-updates there: `pacman` or
+  `omarchy update` own them.
+
+Existing installations on `<= 0.2.2` need one manual upgrade to an updater-enabled build
+with `*-bin` / `*-app` targets before in-app updates take over. Release signing setup,
+publication, and the required real upgrade checks are in
 [CONTRIBUTING.md](../CONTRIBUTING.md#updater-signing-setup-one-time). Installation
 across all supported operating systems must be verified with signed release builds;
-local unit tests do not establish that a published upgrade works.
+local unit tests alone do not establish that a published upgrade works.
 
 ## Status
 
@@ -30,7 +49,9 @@ local unit tests do not establish that a published upgrade works.
 | GitHub Releases | all | ✅ available | `.github/workflows/release.yml` |
 | Scoop (own bucket, then Extras) | Windows | 📝 manifest drafted | [`scoop/gall.json`](scoop/gall.json) |
 | winget | Windows | 🔜 planned | (generated with `wingetcreate`) |
-| AUR `gall-bin` | Arch, Manjaro, EndeavourOS | 📝 PKGBUILD drafted | [`aur/gall-bin/PKGBUILD`](aur/gall-bin/PKGBUILD) |
+| Arch source package `gall` | Arch, Manjaro, EndeavourOS (`x86_64`, `aarch64`) | 📝 PKGBUILD ready (checksum set after tagging) | [`arch/gall/PKGBUILD`](arch/gall/PKGBUILD) |
+| Omarchy package repository (`omacom/omarchy-pkgs`) | Omarchy (`x86_64`, `aarch64`) | 📝 template drafted | [`omarchy-pkgs/package.json`](omarchy-pkgs/package.json), [`omarchy/README.md`](omarchy/README.md) |
+| AUR `gall-bin` | Arch, Manjaro, EndeavourOS (`x86_64`) | 📝 PKGBUILD drafted (repackages the v0.2.2 `.deb`) | [`aur/gall-bin/PKGBUILD`](aur/gall-bin/PKGBUILD) |
 | Flathub | all Linux | 🔜 planned | [`linux/org.gall.app.metainfo.xml`](linux/org.gall.app.metainfo.xml) |
 | Fedora COPR | Fedora, RHEL clones | ✅ available (`dnf copr enable gama87/gall`) | [`copr/gall.spec`](copr/gall.spec), [`scripts/copr-build.sh`](../scripts/copr-build.sh) |
 | AppImageHub | all Linux | 🔜 planned | |
@@ -104,10 +125,42 @@ It is also the most work:
   `--talk-name=org.freedesktop.UDisks2` for mounting and ejecting, and `--talk-name=org.freedesktop.Flatpak`
   so "Open with", "Terminal here" and Git can run host programs via `flatpak-spawn --host`.
   Explain each in the submission PR; reviewers accept these for file managers (Dolphin on Flathub uses host file system access too).
-- **Code changes:** run external commands (terminal, editor, `git`, "Open with") through
-  `flatpak-spawn --host` when `/.flatpak-info` exists, and use the trash portal or host trash.
+- **Code changes (done):** inside a sandbox (`/.flatpak-info` exists) Gall starts the terminal, editors,
+  "Open with" programs and `git` through `flatpak-spawn --host`, and looks programs up on the host
+  (`crates/gall-core/src/util/hostspawn.rs`; outside Flatpak nothing changes). Not covered yet: the
+  Git credential helpers for network operations and the interactive-rebase editor, which need the
+  host Git to call back into the sandbox, and the trash (use the host trash or the trash portal).
+- **Draft manifest:** [`flatpak/io.github.gama87.Gall.yml`](flatpak/io.github.gama87.Gall.yml). It was
+  not run through `flatpak-builder` yet. To finish it:
+  1. In a checkout of the release tag, generate the offline sources next to the manifest:
+     `python3 flatpak-cargo-generator.py Cargo.lock -o cargo-sources.json` and
+     `flatpak-node-generator --output node-sources.json npm ui/package-lock.json`
+     (both from [flatpak-builder-tools](https://github.com/flatpak/flatpak-builder-tools)).
+  2. Set `runtime-version` to the current GNOME runtime, and `tag`/`commit` to the release.
+  3. `flatpak-builder --user --install --force-clean build-dir io.github.gama87.Gall.yml`, then run
+     `flatpak run io.github.gama87.Gall`, `flatpak run --command=flatpak-builder-lint org.flatpak.Builder manifest io.github.gama87.Gall.yml`
+     and `appstreamcli validate` on the installed metainfo.
 - **Submit:** PR to [flathub/flathub](https://github.com/flathub/flathub) on the `new-pr` branch. After
   approval, claim **verification** for `io.github.gama87` so the store shows a checkmark.
+
+### File chooser portal (`xdg-desktop-portal-gall`)
+
+Only the Arch `PKGBUILD` ships the FileChooser backend (`/usr/bin/xdg-desktop-portal-gall`,
+`gall.portal` and the D-Bus service file from `packaging/linux/`). The `.deb`/`.rpm` do not, on purpose:
+
+- Tauri's `bundle.linux.{deb,rpm}.files` can copy the two static files, but the backend is a separate
+  binary (`cargo build --release -p gall-portal`) that the bundler does not build. A `files` entry for a
+  binary that does not exist yet breaks every Linux bundle, so it has to arrive together with a
+  `cargo build --release -p gall-portal` step in the Linux job of `.github/workflows/release.yml`
+  (public repository), checked with `scripts/release-dryrun.sh` and a dry-run release.
+- The backend is opt-in (a `portals.conf` must name `gall`), and the AppImage cannot carry it at all
+  (a D-Bus service needs a fixed `Exec=` path).
+
+To add it later: build `gall-portal` before `tauri build`, then list
+`target/release/xdg-desktop-portal-gall` → `/usr/bin/xdg-desktop-portal-gall`,
+`packaging/linux/gall.portal` → `/usr/share/xdg-desktop-portal/portals/gall.portal` and
+`packaging/linux/org.freedesktop.impl.portal.desktop.gall.service` →
+`/usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.gall.service` in both `files` maps.
 
 ### Fedora COPR
 
@@ -182,3 +235,13 @@ Until then, the own tap and the `.dmg` from Releases are the options.
       (also installed by the `.deb`/`.rpm`, so Discover and GNOME Software show screenshots and a description).
 - [ ] Screenshots in `docs/screenshots/` up to date (`./scripts/screenshots.sh`).
 - [ ] Add a `<release>` entry to the metainfo with every version.
+
+## Arch Linux, Omarchy and aarch64
+
+- `packaging/arch/gall/PKGBUILD`: source package for `x86_64` and `aarch64` (builds from the release
+  tarball, `GALL_PACKAGE_MANAGED=1`, installs the desktop file, D-Bus service, `actions.d`, icons and
+  the `package-managed` marker). `gall-bin` under `aur/` stays the binary alternative.
+- `packaging/omarchy-pkgs/package.json`: template for `omacom/omarchy-pkgs` (verify the schema there).
+- `packaging/omarchy/README.md`: the file-by-file pull request for making Gall Omarchy's file manager.
+- `release.yml` builds Linux on `ubuntu-22.04` and, natively, on `ubuntu-24.04-arm`; the `aarch64`
+  self-update archive is added to `latest.json` as `linux-aarch64-bin` when it was uploaded.

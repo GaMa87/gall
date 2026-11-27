@@ -7,5 +7,5 @@ export default defineConfig({
   clearScreen: false,
   server: { port: 5173, strictPort: true, watch: { ignored: ["**/src-tauri/**"] } },
   build: { target: "es2022", sourcemap: true, chunkSizeWarningLimit: 2000 },
-  test: { environment: "node", include: ["src/**/*.test.ts"], setupFiles: ["./vitest.setup.ts"] },
+  test: { environment: "node", include: ["src/**/*.test.{ts,tsx}"], setupFiles: ["./vitest.setup.ts"] },
 });

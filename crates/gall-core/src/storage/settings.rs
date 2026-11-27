@@ -2,7 +2,7 @@
 
 use crate::nav::path::PathFormat;
 use crate::nav::session::NewTabPlacement;
-use crate::view::sort::SortKey;
+use crate::view::sort::{GroupMode, GroupOrder, SortKey};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -13,6 +13,28 @@ pub enum ThemeMode {
     System,
     Dark,
     Light,
+    Omarchy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum WindowButtonsMode {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkspaceBarMode {
+    /// Always show the numbered workspace switcher (`1 2 3 +`) in the title bar.
+    #[default]
+    Always,
+    /// Show the switcher only when more than one workspace is open.
+    Multiple,
+    /// Hide the workspace switcher from the title bar.
+    Never,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -92,11 +114,31 @@ pub enum KeyboardProfile {
     Vim,
 }
 
+/// One command the user defined for the Git workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct GitCommandDef {
+    pub id: String,
+    pub label: String,
+    /// Where it applies: `commit`, `branch`, `tag`, `file` (Working Changes) or `stash`.
+    pub context: String,
+    /// The program and its arguments, with `{hash}`, `{branch}`, `{file}`, `{selection}`, `{repo}`, `{tag}`, `{stash}`.
+    pub command: Vec<String>,
+    /// One key in the panel of its context (with Vim keys); empty: none.
+    pub key: String,
+    /// Ask before running.
+    pub confirm: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
     // Appearance (A-01…A-06)
     pub theme: ThemeMode,
+    /// Follow Omarchy's `window-glassy.lua` toggle when running on Omarchy.
+    pub omarchy_glassy: bool,
+    /// Follow Omarchy's `fontconfig` monospace font when the Omarchy theme is active.
+    pub omarchy_follow_font: bool,
     /// Name of a theme file in the themes folder; empty = built-in.
     pub custom_theme: String,
     pub accent: String,
@@ -114,8 +156,16 @@ pub struct Settings {
     // View (F-03, F-08)
     pub show_hidden: bool,
     pub hide_temp: bool,
+    /// Before `group` existed; only read to move that choice over (`migrate_defaults`).
     pub folders_on_top: bool,
     pub folders_by_name: bool,
+    /// What is collected before the sort orders each group.
+    pub group: GroupMode,
+    pub group_order: GroupOrder,
+    /// Grouping by type: images, documents, … instead of each extension.
+    pub group_by_kind: bool,
+    /// Headers above the groups; off: a flat list in the same order.
+    pub group_headers: bool,
     pub default_sort: SortKey,
     pub default_descending: bool,
     pub default_view: String,
@@ -126,6 +176,23 @@ pub struct Settings {
     pub marching_ants: bool,
     /// Git status badges in the file list and the branch in the status bar.
     pub show_git_status: bool,
+    /// Where a new worktree goes: `{repo}` (folder of the main worktree, elsewhere in the
+    /// template its name) and `{branch}`. Empty = `{repo}/.worktrees/{branch}`.
+    pub worktree_location: String,
+    /// Double-click on a commit: "details" (its changes) or "checkout" (asks first).
+    pub git_double_click: String,
+    /// Conflict forecast in the branch list: not in repositories with more branches; 0 is off.
+    pub git_forecast_branches: u32,
+    /// Main worktree folder → its own template, instead of `worktree_location`.
+    pub worktree_locations: BTreeMap<String, String>,
+    /// Switching with local changes keeps them with their branch and brings them back on return (`fs::gitwip`). Off by default.
+    pub git_branch_wip: bool,
+    /// Commands of the user for the Git workspace (arguments, never a shell string), with the variables of `fs::gitcustom`.
+    pub git_commands: Vec<GitCommandDef>,
+    /// Main worktree folder → the command (program and arguments) run in a new worktree after it was created.
+    pub worktree_commands: BTreeMap<String, Vec<String>>,
+    /// Main worktree folder → link the folders of `.worktreeinclude` into new worktrees instead of copying them.
+    pub worktree_links: BTreeMap<String, bool>,
     /// Calculate the size of every folder in the open folder (else only on request).
     pub folder_sizes_auto: bool,
     /// Preview + properties pane next to the file list (P-01). Off by default.
@@ -151,10 +218,26 @@ pub struct Settings {
     pub new_tab_path: String,
     pub new_tab_placement: NewTabPlacement,
     pub tabs_show_full_path: bool,
+    /// When the workspace switcher (`1 2 3 +`) appears in the title bar.
+    pub show_workspaces: WorkspaceBarMode,
+    /// Show Live Tab Pairs bridge controls (`PanelMap` + `TabBar` pair actions).
+    pub live_tab_pairs: bool,
+    /// Show zero-config Pair Gravity ghost tab suggestions (`🧲`) on the opposite TabBar.
+    pub pair_gravity: bool,
+
+    /// Interface language: `auto` (Omarchy's language, else the system's) or a language code such as `sl`.
+    pub language: String,
 
     // Window / sidebar (M:window)
     /// Open the main window maximized on start-up.
     pub start_maximized: bool,
+    /// Automatically adapt pane split orientation (horizontal / vertical / single) to window size.
+    pub adaptive_layout: bool,
+    /// The sidebar is shown (the user's choice; a narrow window hides it temporarily without
+    /// changing this).
+    pub sidebar_visible: bool,
+    /// Titlebar window control buttons visibility (`auto` hides on tiling WMs).
+    pub window_buttons: WindowButtonsMode,
     pub show_drives: bool,
     /// Sidebar section with the cloud folders found on this computer (OneDrive, …).
     pub show_cloud: bool,
@@ -206,16 +289,114 @@ pub struct Settings {
 
     // Advanced
     pub watcher_debounce_ms: u32,
+    /// Extra file names or glob patterns treated as generated (collapsed by default in comparisons and Git file lists).
+    #[serde(default)]
+    pub generated_patterns: Vec<String>,
+    /// Download and verify updates automatically in the background, then prompt to restart.
+    pub auto_download_updates: bool,
     /// Action name → key chord, overriding the built-in keymap (C-04).
     pub shortcuts: BTreeMap<String, String>,
     /// Folder path → icon colour (CSS colour), set from the folder context menu.
     pub folder_colors: BTreeMap<String, String>,
+    /// Which changes of defaults this file has been through (`migrate_defaults`). A file
+    /// written before this field existed reads as 0.
+    #[serde(default)]
+    pub defaults_version: u32,
+}
+
+/// The newest change of defaults `Settings::migrate_defaults` knows.
+pub const DEFAULTS_VERSION: u32 = 2;
+
+impl Settings {
+    /// Moves values that still equal an old default to the current one, once per change:
+    /// afterwards the old value is a choice like any other and is kept. Returns whether
+    /// the settings changed and need saving.
+    pub fn migrate_defaults(&mut self) -> bool {
+        if self.defaults_version >= DEFAULTS_VERSION {
+            return false;
+        }
+        if self.defaults_version < 1 {
+            // 0.1.0 remembered 30 folders by default; the default is now 10.
+            if self.history_count == 30 {
+                self.history_count = 10;
+            }
+            // 0.1.2 and before squeezed Miller columns down to 70 px, too narrow for a name
+            // (deep folders showed "C…" "Lo…"); now 120 px, and deeper paths scroll.
+            if self.column_min_width == 70 {
+                self.column_min_width = 120;
+            }
+        }
+        // Grouping by type is for new installs: an older one keeps the order it had.
+        self.group = GroupMode::from_folders_on_top(self.folders_on_top);
+        self.defaults_version = DEFAULTS_VERSION;
+        true
+    }
+
+    /// Expected path to Omarchy's active `colors.toml` theme file on Linux.
+    #[cfg(target_os = "linux")]
+    pub fn omarchy_colors_path() -> Option<std::path::PathBuf> {
+        let state = std::env::var_os("XDG_STATE_HOME")
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from)
+            .or_else(dirs::state_dir)
+            .or_else(|| dirs::home_dir().map(|h| h.join(".local/state")))?;
+        Some(state.join("omarchy/current/theme/colors.toml"))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn omarchy_colors_path() -> Option<std::path::PathBuf> {
+        None
+    }
+
+    /// True if an Omarchy `colors.toml` exists at `colors_toml`.
+    pub fn omarchy_theme_present_at(colors_toml: &std::path::Path) -> bool {
+        colors_toml.is_file()
+    }
+
+    /// True on Linux when Omarchy's active `colors.toml` theme file exists.
+    pub fn is_omarchy_environment() -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            Self::omarchy_colors_path().is_some_and(|p| Self::omarchy_theme_present_at(&p))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
+    /// Applies first-run defaults (`ThemeMode::Omarchy` when `omarchy_present` is true
+    /// and theme is still `ThemeMode::System`).
+    pub fn apply_first_run_defaults_with(&mut self, omarchy_present: bool) {
+        if omarchy_present && self.theme == ThemeMode::System {
+            self.theme = ThemeMode::Omarchy;
+        }
+    }
+
+    /// Applies first-run defaults for the current host environment.
+    pub fn apply_first_run_defaults(&mut self) {
+        self.apply_first_run_defaults_with(Self::is_omarchy_environment());
+    }
+
+    /// Loads `Settings` from `store`, applying first-run Omarchy defaults only when no
+    /// primary or backup file existed (`LoadedFrom::Default`).
+    pub fn load(
+        store: &crate::storage::JsonStore,
+    ) -> (Self, crate::storage::json_store::LoadedFrom) {
+        let (mut settings, from) = store.load::<Self>();
+        if from == crate::storage::json_store::LoadedFrom::Default {
+            settings.apply_first_run_defaults();
+        }
+        (settings, from)
+    }
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Settings {
             theme: ThemeMode::System,
+            omarchy_glassy: true,
+            omarchy_follow_font: true,
             custom_theme: String::new(),
             accent: "#3d8bfd".into(),
             font_family: String::new(),
@@ -232,12 +413,24 @@ impl Default for Settings {
             hide_temp: false,
             folders_on_top: true,
             folders_by_name: false,
+            group: GroupMode::default(),
+            group_order: GroupOrder::default(),
+            group_by_kind: false,
+            group_headers: true,
             default_sort: SortKey::Modified,
             default_descending: true,
             default_view: "default".into(),
             remember_folder_views: true,
             marching_ants: true,
             show_git_status: true,
+            worktree_location: crate::fs::gitlocation::DEFAULT_TEMPLATE.into(),
+            git_double_click: "details".into(),
+            git_forecast_branches: 50,
+            worktree_locations: BTreeMap::new(),
+            git_branch_wip: false,
+            git_commands: Vec::new(),
+            worktree_commands: BTreeMap::new(),
+            worktree_links: BTreeMap::new(),
             folder_sizes_auto: false,
             show_details_pane: false,
             show_nav_columns: false,
@@ -256,12 +449,20 @@ impl Default for Settings {
             new_tab_path: String::new(),
             new_tab_placement: NewTabPlacement::AfterCurrent,
             tabs_show_full_path: false,
+            show_workspaces: WorkspaceBarMode::Always,
+            live_tab_pairs: true,
+            pair_gravity: true,
 
             start_maximized: true,
+            language: "auto".to_string(),
+            adaptive_layout: true,
+            sidebar_visible: true,
+            window_buttons: WindowButtonsMode::Auto,
             show_drives: true,
             show_cloud: true,
             show_history: true,
             show_system_monitor: true,
+            defaults_version: DEFAULTS_VERSION,
             history_count: 10,
             terminal: String::new(),
             editor: String::new(),
@@ -294,9 +495,72 @@ impl Default for Settings {
             leader_key_basic: "Ctrl Ctrl".into(),
 
             watcher_debounce_ms: 250,
+            generated_patterns: Vec::new(),
+            auto_download_updates: true,
             shortcuts: BTreeMap::new(),
             folder_colors: BTreeMap::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod defaults_tests {
+    use super::{Settings, DEFAULTS_VERSION};
+
+    #[test]
+    fn old_defaults_move_once_and_a_later_choice_is_kept() {
+        // A file from before the field existed, still holding the old defaults.
+        let mut s: Settings =
+            serde_json::from_str(r#"{"historyCount":30,"columnMinWidth":70}"#).unwrap();
+        assert_eq!(s.defaults_version, 0);
+        assert!(s.migrate_defaults());
+        assert_eq!((s.history_count, s.column_min_width), (10, 120));
+        assert_eq!(s.defaults_version, DEFAULTS_VERSION);
+        // The user now picks the old values on purpose: they survive a restart.
+        s.history_count = 30;
+        s.column_min_width = 70;
+        let mut again: Settings =
+            serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert!(!again.migrate_defaults());
+        assert_eq!((again.history_count, again.column_min_width), (30, 70));
+    }
+
+    #[test]
+    fn folders_on_top_becomes_the_grouping_once() {
+        use crate::view::sort::GroupMode;
+        for (file, group) in [
+            (
+                r#"{"defaultsVersion":1,"foldersOnTop":true}"#,
+                GroupMode::Folders,
+            ),
+            (
+                r#"{"defaultsVersion":1,"foldersOnTop":false}"#,
+                GroupMode::None,
+            ),
+            // The old default was on.
+            (r#"{"historyCount":12}"#, GroupMode::Folders),
+        ] {
+            let mut s: Settings = serde_json::from_str(file).unwrap();
+            assert!(s.migrate_defaults());
+            assert_eq!(s.group, group, "{file}");
+            // A choice of today is kept, whatever the old field says.
+            s.group = GroupMode::Type;
+            let mut again: Settings =
+                serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+            assert!(!again.migrate_defaults());
+            assert_eq!(again.group, GroupMode::Type);
+        }
+        assert_eq!(Settings::default().group, GroupMode::FoldersType);
+        // Another change of defaults is not repeated on the way.
+        let mut s: Settings =
+            serde_json::from_str(r#"{"defaultsVersion":1,"historyCount":30}"#).unwrap();
+        s.migrate_defaults();
+        assert_eq!(s.history_count, 30);
+    }
+
+    #[test]
+    fn fresh_settings_need_no_migration() {
+        assert!(!Settings::default().migrate_defaults());
     }
 }
 
@@ -360,6 +624,10 @@ mod tests {
             serde_json::from_str(r#"{"fontSize": 15, "unknownFutureKey": true}"#).unwrap();
         assert_eq!(s.font_size, 15.0);
         assert_eq!(s.notification_ms, 6000);
+        assert!(s.auto_download_updates);
+
+        let disabled: Settings = serde_json::from_str(r#"{"autoDownloadUpdates": false}"#).unwrap();
+        assert!(!disabled.auto_download_updates);
     }
 
     #[test]
@@ -389,5 +657,80 @@ mod tests {
             let restored: Settings = serde_json::from_str(&saved).unwrap();
             assert_eq!(restored, s);
         }
+    }
+
+    #[test]
+    fn omarchy_theme_and_window_buttons_roundtrip_and_defaults() {
+        let s = Settings {
+            theme: ThemeMode::Omarchy,
+            window_buttons: WindowButtonsMode::Never,
+            adaptive_layout: false,
+            omarchy_glassy: false,
+            omarchy_follow_font: false,
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""theme":"omarchy""#));
+        assert!(json.contains(r#""windowButtons":"never""#));
+        let restored: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, s);
+
+        for (mode, expected) in [
+            (WindowButtonsMode::Auto, r#""auto""#),
+            (WindowButtonsMode::Always, r#""always""#),
+            (WindowButtonsMode::Never, r#""never""#),
+        ] {
+            assert_eq!(serde_json::to_string(&mode).unwrap(), expected);
+        }
+
+        // Legacy partial JSON fills new fields with expected defaults and preserves theme.
+        let legacy: Settings = serde_json::from_str(r#"{"theme":"system"}"#).unwrap();
+        assert_eq!(legacy.theme, ThemeMode::System);
+        assert!(legacy.adaptive_layout);
+        assert_eq!(
+            legacy.language, "auto",
+            "an old settings file follows Omarchy / the system language"
+        );
+        assert!(legacy.sidebar_visible);
+        let hidden: Settings = serde_json::from_str(r#"{"sidebarVisible":false}"#).unwrap();
+        assert!(!hidden.sidebar_visible);
+        assert_eq!(legacy.window_buttons, WindowButtonsMode::Auto);
+        assert!(legacy.omarchy_glassy);
+        assert!(legacy.omarchy_follow_font);
+    }
+
+    #[test]
+    fn first_run_defaults_apply_omarchy_only_on_default_load() {
+        let t = tempfile::tempdir().unwrap();
+        let colors = t.path().join("colors.toml");
+        assert!(!Settings::omarchy_theme_present_at(&colors));
+
+        let mut s = Settings::default();
+        assert_eq!(s.theme, ThemeMode::System);
+        s.apply_first_run_defaults_with(Settings::omarchy_theme_present_at(&colors));
+        assert_eq!(s.theme, ThemeMode::System);
+
+        std::fs::write(&colors, "accent = \"#ff0000\"\n").unwrap();
+        assert!(Settings::omarchy_theme_present_at(&colors));
+        s.apply_first_run_defaults_with(Settings::omarchy_theme_present_at(&colors));
+        assert_eq!(s.theme, ThemeMode::Omarchy);
+
+        // Explicit user choice (Dark/Light) is never overridden by first-run helper.
+        let mut dark = Settings {
+            theme: ThemeMode::Dark,
+            ..Settings::default()
+        };
+        dark.apply_first_run_defaults_with(true);
+        assert_eq!(dark.theme, ThemeMode::Dark);
+
+        // Existing settings.json loaded via JsonStore preserves ThemeMode::System.
+        let store = crate::storage::JsonStore::new(t.path().join("settings.json"));
+        store.save(&Settings::default()).unwrap();
+        let (mut loaded, from) = store.load::<Settings>();
+        assert_eq!(from, crate::storage::json_store::LoadedFrom::Primary);
+        if from == crate::storage::json_store::LoadedFrom::Default {
+            loaded.apply_first_run_defaults_with(true);
+        }
+        assert_eq!(loaded.theme, ThemeMode::System);
     }
 }

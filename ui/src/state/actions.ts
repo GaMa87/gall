@@ -1,16 +1,31 @@
 // Application actions: everything that changes state or touches the backend.
 import { archiveOf, createFormatFor, isBrowsableArchive, type ArchiveFormat } from "../core/archive";
-import { api, events, setMediaBase, type FavCmd, type MarkCmd, type SessionCmd } from "../api/ipc";
-import type { ConflictInfo, ConflictPolicy, DiffSource, Drive, FileEntry, Layout, Settings, TaskKind, Volume } from "../api/types";
+import { api, events, setMediaBase, type FavCmd, type MarkCmd, type SessionCmd, type WorkspaceCmd } from "../api/ipc";
+import type { ConflictInfo, ConflictPolicy, DiffSource, Drive, FileEntry, FlowDirection, FlowOp, Layout, PairMode, Settings, TaskKind, Volume, WorkspaceSnapshot } from "../api/types";
+import { activePair as findActivePair, flowSourceTabIsActive, nextPairMode, resolveFlowDispatch } from "../core/pairs";
+import { createSerialQueue } from "./serialQueue";
+import { syncActiveWorkspaceSummary } from "../core/workspaces";
+import { eventAnchor, type Anchor } from "../core/anchor";
+import { commitSides } from "../core/gitImages";
+import { ownsClipboard } from "../core/clipOwner";
 import { coalesced } from "../core/coalesce";
 import { etaSeconds, updateRate, type Rate } from "../core/eta";
 import { ancestors, backOutside, basename, isInside, join, parent, splitExt, tildify } from "../core/path";
 import { controller, emitFolderChanged, refreshAll } from "./controllers";
 import { bumpGitStatus, bumpSearchHidden } from "./hooks";
-import { getState, setState, type DialogSpec, type FolderSize, type MenuItem, type NoteKind, type Overlay, type UiState } from "./store";
+import { getState, monitorShown, setState, sidebarShown, type DialogSpec, type FolderSize, type MenuItem, type NoteAction, type NoteKind, type Overlay, type UiState } from "./store";
 import { formatSize } from "../core/format";
+import type { ImportChoice } from "../core/favoritesImport";
 import { keyboardSettings } from "../core/keymap";
+import { effectiveHidden, hiddenDivergence, planApplyHiddenAll, planToggleHiddenAll, planToggleHiddenBoard, type HiddenOverrides, type HiddenTogglePlan } from "../core/hiddenScope";
+import { isMissingError as isMissingOperationError, operationError, volumeMountError } from "../core/operationError";
 import { PREVIOUS_MARK, type MarkOp } from "../core/vim";
+import { applyLaunch } from "./launch";
+import { pickOpenEntries } from "./pick";
+import { keyedActionsFor, runKeyedAction } from "../core/actionsMenu";
+import { syncViewport } from "./desktop";
+import { platformLabel } from "../core/keymap";
+import { tt, t } from "../i18n";
 
 let noteSeq = 1;
 /** Smoothed speed per running task, for the time-left estimate. */
@@ -18,7 +33,6 @@ const taskRates = new Map<number, Rate>();
 
 // ───────────── notifications (W-09) ─────────────
 
-/** Shows a notification. Errors stay until dismissed; the same message is not stacked twice. */
 /** When each shown notification goes away (ms since the epoch); paused while hovered. */
 const noteDue = new Map<number, number>();
 let noteTimer = 0;
@@ -35,20 +49,30 @@ function scheduleNotes() {
   }, Math.max(50, next - Date.now()));
 }
 
-export function notify(text: string, kind: NoteKind = "info", action?: { label: string; run: () => void }, expected = false) {
-  const n = { id: noteSeq++, kind, text, at: Date.now(), action, expected };
-  setState((s) => ({
-    notifications: [...s.notifications.filter((o) => o.text !== text || o.kind !== kind), n].slice(-5),
-    notificationLog: [n, ...s.notificationLog].slice(0, 100),
-  }));
-  // Errors stay longer (and in the notification log, bell); none stays for good.
-  const ms = getState().settings?.notificationMs ?? 6000;
-  const life = kind === "error" ? Math.max(20_000, ms * 4) : kind === "warn" || action ? ms * 1.5 : ms;
-  noteDue.set(n.id, Date.now() + life);
+export function notify(text: string, kind: NoteKind = "info", actions?: NoteAction | NoteAction[], reportError?: string, details?: string, sticky = false): number {
+  const [action, ...more] = Array.isArray(actions) ? actions : [actions];
+  const n = { id: noteSeq++, kind, text, at: Date.now(), action, more: more.filter((item) => !!item), reportError, details };
+  setState((s) => {
+    const last = s.notificationLog[0];
+    const repeated = !action && !last?.action && last?.text === text && last.kind === kind
+      && last.reportError === n.reportError && n.at - last.at < (s.settings?.notificationMs ?? 6000);
+    const history = repeated ? s.notificationLog.slice(1) : s.notificationLog;
+    return {
+      notifications: [...s.notifications.filter((o) => o.text !== text || o.kind !== kind), n].slice(-5),
+      notificationLog: [n, ...history.slice(0, 99)],
+    };
+  });
+  // Errors stay longer (and in the notification log, bell); sticky progress toasts stay until dismissed by caller.
+  if (!sticky) {
+    const ms = getState().settings?.notificationMs ?? 6000;
+    const life = kind === "error" ? Math.max(20_000, ms * 4) : kind === "warn" || action ? ms * 1.5 : ms;
+    noteDue.set(n.id, Date.now() + life);
+  }
   // Those pushed out of the five shown are forgotten.
   const shown = new Set(getState().notifications.map((o) => o.id));
   for (const id of noteDue.keys()) if (!shown.has(id)) noteDue.delete(id);
   scheduleNotes();
+  return n.id;
 }
 
 export function dismiss(id: number) {
@@ -61,6 +85,7 @@ export function dismiss(id: number) {
 /** The pointer is over the notifications: they wait (an Undo button must not run away);
  *  afterwards each gets at least a few more seconds. */
 export function holdNotes(hold: boolean) {
+  if (notesHeld === hold) return;
   notesHeld = hold;
   if (!hold) {
     const min = Date.now() + 2500;
@@ -69,38 +94,23 @@ export function holdNotes(hold: boolean) {
   scheduleNotes();
 }
 
-/** An error that `readableError` turned into plain words is an everyday condition (no permission,
- *  name taken, file in use), not a Gall bug, so its toast gets no "Report a bug" button. */
-function errorNote(raw: string, text = readableError(raw)) {
-  notify(text, "error", undefined, text !== raw);
+/** Displays a failure and keeps its technical details in the application log. */
+function showFailure(err: unknown, context?: string, action?: NoteAction) {
+  const raw = String(err);
+  const feedback = operationError(raw, getState().info?.platform);
+  const text = context && feedback.kind === "error" && !feedback.text.startsWith("Cannot ")
+    ? `${context}: ${feedback.text}` : feedback.text;
+  const detail = context ? `${context}: ${raw}` : raw;
+  notify(text, feedback.kind, action, feedback.reportable ? detail : undefined);
+  if (feedback.kind !== "info") api.uiLog(feedback.reportable ? "error" : "warn", detail).catch(() => {});
 }
 
 export function fail(err: unknown) {
-  errorNote(String(err));
-  api.uiLog("error", String(err)).catch(() => {});
+  showFailure(err);
 }
 
-/** "No such file or directory" (Unix) or "cannot find the path / file" (Windows). */
-export function isMissingError(s: string): boolean {
-  return /os error [23]\)|No such file or directory|cannot find the (path|file)/i.test(s);
-}
-
-/** The same `os error` number means different things on Windows and Unix (32 is a
- *  sharing violation on Windows, a broken pipe on Linux; 39 a full disk vs. a folder that
- *  is not empty), so the numbers are read by the platform; the texts match on any. */
-const OS_ERRORS: Record<string, { windows: number[]; unix: number[]; text: RegExp }> = {
-  denied: { windows: [5], unix: [1, 13], text: /Permission denied|Access is denied|Operation not permitted/i },
-  busy: { windows: [32, 33], unix: [16, 26], text: /being used by another process|locked a portion|resource busy|Text file busy/i },
-  full: { windows: [39, 112], unix: [28, 122], text: /not enough space|No space left|quota exceeded/i },
-  long: { windows: [206], unix: [36], text: /name too long|path is too long/i },
-  readOnly: { windows: [19], unix: [30], text: /Read-only file system|write.?protected/i },
-};
-
-function osError(s: string, kind: keyof typeof OS_ERRORS): boolean {
-  const k = OS_ERRORS[kind];
-  const code = /\(os error (\d+)\)/.exec(s);
-  const codes = getState().info?.platform === "windows" ? k.windows : k.unix;
-  return (code !== null && codes.includes(Number(code[1]))) || k.text.test(s);
+export function isMissingError(raw: string): boolean {
+  return isMissingOperationError(raw, getState().info?.platform);
 }
 
 /** Browser `b` shows `path`, which no longer exists (deleted, renamed, drive gone):
@@ -135,55 +145,23 @@ function isDriveMount(path: string): boolean {
 }
 
 
-/** Backend errors in words: "archive-password:needed:C:\x\a.7z" → "“a.7z” is encrypted …". */
-export function readableError(s: string): string {
-  s = s.replace(/^no-trash: /, "");
-  // "'C:\…\Dokumenti\New folder' already exists" → "“New folder” already exists in “Dokumenti”".
-  const exists = /^'(.+)' (already exists|does not exist)$/.exec(s);
-  if (exists) {
-    const dir = parent(exists[1]);
-    return `“${basename(exists[1])}” ${exists[2]}${dir ? ` in “${basename(dir) || dir}”` : ""}`;
-  }
-  // A folder that cannot be listed: say it in words (the details stay in the log).
-  const list = /^list failed for '(.+)': (.+)$/.exec(s);
-  if (list) {
-    const name = `“${basename(list[1]) || list[1]}”`;
-    if (osError(list[2], "denied")) return `You have no permission to open ${name}.`;
-    if (isMissingError(list[2])) return `${name} does not exist (any more).`;
-    if (/os error 20\)|Not a directory/i.test(list[2])) return `${name} is not a folder.`;
-    return `${name} cannot be opened: ${list[2].replace(/ \(os error \d+\)$/, "")}`;
-  }
-  // Any other file operation: "rename failed for 'C:\…\a.txt': … (os error 32)" →
-  // "Cannot rename “a.txt”: it is open in another program."
-  const io = /^([a-z][a-z ]*) failed for '(.+)': (.+)$/i.exec(s);
-  if (io) {
-    const [, op, path, why] = io;
-    const name = `“${basename(path) || path}”`;
-    const reason =
-      osError(why, "denied") ? "you have no permission"
-      : osError(why, "busy") ? "it is open in another program"
-      : isMissingError(why) ? "it does not exist (any more)"
-      : osError(why, "full") ? "the drive is full"
-      : osError(why, "long") ? "the name or path is too long"
-      : osError(why, "readOnly") ? "the drive is read-only"
-      : why.replace(/ \(os error \d+\)$/, "").replace(/\.$/, ""); // Windows texts end with "."
-    return `Cannot ${op} ${name}: ${reason}.`;
-  }
-  const bad = /^invalid name '(.*)'$/.exec(s);
-  if (bad) return `“${bad[1]}” is not a valid name${getState().info?.platform === "windows" ? ` (Windows names cannot contain < > : " / \\ | ? * or end with a dot or space)` : " (names cannot contain /)"}.`;
-  const inside = /^cannot (\w+): '(.+)' is inside '(.+)'$/.exec(s);
-  if (inside) return `Cannot ${inside[1]} “${basename(inside[3])}” into itself (“${basename(inside[2])}” is inside it).`;
-  const m = /archive-password:(needed|wrong):(.+)$/.exec(s);
-  if (!m) return s;
-  const name = basename(m[2].trim());
-  return m[1] === "wrong"
-    ? `Wrong password for “${name}”. Open it (Enter) to type it again.`
-    : `“${name}” is encrypted. Open it (Enter) to type the password, then try again.`;
+export function readableError(raw: string): string {
+  return operationError(raw, getState().info?.platform).text;
 }
 
 // ───────────── overlays / dialogs / menus ─────────────
 
+function isWaitingComparison(o: Overlay | null | undefined) {
+  const view = o?.type === "dialog" ? o.under : o;
+  return (view?.type === "diff" || view?.type === "dircmp") ? !!view.wait
+    : view?.type === "standaloneMerge" && view.waitOutput !== undefined;
+}
+
 export function openOverlay(o: Overlay | null) {
+  const current = getState().overlay;
+  // An unrelated UI action (for example an update notification) must not replace
+  // the only view that can answer an external caller.
+  if (isWaitingComparison(current) && !isWaitingComparison(o)) return;
   setState({ overlay: o, menu: null });
 }
 
@@ -221,14 +199,14 @@ export async function confirm(title: string, message: string, okLabel = "OK", da
 export async function trustGitFolder(path: string): Promise<boolean> {
   const repo = await api.gitUntrusted(path).catch(() => null);
   if (!repo) return false;
-  const ok = await confirm("Trust this Git repository?",
-    `Git refuses to read this repository because it belongs to another user (for example a WSL folder opened from Windows, or a network share):\n\n${repo}\n\nTrusting adds it to Git's global safe.directory list. Only do this for repositories you trust: their configuration can run commands.`, "Trust");
+  const ok = await confirm(tt("Trust this Git repository?"),
+    tt("Git refuses to read this repository because it belongs to another user (for example a WSL folder opened from Windows, or a network share):\n\n{repo}\n\nTrusting adds it to Git's global safe.directory list. Only do this for repositories you trust: their configuration can run commands.", { repo }), "Trust");
   if (!ok) return true;
   try {
     await api.gitTrust(path);
     bumpGitStatus();
-    notify("Git repository trusted");
-  } catch (e) { notify(`Could not trust the repository: ${e}`, "error"); }
+    notify(tt("Git repository trusted"));
+  } catch (e) { showFailure(e, tt("Could not trust the repository")); }
   return true;
 }
 
@@ -237,8 +215,26 @@ export async function promptText(title: string, value: string, okLabel = "OK", s
   return r && r.button !== "cancel" ? r.value : null;
 }
 
-export function showMenu(x: number, y: number, items: MenuItem[]) {
-  setState({ menu: { x, y, items } });
+let menuToken = 0;
+
+/** Opens a menu at an anchor (the element a key acts on, or a point). The placement rule is in core/anchor.ts. */
+export function showMenuAt(anchor: Anchor, items: MenuItem[]): number {
+  const token = ++menuToken;
+  setState({ menu: { ...anchor, items } });
+  return token;
+}
+
+/** Updates the currently open menu only if it is still the one opened with `token`. */
+export function updateOpenMenu(token: number, updater: (items: MenuItem[]) => MenuItem[]) {
+  if (token !== menuToken) return;
+  const cur = getState().menu;
+  if (!cur) return;
+  setState({ menu: { ...cur, items: updater(cur.items) } });
+}
+
+/** Opens a menu for a click or a right click: at the pointer, or at the element when a key made the event. */
+export function showMenuFor(event: Parameters<typeof eventAnchor>[0], items: MenuItem[]): number {
+  return showMenuAt(eventAnchor(event), items);
 }
 
 // ───────────── bootstrap ─────────────
@@ -264,8 +260,8 @@ export async function bootstrap() {
   // The listeners are registered while the state loads (one message each): events of
   // the first folders must find them.
   const listening = listen();
-  const [info, settings, session, favorites, marks, args] = await Promise.all([
-    timed("appInfo", api.appInfo()), timed("settings", api.getSettings()), timed("session", api.sessionGet()),
+  const [info, settings, wsSnap, favorites, marks, args] = await Promise.all([
+    timed("appInfo", api.appInfo()), timed("settings", api.getSettings()), timed("workspaces", api.workspacesGet()),
     timed("favorites", api.favoritesGet()), timed("marks", api.marksGet()), timed("args", api.startupArgs()),
   ]);
   const fetched = performance.now();
@@ -274,15 +270,29 @@ export async function bootstrap() {
   await listening;
   api.uiLog("info", `startup: state fetched ${Math.round(fetched - began)} ms, drives +${Math.round(withDrives - fetched)} ms, listeners +${Math.round(performance.now() - withDrives)} ms`).catch(() => {});
   setMediaBase(info.mediaBase);
-  setState({ info, settings: keyboardSettings(settings), session, favorites, marks, sidebarVisible: true });
-  if (info.startupNotice) notify(info.startupNotice, "warn");
-  applyCliArgs(args);
+  setState({
+    info,
+    settings: keyboardSettings(settings),
+    session: wsSnap.session,
+    workspaces: wsSnap.workspaces,
+    activeWorkspace: wsSnap.active,
+    favorites,
+    marks,
+    sidebarVisible: settings.sidebarVisible ?? true,
+  });
+  scheduleGravityRefresh();
+  if (args.pick) {
+    setState({ pick: args.pick, pickChoices: Object.fromEntries(args.pick.choices.map((c) => [c.id, c.initial])) });
+    if (args.pick.title) document.title = args.pick.title;
+  }
+  void applyLaunch(args).catch(fail);
   // First start: the welcome setup (not during self-tests, which start with fresh settings).
-  if (info.firstRun && !args.selftest) openOverlay({ type: "welcome" });
+  // Not in a picker window: it answers another program and must not ask for a setup first.
+  if (info.firstRun && !args.selftest && !args.pick && !args.wait && !args.comparePicker) openOverlay({ type: "welcome" });
   if (args.selftest) setTimeout(() => import("../selftest").then((m) => (args.selftestMode === "demo" ? m.runDemo() : args.selftestMode === "design" ? m.runDesignShots() : args.selftestMode === "audit" ? m.runUiAudit() : m.runSelfTest())), 1500);
   // Backend warnings and errors from before the UI listened: never only in the log file.
   // Not awaited: the window appears without waiting for them.
-  void api.logBacklog().then((lines) => { for (const l of lines) notify(l.msg, l.level); }).catch(() => {});
+  void api.logBacklog().then((lines) => { for (const l of lines) notify(l.msg, l.level, undefined, l.level === "error" ? l.msg : undefined); }).catch(() => {});
   // Drives are asked for every few seconds (each time a walk over the mounts and, on
   // Linux, two `lsblk` processes): not while the window is hidden (minimized, on another
   // desktop), and at once when it shows again.
@@ -332,23 +342,24 @@ function listen(): Promise<unknown> {
         return { tasks: t };
       });
       const verb: Record<TaskKind, string> = { copy: "Copied", move: "Moved", delete: "Deleted", compress: "Created", extract: "Extracted", duplicate: "Duplicated" };
-      if (ev.state === "done" && (ev.kind === "compress" || (ev.kind === "extract" && ev.items === 1))) {
-        notify(ev.kind === "compress" ? `Created “${ev.name}”` : `Extracted to “${ev.name}”`, "success", { label: "Undo", run: undo });
+      const operation: Record<TaskKind, string> = { copy: "Copy", move: "Move", delete: "Delete", compress: "Compression", extract: "Extraction", duplicate: "Duplication" };
+      const undoFor = undoAction(ev.undoId);
+      if (ev.state === "done" && ev.items === 0) {
+        notify(ev.skipped ? tt("Skipped {value}", { value: ev.name ? `“${ev.name}”` : items(ev.skipped) }) : tt("{operation} finished. No items changed.", { operation: tt(operation[ev.kind]) }));
+      } else if (ev.state === "done" && (ev.kind === "compress" || (ev.kind === "extract" && ev.items === 1))) {
+        notify(ev.kind === "compress" ? tt("Created “{name}”", { name: ev.name ?? "" }) : tt("Extracted to “{name}”", { name: ev.name ?? "" }), "success", undoFor);
       } else if (ev.state === "done") {
         const what = ev.name && ev.items === 1 ? `“${ev.name}”` : items(ev.items);
-        const to = ev.to && ev.kind !== "delete" ? ` to ${ev.to}` : "";
-        const text = ev.name && ev.items === 0 && ev.skipped
-          ? `Skipped “${ev.name}”`
-          : `${verb[ev.kind]} ${what}${to}${ev.skipped ? `, skipped ${ev.skipped}` : ""}`;
-        notify(text, "success",
-          ev.kind !== "delete" ? { label: "Undo", run: undo } : undefined);
-      } else if (ev.state === "failed" && replaceReq && String(ev.error).startsWith("no-trash:")) {
-        void offerPermanentReplace(replaceReq, String(ev.error));
+        const to = ev.to && ev.kind !== "delete" ? tt(" to {to}", { to: ev.to }) : "";
+        notify(`${tt(verb[ev.kind])} ${what}${to}${ev.skipped ? tt(", skipped {count}", { count: ev.skipped }) : ""}`, "success",
+          ev.kind !== "delete" ? undoFor : undefined);
+      } else if (ev.state === "failed" && retrying && replaceReq) {
+        void offerPermanentReplace(replaceReq, ev.error);
       } else if (ev.state === "failed") {
-        const msg = readableError(String(ev.error));
-        notify(msg.startsWith("Cannot ") ? msg : `${ev.kind} failed: ${msg}`, "error", undefined, msg !== String(ev.error));
+        showFailure(ev.error, tt("{operation} failed", { operation: tt(operation[ev.kind]) }), undoFor);
+      } else {
+        notify(tt("{operation} cancelled", { operation: tt(operation[ev.kind]) }), "info", undoFor);
       }
-      else notify(`${ev.kind} cancelled`, "warn");
       refreshUndo();
       invalidateAllFolderSizes();
       // A folder deleted or moved away leaves the history (the backend drops gone folders).
@@ -357,9 +368,8 @@ function listen(): Promise<unknown> {
       }
     }),
     events.folderSizeProgress(applyFolderSizeProgress),
-    events.secondInstance((a) => applyCliArgs(a)),
     // Backend warnings and errors: never only in the log file.
-    events.backendLog((l) => notify(l.msg, l.level)),
+    events.backendLog((l) => notify(l.msg, l.level, undefined, l.level === "error" ? l.msg : undefined)),
   ]);
 }
 
@@ -367,16 +377,8 @@ let stormShown = 0;
 function setStormNotice(path: string) {
   if (Date.now() - stormShown > 30_000) {
     stormShown = Date.now();
-    notify(`Something is changing files very rapidly in ${path}; refreshes are throttled.`, "warn");
+    notify(tt("Something is changing files very rapidly in {path}; refreshes are throttled.", { path }), "warn");
   }
-}
-
-function applyCliArgs(a: { path1: string | null; path2: string | null; newTab: boolean }) {
-  if (a.path1) {
-    if (a.newTab) sessionCmd({ op: "newTab", b: 0, path: a.path1 });
-    else navigate(0, a.path1);
-  }
-  if (a.path2) navigate(1, a.path2);
 }
 
 export async function refreshDrives() {
@@ -396,14 +398,50 @@ export async function refreshDrives() {
   }
 }
 
+/** The kernel refuses an NTFS volume that Windows left marked dirty. Offers to clear the flag
+ *  (`ntfsfix -d`, asks for the administrator password) and mount it. True when handled. */
+async function repairAndMountNtfs(v: Volume, name: string): Promise<boolean> {
+  const r = await dialog({
+    title: tt("Repair and mount {name}?", { name }),
+    message: tt("{name} could not be mounted. Linux refuses an NTFS volume that Windows left marked as unclean (a crash, a forced power-off or Fast Startup). Gall can clear that flag and mount it; you will be asked for the administrator password. Do this only if Windows was shut down completely. Running chkdsk in Windows is the thorough repair.", { name }),
+    buttons: [{ id: "cancel", label: "Cancel" }, { id: "ok", label: "Repair and mount", primary: true }],
+  });
+  if (!r || r.button !== "ok") return true;
+  const progress = notify(tt("Repairing {name}…", { name }));
+  try {
+    const mount = await api.volumeRepairMount(v.id);
+    await refreshDrives();
+    notify(tt("Mounted {name}", { name }), "success");
+    if (mount) navigate(activeBrowser(), mount);
+  } catch (e) {
+    api.uiLog("warn", `repair mount ${v.id}: ${String(e)}`).catch(() => {});
+    notify(String(e), "warn");
+  } finally {
+    dismiss(progress);
+  }
+  return true;
+}
+
+/** Powers a removable drive off from "Not mounted", so the stick can be unplugged safely. */
+export async function powerOffVolume(v: Volume) {
+  try {
+    await api.volumePowerOff(v.id);
+    notify(tt("“{value}” can be unplugged now", { value: v.label }), "success");
+  } catch (e) {
+    fail(e);
+  }
+  await refreshDrives();
+}
+
 /** Mounts a volume from "Not mounted" (asking for the passphrase if it is encrypted)
  *  and opens it in the active browser. */
 export async function mountVolume(v: Volume) {
   const name = `“${v.label}”`;
+  let progressNotification: number | undefined;
   try {
     let mount: string | null = null;
     if (!v.locked) {
-      notify(`${v.fs === "wsl" ? "Starting" : "Mounting"} ${name}…`);
+      progressNotification = notify(tt(v.fs === "wsl" ? "Starting {name}…" : "Mounting {name}…", { name }));
       mount = await api.volumeMount(v.id);
     } else if (getState().info?.platform === "windows") {
       await api.volumeUnlock(v.id, ""); // Windows asks in its own BitLocker dialog
@@ -413,7 +451,7 @@ export async function mountVolume(v: Volume) {
       let message = `${v.label} is encrypted. Enter its passphrase to unlock and mount it.`;
       for (;;) {
         const r = await dialog({
-          title: `Unlock ${name}`,
+          title: tt("Unlock {name}", { name }),
           message,
           input: { value: "", password: true, placeholder: "Passphrase" },
           buttons: [{ id: "cancel", label: "Cancel" }, { id: "ok", label: "Unlock", primary: true }],
@@ -428,10 +466,20 @@ export async function mountVolume(v: Volume) {
       }
     }
     await refreshDrives();
-    notify(`${v.locked ? "Unlocked" : v.fs === "wsl" ? "Started" : "Mounted"} ${name}`, "success");
+    notify(tt(v.locked ? "Unlocked {name}" : v.fs === "wsl" ? "Started {name}" : "Mounted {name}", { name }), "success");
     if (mount) navigate(activeBrowser(), mount);
   } catch (e) {
-    fail(e);
+    const feedback = volumeMountError(String(e), v.fs);
+    if (feedback) {
+      if (progressNotification !== undefined) dismiss(progressNotification);
+      if (v.fs.toLowerCase() === "ntfs" && !v.locked && (await repairAndMountNtfs(v, name))) return;
+      notify(tt(feedback.text, { name: v.label, fs: v.fs || "unknown" }), feedback.kind, undefined, undefined, feedback.details);
+      api.uiLog("warn", `mount ${v.id}: ${String(e)}`).catch(() => {});
+    } else {
+      fail(e);
+    }
+  } finally {
+    if (progressNotification !== undefined) dismiss(progressNotification);
   }
 }
 
@@ -462,12 +510,30 @@ async function leaveMountIn(b: number, mount: string) {
 /** Ejects a removable drive; browsers on it go back first. */
 export async function ejectDrive(d: Drive) {
   // Stopping a WSL distribution ends every program in it, editors with unsaved work too.
-  if (d.fs === "wsl" && !(await confirm(`Stop ${d.short}?`,
-    `Every program running in the WSL distribution “${d.short}” is closed; unsaved work in them is lost.`, "Stop", true))) return;
+  if (d.fs === "wsl" && !(await confirm(tt("Stop {short}?", { short: d.short }),
+    tt("Every program running in the WSL distribution “{short}” is closed; unsaved work in them is lost.", { short: d.short }), "Stop", true))) return;
+  // Linux only unmounts when ejecting; ask whether the stick should also be powered off so it
+  // can be unplugged. Enter picks the default, the full power-off.
+  let powerOff = false;
+  if (d.fs !== "wsl" && getState().info?.platform === "linux") {
+    const r = await dialog({
+      title: tt("Remove {value}", { value: d.label || d.short }),
+      message: tt("Power the drive off so it can be unplugged, or only unmount it? An unmounted drive stays under “Not mounted” and can be mounted again."),
+      buttons: [
+        { id: "cancel", label: "Cancel" },
+        { id: "unmount", label: "Unmount only" },
+        { id: "poweroff", label: "Power off", primary: true },
+      ],
+    });
+    if (!r || r.button === "cancel") return;
+    powerOff = r.button === "poweroff";
+  }
   await leaveMount(d.mount);
   try {
-    await api.eject(d.mount);
-    notify(d.fs === "wsl" ? `Stopped “${d.short}” (WSL)` : `Ejected “${d.label || d.short}”`, "success");
+    await api.eject(d.mount, powerOff);
+    notify(d.fs === "wsl" ? tt("Stopped “{short}” (WSL)", { short: d.short })
+      : powerOff ? tt("“{value}” can be unplugged now", { value: d.label || d.short })
+      : tt("Ejected “{value}”", { value: d.label || d.short }), "success");
   } catch (e) {
     fail(e);
   }
@@ -479,7 +545,7 @@ export async function lockDrive(d: Drive) {
   try {
     await leaveMount(d.mount);
     await api.driveLock(d.mount);
-    notify(`Locked “${d.label || d.short}”`, "success");
+    notify(tt("Locked “{value}”", { value: d.label || d.short }), "success");
     await refreshDrives();
   } catch (e) {
     fail(e);
@@ -519,17 +585,31 @@ export async function updateSettings(patch: Partial<Settings>, whileTyping = fal
   const next = keyboardSettings(s, patch);
   const changedKeys = next.keyboardProfile !== s.keyboardProfile || next.leaderKey !== s.leaderKey || next.leaderKeyBasic !== s.leaderKeyBasic;
   setState({ settings: next, ...(changedKeys ? { keySeq: [] } : {}) });
+  // Changing the global showHidden default re-syncs any per-browser override.
+  if (patch.showHidden !== undefined && getState().session?.browsers.some((br) => br.showHidden != null)) {
+    void sessionCmd({ op: "hidden", b: null, on: null });
+  }
+  if (patch.liveTabPairs === false) {
+    const pairs = getState().session?.pairs ?? [];
+    for (const p of pairs) void sessionCmd({ op: "unpair", pairId: p.id });
+    if (getState().hoveredPairId !== null) setState({ hoveredPairId: null });
+  }
+  if (patch.pairGravity === false) {
+    if (getState().gravityGhost[0] || getState().gravityGhost[1]) setState({ gravityGhost: [null, null] });
+  } else if (patch.pairGravity === true) {
+    scheduleGravityRefresh();
+  }
   if (whileTyping) settingsSave.later(next);
   else await settingsSave.now(next);
 }
 
 /** Forgets the sort and view kept for every folder (Settings › View). */
 export async function forgetFolderViews() {
-  if (!(await confirm("Forget folder views?", "Every folder goes back to the default sort and view.", "Forget", true))) return;
+  if (!(await confirm(tt("Forget folder views?"), tt("Every folder goes back to the default sort and view."), "Forget", true))) return;
   try {
     await api.clearPrefs();
     setState({ settingsRev: getState().settingsRev + 1 });
-    notify("Folder views forgotten");
+    notify(tt("Folder views forgotten"));
   } catch (e) {
     fail(e);
   }
@@ -537,14 +617,14 @@ export async function forgetFolderViews() {
 
 /** Factory reset (Settings › Advanced): every setting back to its default. */
 export async function resetAllSettings() {
-  if (!(await confirm("Reset all settings?",
-    "Every setting, shortcut, folder colour, remembered program and folder view goes back to the default. Favourites, colour tags, history and open tabs stay.",
+  if (!(await confirm(tt("Reset all settings?"),
+    tt("Every setting, shortcut, folder colour, remembered program and folder view goes back to the default. Favourites, colour tags, history and open tabs stay."),
     "Reset", true))) return;
   try {
     await settingsSave.flush();
     const settings = await api.resetSettings();
     setState({ settings: keyboardSettings(settings), keySeq: [], settingsRev: getState().settingsRev + 1 });
-    notify("Settings reset to defaults");
+    notify(tt("Settings reset to defaults"));
     // Back to first-start settings: the welcome setup again (it replaces the settings window).
     openOverlay({ type: "welcome" });
   } catch (e) {
@@ -554,16 +634,315 @@ export async function resetAllSettings() {
 
 // ───────────── session / navigation ─────────────
 
-export async function sessionCmd(cmd: SessionCmd) {
+const enqueueWorkspaceMutation = createSerialQueue();
+
+export async function sessionCmd(cmd: SessionCmd): Promise<boolean> {
+  const s = getState();
+  const workspaceId = s.workspaces[s.activeWorkspace]?.id;
   try {
-    const session = await api.sessionCmd(cmd);
-    setState({ session });
-    if (cmd.op === "navigate" || cmd.op === "back" || cmd.op === "forward" || cmd.op === "up") {
-      api.historyGet().then((history) => setState({ history })).catch(() => {});
+    return await enqueueWorkspaceMutation(async () => {
+      const session = await api.sessionCmd(cmd, workspaceId);
+      const current = getState();
+      if (workspaceId != null && current.workspaces[current.activeWorkspace]?.id !== workspaceId) return false;
+      setState((state) => ({
+        session,
+        workspaces: syncActiveWorkspaceSummary(state.workspaces, state.activeWorkspace, session),
+      }));
+      if (cmd.op === "navigate" || cmd.op === "back" || cmd.op === "forward" || cmd.op === "up") {
+        api.historyGet().then((history) => setState({ history })).catch(() => {});
+      }
+      scheduleGravityRefresh();
+      return true;
+    });
+  } catch (e) {
+    fail(e);
+    return false;
+  }
+}
+
+function applyWorkspaceSnapshot(snap: WorkspaceSnapshot) {
+  const prev = getState();
+  const prevId = prev.workspaces[prev.activeWorkspace]?.id ?? null;
+  const nextId = snap.workspaces[snap.active]?.id ?? null;
+  const switched = prevId !== null && nextId !== null && prevId !== nextId;
+  setState({
+    session: snap.session,
+    workspaces: snap.workspaces,
+    activeWorkspace: snap.active,
+    ...(switched ? { focused: [null, null], worktreeOf: [], keySeq: [], menu: null, hoveredPairId: null, gravityGhost: [null, null] } : {}),
+  });
+  if (switched) {
+    setTimeout(() => controller(snap.session.activeBrowser)?.focus(), 0);
+    scheduleGravityRefresh();
+  }
+}
+
+export async function workspaceCmd(cmd: WorkspaceCmd) {
+  const s = getState();
+  const sourceWorkspaceId = s.workspaces[s.activeWorkspace]?.id;
+  const expectedWorkspaceIds = s.workspaces.map((workspace) => workspace.id);
+  try {
+    await enqueueWorkspaceMutation(async () => {
+      const snap = await api.workspaceCmd(cmd, sourceWorkspaceId, cmd.op === "create" ? undefined : expectedWorkspaceIds);
+      applyWorkspaceSnapshot(snap);
+    });
+  } catch (e) {
+    fail(e);
+  }
+}
+
+export function switchWorkspace(idx: number) {
+  const s = getState();
+  if (idx < 0 || idx >= s.workspaces.length || idx === s.activeWorkspace) return;
+  void workspaceCmd({ op: "switch", idx });
+}
+
+export function cycleWorkspace(delta: 1 | -1) {
+  const s = getState();
+  if (s.workspaces.length < 2) return;
+  const next = (s.activeWorkspace + delta + s.workspaces.length) % s.workspaces.length;
+  void workspaceCmd({ op: "switch", idx: next });
+}
+
+export function createWorkspace(opts?: { name?: string | null; accent?: string | null; cloneCurrent?: boolean }) {
+  void workspaceCmd({ op: "create", ...opts });
+}
+
+export function duplicateWorkspace(idx: number) {
+  void workspaceCmd({ op: "duplicate", idx });
+}
+
+export async function promptRenameWorkspace(idx: number) {
+  const ws = getState().workspaces[idx];
+  if (!ws) return;
+  const name = await promptText(t("workspace.renameTitle"), ws.name ?? "", t("common.save"));
+  if (name !== null) void workspaceCmd({ op: "rename", idx, name: name.trim() || null });
+}
+
+export function setWorkspaceAccent(idx: number, accent: string | null) {
+  void workspaceCmd({ op: "accent", idx, accent });
+}
+
+export function reorderWorkspace(from: number, to: number) {
+  if (from === to) return;
+  void workspaceCmd({ op: "reorder", from, to });
+}
+
+export function closeWorkspace(idx: number) {
+  if (getState().workspaces.length < 2) return;
+  void workspaceCmd({ op: "close", idx });
+}
+
+// ───────────── live tab pairs (WN-180) ─────────────
+
+export function pairTabs(
+  leftIdx: number,
+  rightIdx: number,
+  mode: PairMode = "linked",
+  flowDir?: FlowDirection,
+  flowOp?: FlowOp,
+) {
+  void sessionCmd({ op: "pairTabs", leftIdx, rightIdx, mode, flowDir, flowOp });
+}
+
+export function pairActiveTabs(mode: PairMode = "linked", flowDir?: FlowDirection, flowOp?: FlowOp) {
+  const s = getState().session;
+  if (!s || s.browsers.length < 2) return;
+  pairTabs(s.browsers[0].active, s.browsers[1].active, mode, flowDir, flowOp);
+}
+
+export function unpairTabs(pairId: number) {
+  if (getState().hoveredPairId === pairId) setState({ hoveredPairId: null });
+  void sessionCmd({ op: "unpair", pairId });
+}
+
+export function setHoveredPair(pairId: number | null) {
+  if (getState().hoveredPairId !== pairId) setState({ hoveredPairId: pairId });
+}
+
+export function setPairMode(pairId: number, mode: PairMode, flowDir?: FlowDirection, flowOp?: FlowOp) {
+  void sessionCmd({ op: "pairMode", pairId, mode, flowDir, flowOp });
+}
+
+export function reanchorPair(pairId: number) {
+  void sessionCmd({ op: "pairReanchor", pairId });
+  notify(t("pair.reanchored"), "info");
+}
+
+export function toggleActivePair() {
+  if (getState().settings?.liveTabPairs === false) return;
+  const s = getState().session;
+  if (!s || s.browsers.length < 2) return;
+  const cur = findActivePair(s);
+  if (cur) {
+    unpairTabs(cur.id);
+    return;
+  }
+  // If both panes are in different linked Git worktrees, default straight to Tandem walk.
+  const wt = getState().worktreeOf;
+  const defaultMode: PairMode = wt[0] && wt[1] && wt[0] !== wt[1] ? "tandem" : "linked";
+  pairActiveTabs(defaultMode);
+}
+
+export function cycleActivePairMode(pairId?: number) {
+  const s = getState().session;
+  if (!s) return;
+  const pair = pairId != null ? s.pairs?.find((p) => p.id === pairId) : findActivePair(s);
+  if (!pair) {
+    pairActiveTabs("linked");
+    return;
+  }
+  const next = nextPairMode(pair.mode);
+  setPairMode(pair.id, next, pair.flowDir, pair.flowOp);
+}
+
+export function flipActiveFlowDirection(pairId?: number) {
+  const s = getState().session;
+  if (!s) return;
+  const pair = pairId != null ? s.pairs?.find((p) => p.id === pairId) : findActivePair(s);
+  if (!pair) return;
+  const nextDir: FlowDirection = pair.flowDir === "rightToLeft" ? "leftToRight" : "rightToLeft";
+  setPairMode(pair.id, "flow", nextDir, pair.flowOp);
+}
+
+export async function sendAcrossFlow(pairId?: number) {
+  const s = getState().session;
+  if (!s) return;
+  const pair = pairId != null ? s.pairs?.find((p) => p.id === pairId) : findActivePair(s);
+  const plan = resolveFlowDispatch(s, pair);
+  if (!plan) {
+    notify(t("pair.noActiveFlow"), "warn");
+    return;
+  }
+  const sourceBrowser = s.browsers[plan.srcBrowser];
+  const sourceTab = sourceBrowser?.tabs[sourceBrowser.active];
+  const sourceController = controller(plan.srcBrowser);
+  if (
+    !pair
+    || !flowSourceTabIsActive(s, pair)
+    || !sourceTab
+    || !sourceController
+    || sourceController.path() !== sourceTab.path
+  ) {
+    notify(t("pair.noActiveFlow"), "warn");
+    return;
+  }
+  const items = sourceController.selection();
+  if (!items.length) {
+    notify(t("pair.selectToSend"), "warn");
+    return;
+  }
+  await transfer(plan.op, items.map((i) => i.path), plan.dstPath);
+}
+
+export async function createTandemFolder(path: string, onDone?: () => void) {
+  try {
+    await api.ensureDir(path);
+    refreshAll();
+    onDone?.();
+    notify(t("pair.folderCreated", { name: basename(path) || path }), "success");
+  } catch (e) {
+    fail(e);
+  }
+}
+
+export async function openTandemParent(b: number, missingPath: string, root: string) {
+  const chain = ancestors(missingPath).reverse();
+  for (let i = 1; i < chain.length; i++) {
+    const anc = chain[i];
+    const r = await api.pathResolve(anc).catch(() => null);
+    if (r?.exists && r.isDir) {
+      await sessionCmd({ op: "navigateSolo", b, path: anc });
+      return;
+    }
+  }
+  if (root && root !== missingPath) {
+    await sessionCmd({ op: "navigateSolo", b, path: root });
+  }
+}
+
+// ───────────── pair gravity (WN-181) ─────────────
+
+let gravityTimer: number | null = null;
+let gravitySeq = 0;
+
+/** Schedules an asynchronous, debounced Pair Gravity lookup for the opposite TabBar.
+ *  Zero synchronous I/O during navigation or first paint. */
+export function scheduleGravityRefresh() {
+  if (typeof window === "undefined") return;
+  if (gravityTimer !== null) window.clearTimeout(gravityTimer);
+  gravityTimer = window.setTimeout(() => {
+    gravityTimer = null;
+    void refreshGravityNow();
+  }, 140);
+}
+
+async function refreshGravityNow() {
+  const s = getState();
+  const session = s.session;
+  if (s.settings?.pairGravity === false || !session || session.layout === "classic" || session.browsers.length < 2 || s.pick) {
+    if (s.gravityGhost[0] || s.gravityGhost[1]) setState({ gravityGhost: [null, null] });
+    return;
+  }
+  const srcB = session.activeBrowser === 1 ? 1 : 0;
+  const dstB = 1 - srcB;
+  const srcTab = session.browsers[srcB]?.tabs[session.browsers[srcB].active];
+  if (!srcTab || findActivePair(session) || session.browsers[dstB]?.collapsed) {
+    if (s.gravityGhost[0] || s.gravityGhost[1]) setState({ gravityGhost: [null, null] });
+    return;
+  }
+  const srcPath = srcTab.path;
+  if (!srcPath || archiveOf(srcPath)) {
+    if (s.gravityGhost[0] || s.gravityGhost[1]) setState({ gravityGhost: [null, null] });
+    return;
+  }
+  const oppositePaths = session.browsers[dstB].tabs.map((tab) => tab.path);
+  const seq = ++gravitySeq;
+  const suggestion = await api.gravitySuggest(srcPath, oppositePaths).catch(() => null);
+  if (seq !== gravitySeq) return;
+  // Re-verify active state did not move while the async lookup ran.
+  const latest = getState().session;
+  const latestTab = latest?.browsers[srcB]?.tabs[latest.browsers[srcB].active];
+  if (!latest || !latestTab || latestTab.path !== srcPath || findActivePair(latest)) {
+    return;
+  }
+  const next: [typeof suggestion, typeof suggestion] = dstB === 0 ? [suggestion, null] : [null, suggestion];
+  setState({ gravityGhost: next });
+}
+
+export async function acceptGravityGhost(targetBrowser?: number, pair = true) {
+  const s = getState();
+  const session = s.session;
+  if (!session || session.browsers.length < 2) return;
+  const dstB = targetBrowser ?? (s.gravityGhost[1] ? 1 : s.gravityGhost[0] ? 0 : 1 - session.activeBrowser);
+  const ghost = s.gravityGhost[dstB];
+  if (!ghost) return;
+  setState({ gravityGhost: [null, null] });
+  try {
+    const workspaceId = s.workspaces[s.activeWorkspace]?.id;
+    if (!(await sessionCmd({ op: "newTab", b: dstB, path: ghost.path, activate: true }))) return;
+    const current = getState();
+    if (workspaceId != null && current.workspaces[current.activeWorkspace]?.id !== workspaceId) return;
+    const updated = current.session;
+    if (!updated) return;
+    if (pair) {
+      const leftIdx = updated.browsers[0].active;
+      const rightIdx = updated.browsers[1].active;
+      await sessionCmd({ op: "pairTabs", leftIdx, rightIdx, mode: ghost.suggestedMode });
     }
   } catch (e) {
     fail(e);
   }
+}
+
+export async function dismissGravityGhost(targetBrowser?: number) {
+  const s = getState();
+  const dstB = targetBrowser ?? (s.gravityGhost[1] ? 1 : s.gravityGhost[0] ? 0 : -1);
+  if (dstB < 0) return;
+  const ghost = s.gravityGhost[dstB];
+  if (!ghost) return;
+  setState({ gravityGhost: [null, null] });
+  await api.gravityDismiss(ghost.sourcePath, ghost.path).catch(() => {});
 }
 
 export function activeBrowser(): number {
@@ -669,6 +1048,55 @@ export function toggleDetails(b: number) {
   sessionCmd({ op: "details", b, on: !detailsShown(getState(), b) });
 }
 
+function hiddenOverrides(s: Pick<UiState, "session">): HiddenOverrides {
+  return [s.session?.browsers[0]?.showHidden ?? null, s.session?.browsers[1]?.showHidden ?? null];
+}
+
+function isSingleBoard(s: Pick<UiState, "session" | "shownBrowsers">): boolean {
+  return s.session?.layout === "classic" || s.shownBrowsers.length < 2;
+}
+
+/** Are hidden files shown in browser `b`? Its own override, else the global setting. */
+export function hiddenShown(s: Pick<UiState, "session" | "settings">, b: number): boolean {
+  return effectiveHidden(s.settings?.showHidden ?? false, s.session?.browsers[b]?.showHidden);
+}
+
+/** Non-null only in dual-board view when browser `b` overrides the global hidden-files state. */
+export function hiddenDiverged(s: Pick<UiState, "session" | "settings" | "shownBrowsers">, b: number): boolean | null {
+  return hiddenDivergence(s.settings?.showHidden ?? false, hiddenOverrides(s), b, isSingleBoard(s));
+}
+
+function commitHiddenPlan(plan: HiddenTogglePlan) {
+  // Update session overrides first when global did not change, or alongside updateSettings
+  // (which clears overrides automatically whenever global showHidden changes).
+  if (plan.globalChanged) {
+    void updateSettings({ showHidden: plan.nextGlobal });
+  } else if (plan.sessionOp) {
+    void sessionCmd({ op: "hidden", ...plan.sessionOp });
+  }
+}
+
+/** Toggles hidden files for browser `b` (self-healing back to global sync when both match). */
+export function toggleHidden(b: number) {
+  const s = getState();
+  if (!s.settings) return;
+  commitHiddenPlan(planToggleHiddenBoard(s.settings.showHidden, hiddenOverrides(s), b, isSingleBoard(s)));
+}
+
+/** Toggles hidden files across both browsers and re-syncs them with the global default. */
+export function toggleHiddenAll() {
+  const s = getState();
+  if (!s.settings) return;
+  commitHiddenPlan(planToggleHiddenAll(s.settings.showHidden, hiddenOverrides(s)));
+}
+
+/** Sets hidden files to `on` across both browsers and re-syncs them. */
+export function applyHiddenAll(on: boolean) {
+  const s = getState();
+  if (!s.settings) return;
+  commitHiddenPlan(planApplyHiddenAll(s.settings.showHidden, hiddenOverrides(s), on));
+}
+
 /** Swaps the folders of the two browsers; each keeps its own pane layout. */
 export function swapBrowsers() {
   const s = getState().session;
@@ -693,7 +1121,7 @@ export function nextLayout() {
 export async function goToTyped(b: number, input: string) {
   const r = await api.pathResolve(input, activePath(b)).catch((e) => (fail(e), null));
   if (!r) return;
-  if (!r.exists) return fail(`Path not found: ${r.path}`);
+  if (!r.exists) return notify(`“${r.path}” does not exist`, "warn");
   if (r.isDir) navigate(b, r.path);
   else {
     const p = parent(r.path);
@@ -725,6 +1153,20 @@ async function markReachable(path: string): Promise<boolean> {
   return !!r?.exists && (arc ? true : r.isDir);
 }
 
+/** The actions.d actions for the active selection with their keys in the leader group `x` (which-key). */
+export function leaderActions() {
+  const b = activeBrowser();
+  return keyedActionsFor(controller(b)?.selection() ?? [], activePath(b));
+}
+
+/** Leader, x, then a key: runs that actions.d action on the selection (or the folder). The selection is
+ *  read now, before the list is fetched, so a selection change meanwhile cannot redirect the action. */
+export async function runLeaderAction(key: string) {
+  const b = activeBrowser();
+  const ran = await runKeyedAction(key, controller(b)?.selection() ?? [], activePath(b), fail);
+  if (!ran) notify(tt("No custom action on that key for this selection"), "info");
+}
+
 /** Runs a folder-mark key sequence (vim keys: m{x}, '{x}, `{x}, dm{x}). */
 export function runMark(op: MarkOp, key: string) {
   if (op === "set") void setMark(key);
@@ -741,10 +1183,10 @@ export async function setMark(key: string) {
   if (!(await markCmd({ op: "set", key, path, item }))) return;
   const home = getState().info?.home;
   if (prev && prev.path !== path) {
-    notify(`Mark ${key}: ${tildify(path, home)} (was ${tildify(prev.path, home)})`, "info", {
+    notify(tt("Mark {key}: {value} (was {value2})", { key, value: tildify(path, home), value2: tildify(prev.path, home) }), "info", {
       label: "Undo", run: () => void markCmd({ op: "set", key, path: prev.path, item: prev.item }),
     });
-  } else notify(`Mark ${key}: ${tildify(path, home)}`);
+  } else notify(tt("Mark {key}: {value}", { key, value: tildify(path, home) }));
 }
 
 /** '{x} / `{x}: opens the marked folder in the active browser; `{x} also selects the item
@@ -753,7 +1195,7 @@ export async function jumpToMark(key: string, withItem: boolean) {
   const m = getState().marks.marks[key];
   const home = getState().info?.home;
   if (!m) {
-    notify(key === PREVIOUS_MARK ? "No earlier folder to go back to yet" : `Mark ${key} is not set (m ${key} marks this folder)`, "warn");
+    notify(key === PREVIOUS_MARK ? tt("No earlier folder to go back to yet") : tt("Mark {key} is not set (m {key2} marks this folder)", { key, key2: key }), "warn");
     return;
   }
   const b = activeBrowser();
@@ -769,8 +1211,8 @@ export async function jumpToMark(key: string, withItem: boolean) {
   // A slow check (a disconnected network share): the user went on meanwhile, so do nothing.
   if (activePath(b) !== from || tab() !== startTab) return;
   if (!reachable) {
-    notify(`Mark ${markName(key)}: ${tildify(m.path, home)} is not available`, "warn", {
-      label: "Delete mark", run: () => void deleteMark(key),
+    notify(tt("Mark {value}: {value2} is not available", { value: markName(key), value2: tildify(m.path, home) }), "warn", {
+      label: tt("Delete mark"), run: () => void deleteMark(key),
     });
     return;
   }
@@ -780,7 +1222,7 @@ export async function jumpToMark(key: string, withItem: boolean) {
   }
   if (withItem && m.item) {
     if (item) controller(b)?.select([m.item], m.item);
-    else notify(`Mark ${markName(key)}: ${basename(m.item)} is no longer in that folder`, "warn");
+    else notify(tt("Mark {value}: {value2} is no longer in that folder", { value: markName(key), value2: basename(m.item) }), "warn");
   }
 }
 
@@ -788,16 +1230,44 @@ export async function jumpToMark(key: string, withItem: boolean) {
 export async function deleteMark(key: string) {
   const prev = getState().marks.marks[key];
   if (!prev) {
-    notify(`Mark ${markName(key)} is not set`, "warn");
+    notify(tt("Mark {value} is not set", { value: markName(key) }), "warn");
     return;
   }
   if (!(await markCmd({ op: "remove", key }))) return;
-  notify(`Mark ${markName(key)} deleted`, "info", {
+  notify(tt("Mark {value} deleted", { value: markName(key) }), "info", {
     label: "Undo", run: () => void markCmd({ op: "set", key, path: prev.path, item: prev.item }),
   });
 }
 
 // ───────────── favourites ─────────────
+
+/**
+ * Imports the ticked places, one new group per source. One notification offers "Undo import" for the whole batch
+ * (it removes exactly the places this import added). Returns whether anything was added.
+ */
+export async function importFavorites(choices: ImportChoice[]): Promise<boolean> {
+  try {
+    const { favorites, receipt } = await api.favoritesImportApply(choices);
+    setState({ favorites });
+    const added = receipt.groups.reduce((count, group) => count + group.paths.length, 0);
+    if (added === 0) {
+      notify(tt("Nothing new to import: everything ticked is already in your favorites."));
+      return false;
+    }
+    notify(tt("Imported favorites: {count}", { count: added }), "success", {
+      label: tt("Undo import"),
+      run: () => {
+        api.favoritesImportUndo(receipt)
+          .then((restored) => { setState({ favorites: restored }); notify(tt("Import undone")); })
+          .catch(fail);
+      },
+    });
+    return true;
+  } catch (e) {
+    fail(e);
+    return false;
+  }
+}
 
 export async function favCmd(cmd: FavCmd) {
   try {
@@ -811,8 +1281,10 @@ export async function favCmd(cmd: FavCmd) {
 
 const fileSrc = (path: string): DiffSource => ({ kind: "file", path });
 
-export function compare(a: DiffSource, b: DiffSource) {
-  openOverlay({ type: "diff", a, b });
+export function compare(a: DiffSource, b: DiffSource, wait?: boolean) {
+  // Documents (.docx / .pdf) open directly inside DiffView's DocumentCompare mode so extraction
+  // can be cancelled immediately by closing the window, with one-click text or byte fallback.
+  openOverlay({ type: "diff", a, b, wait });
 }
 
 /** Partner for `entry` in the other browser: its focused file, else a file with the same name. */
@@ -827,25 +1299,43 @@ export async function otherPanelPartner(b: number, entry: FileEntry): Promise<st
   return r?.exists && !r.isDir ? r.path : null;
 }
 
-export function compareFolders(left: string, right: string) {
-  if (left === right) return notify("Both sides are the same folder", "warn");
+/**
+ * Opens the standalone merge of three files. `paths` are the selected files: three are base, local and remote in
+ * the order they are listed, two are local and remote (no base); anything else opens the window empty.
+ */
+export function openStandaloneMerge(paths: string[] = []) {
+  const [a, b, c] = paths;
+  openOverlay(paths.length === 3 ? { type: "standaloneMerge", base: a, left: b, right: c } : paths.length === 2 ? { type: "standaloneMerge", left: a, right: b } : { type: "standaloneMerge" });
+}
+
+/** The merge of the files selected in a browser (up to three). */
+export function mergeSelection(b: number) {
+  const files = (controller(b)?.selection() ?? []).filter((e) => !e.isDir);
+  if (files.length > 3) notify(tt("Using the first three selected files for the merge."), "warn");
+  openStandaloneMerge(files.slice(0, 3).map((e) => e.path));
+}
+
+export function compareFolders(left: string, right: string, wait?: boolean) {
+  const reject = (message: string) => { if (wait) throw new Error(message); return notify(message, "warn"); };
+  if (left === right) return reject(tt("Both sides are the same folder"));
   // A folder and one inside it: a sync would copy the folder into itself or trash its own files.
   if (isInside(left, right) || isInside(right, left))
-    return notify(`“${basename(isInside(left, right) ? left : right)}” is inside the other folder: compare two separate folders`, "warn");
-  openOverlay({ type: "dircmp", left, right });
+    return reject(`“${basename(isInside(left, right) ? left : right)}” is inside the other folder: compare two separate folders`);
+  void api.gravityRecord(left, right, 1.5, false).catch(() => {});
+  openOverlay({ type: "dircmp", left, right, wait });
 }
 
 /** The folders shown in both browsers (browser 1 on the left). */
 export function comparePanelFolders(b: number) {
   const o = otherBrowser(b);
-  if (o === b || getState().session?.layout === "classic") return notify("Compare folders needs two panels", "warn");
+  if (o === b || getState().session?.layout === "classic") return notify(tt("Compare folders needs two panels"), "warn");
   compareFolders(activePath(0), activePath(1));
 }
 
 /** One folder: the folder with the same name in the other panel, else the other panel's folder. */
 export async function compareFolderWithOther(b: number, dir: FileEntry) {
   const o = otherBrowser(b);
-  if (o === b) return notify("Compare folders needs two panels", "warn");
+  if (o === b) return notify(tt("Compare folders needs two panels"), "warn");
   const same = join(activePath(o), dir.name);
   const r = await api.pathResolve(same).catch(() => null);
   const other = r?.exists && r.isDir && r.path !== dir.path ? r.path : activePath(o);
@@ -862,7 +1352,7 @@ export async function compareSelection(b: number) {
   if (files.length > 2) return openOverlay({ type: "matrix", paths: files.slice(0, 30).map((f) => f.path) });
   if (files.length === 2) return compare(fileSrc(files[0].path), fileSrc(files[1].path));
   const one = files[0] ?? (c?.focused()?.isDir === false ? c.focused() : null);
-  if (!one) return notify("Select two files to compare (or one, to compare with the other panel)", "warn");
+  if (!one) return notify(tt("Select two files to compare (or one, to compare with the other panel)"), "warn");
   const partner = (await otherPanelPartner(b, one)) ?? (await pickCompareFile(b, one));
   if (!partner) return;
   b === 0 ? compare(fileSrc(one.path), fileSrc(partner)) : compare(fileSrc(partner), fileSrc(one.path));
@@ -873,7 +1363,7 @@ async function pickCompareFile(b: number, one: FileEntry): Promise<string | null
   const o = otherBrowser(b);
   const start = o !== b && getState().session?.layout !== "classic" ? activePath(o) : parent(one.path);
   const { open } = await import("@tauri-apps/plugin-dialog");
-  const p = await open({ title: `Compare ${one.name} with…`, defaultPath: start ?? undefined, multiple: false, directory: false });
+  const p = await open({ title: tt("Compare {name} with…", { name: one.name }), defaultPath: start ?? undefined, multiple: false, directory: false });
   return typeof p === "string" && p !== one.path ? p : null;
 }
 
@@ -882,11 +1372,50 @@ export async function compareWithClipboard(path: string) {
   if (c?.kind === "text") return compare(fileSrc(path), { kind: "text", label: "Clipboard", text: c.text });
   if (c?.kind === "url") return compare(fileSrc(path), { kind: "text", label: "Clipboard", text: c.url });
   if (c?.kind === "paths" && c.paths.length === 1) return compare(fileSrc(path), fileSrc(c.paths[0]));
-  notify("The clipboard holds no text or single file to compare with", "warn");
+  notify(tt("The clipboard holds no text or single file to compare with"), "warn");
 }
 
-export function compareWithGitHead(path: string) {
-  compare({ kind: "gitHead", path }, fileSrc(path));
+let gitFileComparisonRequest = 0;
+
+export async function compareGitFile(path: string, revision: "head" | "lastChange" = "head") {
+  const id = ++gitFileComparisonRequest;
+  const overlay = getState().overlay;
+  const browser = activeBrowser();
+  const folder = activePath(browser);
+  const current = () => id === gitFileComparisonRequest && getState().overlay === overlay && activeBrowser() === browser && activePath(browser) === folder;
+  try {
+    if (revision === "lastChange") {
+      const { history } = await api.gitLastFileChange(path);
+      if (!current()) return;
+      const lastTouch = history.entries[0];
+      if (!lastTouch) {
+        notify(tt("No file history at this revision."), "warn");
+        return;
+      }
+      const details = await api.gitCommitDetails(path, lastTouch.id);
+      if (!current()) return;
+      const file = details.files.find((file) => file.path === lastTouch.file)
+        ?? details.files.find((file) => file.original === lastTouch.file);
+      if (!file) {
+        notify(tt("No file changes between these revisions."), "warn");
+        return;
+      }
+      const [before, after] = commitSides(file, details.id, details.base);
+      const source = (side: typeof before, absent: string): DiffSource => side.kind === "commit"
+        ? { kind: "gitBlob", root: details.root, commit: side.id, file: side.file, lastTouch: side.id === lastTouch.id ? lastTouch : null }
+        : { kind: "text", label: absent, text: "" };
+      compare(source(before, tt("Absent before this commit")), source(after, tt("Absent after this commit")));
+      return;
+    }
+    const { left, right, lastTouch } = await api.gitWorktreeComparison(path);
+    if (!current()) return;
+    compare(
+      left ? { ...left, isHead: true, lastTouch } : { kind: "text", label: tt("Absent from HEAD"), text: "" },
+      right ?? { kind: "text", label: tt("Absent from the worktree"), text: "" },
+    );
+  } catch (error) {
+    if (current()) fail(error);
+  }
 }
 
 /** "Compare with…" submenu for one file. `inRepo` comes from the pane (Git root of its folder). */
@@ -895,19 +1424,21 @@ export function compareMenu(b: number, entry: FileEntry, inRepo: boolean): MenuI
   const focusedOther = o !== b ? controller(o)?.focused() : null;
   const other = focusedOther && !focusedOther.isDir && focusedOther.path !== entry.path ? focusedOther.name : null;
   return {
-    label: "Compare with",
+    label: tt("Compare with"),
     icon: "compare",
     submenu: [
-      { label: other ? `Other panel: ${other}` : "Other panel (same name)", shortcut: "Ctrl+Shift+D", run: async () => {
+      { label: other ? tt("Other panel: {other}", { other }) : tt("Other panel (same name)"), shortcut: "Ctrl+Shift+D", run: async () => {
           const partner = (await otherPanelPartner(b, entry)) ?? (await pickCompareFile(b, entry));
           if (!partner) return;
           b === 0 ? compare(fileSrc(entry.path), fileSrc(partner)) : compare(fileSrc(partner), fileSrc(entry.path));
         } },
       { label: "Clipboard", run: () => compareWithClipboard(entry.path) },
-      { label: inRepo ? "Git HEAD (my changes)" : "Git HEAD (not in a repository)", disabled: !inRepo, run: () => compareWithGitHead(entry.path) },
-      { label: "Git commit…", disabled: !inRepo, run: () => openOverlay({ type: "gitCommits", path: entry.path }) },
+      { label: inRepo ? tt("Git HEAD (my changes)") : tt("Git HEAD (not in a repository)"), disabled: !inRepo, run: () => compareGitFile(entry.path) },
+      { label: tt("Show the last Git change to this file"), disabled: !inRepo, run: () => compareGitFile(entry.path, "lastChange") },
+      { label: tt("Open file history"), disabled: !inRepo, run: () => openOverlay({ type: "gitGraph", path: parent(entry.path) ?? entry.path, focusFile: entry.path }) },
+      { label: tt("Git commit…"), disabled: !inRepo, run: () => openOverlay({ type: "gitCommits", path: entry.path }) },
       { separator: true },
-      { label: "Choose file…", run: async () => {
+      { label: tt("Choose file…"), run: async () => {
           const { open } = await import("@tauri-apps/plugin-dialog");
           const p = await open({ defaultPath: parent(entry.path) ?? undefined, multiple: false, directory: false });
           if (typeof p === "string") compare(fileSrc(entry.path), fileSrc(p));
@@ -939,7 +1470,7 @@ export function setFolderColor(paths: string[], color: string | null) {
 export function folderColorMenu(paths: string[]): MenuItem {
   const cur = paths.length === 1 ? getState().settings?.folderColors[paths[0]] : undefined;
   return {
-    label: "Folder colour",
+    label: tt("Folder colour"),
     icon: "folder",
     submenu: [
       { label: "Default", checked: !cur, run: () => setFolderColor(paths, null) },
@@ -947,14 +1478,14 @@ export function folderColorMenu(paths: string[]): MenuItem {
       ...FOLDER_COLORS.map(([label, c]) => ({ label, swatch: c, checked: cur === c, run: () => setFolderColor(paths, c) })),
       { separator: true },
       {
-        label: "Custom…",
+        label: tt("Custom…"),
         swatch: cur && !FOLDER_COLORS.some(([, c]) => c === cur) ? cur : undefined,
         run: async () => {
-          const v = await promptText("Folder colour (e.g. #ff8800 or rebeccapurple; empty = default)", cur ?? "", "Apply");
+          const v = await promptText(tt("Folder colour (e.g. #ff8800 or rebeccapurple; empty = default)"), cur ?? "", "Apply");
           if (v === null) return;
           const t = v.trim();
           if (!t) return setFolderColor(paths, null);
-          if (!CSS.supports("color", t)) return notify(`Not a valid colour: ${t}`, "warn");
+          if (!CSS.supports("color", t)) return notify(tt("Not a valid colour: {t}", { t }), "warn");
           setFolderColor(paths, t);
         },
       },
@@ -992,7 +1523,7 @@ export async function hideFromSearch(paths: string[]) {
   }
   bumpSearchHidden();
   if (!added.length) {
-    if (paths.length) notify(paths.length === 1 ? `“${basename(paths[0])}” is already hidden from search` : "Already hidden from search", "info");
+    if (paths.length) notify(paths.length === 1 ? `“${basename(paths[0])}” is already hidden from search` : tt("Already hidden from search"), "info");
     return;
   }
   const what = added.length === 1 ? `“${basename(added[0])}”` : `${added.length} items`;
@@ -1016,13 +1547,13 @@ export async function showInSearch(path: string) {
         break;
       case "excepted":
         notify(`${name} shows in search again (a pattern hides it, so ${tildify(out.file, home)} got an exception for it)`, "success", {
-          label: "Edit list",
+          label: tt("Edit list"),
           run: () => void api.openPath(out.file).catch(fail),
         });
         break;
       case "insideHidden":
         notify(`${name} is inside “${basename(out.folder)}”, which is hidden from search. Show that folder first.`, "warn", {
-          label: "Show it",
+          label: tt("Show it"),
           run: () => void showInSearch(out.folder),
         });
         break;
@@ -1044,7 +1575,7 @@ export async function togglePin(path: string) {
       for (const s of [...spots].sort((a, b) => b.index - a.index)) {
         setState({ favorites: await api.favoritesCmd({ op: "removeItem", id: s.id, index: s.index }) });
       }
-      notify(`Unpinned ${basename(path) || path}`, "info", {
+      notify(tt("Unpinned {value}", { value: basename(path) || path }), "info", {
         label: "Undo",
         run: async () => {
           for (const s of [...spots].sort((a, b) => a.index - b.index)) {
@@ -1065,7 +1596,7 @@ export async function togglePin(path: string) {
     }
     if (g.collapsed) await api.favoritesCmd({ op: "collapse", id: g.id, collapsed: false });
     setState({ favorites: await api.favoritesCmd({ op: "addItem", id: g.id, path }) });
-    notify(`Pinned ${basename(path) || path} to the sidebar`, "success");
+    notify(tt("Pinned {value} to the sidebar", { value: basename(path) || path }), "success");
   } catch (e) {
     fail(e);
   }
@@ -1080,31 +1611,86 @@ export async function refreshUndo() {
 
 /** Undo the most recent operation in folder `dir` (the panel's undo button). */
 export async function undoIn(dir: string) {
-  await runUndo((permanent) => api.undoIn(dir, permanent));
+  await runUndo((permanent) => api.undoIn(dir, permanent), tt("Nothing to undo in this folder"));
 }
 
 export async function undo() {
   await runUndo((permanent) => api.undo(permanent));
 }
 
+/** Undo the specific file operation tied to a notification card. */
+export async function undoRecord(id: number) {
+  await runUndo((permanent) => api.undoById(id, permanent), tt("This action can no longer be undone"));
+}
+
+/** Undo one or more specific file operations (e.g. a two-sided compare save) in reverse order. */
+export async function undoRecords(ids: number[]) {
+  const ordered = [...ids].reverse();
+  if (ordered.length === 1) return undoRecord(ordered[0]);
+  let undoneCount = 0;
+  let lastDescription: string | null = null;
+  for (const id of ordered) {
+    try {
+      const description = await api.undoById(id, false);
+      if (description !== null) {
+        undoneCount++;
+        lastDescription = description;
+      }
+    } catch (e) {
+      if (!String(e).startsWith("no-trash: ")) {
+        fail(e);
+        break;
+      }
+      if (await confirm(tt("Undo without the trash?"),
+        `${readableError(String(e))} Undo deletes them for good instead; they cannot be restored.`, tt("Delete for good"), true)) {
+        try {
+          const description = await api.undoById(id, true);
+          if (description !== null) {
+            undoneCount++;
+            lastDescription = description;
+          }
+        } catch (err) {
+          fail(err);
+          break;
+        }
+      } else {
+        break;
+      }
+    }
+  }
+  if (undoneCount === 0) notify(tt("This action can no longer be undone"));
+  else {
+    notify(undoneCount === 1 && lastDescription ? lastDescription : tt("Undid {count} saved files", { count: undoneCount }), "success");
+    refreshAll();
+  }
+  refreshUndo();
+  invalidateAllFolderSizes();
+}
+
+/** Builds a notification Undo action bound to a specific undo journal record ID. */
+export function undoAction(undoId?: number | null): NoteAction | undefined {
+  return undoId != null ? { label: "Undo", run: () => void undoRecord(undoId) } : undefined;
+}
+
 /** Runs an undo. When the trash refuses what the operation created (a copy on a network
  *  drive), asks to delete it for good instead: otherwise that undo would fail every time
  *  and block Ctrl+Z for everything older. */
-async function runUndo(call: (permanent: boolean) => Promise<string>) {
+async function runUndo(call: (permanent: boolean) => Promise<string | null>, empty = tt("Nothing to undo")) {
+  const apply = async (permanent: boolean) => {
+    const description = await call(permanent);
+    if (description === null) notify(empty);
+    else {
+      notify(description, "success");
+      refreshAll();
+    }
+  };
   try {
-    // The backend says what the undo did: "Removed “a.pdf” (in the trash)".
-    notify(await call(false), "info");
-    refreshAll();
+    await apply(false);
   } catch (e) {
-    if (!String(e).startsWith("no-trash:")) fail(e);
-    else if (await confirm("Undo without the trash?",
-      `${readableError(String(e))} Undo deletes them for good instead; they cannot be restored.`, "Delete for good", true)) {
-      try {
-        notify(await call(true), "info");
-        refreshAll();
-      } catch (e2) {
-        fail(e2);
-      }
+    if (!String(e).startsWith("no-trash: ")) fail(e);
+    else if (await confirm(tt("Undo without the trash?"),
+      `${readableError(String(e))} Undo deletes them for good instead; they cannot be restored.`, tt("Delete for good"), true)) {
+      await apply(true).catch(fail);
     }
   }
   refreshUndo();
@@ -1128,13 +1714,13 @@ async function askConflict(info: ConflictInfo): Promise<ConflictChoice | null> {
   const r = await dialog({
     title: `${named(conflicts)} already exist${one ? "s" : ""}`,
     message: (one ? `in ${tildify(parent(conflicts[0]) ?? conflicts[0], home)}` : list(conflicts.slice(0, 5), conflicts.length - 5))
-      + (info.folders ? `\n${allFolders ? (one ? "It is a folder on both sides" : "They are folders on both sides") : `${items(info.folders)} are folders on both sides`}: Merge puts the contents together.` : ""),
+      + (info.folders ? `\n${allFolders ? (one ? tt("It is a folder on both sides") : tt("They are folders on both sides")) : `${items(info.folders)} are folders on both sides`}: Merge puts the contents together.` : ""),
     buttons: [
       { id: "cancel", label: "Cancel", key: "c" },
       { id: "skip", label: "Skip", key: "s" },
       { id: "overwrite", label: "Replace", danger: true, key: "r", hint: "old one to the trash" },
       ...(info.folders ? [{ id: "merge", label: "Merge", key: "m", hint: "folders", primary: true }] : []),
-      { id: "keepBoth", label: "Keep both", primary: !info.folders, key: "k" },
+      { id: "keepBoth", label: tt("Keep both"), primary: !info.folders, key: "k" },
     ],
   });
   if (!r || r.button === "cancel") return null;
@@ -1147,9 +1733,9 @@ async function askConflict(info: ConflictInfo): Promise<ConflictChoice | null> {
     buttons: [
       { id: "cancel", label: "Cancel", key: "c" },
       { id: "skip", label: "Skip", key: "s", hint: "keep existing" },
-      { id: "overwriteOlder", label: "Replace older", key: "o", hint: "if newer" },
+      { id: "overwriteOlder", label: tt("Replace older"), key: "o", hint: "if newer" },
       { id: "overwrite", label: "Replace", danger: true, key: "r", hint: "old to the trash" },
-      { id: "keepBoth", label: "Keep both", primary: true, key: "k" },
+      { id: "keepBoth", label: tt("Keep both"), primary: true, key: "k" },
     ],
   });
   if (!f || f.button === "cancel") return null;
@@ -1169,7 +1755,7 @@ export async function compress(paths: string[], dest: string, name: string, form
 
 /** Asks for the archive name; the extension picks the format (.zip when it names none Gall writes). */
 export async function compressAs(paths: string[], dest: string, base: string) {
-  const v = await promptText("Compress to", `${base}.zip`, "Compress", [0, base.length]);
+  const v = await promptText(tt("Compress to"), `${base}.zip`, "Compress", [0, base.length]);
   if (!v?.trim()) return;
   let name = v.trim();
   let format = createFormatFor(name);
@@ -1196,7 +1782,7 @@ export async function extract(paths: string[], dest: string, mode: "smart" | "fo
 export function refuseInArchive(dirOrItems: string | string[], what = "change"): boolean {
   const inside = typeof dirOrItems === "string" ? archiveOf(dirOrItems) : dirOrItems.map((p) => archiveOf(parent(p) ?? "")).find(Boolean);
   if (!inside) return false;
-  notify(`Can't ${what} inside “${basename(inside)}”: archives open read-only. Copy items out (y y / Ctrl+C) or extract it.`, "warn");
+  notify(platformLabel(tt("Can't {what} inside “{value}”: archives open read-only. Copy items out (y y / Ctrl+C) or extract it.", { what, value: basename(inside) })), "warn");
   return true;
 }
 
@@ -1212,8 +1798,8 @@ export async function askArchivePassword(err: unknown): Promise<boolean> {
   const wrong = rest.startsWith("wrong:");
   const archive = rest.slice(rest.indexOf(":") + 1).trim();
   const r = await dialog({
-    title: wrong ? "Wrong password" : "Password required",
-    message: wrong ? `That password does not open “${basename(archive)}”. Try again.` : `“${basename(archive)}” is encrypted.`,
+    title: wrong ? tt("Wrong password") : tt("Password required"),
+    message: wrong ? tt("That password does not open “{value}”. Try again.", { value: basename(archive) }) : `“${basename(archive)}” is encrypted.`,
     input: { value: "", password: true, placeholder: "Password" },
     buttons: [{ id: "cancel", label: "Cancel" }, { id: "ok", label: "Unlock", primary: true }],
   });
@@ -1237,7 +1823,7 @@ export async function withArchivePassword<T>(fn: () => Promise<T>): Promise<T> {
  *  the clipboard and dragging work with real files. Other paths are unchanged. */
 export async function realPaths(paths: string[]): Promise<string[]> {
   if (!paths.some((p) => archiveOf(parent(p) ?? ""))) return paths;
-  const n = setTimeout(() => notify(`Extracting ${named(paths)} from the archive…`), 400);
+  const n = setTimeout(() => notify(tt("Extracting {value} from the archive…", { value: named(paths) })), 400);
   try {
     return await withArchivePassword(() => api.archiveMaterialize(paths));
   } finally {
@@ -1250,11 +1836,20 @@ export async function realPaths(paths: string[]): Promise<string[]> {
  *  place goes back on the clipboard. */
 const cutPastes = new Map<number, string[]>();
 
+/** Did the system clipboard take the files of our last copy or cut? Where it did not
+ *  (no clipboard, or a write that failed), it still shows something older, which must
+ *  not be read as "copied later in another program". */
+let clipShared = false;
+async function shareClip(paths: string[], cut: boolean) {
+  await api.clipSetFiles(paths, cut);
+  clipShared = ownsClipboard(paths, await api.clipInspect().catch(() => ({ kind: "empty" as const })));
+}
+
 async function restoreCut(paths: string[]) {
   if (getState().clipboard.paths.length) return; // something else was cut or copied since
   const left = await api.findExisting(paths).catch(() => []);
   if (!left.length || getState().clipboard.paths.length) return;
-  await api.clipSetFiles(left, true).catch(() => {});
+  await shareClip(left, true).catch(() => {});
   setState({ clipboard: { paths: left, cut: true } });
   notify(`${named(left)} not moved: still on the clipboard`, "info");
 }
@@ -1268,10 +1863,10 @@ const replacing = (p: ConflictPolicy) => p === "overwrite";
 
 async function offerPermanentReplace(req: TransferRequest, error: string) {
   const ok = await confirm(
-    "Replace permanently?",
+    tt("Replace permanently?"),
     `${readableError(error)} Replace without the trash? The replaced items will be deleted and cannot be restored.`,
-    "Replace permanently", true);
-  if (!ok) return notify(`${req.kind === "move" ? "Move" : "Copy"} stopped; nothing more was replaced`, "warn");
+    tt("Replace permanently"), true);
+  if (!ok) return notify(tt(req.kind === "move" ? "Move stopped; nothing more was replaced" : "Copy stopped; nothing more was replaced"), "warn");
   await api.startTask({ ...req, conflict: "overwritePermanently" }).catch(fail);
 }
 
@@ -1285,13 +1880,17 @@ export async function transfer(kind: "copy" | "move", sources: string[], dest: s
   } catch (e) {
     return fail(e);
   }
-  if (sources.some((s) => isInside(dest, s) && s !== dest)) return fail(`Cannot ${kind} a folder into itself`);
+  if (sources.some((s) => isInside(dest, s) && s !== dest)) return notify(tt(kind === "copy" ? "Cannot copy a folder into itself" : "Cannot move a folder into itself"), "warn");
   if (kind === "move" && sources.every((s) => parent(s) === dest)) return;
   try {
     const choice = await askConflict(await api.conflictInfo(sources, dest));
     if (!choice) return;
     const id = await api.startTask({ kind, sources, dest, conflict: choice.policy, merge: choice.merge });
     if (replacing(choice.policy)) replaceRequests.set(id, { kind, sources, dest, merge: choice.merge });
+    const srcFolder = parent(sources[0]);
+    if (srcFolder && srcFolder !== dest) {
+      void api.gravityRecord(srcFolder, dest, 1.0, false).catch(() => {});
+    }
   } catch (e) {
     fail(e);
   }
@@ -1301,9 +1900,9 @@ export async function trashPaths(paths: string[]) {
   if (!paths.length) return;
   if (refuseInArchive(paths, "delete")) return;
   try {
-    await api.trash(paths);
+    const undoId = await api.trash(paths);
     refreshAll();
-    notify(`Moved ${named(paths)} to trash`, "info", { label: "Undo", run: undo });
+    notify(tt("Moved {value} to trash", { value: named(paths) }), "info", undoAction(undoId));
     refreshUndo();
     invalidateAllFolderSizes();
   } catch (e) {
@@ -1315,9 +1914,9 @@ export async function trashPaths(paths: string[]) {
     // No trash here (network share, read-only trash, …): offer to delete for good.
     const left = await api.findExisting(paths).catch(() => paths);
     if (!left.length) return fail(e);
-    const ok = await confirm("Can't move to the trash",
+    const ok = await confirm(tt("Can't move to the trash"),
       `${msg.replace(/^trash:\s*/, "")}. Delete ${named(left)} permanently instead? This cannot be undone.`,
-      "Delete permanently", true);
+      tt("Delete permanently"), true);
     if (ok) await api.startTask({ kind: "delete", sources: left }).catch(fail);
   }
 }
@@ -1325,7 +1924,7 @@ export async function trashPaths(paths: string[]) {
 export async function deletePermanently(paths: string[]) {
   if (!paths.length) return;
   if (refuseInArchive(paths, "delete")) return;
-  if (!(await confirm("Delete permanently?", `${named(paths)} will be deleted and cannot be restored.`, "Delete", true))) return;
+  if (!(await confirm(tt("Delete permanently?"), `${named(paths)} will be deleted and cannot be restored.`, "Delete", true))) return;
   try {
     await api.startTask({ kind: "delete", sources: paths });
   } catch (e) {
@@ -1356,7 +1955,7 @@ export async function renameEntry(b: number, entry: FileEntry) {
   if (!r || r.button === "cancel" || r.value === entry.name || !r.value.trim()) return;
   const newName = r.value.trim();
   if (!entry.isDir && ext && !newName.includes(".")) {
-    if (!(await confirm("Remove extension?", `"${newName}" has no extension. The file may no longer open with the right program.`, "Rename"))) return;
+    if (!(await confirm(tt("Remove extension?"), `"${newName}" has no extension. The file may no longer open with the right program.`, "Rename"))) return;
   }
   try {
     const p = await api.rename(entry.path, newName);
@@ -1393,24 +1992,24 @@ export async function newFolder(b: number) {
   if (refuseInArchive(dir, "create folders")) return;
   const sel = controller(b)?.selection() ?? [];
   // A free name to start with: "New folder (2)" when "New folder" is taken.
-  const name = await freeName(dir, "New folder");
+  const name = await freeName(dir, tt("New folder"));
   const r = await dialog({
-    title: "New folder",
+    title: tt("New folder"),
     input: { value: name, select: [0, name.length] },
     buttons: [
       { id: "cancel", label: "Cancel" },
-      ...(sel.length ? [{ id: "moveIn", label: "Create & move selection inside", hint: "Shift+Enter" }] : []),
-      { id: "open", label: "Create & open", hint: "Ctrl+Enter" },
+      ...(sel.length ? [{ id: "moveIn", label: tt("Create & move selection inside"), hint: "Shift+Enter" }] : []),
+      { id: "open", label: tt("Create & open"), hint: "Ctrl+Enter" },
       { id: "ok", label: "Create", primary: true },
     ],
   });
   if (!r || r.button === "cancel" || !r.value.trim()) return;
   try {
-    const p = await api.createDir(dir, r.value.trim());
+    const { path: p, undoId } = await api.createDirWithUndo(dir, r.value.trim());
     if (r.button === "open") navigate(b, p);
     else if (r.button === "moveIn") await api.startTask({ kind: "move", sources: sel.map((e) => e.path), dest: p, conflict: "keepBoth" });
     else controller(b)?.select([p], p);
-    if (r.button !== "moveIn") notify(`Created folder “${basename(p)}”`, "success", { label: "Undo", run: undo });
+    if (r.button !== "moveIn") notify(tt("Created folder “{value}”", { value: basename(p) }), "success", undoAction(undoId));
     refreshUndo();
   } catch (e) {
     fail(e);
@@ -1419,18 +2018,23 @@ export async function newFolder(b: number) {
 
 export async function createFromTemplate(b: number, dir: string, template: string | undefined, name: string, open: boolean) {
   try {
-    const p = await api.createFile(dir, name, template);
+    const { path: p, undoId } = await api.createFileWithUndo(dir, name, template);
     if (open) await api.openPath(p);
     controller(b)?.select([p], p);
-    notify(`Created “${basename(p)}”`, "success", { label: "Undo", run: undo });
+    notify(tt("Created “{value}”", { value: basename(p) }), "success", undoAction(undoId));
     refreshUndo();
   } catch (e) {
     fail(e);
   }
 }
 
+function isNoDefaultAppError(err: unknown): boolean {
+  return /no default application/i.test(String(err));
+}
+
 export async function openEntries(b: number, entries: FileEntry[]) {
   if (!entries.length) return;
+  if (pickOpenEntries(b, entries)) return;
   const resolved: FileEntry[] = [];
   for (const entry of entries) {
     if (entry.ext !== "lnk") {
@@ -1445,13 +2049,21 @@ export async function openEntries(b: number, entries: FileEntry[]) {
   }
   entries = resolved;
   if (!entries.length) return;
+  const platform = getState().info?.platform;
   const dirs = entries.filter((e) => e.isDir);
   const files = entries.filter((e) => !e.isDir);
-  if (files.length >= 10 && !(await confirm("Open many files?", `Open ${files.length} files at once?`, "Open"))) return;
+  if (files.length >= 10 && !(await confirm(tt("Open many files?"), tt("Open {length} files at once?", { length: files.length }), "Open"))) return;
+  // macOS: `.app` bundles are directories on disk, but Finder launches them on Open
+  // (Show package contents navigates inside).
+  if (platform === "macos" && dirs.length === 1 && !files.length && dirs[0].name.toLowerCase().endsWith(".app")) {
+    api.openPath(dirs[0].path).catch(fail);
+    return;
+  }
   if (dirs.length === 1 && !files.length) return navigate(b, dirs[0].path);
   // An archive opens like a folder (Open with… still hands it to another program).
   if (entries.length === 1 && isBrowsableArchive(files[0].name)) return navigate(b, files[0].path);
   for (const d of dirs) sessionCmd({ op: "newTab", b, path: d.path, activate: false });
+  const toOpen: FileEntry[] = [];
   for (const f of files) {
     // A link to nothing: the system opener would fail out of sight.
     if (f.isSymlink && !archiveOf(parent(f.path) ?? "")) {
@@ -1466,7 +2078,45 @@ export async function openEntries(b: number, entries: FileEntry[]) {
       openOverlay({ type: "note", dir: activePath(b), path: f.path, text: info?.text ?? "" });
       continue;
     }
-    withArchivePassword(() => api.openPath(f.path)).catch(fail);
+    toOpen.push(f);
+  }
+  if (!toOpen.length) return;
+  const handleOpenError = (e: unknown) => {
+    if (isNoDefaultAppError(e)) {
+      notify(tt("No default application for {item} — choose one", { item: named(toOpen.map((f) => f.path)) }), "info");
+      openOverlay({ type: "openWith", paths: toOpen.map((f) => f.path), mode: "file" });
+      return;
+    }
+    fail(e);
+  };
+  if (toOpen.length === 1) {
+    withArchivePassword(() => api.openPath(toOpen[0].path)).catch(handleOpenError);
+  } else {
+    withArchivePassword(() => api.openPaths(toOpen.map((f) => f.path))).catch(handleOpenError);
+  }
+}
+
+/** Navigates to a symlink or Windows shortcut target's folder and selects the target (Explorer "Open file location" / Finder "Show Original"). */
+export async function openTargetLocation(b: number, entry: FileEntry) {
+  try {
+    let targetPath: string | null = null;
+    if (entry.ext === "lnk") {
+      const r = await withArchivePassword(() => api.shortcutResolve(entry.path));
+      targetPath = r?.path ?? null;
+    } else {
+      const r = await api.pathResolve(entry.path);
+      targetPath = r.exists ? r.path : null;
+    }
+    if (!targetPath) {
+      notify(tt("Target of “{name}” could not be found", { name: entry.name }), "warn");
+      return;
+    }
+    const dir = parent(targetPath);
+    if (!dir) return;
+    await navigate(b, dir);
+    controller(b)?.select([targetPath], targetPath);
+  } catch (e) {
+    fail(e);
   }
 }
 
@@ -1516,7 +2166,7 @@ export async function copyToClipboard(entries: FileEntry[], cut: boolean) {
   try {
     // From an archive: the clipboard gets extracted copies, so any program can paste them.
     paths = await realPaths(paths);
-    await api.clipSetFiles(paths, cut);
+    await shareClip(paths, cut);
   } catch (e) {
     return fail(e);
   }
@@ -1529,7 +2179,7 @@ export async function copyToClipboard(entries: FileEntry[], cut: boolean) {
 
 /** "1 item", "3 items". */
 export function items(n: number): string {
-  return `${n} item${n === 1 ? "" : "s"}`;
+  return t("count.items", { count: n });
 }
 
 /** What a message is about: the quoted name of a single item (“a.txt”), else the count (3 items). */
@@ -1549,8 +2199,14 @@ export async function paste(b: number) {
   const clip = getState().clipboard;
   try {
     const ext = await api.clipInspect().catch(() => ({ kind: "empty" as const }));
-    // Our own file clipboard wins if the system clipboard still holds its paths.
-    const ours = clip.paths.length && (ext.kind !== "paths" || ext.paths.join("\n") === clip.paths.join("\n"));
+    // Our own file clipboard wins while the system clipboard still holds its paths.
+    const ours = clipShared ? ownsClipboard(clip.paths, ext) : clip.paths.length > 0 && (ext.kind !== "paths" || ownsClipboard(clip.paths, ext));
+    // Something copied later in another program replaced them: forget ours, so the cut
+    // marks go and a later paste cannot bring the old files back.
+    if (!ours && clip.paths.length) {
+      setState({ clipboard: { paths: [], cut: false } });
+      api.clipClearFiles().catch(() => {});
+    }
     if (ours) {
       const sameFolder = clip.paths.every((p) => parent(p) === dir);
       const choice = sameFolder && !clip.cut ? { policy: "keepBoth" as const, merge: false } : await askConflict(await api.conflictInfo(clip.paths, dir));
@@ -1574,7 +2230,8 @@ export async function paste(b: number) {
     }
     switch (ext.kind) {
       case "paths":
-        return transfer("copy", ext.paths, dir);
+        // A cut made in another program (x-special/gnome-copied-files "cut") moves.
+        return transfer(ext.cut ? "move" : "copy", ext.paths, dir);
       case "image": {
         const p = await api.clipPasteAsFile(dir, "image");
         controller(b)?.select([p], p);
@@ -1582,9 +2239,9 @@ export async function paste(b: number) {
       }
       case "url": {
         const r = await dialog({
-          title: "Paste link",
+          title: tt("Paste link"),
           message: ext.url,
-          buttons: [{ id: "cancel", label: "Cancel" }, { id: "text", label: "As text file", key: "t" }, { id: "url", label: "As link shortcut", primary: true, key: "l" }],
+          buttons: [{ id: "cancel", label: "Cancel" }, { id: "text", label: tt("As text file"), key: "t" }, { id: "url", label: tt("As link shortcut"), primary: true, key: "l" }],
         });
         if (!r || r.button === "cancel") return;
         const p = await api.clipPasteAsFile(dir, r.button as "text" | "url");
@@ -1594,11 +2251,11 @@ export async function paste(b: number) {
       case "text": {
         const p = await api.clipPasteAsFile(dir, "text");
         controller(b)?.select([p], p);
-        notify(`Created ${basename(p)} from clipboard text`, "success");
+        notify(tt("Created {value} from clipboard text", { value: basename(p) }), "success");
         return;
       }
       default:
-        notify("Clipboard is empty", "info");
+        notify(tt("Clipboard is empty"), "info");
     }
   } catch (e) {
     fail(e);
@@ -1619,7 +2276,7 @@ export async function copyPaths(entries: FileEntry[], fallbackFolder: string) {
   try {
     const formatted = await Promise.all(paths.map((p) => api.pathFormat(p)));
     await api.clipSetText(formatted.join("\n"));
-    notify(paths.length === 1 ? `Copied path: ${formatted[0]}` : `Copied ${paths.length} paths`, "info");
+    notify(paths.length === 1 ? tt("Copied path: {value}", { value: formatted[0] }) : tt("Copied {length} paths", { length: paths.length }), "info");
   } catch (e) {
     fail(e);
   }
@@ -1627,7 +2284,7 @@ export async function copyPaths(entries: FileEntry[], fallbackFolder: string) {
 
 export async function tabFromClipboard(b: number) {
   const c = await api.clipInspect().catch(() => null);
-  if (c?.kind !== "paths") return notify("Clipboard does not contain a path", "warn");
+  if (c?.kind !== "paths") return notify(tt("Clipboard does not contain a path"), "warn");
   try {
     const r = await api.pathResolve(c.paths[0]);
     if (!r.exists) return notify(`“${r.path}” does not exist`, "warn");
@@ -1813,7 +2470,7 @@ export function folderSizeLabel(f: FolderSize | undefined): string {
 
 export function folderSizeTitle(f: FolderSize | undefined): string {
   if (!f) return "";
-  if (f.virtualFs) return "Virtual filesystem; folder size is not applicable";
+  if (f.virtualFs) return tt("Virtual filesystem; folder size is not applicable");
   const what = `${f.files.toLocaleString()} files, ${f.dirs.toLocaleString()} folders`;
   return `${f.bytes.toLocaleString()} bytes in ${what}${f.unreadable ? `; ${items(f.unreadable)} could not be read (the total is at least this)` : ""}${f.done ? "" : " (counting…)"}`;
 }
@@ -1828,4 +2485,95 @@ export function folderSizeDetails(f: FolderSize | undefined): string {
   if (!f) return "counting…";
   if (f.virtualFs) return `${folderSizeLabel(f)} ${folderSizeTitle(f)}`;
   return `${folderSizeLabel(f)} (${f.bytes.toLocaleString()} bytes) in ${f.files.toLocaleString()} files, ${f.dirs.toLocaleString()} folders${f.unreadable ? `; ${items(f.unreadable)} unreadable` : ""}`;
+}
+
+/** Shows or hides the sidebar. In a narrow window (auto-hidden) the choice is temporary and the
+ *  saved preference is left alone. */
+export function toggleSidebar(show?: boolean) {
+  const s = getState();
+  const next = show ?? !sidebarShown(s);
+  if (s.sidebarAuto) setState({ sidebarOverride: next });
+  else {
+    setState({ sidebarVisible: next });
+    if (s.settings && s.settings.sidebarVisible !== next) void updateSettings({ sidebarVisible: next });
+  }
+  // The panes' share of the window changed: the adaptive layout may need another mode.
+  syncViewport();
+}
+
+/** Shows or hides the sidebar system monitor (toolbar button, monitor menu). Showing it works
+ *  even in a crowded sidebar and saves the wish; hiding saves the wish to keep it hidden. */
+export function toggleSystemMonitor(show?: boolean) {
+  const s = getState();
+  const next = show ?? !monitorShown(s);
+  // The override only matters while the sidebar is crowded; the sidebar clears it once the
+  // monitor fits, so a later shrink hides the monitor again.
+  setState({ monitorOverride: next });
+  if (s.settings && s.settings.showSystemMonitor !== next) void updateSettings({ showSystemMonitor: next });
+}
+
+/** Opens the Git workspace of the repository containing `path` (asks to trust the folder first). */
+/** The worktrees of the repository of a folder, to jump between them. */
+export async function openWorktrees(path: string) {
+  if (await api.gitRoot(path).catch(() => null)) openOverlay({ type: "worktrees", path });
+  else notify(tt("This folder is not in a Git repository"), "warn");
+}
+
+export async function openGitWorkspace(path: string) {
+  const root = await api.gitRoot(path).catch(() => null);
+  if (root) return openOverlay({ type: "gitGraph", path });
+  const refused = await trustGitFolder(path);
+  if (!refused) notify(tt("This folder is not inside a Git repository"), "warn");
+}
+
+// ───────────── network mounts (GVFS) ─────────────
+
+let networkSeq = 0;
+
+/** Reloads the GVFS network mounts for the sidebar (errors, e.g. off Linux, mean none). A slow
+ *  answer that was overtaken by a newer request is dropped. */
+export async function refreshNetwork() {
+  const seq = ++networkSeq;
+  const mounts = await api.gvfsNetworkMounts().catch(() => []);
+  if (seq !== networkSeq) return;
+  if (JSON.stringify(getState().networkMounts) !== JSON.stringify(mounts)) setState({ networkMounts: mounts });
+}
+
+/** Asks for a server address and mounts it; the new mount shows up in the sidebar. */
+export async function connectToServer(initial = "") {
+  const { validateServerUri } = await import("../core/actionsMenu");
+  let value = initial;
+  for (;;) {
+    const r = await dialog({
+      title: tt("Connect to server"),
+      message: tt("Address, for example smb://server/share, sftp://user@host/path, nfs://host/export, davs://host/dav or ftp://host."),
+      input: { value, placeholder: "smb://server/share" },
+      buttons: [{ id: "cancel", label: "Cancel" }, { id: "ok", label: "Connect", primary: true }],
+    });
+    if (!r || r.button === "cancel") return;
+    value = r.value;
+    const v = validateServerUri(value);
+    if (!v.ok) { notify(v.error, "warn"); continue; }
+    notify(tt("Connecting to {uri}…", { uri: v.uri }));
+    try {
+      await api.connectServer(v.uri);
+      notify(tt("Connected to {uri}", { uri: v.uri }), "success");
+    } catch (e) {
+      fail(e);
+    }
+    void refreshNetwork();
+    return;
+  }
+}
+
+/** Disconnects a network mount; the browsers leave it once it is gone (the backend releases watchers first). */
+export async function disconnectNetwork(m: { name: string; uri: string; mountPath: string }) {
+  try {
+    await api.gvfsUnmount(m.mountPath || m.uri);
+    notify(tt("Disconnected “{name}”", { name: m.name }));
+    if (m.mountPath) void leaveMount(m.mountPath);
+  } catch (e) {
+    fail(e);
+  }
+  void refreshNetwork();
 }

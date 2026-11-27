@@ -156,6 +156,12 @@ fn windows_link_target(path: &Path, link_meta: &Metadata) -> Option<String> {
     Some(t.strip_prefix(r"\\?\").unwrap_or(&t).to_string())
 }
 
+/// Files an operating system litters folders with (macOS Finder's `.DS_Store`): they are no content,
+/// so a folder comparison leaves them out even when hidden files are shown.
+pub fn is_os_noise_name(name: &str) -> bool {
+    name == ".DS_Store"
+}
+
 pub fn is_hidden_name(name: &str) -> bool {
     name.starts_with('.')
 }

@@ -41,13 +41,22 @@ pub enum IndexAction {
     Exclude,
 }
 
-fn checked_root(path: &Path) -> Result<PathBuf> {
-    let p = root(path)?;
-    if has_content_filters(&p) {
-        return Err(CoreError::Other(
-            "Index operations with content filters are not supported yet".into(),
-        ));
+fn protect_filtered_path(root: &Path, file: &str) -> Result<()> {
+    if !has_content_filters(root) {
+        return Ok(());
     }
+    let record = git(root, &["check-attr", "-z", "filter", "--", file])?;
+    match record.split_terminator('\0').nth(2) {
+        Some("unspecified" | "unset") => Ok(()),
+        Some(_) => Err(CoreError::Other(format!(
+            "This operation cannot guarantee the original filtered bytes at {file}. Use index-only staging or keep a copy of the working file"
+        ))),
+        None => Err(CoreError::Other(format!("Could not inspect content filters for {file}"))),
+    }
+}
+
+fn native_index_root(path: &Path) -> Result<PathBuf> {
+    let p = root(path)?;
     let listed = super::gitfacts::markers(&p);
     for marker in [
         "MERGE_HEAD",
@@ -282,7 +291,7 @@ fn changes(path: &Path) -> Result<Vec<Change>> {
     Ok(out)
 }
 pub fn workspace(path: &Path) -> Result<Workspace> {
-    let root = checked_root(path)?;
+    let root = native_index_root(path)?;
     super::gitfacts::keep_commit_graph(&root);
     std::thread::scope(|scope| {
         // Subject and full message in one query, next to the state.
@@ -309,8 +318,33 @@ pub fn index_action(
     message: &str,
     expected: &str,
 ) -> Result<()> {
+    use super::gitjournal::Kind;
+    let label = || {
+        let subject = message.trim().lines().next().unwrap_or_default();
+        subject.chars().take(100).collect::<String>()
+    };
+    let operation = match action {
+        IndexAction::Commit => Some((Kind::Commit, label())),
+        IndexAction::Amend => Some((Kind::Amend, label())),
+        _ => None,
+    };
+    super::gitjournal::around(path, operation, || {
+        index_action_now(path, action, file, message, expected)
+    })
+}
+
+fn index_action_now(
+    path: &Path,
+    action: IndexAction,
+    file: Option<&str>,
+    message: &str,
+    expected: &str,
+) -> Result<()> {
     let _busy = super::gitfacts::mutating();
-    let root = checked_root(path)?;
+    let root = native_index_root(path)?;
+    if let (IndexAction::Discard, Some(file)) = (&action, file) {
+        protect_filtered_path(&root, file)?;
+    }
     let seen = verified(&root, expected)?;
     if matches!(action, IndexAction::Commit) && super::gitrewrite::is_edit_stop(&root) {
         return Err(CoreError::Other(
@@ -319,6 +353,14 @@ pub fn index_action(
     }
     match action {
         IndexAction::Commit | IndexAction::Amend => {
+            super::gitprogress::report_phase(
+                if matches!(action, IndexAction::Amend) {
+                    "Amending commit"
+                } else {
+                    "Committing changes"
+                },
+                None,
+            );
             if message.trim().is_empty() {
                 return Err(CoreError::Other("A commit message is required".into()));
             }
@@ -358,6 +400,7 @@ pub fn index_action(
             })?;
         }
         IndexAction::StageAll => {
+            super::gitprogress::report_phase("Staging changes", None);
             // Submodule pointers are not listed in the changes, so they are not staged blindly.
             let mut args = vec!["add".to_owned(), "--all".into(), "--".into(), ".".into()];
             for line in git(&root, &["ls-files", "--stage", "-z"])?.split('\0') {
@@ -372,6 +415,7 @@ pub fn index_action(
             git(&root, &args)?;
         }
         IndexAction::UnstageAll => {
+            super::gitprogress::report_phase("Unstaging changes", None);
             if head(&root).is_empty() {
                 git(&root, &["rm", "--cached", "-r", "--", "."])?;
             } else {
@@ -457,32 +501,55 @@ fn ignore(path: &Path, file: &str, local: bool) -> Result<()> {
             "Filenames with line breaks cannot be written as ignore rules".into(),
         ));
     }
-    let mut rule = String::from("/");
-    for c in file.chars() {
-        if matches!(c, '\\' | '*' | '?' | '[' | ']' | '!' | '#' | ' ') {
-            rule.push('\\');
-        }
-        rule.push(c);
-    }
-    let target = if local {
+    let rule = format!("/{}", escape_rule(file));
+    if local {
         let common = git(path, &["rev-parse", "--git-common-dir"])?;
         let common = path
             .join(super::gitexec::host_path(path, common.trim()))
             .canonicalize()
             .map_err(|e| CoreError::Other(e.to_string()))?;
-        let info = common.join("info");
-        if info
-            .symlink_metadata()
-            .is_ok_and(|m| !m.is_dir() || m.is_symlink())
-        {
-            return Err(CoreError::Other(
-                "Refusing to append local excludes through a symlinked metadata directory".into(),
-            ));
-        }
-        info.join("exclude")
+        exclude_locally(&common, &rule)
     } else {
-        path.join(".gitignore")
-    };
+        append_rule(&path.join(".gitignore"), &rule, &[])
+    }
+}
+/// `name` with the characters escaped that have a meaning in ignore rules.
+pub(super) fn escape_rule(name: &str) -> String {
+    let mut rule = String::new();
+    for c in name.chars() {
+        if matches!(c, '\\' | '*' | '?' | '[' | ']' | '!' | '#' | ' ') {
+            rule.push('\\');
+        }
+        rule.push(c);
+    }
+    rule
+}
+/// Adds `rule` to `info/exclude` of the common Git directory, which no commit contains.
+pub(super) fn exclude_locally(common: &Path, rule: &str) -> Result<()> {
+    let info = common.join("info");
+    if info
+        .symlink_metadata()
+        .is_ok_and(|m| !m.is_dir() || m.is_symlink())
+    {
+        return Err(CoreError::Other(
+            "Refusing to append local excludes through a symlinked metadata directory".into(),
+        ));
+    }
+    // A folder rule may already be there in another spelling that means the same.
+    let mut same = Vec::new();
+    if let Some(folder) = rule
+        .strip_prefix('/')
+        .and_then(|rule| rule.strip_suffix('/'))
+    {
+        same.push(format!("/{folder}"));
+        if !folder.contains('/') {
+            same.extend([folder.to_string(), format!("{folder}/")]);
+        }
+    }
+    append_rule(&info.join("exclude"), rule, &same)
+}
+/// Appends `rule` to an ignore file unless it, or one of `same`, is already there.
+fn append_rule(target: &Path, rule: &str, same: &[String]) -> Result<()> {
     if target
         .symlink_metadata()
         .is_ok_and(|m| m.is_symlink() || !m.is_file())
@@ -491,12 +558,15 @@ fn ignore(path: &Path, file: &str, local: bool) -> Result<()> {
             "Refusing to append ignore rules through a symlink".into(),
         ));
     }
-    let content = match std::fs::read_to_string(&target) {
+    let content = match std::fs::read_to_string(target) {
         Ok(v) => v,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(CoreError::Other(e.to_string())),
     };
-    if content.lines().any(|line| line == rule) {
+    if content
+        .lines()
+        .any(|line| line == rule || same.iter().any(|other| line == other))
+    {
         return Ok(());
     }
     if let Some(parent) = target.parent() {
@@ -510,7 +580,7 @@ fn ignore(path: &Path, file: &str, local: bool) -> Result<()> {
         options.custom_flags(libc::O_NOFOLLOW);
     }
     let mut output = options
-        .open(&target)
+        .open(target)
         .map_err(|e| CoreError::Other(e.to_string()))?;
     // Always delimit an appended rule, including if another writer just appended a partial line.
     let suffix = format!("\n{rule}\n");
@@ -519,7 +589,7 @@ fn ignore(path: &Path, file: &str, local: bool) -> Result<()> {
         .map_err(|e| CoreError::Other(e.to_string()))
 }
 pub fn patch(path: &Path, file: &str, staged: bool) -> Result<String> {
-    let root = checked_root(path)?;
+    let root = native_index_root(path)?;
     patch_of(&root, &changes(&root)?, file, staged)
 }
 /// The patch of `file`, one entry of the change `list` of the work tree `root`.
@@ -615,7 +685,7 @@ pub fn selection_patch(path: &Path, file: &str, staged: bool) -> Result<Selectio
     }
 }
 fn selection_patch_once(path: &Path, file: &str, staged: bool) -> Result<SelectionPatch> {
-    let root = checked_root(path)?;
+    let root = native_index_root(path)?;
     // The patch must describe one state: the state is read, then the patch, then the
     // state again, and the two have to agree. Each state is read once (it used to be read
     // three times, and the list of changes five times).
@@ -682,14 +752,25 @@ fn selection_patch_once(path: &Path, file: &str, staged: bool) -> Result<Selecti
     Ok(SelectionPatch { token: patch_token_of(&before, file, staged, &text), text, selectable: !unsupported,
         reason: unsupported.then(|| "Select the whole file for additions, deletions, renames, binary/mode changes, very large files or files without a final newline.".into()), lines })
 }
+/// The line a hunk side starts at, as the position of its first line. A side without
+/// lines (`-0,0` of an empty file) names the line before it, so it is moved forward.
 fn hunk_start(header: &str, index: usize) -> Result<i64> {
-    header
+    let invalid = || CoreError::Other("Invalid Git patch hunk header".into());
+    let field = header
         .split_whitespace()
         .nth(index)
         .and_then(|field| field.get(1..))
-        .and_then(|field| field.split(',').next())
+        .ok_or_else(invalid)?;
+    let mut parts = field.split(',');
+    let start: i64 = parts
+        .next()
         .and_then(|n| n.parse().ok())
-        .ok_or_else(|| CoreError::Other("Invalid Git patch hunk header".into()))
+        .ok_or_else(invalid)?;
+    let count: i64 = match parts.next() {
+        Some(n) => n.parse().map_err(|_| invalid())?,
+        None => 1,
+    };
+    Ok(if count == 0 { start + 1 } else { start })
 }
 fn selected_patch(patch: &SelectionPatch, selected: &[usize], reverse: bool) -> Result<String> {
     if !patch.selectable {
@@ -780,7 +861,38 @@ fn selected_patch(patch: &SelectionPatch, selected: &[usize], reverse: bool) -> 
     Ok(result)
 }
 fn apply_cached(path: &Path, text: &str, reverse: bool) -> Result<()> {
-    let mut command = super::gitexec::command(path, super::gitstatus::program());
+    apply_patch(path, text, reverse, true)
+}
+
+pub(super) fn apply_cached_to(path: &Path, text: &str, index: &Path) -> Result<()> {
+    apply_text_with_index(path, text, false, true, false, true, Some(index))
+}
+/// `git apply` of a selection patch: to the index (`cached`) or, reversed, to the working file.
+fn apply_patch(path: &Path, text: &str, reverse: bool, cached: bool) -> Result<()> {
+    apply_text(path, text, reverse, cached, false, true)
+}
+/// `git apply`: `check` only tests, `zero` accepts patches without context (the staging patches), which must not be used
+/// for a patch that is applied to a file that may differ from the one it was made from.
+fn apply_text(
+    path: &Path,
+    text: &str,
+    reverse: bool,
+    cached: bool,
+    check: bool,
+    zero: bool,
+) -> Result<()> {
+    apply_text_with_index(path, text, reverse, cached, check, zero, None)
+}
+fn apply_text_with_index(
+    path: &Path,
+    text: &str,
+    reverse: bool,
+    cached: bool,
+    check: bool,
+    zero: bool,
+    index: Option<&Path>,
+) -> Result<()> {
+    let mut command = super::gitexec::command_with_index(path, super::gitstatus::program(), index);
     command
         .arg("-C")
         .arg(super::gitexec::dir_arg(path))
@@ -789,13 +901,17 @@ fn apply_cached(path: &Path, text: &str, reverse: bool) -> Result<()> {
             "core.hooksPath={}",
             super::gitexec::null_device(path)
         ))
-        .args([
-            "apply",
-            "--cached",
-            "--unidiff-zero",
-            "--whitespace=nowarn",
-            "--recount",
-        ]);
+        .arg("apply");
+    if cached {
+        command.arg("--cached");
+    }
+    if zero {
+        command.arg("--unidiff-zero");
+    }
+    command.args(["--whitespace=nowarn", "--recount"]);
+    if check {
+        command.arg("--check");
+    }
     if reverse {
         command.arg("--reverse");
     }
@@ -834,7 +950,7 @@ pub fn apply_selection(
     expected: &str,
 ) -> Result<()> {
     let _busy = super::gitfacts::mutating();
-    let root = checked_root(path)?;
+    let root = native_index_root(path)?;
     let patch = selection_patch(&root, file, staged)?;
     if patch.token != expected {
         return Err(CoreError::Other(
@@ -849,10 +965,378 @@ pub fn apply_selection(
     }
     apply_cached(&root, &text, staged)
 }
+/// Discards the selected changed lines of an unstaged file from the working file. The whole state is saved first
+/// as a recovery reference (like a file discard), and the same token checks as staging apply, so nothing is
+/// thrown away from a diff that is no longer what the user saw.
+pub fn discard_selection(
+    path: &Path,
+    file: &str,
+    selected: &[usize],
+    expected: &str,
+) -> Result<()> {
+    let _busy = super::gitfacts::mutating();
+    let root = native_index_root(path)?;
+    protect_filtered_path(&root, file)?;
+    let patch = selection_patch(&root, file, false)?;
+    if patch.token != expected {
+        return Err(CoreError::Other(
+            "The selected diff changed. Refresh and select the changes again".into(),
+        ));
+    }
+    // The working file is the new side of this diff, so the "unstage" form of the patch (new side kept in
+    // step) is the one that reverses cleanly onto it.
+    let text = selected_patch(&patch, selected, true)?;
+    let saved = git(
+        &root,
+        &["stash", "create", "Gall recovery before line discard"],
+    )?;
+    if saved.trim().is_empty() {
+        return Err(CoreError::Other(
+            "Could not preserve the file before discarding lines".into(),
+        ));
+    }
+    super::gitgraph::retain_recovery(&root, saved.trim(), "Gall recovery before line discard")?;
+    if patch_token(&root, file, false, &patch.text)? != expected {
+        return Err(CoreError::Other(
+            "The index or working file changed while discarding the selection".into(),
+        ));
+    }
+    apply_patch(&root, &text, true, false)
+}
+
+/// Stashes the selected changed lines of an unstaged file and removes them from the working file. The whole state
+/// is saved first as a recovery reference. Nothing may be staged: the stash is made of HEAD and these lines alone.
+pub fn stash_selection(
+    path: &Path,
+    file: &str,
+    selected: &[usize],
+    message: &str,
+    expected: &str,
+) -> Result<()> {
+    let _busy = super::gitfacts::mutating();
+    let root = native_index_root(path)?;
+    protect_filtered_path(&root, file)?;
+    let patch = selection_patch(&root, file, false)?;
+    if patch.token != expected {
+        return Err(CoreError::Other(
+            "The selected diff changed. Refresh and select the changes again".into(),
+        ));
+    }
+    if !git(&root, &["diff", "--cached", "--name-only", "-z"])?.is_empty() {
+        return Err(CoreError::Other(
+            "Unstage or commit the staged changes before stashing lines".into(),
+        ));
+    }
+    let forward = selected_patch(&patch, selected, false)?;
+    let backward = selected_patch(&patch, selected, true)?;
+    let saved = git(
+        &root,
+        &["stash", "create", "Gall recovery before line stash"],
+    )?;
+    if saved.trim().is_empty() {
+        return Err(CoreError::Other(
+            "Could not preserve the file before stashing lines".into(),
+        ));
+    }
+    super::gitgraph::retain_recovery(&root, saved.trim(), "Gall recovery before line stash")?;
+    if patch_token(&root, file, false, &patch.text)? != expected {
+        return Err(CoreError::Other(
+            "The index or working file changed while stashing the selection".into(),
+        ));
+    }
+    // The lines are put into the index for a moment to get the tree with them; nothing else is staged.
+    apply_cached(&root, &forward, false)?;
+    let tree = git(&root, &["write-tree"]);
+    let restored = apply_cached(&root, &forward, true)
+        .or_else(|_| git(&root, &["reset", "-q", "--mixed", "HEAD"]).map(|_| ()));
+    let tree = tree?;
+    restored?;
+    let head = git(&root, &["rev-parse", "--verify", "HEAD"])?;
+    let head = head.trim();
+    let branch = git(&root, &["symbolic-ref", "-q", "--short", "HEAD"])
+        .map(|name| name.trim().to_owned())
+        .unwrap_or_else(|_| "(no branch)".into());
+    let message = match message.trim() {
+        "" => "Gall line stash",
+        message => message,
+    };
+    let title = format!("On {branch}: {message}");
+    let index = git(
+        &root,
+        &[
+            "commit-tree",
+            &format!("{head}^{{tree}}"),
+            "-p",
+            head,
+            "-m",
+            &format!("index on {branch}"),
+        ],
+    )?;
+    let stash = git(
+        &root,
+        &[
+            "commit-tree",
+            tree.trim(),
+            "-p",
+            head,
+            "-p",
+            index.trim(),
+            "-m",
+            &title,
+        ],
+    )?;
+    let stash = stash.trim();
+    git(&root, &["stash", "store", "-m", &title, stash])?;
+    // The working file is the new side of the diff, see `discard_selection`.
+    if let Err(error) = apply_patch(&root, &backward, true, false) {
+        // The lines are still in the file, so the entry would be a second copy of them.
+        let top = git(&root, &["rev-parse", "-q", "--verify", "refs/stash"]).unwrap_or_default();
+        if top.trim() == stash {
+            let _ = git(&root, &["stash", "drop", "-q", "stash@{0}"]);
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// What dragging a changed file or hunk onto another worktree would do, and the token of the state it was made from.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Transfer {
+    pub token: String,
+    /// The file is copied (a new file, which the target does not have) instead of a patch applied.
+    pub copy: bool,
+    /// Changed lines in the patch (added plus deleted); 0 for a copy.
+    pub lines: usize,
+    /// The target has local changes; they are saved as a recovery reference before anything is applied.
+    pub target_changed: bool,
+}
+fn same_repository(a: &Path, b: &Path) -> Result<bool> {
+    let common = |path: &Path| -> Result<PathBuf> {
+        let value = git(path, &["rev-parse", "--git-common-dir"])?;
+        path.join(super::gitexec::host_path(path, value.trim()))
+            .canonicalize()
+            .map_err(|e| CoreError::Other(e.to_string()))
+    };
+    Ok(common(a)? == common(b)?)
+}
+/// The patch of the chosen lines (`selected`, or all changed lines of the file) for a forward `git apply` in another worktree.
+fn transfer_patch(patch: &SelectionPatch, selected: Option<&[usize]>) -> Result<(String, usize)> {
+    let all: Vec<usize> = patch
+        .lines
+        .iter()
+        .filter(|line| matches!(line.kind.as_str(), "added" | "deleted"))
+        .map(|line| line.index)
+        .collect();
+    let chosen = selected.map_or(all, |list| list.to_vec());
+    let count = chosen.len();
+    // The patch keeps its context lines: Git then only applies it where the file there looks the same.
+    Ok((selected_patch(patch, &chosen, false)?, count))
+}
+/// Brings the changed file `file` of the worktree `path`, or only the changed lines `selected` of it, to the worktree
+/// `target` of the same repository (the working files only; nothing is staged there). `apply: false` only checks and
+/// returns the token the real call must name. Refused when Git cannot apply the patch to the file as it is there, or for
+/// a change that is no plain text patch (deleted, renamed, binary or mode changes); a new file is copied when the target
+/// has nothing at that path. The local changes of the target are saved as a recovery reference first.
+pub fn transfer(
+    path: &Path,
+    target: &Path,
+    file: &str,
+    staged: bool,
+    selected: Option<&[usize]>,
+    expected: Option<&str>,
+    apply: bool,
+) -> Result<Transfer> {
+    let _busy = apply.then(super::gitfacts::mutating);
+    let root = native_index_root(path)?;
+    let destination = native_index_root(target)?;
+    if root == destination {
+        return Err(CoreError::Other("Choose another worktree".into()));
+    }
+    if !same_repository(&root, &destination)? {
+        return Err(CoreError::Other(
+            "The two folders are not worktrees of the same repository".into(),
+        ));
+    }
+    if file.is_empty()
+        || Path::new(file).is_absolute()
+        || Path::new(file)
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err(CoreError::Other("Invalid file path".into()));
+    }
+    protect_filtered_path(&root, file)?;
+    protect_filtered_path(&destination, file)?;
+    let patch = selection_patch(&root, file, staged)?;
+    if expected.is_some_and(|token| token != patch.token) {
+        return Err(CoreError::Other(
+            "The change was edited meanwhile. Refresh and drag it again".into(),
+        ));
+    }
+    if apply && expected.is_none() {
+        return Err(CoreError::Other(
+            "Check the transfer before applying it".into(),
+        ));
+    }
+    let target_changed = !git(
+        &destination,
+        &["status", "--porcelain", "--ignore-submodules=dirty"],
+    )?
+    .is_empty();
+    if !patch.selectable {
+        // A new file: copied when the other worktree has nothing there.
+        let source = root.join(file);
+        let target_file = destination.join(file);
+        let new_file = !patch.text.lines().any(|l| l.starts_with("@@ "))
+            || patch.text.lines().any(|l| l.starts_with("new file mode "));
+        let plain = source
+            .symlink_metadata()
+            .is_ok_and(|m| m.is_file() && m.len() <= 50 * 1024 * 1024);
+        let binary = patch.text.lines().any(|l| {
+            l.starts_with("Binary files ")
+                || l.starts_with("GIT binary patch")
+                || l.starts_with("deleted file mode ")
+                || l.starts_with("rename ")
+        });
+        if !(new_file && plain && !binary && selected.is_none()) {
+            return Err(CoreError::Other(patch.reason.clone().unwrap_or_else(
+                || "This change cannot be moved by dragging; copy the file by hand".into(),
+            )));
+        }
+        if target_file.symlink_metadata().is_ok() {
+            return Err(CoreError::Other(format!(
+                "{file} already exists in the other worktree; nothing was overwritten"
+            )));
+        }
+        if apply {
+            if let Some(parent) = target_file.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| CoreError::Other(e.to_string()))?;
+            }
+            std::fs::copy(&source, &target_file).map_err(|e| CoreError::Other(e.to_string()))?;
+        }
+        return Ok(Transfer {
+            token: patch.token,
+            copy: true,
+            lines: 0,
+            target_changed,
+        });
+    }
+    let (text, lines) = transfer_patch(&patch, selected)?;
+    apply_text(&destination, &text, false, false, true, false).map_err(|e| {
+        CoreError::Other(format!(
+            "The change does not fit the file in the other worktree: {e}"
+        ))
+    })?;
+    if apply {
+        if target_changed {
+            let saved = git(
+                &destination,
+                &[
+                    "stash",
+                    "create",
+                    "Gall recovery before a transferred change",
+                ],
+            )?;
+            if !saved.trim().is_empty() {
+                super::gitgraph::retain_recovery(
+                    &destination,
+                    saved.trim(),
+                    "Gall recovery before a transferred change",
+                )?;
+            }
+        }
+        apply_text(&destination, &text, false, false, false, false)?;
+    }
+    Ok(Transfer {
+        token: patch.token,
+        copy: false,
+        lines,
+        target_changed,
+    })
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_index_actions_stage_filtered_bytes_without_changing_the_worktree() {
+        let directory = tempfile::tempdir().unwrap();
+        let p = directory.path();
+        git(p, &["init", "-q", "-b", "main"]).unwrap();
+        for (key, value) in [
+            ("user.name", "Test"),
+            ("user.email", "test@example.com"),
+            ("core.autocrlf", "false"),
+        ] {
+            git(p, &["config", key, value]).unwrap();
+        }
+        std::fs::write(p.join(".gitattributes"), "filtered.txt filter=roundtrip\n").unwrap();
+        std::fs::write(p.join("filtered.txt"), "repository old\n").unwrap();
+        git(p, &["add", "."]).unwrap();
+        git(p, &["commit", "-qm", "Base"]).unwrap();
+        for (key, value) in [
+            ("filter.roundtrip.clean", "sed 's/working/repository/g'"),
+            ("filter.roundtrip.smudge", "sed 's/repository/working/g'"),
+            ("filter.roundtrip.required", "true"),
+        ] {
+            git(p, &["config", key, value]).unwrap();
+        }
+        let action = |action, message: &str| {
+            let state = workspace(p).unwrap();
+            index_action(p, action, Some("filtered.txt"), message, &state.token)
+        };
+        let working = "working change\n";
+        std::fs::write(p.join("filtered.txt"), working).unwrap();
+        action(IndexAction::Stage, "").unwrap();
+        assert_eq!(
+            git(p, &["show", ":filtered.txt"]).unwrap(),
+            "repository change\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(p.join("filtered.txt")).unwrap(),
+            working
+        );
+        action(IndexAction::Unstage, "").unwrap();
+        assert_eq!(
+            git(p, &["show", ":filtered.txt"]).unwrap(),
+            "repository old\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(p.join("filtered.txt")).unwrap(),
+            working
+        );
+        assert!(action(IndexAction::Discard, "")
+            .unwrap_err()
+            .to_string()
+            .contains("filtered.txt"));
+        assert_eq!(
+            std::fs::read_to_string(p.join("filtered.txt")).unwrap(),
+            working
+        );
+        std::fs::write(p.join("unrelated.txt"), "untracked local bytes\n").unwrap();
+        let unrelated = workspace(p).unwrap();
+        index_action(
+            p,
+            IndexAction::Discard,
+            Some("unrelated.txt"),
+            "",
+            &unrelated.token,
+        )
+        .unwrap();
+        assert!(!p.join("unrelated.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(p.join("filtered.txt")).unwrap(),
+            working
+        );
+        action(IndexAction::StageAll, "").unwrap();
+        action(IndexAction::Commit, "Filtered commit").unwrap();
+        assert_eq!(
+            git(p, &["show", "HEAD:filtered.txt"]).unwrap(),
+            "repository change\n"
+        );
+    }
+
     #[test]
     fn changes_load_when_an_untracked_nested_repository_is_listed() {
         let temp = fixture();
@@ -1133,6 +1617,194 @@ mod tests {
         git(root, &["add", "."]).unwrap();
         git(root, &["commit", "-qm", "initial"]).unwrap();
         temp
+    }
+    /// A linked worktree of the fixture, next to it; the folder is removed with the temp folder.
+    fn linked(temp: &tempfile::TempDir) -> PathBuf {
+        let other = temp.path().with_file_name(format!(
+            "{}-linked",
+            temp.path().file_name().unwrap().to_string_lossy()
+        ));
+        git(
+            temp.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "other",
+                other.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        other
+    }
+    #[test]
+    fn a_hunk_or_a_file_moves_to_another_worktree_and_what_does_not_fit_is_refused() {
+        let temp = fixture();
+        let root = temp.path();
+        let other = linked(&temp);
+        std::fs::write(
+            root.join("a.txt"),
+            "ONE\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\nTWELVE\n",
+        )
+        .unwrap();
+        let patch = selection_patch(root, "a.txt", false).unwrap();
+        let first: Vec<_> = patch
+            .lines
+            .iter()
+            .filter(|line| matches!(line.text.as_str(), "-one" | "+ONE"))
+            .map(|line| line.index)
+            .collect();
+        // The check changes nothing, and the real call needs its token.
+        let found = transfer(root, &other, "a.txt", false, Some(&first), None, false).unwrap();
+        assert!(!found.copy && found.lines == 2 && !found.target_changed);
+        assert_eq!(
+            std::fs::read_to_string(other.join("a.txt"))
+                .unwrap()
+                .lines()
+                .next(),
+            Some("one")
+        );
+        assert!(transfer(root, &other, "a.txt", false, Some(&first), None, true).is_err());
+        transfer(
+            root,
+            &other,
+            "a.txt",
+            false,
+            Some(&first),
+            Some(&found.token),
+            true,
+        )
+        .unwrap();
+        let there = std::fs::read_to_string(other.join("a.txt")).unwrap();
+        assert!(
+            there.starts_with("ONE\ntwo\n") && there.ends_with("twelve\n"),
+            "{there}"
+        );
+        // Nothing is staged in the target, and the source is untouched.
+        assert!(git(&other, &["diff", "--cached", "--name-only"])
+            .unwrap()
+            .is_empty());
+        assert!(std::fs::read_to_string(root.join("a.txt"))
+            .unwrap()
+            .ends_with("TWELVE\n"));
+        // The same lines again do not fit the file there any more: refused, nothing changes.
+        let again = transfer(root, &other, "a.txt", false, Some(&first), None, false);
+        assert!(again.is_err(), "{again:?}");
+        // The other changed line fits, and the local change of the target is saved first.
+        let last: Vec<_> = patch
+            .lines
+            .iter()
+            .filter(|line| matches!(line.text.as_str(), "-twelve" | "+TWELVE"))
+            .map(|line| line.index)
+            .collect();
+        let found = transfer(root, &other, "a.txt", false, Some(&last), None, false).unwrap();
+        assert!(found.target_changed);
+        transfer(
+            root,
+            &other,
+            "a.txt",
+            false,
+            Some(&last),
+            Some(&found.token),
+            true,
+        )
+        .unwrap();
+        assert!(std::fs::read_to_string(other.join("a.txt"))
+            .unwrap()
+            .ends_with("TWELVE\n"));
+        assert!(git(&other, &["for-each-ref", "refs/gall/recovery"])
+            .unwrap()
+            .contains("recovery"));
+        // A stale token (the source changed after the check) is refused.
+        std::fs::write(root.join("other.txt"), "one\n").unwrap();
+        let found = transfer(root, &other, "other.txt", false, None, None, false).unwrap();
+        std::fs::write(root.join("other.txt"), "two\n").unwrap();
+        assert!(transfer(
+            root,
+            &other,
+            "other.txt",
+            false,
+            None,
+            Some(&found.token),
+            true
+        )
+        .is_err());
+        // The same folder, and a folder of another repository, are no targets.
+        assert!(transfer(root, root, "other.txt", false, None, None, false).is_err());
+        let stranger = fixture();
+        assert!(transfer(root, stranger.path(), "other.txt", false, None, None, false).is_err());
+        // A path that leaves the worktree is refused.
+        assert!(transfer(root, &other, "../escape.txt", false, None, None, false).is_err());
+        let _ = std::fs::remove_dir_all(&other);
+    }
+    #[test]
+    fn a_new_file_is_copied_only_where_nothing_is_at_its_path() {
+        let temp = fixture();
+        let root = temp.path();
+        let other = linked(&temp);
+        std::fs::write(root.join("fresh.txt"), "new\n").unwrap();
+        let found = transfer(root, &other, "fresh.txt", false, None, None, false).unwrap();
+        assert!(found.copy);
+        assert!(!other.join("fresh.txt").exists());
+        transfer(
+            root,
+            &other,
+            "fresh.txt",
+            false,
+            None,
+            Some(&found.token),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(other.join("fresh.txt")).unwrap(),
+            "new\n"
+        );
+        // It now exists there: a second copy is refused and the file there is kept.
+        std::fs::write(other.join("fresh.txt"), "mine\n").unwrap();
+        assert!(transfer(root, &other, "fresh.txt", false, None, None, false).is_err());
+        assert_eq!(
+            std::fs::read_to_string(other.join("fresh.txt")).unwrap(),
+            "mine\n"
+        );
+        let _ = std::fs::remove_dir_all(&other);
+    }
+    #[test]
+    fn discarding_selected_lines_keeps_the_others_and_saves_the_file() {
+        let temp = fixture();
+        let root = temp.path();
+        let working = "ONE\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\nTWELVE\n";
+        std::fs::write(root.join("a.txt"), working).unwrap();
+        let patch = selection_patch(root, "a.txt", false).unwrap();
+        let first: Vec<_> = patch
+            .lines
+            .iter()
+            .filter(|line| {
+                line.hunk == Some(0) && matches!(line.kind.as_str(), "added" | "deleted")
+            })
+            .map(|line| line.index)
+            .collect();
+        discard_selection(root, "a.txt", &first, &patch.token).unwrap();
+        // The first hunk is back to the committed text, the last one is still changed, the index is untouched.
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\nTWELVE\n"
+        );
+        assert_eq!(
+            git(root, &["show", ":a.txt"]).unwrap().lines().next(),
+            Some("one")
+        );
+        assert_eq!(
+            git(
+                root,
+                &["show", &format!("{}:a.txt", only(&recovery_ids(root)))]
+            )
+            .unwrap(),
+            working
+        );
+        // The same diff cannot be discarded twice.
+        assert!(discard_selection(root, "a.txt", &first, &patch.token).is_err());
     }
     #[test]
     fn selected_lines_stage_and_unstage_without_worktree_writes() {
@@ -1472,5 +2144,105 @@ mod tests {
             .collect();
         apply_selection(root, "a.txt", false, &selected, &patch.token).unwrap();
         assert_eq!(git(root, &["show", ":a.txt"]).unwrap(), "new\r\nkeep\r\n");
+    }
+    #[test]
+    fn partial_index_actions_use_canonical_filtered_lines_and_reject_a_stale_selection() {
+        let temp = fixture();
+        let root = temp.path();
+        std::fs::write(root.join(".gitattributes"), "a.txt filter=roundtrip\n").unwrap();
+        std::fs::write(root.join("a.txt"), "repository old\nkeep\n").unwrap();
+        git(root, &["add", "--", ".gitattributes", "a.txt"]).unwrap();
+        git(root, &["commit", "-qm", "Filtered base"]).unwrap();
+        for (key, value) in [
+            ("filter.roundtrip.clean", "sed 's/working/repository/g'"),
+            ("filter.roundtrip.smudge", "sed 's/repository/working/g'"),
+            ("filter.roundtrip.required", "true"),
+        ] {
+            git(root, &["config", key, value]).unwrap();
+        }
+        let working = "working new\nkeep\n";
+        std::fs::write(root.join("a.txt"), working).unwrap();
+        let select = |patch: &SelectionPatch| {
+            patch
+                .lines
+                .iter()
+                .filter(|line| matches!(line.kind.as_str(), "added" | "deleted"))
+                .map(|line| line.index)
+                .collect::<Vec<_>>()
+        };
+        let pending = selection_patch(root, "a.txt", false).unwrap();
+        assert!(pending.text.contains("+repository new"));
+        apply_selection(root, "a.txt", false, &select(&pending), &pending.token).unwrap();
+        assert_eq!(
+            git(root, &["show", ":a.txt"]).unwrap(),
+            "repository new\nkeep\n"
+        );
+        let staged = selection_patch(root, "a.txt", true).unwrap();
+        apply_selection(root, "a.txt", true, &select(&staged), &staged.token).unwrap();
+        assert_eq!(
+            git(root, &["show", ":a.txt"]).unwrap(),
+            "repository old\nkeep\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            working
+        );
+        let pending = selection_patch(root, "a.txt", false).unwrap();
+        let newer = "working newer edit\nkeep\n";
+        std::fs::write(root.join("a.txt"), newer).unwrap();
+        assert!(apply_selection(root, "a.txt", false, &select(&pending), &pending.token).is_err());
+        assert_eq!(
+            git(root, &["show", ":a.txt"]).unwrap(),
+            "repository old\nkeep\n"
+        );
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), newer);
+    }
+
+    #[test]
+    fn selected_lines_stage_into_and_unstage_out_of_an_empty_file() {
+        let temp = fixture();
+        let root = temp.path();
+        std::fs::write(root.join("a.txt"), "").unwrap();
+        git(root, &["add", "a.txt"]).unwrap();
+        git(root, &["commit", "-qm", "empty"]).unwrap();
+        // An empty tracked file gains lines: `@@ -0,0 +1,2 @@`.
+        std::fs::write(root.join("a.txt"), "first\nsecond\n").unwrap();
+        let patch = selection_patch(root, "a.txt", false).unwrap();
+        assert!(patch.selectable);
+        let second = patch
+            .lines
+            .iter()
+            .find(|line| line.text == "+second")
+            .unwrap()
+            .index;
+        apply_selection(root, "a.txt", false, &[second], &patch.token).unwrap();
+        assert_eq!(git(root, &["show", ":a.txt"]).unwrap(), "second\n");
+        // Unstaging it again leaves the index empty: the new side has no lines.
+        let patch = selection_patch(root, "a.txt", true).unwrap();
+        let added = patch
+            .lines
+            .iter()
+            .find(|line| line.kind == "added")
+            .unwrap()
+            .index;
+        apply_selection(root, "a.txt", true, &[added], &patch.token).unwrap();
+        assert_eq!(git(root, &["show", ":a.txt"]).unwrap(), "");
+
+        // A staged change that empties a file: `@@ -1,2 +0,0 @@`, one line unstaged.
+        std::fs::write(root.join("a.txt"), "first\nsecond\n").unwrap();
+        git(root, &["add", "a.txt"]).unwrap();
+        git(root, &["commit", "-qm", "two lines"]).unwrap();
+        std::fs::write(root.join("a.txt"), "").unwrap();
+        git(root, &["add", "a.txt"]).unwrap();
+        let patch = selection_patch(root, "a.txt", true).unwrap();
+        assert!(patch.selectable);
+        let first = patch
+            .lines
+            .iter()
+            .find(|line| line.text == "-first")
+            .unwrap()
+            .index;
+        apply_selection(root, "a.txt", true, &[first], &patch.token).unwrap();
+        assert_eq!(git(root, &["show", ":a.txt"]).unwrap(), "first\n");
     }
 }

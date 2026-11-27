@@ -1,6 +1,7 @@
 // What Gall is, who made it and where it keeps its files. Settings › About shows it in
 // full with every tip; the About window shows it compact with one tip at a time.
 import * as A from "../state/actions";
+import { tt } from "../i18n";
 import { useStore } from "../state/store";
 import { FolderLink } from "./FolderLink";
 import { Icon } from "./Icon";
@@ -21,14 +22,14 @@ function SupportCard({ quiet = false }: { quiet?: boolean }) {
   return (
     <section className={`about-support${quiet ? " settings-support" : ""}`}>
       <div className="about-support-copy">
-        <span className="about-support-label">Support Gall</span>
-        <b>Enjoying Gall?</b>
-        <p>Gall is free and built in spare time. If it saves you time, you can buy me a coffee.</p>
+        <span className="about-support-label">{tt("Support Gall")}</span>
+        <b>{tt("Enjoying Gall?")}</b>
+        <p>{tt("Gall is free and built in spare time. If it saves you time, you can buy me a coffee.")}</p>
         <button className="about-support-link" onClick={() => openUrl(SUPPORT_URL)}>
-          Buy me a coffee <span aria-hidden="true">·</span> Revolut
+          {tt("Buy me a coffee")} <span aria-hidden="true">·</span> {tt("Revolut")}
         </button>
         <span className="about-support-tag">revtag <code>@gama87</code></span>
-        <p className="about-support-thanks">Stars, bug reports and pull requests help just as much. Thank you!</p>
+        <p className="about-support-thanks">{tt("Stars, bug reports and pull requests help just as much. Thank you!")}</p>
       </div>
       <button
         className="about-support-qr"
@@ -44,24 +45,24 @@ function SupportCard({ quiet = false }: { quiet?: boolean }) {
 export function AboutInfo({ full = false }: { full?: boolean }) {
   const info = useStore((s) => s.info);
   const reportButton = <button className="btn about-report-button" onClick={() => A.openOverlay({ type: "bugReport" })}>
-    <span className="about-report-icon"><Icon name="activity" size={15} /></span><span>Report a bug</span>
+    <span className="about-report-icon"><Icon name="activity" size={15} /></span><span>{tt("Report a bug")}</span>
   </button>;
   return (
     <div className={`about ${full ? "full" : "compact"}`}>
       <header className="about-hero">
         <Logo size={full ? 56 : 44} />
         <div className="about-title">
-          <div><b>Gall</b>{info?.version && <span className="about-ver">v{info.version}</span>}</div>
-          <span className="about-sub">Open-source Miller-column, dual-pane file manager</span>
+          <div><b>{tt("Gall")}</b>{info?.version && <span className="about-ver">v{info.version}</span>}</div>
+          <span className="about-sub">{tt("Open-source Miller-column, dual-pane file manager")}</span>
           <div className="about-links">
             {!full && reportButton}
-            <button className="link-btn" onClick={() => openUrl(SOURCE_URL)}><Icon name="code" size={13} />Source code</button>
+            <button className="link-btn" onClick={() => openUrl(SOURCE_URL)}><Icon name="code" size={13} />{tt("Source code")}</button>
             <span className="about-dot">·</span>
-            <span>MIT licence</span>
+            <span>{tt("MIT licence")}</span>
             <span className="about-dot">·</span>
             <span>by Matej Gajšek</span>
             <span className="about-dot">·</span>
-            <button className="link-btn" onClick={() => A.openOverlay({ type: "welcome" })}><Icon name="wand" size={13} />Welcome setup</button>
+            <button className="link-btn" onClick={() => A.openOverlay({ type: "welcome" })}><Icon name="wand" size={13} />{tt("Welcome setup")}</button>
           </div>
         </div>
         {full && reportButton}
@@ -69,15 +70,48 @@ export function AboutInfo({ full = false }: { full?: boolean }) {
 
 
       <dl className="about-facts">
-        <dt>Version</dt><dd>{info?.version}</dd>
-        <dt>Platform</dt><dd>{PLATFORM[info?.platform ?? ""] ?? info?.platform}</dd>
-        <dt>Settings</dt><dd>{info && <FolderLink path={info.configDir} />}</dd>
-        <dt>Data</dt><dd>{info && <FolderLink path={info.dataDir} />}</dd>
+        <dt>{tt("Version")}</dt>
+        <dd>
+          {info?.version}
+          {info?.runningOverlay && info.baseVersion ? <span className="about-fact-note">(updated over {info.baseVersion})</span> : null}
+        </dd>
+        <dt>{tt("Platform")}</dt><dd>{PLATFORM[info?.platform ?? ""] ?? info?.platform}</dd>
+        <dt>{tt("Settings")}</dt><dd>{info && <FolderLink path={info.configDir} />}</dd>
+        <dt>{tt("Data")}</dt><dd>{info && <FolderLink path={info.dataDir} />}</dd>
+        <dt>{tt("Install")}</dt>
+        <dd>
+          {info && (
+            <span className="about-fact-stack">
+              <FolderLink path={info.installDir} />
+              {info.runningOverlay && info.baseExePath ? <small>Base installation ({info.baseExePath}) stays untouched</small> : null}
+            </span>
+          )}
+        </dd>
+        <dt>{tt("Updates")}</dt>
+        <dd>
+          {info && (
+            info.updateStrategy === "overlay" ? (
+              <span className="about-fact-stack">
+                <FolderLink path={info.updatesDir} />
+                <small>{tt("In-app updates install here (system install stays untouched)")}</small>
+              </span>
+            ) : info.updateStrategy === "inPlace" ? (
+              <span className="about-fact-stack">
+                <FolderLink path={info.installDir} />
+                <small>{tt("Updated in place")}</small>
+              </span>
+            ) : info.updateStrategy === "storeManaged" ? (
+              <span>{tt("Managed by package manager / software store")}</span>
+            ) : (
+              <span>{tt("Not configured in this build")}</span>
+            )
+          )}
+        </dd>
       </dl>
 
       {full ? (
         <>
-          <h4 className="about-section">Tips & tricks</h4>
+          <h4 className="about-section">{tt("Tips & tricks")}</h4>
           <FeaturedTips />
         </>
       ) : (
@@ -87,7 +121,7 @@ export function AboutInfo({ full = false }: { full?: boolean }) {
       {full ? (
         <>
           <SupportCard quiet />
-          <h4 className="about-section">More tips & tricks</h4>
+          <h4 className="about-section">{tt("More tips & tricks")}</h4>
           <TipsList />
         </>
       ) : (
@@ -95,7 +129,7 @@ export function AboutInfo({ full = false }: { full?: boolean }) {
       )}
 
       <p className="about-note">
-        Independent implementation inspired by publicly documented workflows of OneCommander; not affiliated with or endorsed by its authors.
+        {tt("Independent implementation inspired by publicly documented workflows of OneCommander; not affiliated with or endorsed by its authors.")}
       </p>
     </div>
   );

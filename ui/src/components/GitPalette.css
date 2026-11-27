@@ -1,0 +1,16 @@
+.gp-backdrop { position: absolute; inset: 0; z-index: 6; display: flex; justify-content: center; align-items: flex-start; padding: 8vh 16px 16px; background: rgba(0, 0, 0, .28); border-radius: inherit; contain: layout style paint; }
+.gp { display: flex; flex-direction: column; width: min(720px, 100%); max-height: min(560px, 100%); background: var(--bg-2); color: var(--readable-fg, var(--fg)); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); overflow: hidden; }
+.gp-input { flex: none; display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--border-soft); }
+.gp-input input { flex: 1; min-width: 80px; padding: 7px 9px; font-size: 14px; }
+.gp-step { flex: 0 1 auto; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 3px 9px; font-size: 12px; border-radius: 999px; background: var(--accent-soft); color: var(--readable-accent-text, var(--accent-text)); }
+.gp-list { flex: 1; min-height: 60px; overflow: auto; padding: 5px; }
+.gp-row { display: flex; align-items: center; gap: 10px; padding: 6px 9px; border-radius: var(--radius); cursor: default; }
+.gp-row.on { background: var(--accent-soft); }
+.gp-row.off { opacity: .45; }
+.gp-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gp-label b { color: var(--readable-accent-text, var(--accent-text)); font-weight: 700; }
+.gp-row.danger .gp-label { color: var(--readable-danger, var(--danger, #e16e6e)); }
+.gp-detail, .gp-scope { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--readable-fg-dim, var(--fg-dim)); font-size: 11px; }
+.gp-row kbd { flex: none; }
+.gp-empty { margin: 0; padding: 18px; text-align: center; color: var(--readable-fg-dim, var(--fg-dim)); }
+.gp-foot { flex: none; display: flex; justify-content: space-between; gap: 12px; padding: 6px 12px; border-top: 1px solid var(--border-soft); color: var(--readable-fg-dim, var(--fg-dim)); font-size: 11px; white-space: nowrap; overflow: hidden; }

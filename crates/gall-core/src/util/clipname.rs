@@ -16,15 +16,17 @@ pub enum ClipText {
 
 pub fn classify_text(t: &str) -> ClipText {
     let s = t.trim();
-    if !s.contains('\n')
+    // No control character (a lone CR would start a new line in a Windows .url file).
+    if !s.chars().any(char::is_control)
         && (s.starts_with("http://") || s.starts_with("https://"))
         && !s.contains(' ')
     {
         return ClipText::Url(s.to_string());
     }
     let unquoted = s.trim_matches('"');
-    let expanded = crate::nav::path::expand(unquoted);
-    let p = expanded.strip_prefix("file://").unwrap_or(&expanded);
+    // A `file://` URI is decoded (`%20`); anything else is a path as written.
+    let expanded = crate::nav::path::expand(&crate::nav::path::file_uri_or_raw(unquoted));
+    let p = expanded.as_str();
     if !s.contains('\n')
         && std::path::Path::new(p).is_absolute()
         && std::path::Path::new(p).exists()
@@ -60,10 +62,24 @@ mod tests {
             ClipText::Url("https://example.com/a.pdf".into())
         );
         assert_eq!(classify_text("hello world"), ClipText::Text);
+        assert_eq!(classify_text("http://a.example/x\ry"), ClipText::Text);
         let d = tempfile::tempdir().unwrap();
         assert_eq!(
             classify_text(&format!("\"{}\"", d.path().display())),
             ClipText::Path(d.path().to_string_lossy().into())
+        );
+    }
+
+    #[test]
+    fn a_file_uri_with_escapes_is_a_path() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("a b");
+        std::fs::create_dir(&dir).unwrap();
+        let uri = crate::nav::path::encode_file_uri(&dir);
+        assert!(uri.contains("%20"));
+        assert_eq!(
+            classify_text(&uri),
+            ClipText::Path(dir.to_string_lossy().into())
         );
     }
 }

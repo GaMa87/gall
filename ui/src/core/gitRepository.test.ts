@@ -1,5 +1,6 @@
 import { expect, it } from "vitest";
-import { contextHints, gitActionEnabled, gitCommandForKey, gitCommands, gitContextHint, gitMenuGroup, gitNavigationHint, gitPanelOf, rewritesHistory, stashAtCommit, stashEntryActions, type GitContext } from "./gitRepository";
+import { gitHints } from "./gitCommands";
+import { activeConflicts, contextHints, gitActionEnabled, gitCommandForKey, gitCommands, gitMenuGroup, gitNavigationHint, gitPanelOf, rewritesHistory, stashAtCommit, stashEntryActions, type GitContext } from "./gitRepository";
 it("uses lazygit actions for each focused panel without a prefix", () => {
   expect(gitCommandForKey("files", " ")?.action).toBe("file: ");
   expect(gitCommandForKey("files", "s")?.action).toBe("stashSave");
@@ -9,11 +10,19 @@ it("uses lazygit actions for each focused panel without a prefix", () => {
   expect(gitCommandForKey("history", "p")?.action).toBe("pull");
   expect(gitCommandForKey("history", "P")?.action).toBe("push");
 });
+it("registers a keyboard command for every drop in the graph and sidebar (cherry-pick, merge, rebase)", () => {
+  // The drop confirmations name these registry commands as their keyboard equivalents.
+  expect(gitCommands("history").some((c) => c.action === "cherryPick")).toBe(true);
+  expect(gitCommands("history").some((c) => c.action === "cherryPickTo")).toBe(true);
+  expect(gitCommands("branches").some((c) => c.action === "merge")).toBe(true);
+  expect(gitCommands("branches").some((c) => c.action === "rebase")).toBe(true);
+});
 it("keeps commit-panel keys identical to lazygit and leaves rebase/merge keys to the branch panel", () => {
   // Lazygit commits panel: s squash, f fixup, r reword, d drop, i interactive rebase,
-  // C/V cherry-pick, t revert, T tag, g reset, n new branch, space checkout.
-  const lazygit: Record<string, string> = { s: "quick:squash", f: "quick:fixup", r: "reword", d: "quick:drop", i: "interactiveRebase", C: "copyCommit", V: "cherryPick", t: "revert", T: "createTag", g: "reset", n: "createBranch", " ": "checkout" };
+  // t revert, T tag, g reset, n new branch. Space and v choose commits, C and V cherry-pick them directly, c checks out.
+  const lazygit: Record<string, string> = { s: "quick:squash", f: "quick:fixup", r: "reword", d: "quick:drop", i: "interactiveRebase", t: "revert", T: "createTag", g: "reset", n: "createBranch" };
   for (const [key, action] of Object.entries(lazygit)) expect(gitCommandForKey("history", key)?.action).toBe(action);
+  for (const [key, action] of Object.entries({ " ": "pick", v: "pickRange", C: "cherryPick", V: "cherryPickTo", c: "checkout" })) expect(gitCommandForKey("history", key)?.action).toBe(action);
   // `b` is bisect options and `w` worktree options in lazygit (never a rebase); rebase/merge are branch keys.
   expect(gitCommandForKey("history", "b")?.action).toBe("tools:bisect");
   expect(gitCommandForKey("history", "w")?.action).toBe("tools:worktrees");
@@ -47,13 +56,14 @@ it("finds the stash that a graph row belongs to", () => {
   expect(stashAtCommit(stashes, null)).toBeUndefined();
   for (const action of ["quick:squash", "quick:fixup", "quick:drop", "quick:moveEarlier", "reword", "revert", "cherryPick", "reset", "rebase", "merge", "interactiveRebase"]) expect(rewritesHistory(action)).toBe(true);
   for (const action of ["stashDrop", "stashPop", "stashApply", "copyMenu", "createBranch", "createTag", "refresh"]) expect(rewritesHistory(action)).toBe(false);
-  expect(stashEntryActions).toEqual(["stashApply", "stashPop", "stashDrop"]);
+  // Renaming a stash (`r`, WN-74) is an action on a saved entry like the others.
+  expect(stashEntryActions).toEqual(["stashApply", "stashPop", "stashDrop", "stashBranch", "stashRename"]);
 });
-it("shows unambiguous contextual menus and reserves lower-case typing for inputs", () => {
+it("shows unambiguous contextual menus with a shared shortcut to the stashes", () => {
   for (const context of ["history", "files", "branches", "stashes", "remotes", "conflicts", "details"] as GitContext[]) {
-    const keys = gitCommands(context).map((c) => c.key);
+    const keys = gitCommands(context).flatMap((c) => c.keys);
     expect(new Set(keys).size).toBe(keys.length);
-    expect(gitCommandForKey(context, "z")).toBeUndefined();
+    expect(gitCommandForKey(context, "z")).toMatchObject({ action: "showStashes", shared: true });
   }
   expect(gitCommandForKey("branches", "R")?.action).toBe("renameBranch");
   expect(gitCommandForKey("files", "R")?.action).toBe("refresh");
@@ -66,9 +76,9 @@ it("footer key hints only advertise keys that really exist in that panel", () =>
     if (context === "details" || context === "tools" || context === "worktrees") continue;
     for (const [key] of contextHints[context]) expect(gitCommandForKey(context, key), `${context} ${key}`).toBeDefined();
   }
-  expect(gitContextHint("history")).toContain("r reword");
-  expect(gitContextHint("branches")).toContain("r rebase");
-  expect(gitContextHint("branches")).toContain("Space checkout");
+  expect(gitHints("history")).toContainEqual({ key: "r", label: "reword" });
+  expect(gitHints("branches")).toContainEqual({ key: "r", label: "rebase" });
+  expect(gitHints("branches")).toContainEqual({ key: " ", label: "checkout" });
   expect(gitNavigationHint("history")).toContain("l or Enter details");
   expect(gitNavigationHint("branches")).toContain("l commits");
   expect(gitNavigationHint("details")).toContain("h commits");
@@ -92,4 +102,22 @@ it("groups rarely used Git actions into context menu submenus", () => {
   expect(gitMenuGroup("push")).toBe("Remote");
   expect(gitMenuGroup("checkout")).toBeNull();
   expect(gitMenuGroup("createBranch")).toBeNull();
+});
+
+const branchRef = (name: string) => ({ name, fullName: `refs/heads/${name}`, kind: "branch" as const, id: "a".repeat(40), upstream: null, ahead: 0, behind: 0, upstreamGone: false });
+it("shows the active conflicts on the current branch row, or as an entry of their own when there is no such row", () => {
+  const base = { operation: "rebase", conflicts: ["a.txt", "dir/b.txt"], branch: "topic" as string | null, refs: [branchRef("main"), branchRef("topic")] };
+  expect(activeConflicts(base)).toEqual({ count: 2, first: "a.txt", onCurrentRow: true });
+  // A detached rebase has no current local branch; so does a branch the list does not hold.
+  expect(activeConflicts({ ...base, branch: null })).toEqual({ count: 2, first: "a.txt", onCurrentRow: false });
+  expect(activeConflicts({ ...base, branch: "gone" })?.onCurrentRow).toBe(false);
+  // A tag or remote of that name is not a local branch.
+  expect(activeConflicts({ ...base, refs: [{ ...branchRef("topic"), kind: "remote" as const }] })?.onCurrentRow).toBe(false);
+});
+it("has no active conflicts without an operation or without unresolved files", () => {
+  const base = { operation: null as string | null, conflicts: ["a.txt"], branch: "main" as string | null, refs: [branchRef("main")] };
+  expect(activeConflicts(base)).toBeNull();
+  expect(activeConflicts({ ...base, operation: "merge", conflicts: [] })).toBeNull();
+  expect(activeConflicts(null)).toBeNull();
+  expect(activeConflicts(undefined)).toBeNull();
 });

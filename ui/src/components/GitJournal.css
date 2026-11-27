@@ -1,0 +1,24 @@
+.gj { position: absolute; inset-block: 70px 44px; inset-inline-end: 14px; z-index: 5; display: flex; flex-direction: column; width: min(430px, calc(100% - 28px)); background: var(--bg-2); color: var(--readable-fg, var(--fg)); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); overflow: hidden; }
+.gj:focus { outline: none; }
+.gj-head { flex: none; display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; border-bottom: 1px solid var(--border-soft); }
+.gj-list { flex: 1; min-height: 60px; overflow: auto; padding: 8px 10px; }
+.gj-node { position: relative; display: block; width: 100%; padding: 7px 8px 7px 30px; border: 0; border-radius: var(--radius); background: transparent; color: inherit; text-align: start; font: inherit; cursor: default; }
+/* The line of the timeline and a dot for each state on it. */
+.gj-node::before { content: ""; position: absolute; inset-block: 0; inset-inline-start: 13px; width: 2px; background: var(--border); }
+.gj-node:first-child::before { top: 16px; }
+.gj-node:last-child::before { bottom: auto; height: 16px; }
+.gj-node i { position: absolute; top: 11px; inset-inline-start: 9px; width: 10px; height: 10px; box-sizing: border-box; border: 2px solid var(--accent); border-radius: 50%; background: var(--bg-2); }
+.gj-node.current i { background: var(--accent); }
+.gj-node.undone { opacity: .55; }
+.gj-node.undone i { border-color: var(--fg-dim); }
+.gj-node.selected { background: var(--accent-soft); opacity: 1; }
+.gj-text { display: flex; gap: 8px; align-items: baseline; }
+.gj-text b { flex: none; }
+.gj-text span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gj-text em { flex: none; padding: 0 7px; border-radius: 999px; background: var(--primary-gradient); color: var(--primary-fg); font-size: 10px; font-style: normal; font-weight: 700; }
+.gj-node small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--readable-fg-dim, var(--fg-dim)); font-size: 11px; }
+.gj-foot { flex: none; display: flex; flex-direction: column; gap: 8px; align-items: flex-start; padding: 10px 14px; border-top: 1px solid var(--border-soft); }
+.gj-foot p { margin: 0; font-size: 12px; overflow-wrap: anywhere; }
+.gj-foot code { display: block; margin-top: 3px; }
+.gj-empty { margin: 0; padding: 16px; color: var(--readable-fg-dim, var(--fg-dim)); }
+.gj-error { margin: 0; padding: 0; color: var(--readable-danger, var(--danger, #e16e6e)); font-size: 12px; overflow-wrap: anywhere; }

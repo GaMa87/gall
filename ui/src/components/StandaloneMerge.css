@@ -1,0 +1,22 @@
+.sm { width: min(1400px, 96vw); height: 92vh; border-radius: var(--radius-xl); display: flex; flex-direction: column; overflow: hidden; outline: none;
+  background: var(--bg-2); border: 1px solid var(--border-soft); box-shadow: var(--shadow); animation: pop 150ms var(--ease); }
+.sm-head { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; border-bottom: 1px solid var(--border-soft); }
+.sm-head h2 { margin: 0; font-size: 1.05em; }
+.sm-pick { padding: 10px 14px; display: flex; flex-direction: column; gap: 6px; border-bottom: 1px solid var(--border-soft); }
+.sm-row { display: flex; align-items: center; gap: 8px; }
+.sm-row > label { width: 64px; flex: none; opacity: 0.8; }
+.sm-row > input { flex: 1; min-width: 0; }
+.sm-nobase { display: flex; align-items: center; gap: 6px; font-size: 0.9em; opacity: 0.85; padding-left: 72px; }
+.sm-actions { display: flex; align-items: center; gap: 12px; padding-left: 72px; }
+.sm-out { opacity: 0.75; font-size: 0.9em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sm-hint { padding: 14px; opacity: 0.75; }
+.sm > .gm { flex: 1; min-height: 0; }
+
+/* The patch dialog shares the panel of the merge window. */
+.sm textarea { width: 100%; font-family: var(--mono); font-size: 12px; resize: vertical; }
+.sm select { max-width: 220px; }
+.sm.pi { width: min(1000px, 96vw); height: auto; max-height: 92vh; }
+.pi-result { padding: 10px 14px; overflow: auto; flex: 1; min-height: 0; }
+.pi-problems { color: var(--readable-danger, var(--danger)); margin: 0; padding-left: 18px; }
+.pi-files { margin: 0; padding-left: 18px; }
+.pi-keys { margin: 6px 0 0; font-size: 12px; opacity: 0.75; }

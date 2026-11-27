@@ -1,7 +1,7 @@
 {
   "name": "gall",
   "private": true,
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "Open-source Miller-column, dual-pane file manager for Linux (Tauri + Rust + React)",
   "license": "MIT",
   "repository": {
@@ -16,6 +16,6 @@
     "lint": "cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && npm --prefix ui run typecheck"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2.12.4"
+    "@tauri-apps/cli": "^2.12.6"
   }
 }

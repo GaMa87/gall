@@ -46,10 +46,8 @@ function lineMark(marks: DiffMarks | undefined, n: number, cosmetic: boolean | u
 function moveMaps(moves: DiffMove[] = []) {
   const a = new Map<number, number>(), b = new Map<number, number>();
   moves.forEach((m, k) => {
-    for (let i = 0; i < m.len; i++) {
-      a.set(m.a + i, k);
-      b.set(m.b + i, k);
-    }
+    for (let i = 0; i < m.len; i++) a.set(m.a + i, k);
+    for (let i = 0; i < m.bLen; i++) b.set(m.b + i, k);
   });
   return { a, b };
 }
@@ -57,7 +55,24 @@ function moveMaps(moves: DiffMove[] = []) {
 /** The line a moved line went to (side "l") or came from (side "r"). */
 export function moveTarget(moves: DiffMove[], mv: number, side: "l" | "r", n: number): number {
   const m = moves[mv];
-  return side === "l" ? m.b + (n - m.a) : m.a + (n - m.b);
+  // An edited move can change its length: stay inside the other end.
+  return side === "l" ? m.b + Math.min(n - m.a, m.bLen - 1) : m.a + Math.min(n - m.b, m.len - 1);
+}
+
+/** The two ends of every moved block, in reading order (left start, right start), for keyboard jumps. */
+export function moveEnds(moves: DiffMove[]): { mv: number; side: "l" | "r"; n: number }[] {
+  return moves.flatMap((m, mv) => [{ mv, side: "l" as const, n: m.a }, { mv, side: "r" as const, n: m.b }]);
+}
+
+/**
+ * The end to jump to from the row at `rowOf(end)`: the first end below `from` (or the last above it when
+ * `back`), wrapping around. `rowOf` gives the row of an end, or -1 when it is not shown.
+ */
+export function nextMoveEnd(moves: DiffMove[], rowOf: (e: { side: "l" | "r"; n: number }) => number, from: number, back: boolean) {
+  const shown = moveEnds(moves).map((e) => ({ e, row: rowOf(e) })).filter((x) => x.row >= 0).sort((x, y) => x.row - y.row);
+  if (!shown.length) return undefined;
+  const hit = back ? [...shown].reverse().find((x) => x.row < from) : shown.find((x) => x.row > from);
+  return (hit ?? (back ? shown[shown.length - 1] : shown[0])).e;
 }
 
 interface Built<R> { rows: R[]; blocks: number[] }
@@ -227,4 +242,105 @@ export function rowAt(off: number[], y: number): number {
     else hi = mid - 1;
   }
   return lo;
+}
+
+type CompactRun =
+  | { start: number; length: number; kind: "equal"; a: number; b: number }
+  | { start: number; length: 1; kind: "fold"; row: Extract<SplitRow, { kind: "fold" }> }
+  | { start: number; length: number; kind: "change"; op: DiffOp; block?: number };
+
+interface CompactBlock { start: number; length: number; op: DiffOp }
+
+/** Index of display rows for large comparisons. Expanded equal runs and
+ * unpaired edits take constant space per operation, regardless of line count. */
+export function indexDiffRows(ops: DiffOp[], mode: "split" | "unified", options: BuildOptions) {
+  const runs: CompactRun[] = [];
+  const blocks: CompactBlock[] = [];
+  let length = 0;
+  for (const [i, op] of ops.entries()) {
+    if (op.tag === "equal") {
+      const { keep, fold } = foldRun(op, i === 0, i === ops.length - 1, options);
+      for (const [j, [start, end]] of keep.entries()) {
+        if (j === 1 && fold) {
+          runs.push({ start: length, length: 1, kind: "fold", row: { kind: "fold", ...fold } });
+          length++;
+        }
+        if (end > start) {
+          runs.push({ start: length, length: end - start, kind: "equal", a: op.a + start, b: op.b + start });
+          length += end - start;
+        }
+      }
+      continue;
+    }
+    const size = mode === "split" ? Math.max(op.aLen, op.bLen) : op.aLen + op.bLen;
+    if (!size) continue;
+    const block = op.cosmetic ? undefined : blocks.length;
+    if (block != null) blocks.push({ start: length, length: size, op });
+    runs.push({ start: length, length: size, kind: "change", op, block });
+    length += size;
+  }
+
+  function rowAtIndex(index: number): SplitRow | UnifiedRow | undefined {
+    if (index < 0 || index >= length) return;
+    let lo = 0, hi = runs.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (runs[mid].start <= index) lo = mid + 1;
+      else hi = mid;
+    }
+    const run = runs[lo - 1];
+    const offset = index - run.start;
+    if (run.kind === "fold") return run.row;
+    if (run.kind === "equal") {
+      const a = run.a + offset, b = run.b + offset;
+      return mode === "split"
+        ? { kind: "line", l: { n: a, t: "eq" }, r: { n: b, t: "eq" } }
+        : { kind: "line", t: "eq", an: a, bn: b, side: "b" };
+    }
+    const { op, block } = run;
+    const fmt = op.cosmetic || undefined;
+    if (mode === "split") return {
+      kind: "line", block,
+      l: offset < op.aLen ? { n: op.a + offset, t: "del", fmt } : undefined,
+      r: offset < op.bLen ? { n: op.b + offset, t: "ins", fmt } : undefined,
+    };
+    return offset < op.aLen
+      ? { kind: "line", block, t: "del", an: op.a + offset, side: "a", fmt }
+      : { kind: "line", block, t: "ins", bn: op.b + offset - op.aLen, side: "b", fmt };
+  }
+
+  return { length, blocks, rowAt: rowAtIndex };
+}
+
+/** A change on the overview ruler: where it is in the document (pixels) and its kind. */
+export interface RulerMark { top: number; height: number; tag: "ins" | "del" | "chg" }
+/** Changes that share a slot of the ruler: one element instead of one per change. */
+export interface RulerBucket { top: number; height: number; tag: "ins" | "del" | "chg"; count: number; first: number; last: number }
+
+/**
+ * Aggregates the marks of the overview ruler into at most `slots` buckets (never more than one per
+ * displayed row or per few pixels of the ruler), so a file with thousands of changes draws a bounded
+ * number of elements. A bucket holds the marks that fall in the same slot of the document; it spans
+ * from the first to the end of the last, has the kind of its marks (or "chg" when they differ) and
+ * knows the indexes of its first and last change, so the current change can be shown in it.
+ */
+export function rulerBuckets(marks: RulerMark[], total: number, slots: number): RulerBucket[] {
+  const n = Math.max(1, Math.floor(slots));
+  const size = Math.max(total, 1);
+  const out = new Map<number, RulerBucket>();
+  marks.forEach((m, index) => {
+    const slot = Math.min(n - 1, Math.max(0, Math.floor((m.top / size) * n)));
+    const bottom = m.top + m.height;
+    const b = out.get(slot);
+    if (!b) out.set(slot, { top: m.top, height: m.height, tag: m.tag, count: 1, first: index, last: index });
+    else {
+      const end = Math.max(b.top + b.height, bottom);
+      b.top = Math.min(b.top, m.top);
+      b.height = end - b.top;
+      if (b.tag !== m.tag) b.tag = "chg";
+      b.count++;
+      b.last = index;
+    }
+  });
+  return [...out.entries()].sort((x, y) => x[0] - y[0]).map(([, b]) => b);
 }

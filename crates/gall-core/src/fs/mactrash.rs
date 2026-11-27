@@ -93,6 +93,15 @@ fn exists(p: &Path) -> bool {
     std::fs::symlink_metadata(p).is_ok()
 }
 
+/// Returns `true` when `~/.Trash` can be listed directly (i.e. macOS Full Disk Access is
+/// granted). Reading `~/.Trash` returns `PermissionDenied` immediately without triggering a
+/// TCC permission prompt when Full Disk Access is absent.
+pub fn trash_folder_accessible() -> bool {
+    dirs::home_dir()
+        .map(|h| h.join(".Trash"))
+        .is_some_and(|p| std::fs::read_dir(p).is_ok())
+}
+
 /// Moves the items to the Trash and records where each one went.
 pub fn trash(paths: &[PathBuf]) -> Result<()> {
     let mgr = NSFileManager::defaultManager();

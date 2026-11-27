@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { DiffOp } from "../api/types";
-import { applyBlock, buildSplit, buildUnified, joinLines, moveTarget, offsets, rowAt, segments, visualWidth, wrappedLines } from "./diffRows";
+import { applyBlock, buildSplit, buildUnified, indexDiffRows, joinLines, moveEnds, moveTarget, nextMoveEnd, offsets, rowAt, rulerBuckets, segments, visualWidth, wrappedLines, type RulerMark } from "./diffRows";
 
 const eq = (a: number, b: number, len: number): DiffOp => ({ tag: "equal", a, aLen: len, b, bLen: len });
 const all = { context: Infinity, expanded: new Set<string>() };
@@ -111,7 +111,7 @@ describe("pairing inside a change block", () => {
 describe("moved lines", () => {
   // left 0..1 deleted, right 3..4 inserted: the same two lines, moved
   const ops: DiffOp[] = [{ tag: "delete", a: 0, aLen: 2, b: 0, bLen: 0 }, eq(2, 0, 3), { tag: "insert", a: 5, aLen: 0, b: 3, bLen: 2 }];
-  const moves = [{ a: 0, b: 3, len: 2 }];
+  const moves = [{ id: 1, a: 0, b: 3, len: 2, bLen: 2, edited: false }];
   it("marks moved cells and finds the other end", () => {
     const { rows } = buildSplit(ops, [], { ...all, moves });
     const l = rows[0].kind === "line" ? rows[0].l : undefined;
@@ -120,6 +120,34 @@ describe("moved lines", () => {
     expect(moveTarget(moves, 0, "r", 3)).toBe(0);
     const u = buildUnified(ops, [], { ...all, moves }).rows;
     expect(u.filter((r) => r.kind === "line" && r.mv === 0).length).toBe(4);
+  });
+});
+
+describe("moved blocks that were edited", () => {
+  const moves = [
+    { id: 1, a: 2, b: 20, len: 4, bLen: 6, edited: true },
+    { id: 2, a: 10, b: 4, len: 3, bLen: 3, edited: false },
+  ];
+  const ops: DiffOp[] = [{ tag: "replace", a: 2, aLen: 4, b: 0, bLen: 1 }, { tag: "insert", a: 6, aLen: 0, b: 20, bLen: 6 }];
+  it("maps every line of both ends and stays inside the other end", () => {
+    const { rows } = buildUnified(ops, [], { ...all, moves });
+    expect(rows.filter((r) => r.kind === "line" && r.mv === 0 && r.side === "a").length).toBe(4);
+    expect(rows.filter((r) => r.kind === "line" && r.mv === 0 && r.side === "b").length).toBe(6);
+    expect(moveTarget(moves, 0, "l", 5)).toBe(23);
+    expect(moveTarget(moves, 0, "r", 25)).toBe(5);
+  });
+  it("lists the ends and steps through them in row order, wrapping around", () => {
+    expect(moveEnds(moves).map((e) => `${e.mv}${e.side}${e.n}`)).toEqual(["0l2", "0r20", "1l10", "1r4"]);
+    const rowOf = (e: { side: "l" | "r"; n: number }) => (e.side === "l" ? e.n : e.n + 100);
+    expect(nextMoveEnd(moves, rowOf, -1, false)).toMatchObject({ side: "l", n: 2 });
+    expect(nextMoveEnd(moves, rowOf, 2, false)).toMatchObject({ side: "l", n: 10 });
+    expect(nextMoveEnd(moves, rowOf, 104, false)).toMatchObject({ side: "r", n: 20 });
+    expect(nextMoveEnd(moves, rowOf, 120, false)).toMatchObject({ side: "l", n: 2 });
+    expect(nextMoveEnd(moves, rowOf, 2, true)).toMatchObject({ side: "r", n: 20 });
+    expect(nextMoveEnd(moves, rowOf, 104, true)).toMatchObject({ side: "l", n: 10 });
+  });
+  it("skips ends that are not in the view", () => {
+    expect(nextMoveEnd(moves, () => -1, 0, false)).toBeUndefined();
   });
 });
 
@@ -145,5 +173,59 @@ describe("line wrapping", () => {
     expect(rowAt(off, 60)).toBe(2);
     expect(rowAt(off, 500)).toBe(2);
     expect(rowAt(offsets([]), 10)).toBe(0);
+  });
+});
+
+describe("compact diff row index", () => {
+  const ops: DiffOp[] = [
+    eq(0, 0, 50_000),
+    { tag: "replace", a: 50_000, aLen: 50_000, b: 50_000, bLen: 49_999 },
+    { tag: "insert", a: 100_000, aLen: 0, b: 99_999, bLen: 1 },
+  ];
+
+  it("looks up windows in a large split comparison and retains fold coordinates", () => {
+    const opts = { context: 3, expanded: new Set<string>() };
+    const index = indexDiffRows(ops, "split", opts);
+    expect(index.length).toBe(50_005);
+    expect(index.rowAt(0)).toEqual({ kind: "fold", id: "0:0", a: 0, b: 0, count: 49_997 });
+    expect(index.blocks.map((block) => block.start)).toEqual([4, 50_004]);
+    expect(index.rowAt(50_004)).toMatchObject({ kind: "line", block: 1, r: { n: 99_999, t: "ins" } });
+    expect(index.rowAt(index.length)).toBeUndefined();
+    const expanded = indexDiffRows(ops, "split", { ...opts, expanded: new Set(["0:0"]) });
+    expect(expanded.rowAt(49_999)).toMatchObject({ l: { n: 49_999 }, r: { n: 49_999 } });
+  });
+
+  it("keeps deletions and insertions distinct in the unified index", () => {
+    const index = indexDiffRows(ops, "unified", all);
+    expect(index.length).toBe(150_000);
+    expect(index.rowAt(99_999)).toMatchObject({ side: "a", an: 99_999, t: "del" });
+    expect(index.rowAt(100_000)).toMatchObject({ side: "b", bn: 50_000, t: "ins" });
+    expect(index.rowAt(149_999)).toMatchObject({ side: "b", bn: 99_999, block: 1 });
+  });
+});
+
+describe("rulerBuckets", () => {
+  const marks = (n: number, step = 10): RulerMark[] => Array.from({ length: n }, (_, i) => ({ top: i * step, height: 4, tag: i % 2 ? "ins" : "del" }));
+  it("keeps one bucket per mark when there is room", () => {
+    const b = rulerBuckets([{ top: 0, height: 4, tag: "ins" }, { top: 500, height: 4, tag: "del" }], 1000, 100);
+    expect(b).toEqual([
+      { top: 0, height: 4, tag: "ins", count: 1, first: 0, last: 0 },
+      { top: 500, height: 4, tag: "del", count: 1, first: 1, last: 1 },
+    ]);
+  });
+  it("draws at most one bucket per slot however many changes there are", () => {
+    const b = rulerBuckets(marks(5000), 50_000, 40);
+    expect(b.length).toBeLessThanOrEqual(40);
+    expect(b.reduce((s, x) => s + x.count, 0)).toBe(5000);
+  });
+  it("marks a mixed bucket as a change, keeps one kind, and spans first to last", () => {
+    const b = rulerBuckets([{ top: 0, height: 4, tag: "ins" }, { top: 6, height: 4, tag: "ins" }, { top: 12, height: 4, tag: "del" }], 1000, 2);
+    expect(b).toEqual([{ top: 0, height: 16, tag: "chg", count: 3, first: 0, last: 2 }]);
+    expect(rulerBuckets([{ top: 0, height: 4, tag: "del" }, { top: 6, height: 4, tag: "del" }], 1000, 2)[0].tag).toBe("del");
+  });
+  it("copes with an empty list, a zero height and marks at the very end", () => {
+    expect(rulerBuckets([], 0, 10)).toEqual([]);
+    expect(rulerBuckets([{ top: 100, height: 0, tag: "chg" }], 0, 0)).toHaveLength(1);
+    expect(rulerBuckets([{ top: 1000, height: 4, tag: "chg" }], 1000, 10)).toHaveLength(1);
   });
 });

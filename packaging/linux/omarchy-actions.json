@@ -1,0 +1,106 @@
+[
+  {
+    "id": "omarchy.localsend",
+    "label": "Send via LocalSend",
+    "pluralLabel": "Send {count} items via LocalSend",
+    "icon": "open",
+    "whenCommand": "localsend",
+    "selection": "any",
+    "command": ["localsend", "--headless", "send", "{paths}"]
+  },
+  {
+    "id": "omarchy.transcode",
+    "label": "Transcode media\u2026",
+    "pluralLabel": "Transcode {count} items\u2026",
+    "icon": "video",
+    "whenCommand": "omarchy-transcode",
+    "selection": "files",
+    "mimePrefixes": ["image/", "video/"],
+    "extensions": [
+      "jpg", "jpeg", "png", "webp", "gif", "heic", "avif",
+      "mp4", "mov", "m4v", "mkv", "webm", "avi"
+    ],
+    "terminal": "floating-presentation",
+    "command": [
+      "sh",
+      "-c",
+      "for f in \"$@\"; do omarchy-transcode -- \"$f\" || exit $?; done",
+      "_",
+      "{paths}"
+    ]
+  },
+  {
+    "id": "omarchy.taildrop",
+    "label": "Send via Taildrop\u2026",
+    "pluralLabel": "Send {count} items via Taildrop\u2026",
+    "icon": "cloud",
+    "whenCommand": ["tailscale", "omarchy-tailscale-send", "python3", "omarchy-menu-select"],
+    "selection": "files",
+    "command": [
+      "sh",
+      "-c",
+      "status_json=$(tailscale status --json 2>/dev/null) || { command -v omarchy-notification-send >/dev/null 2>&1 && omarchy-notification-send -u critical \"Taildrop\" \"Tailscale is not running or unavailable\"; exit 1; }; [ -n \"$status_json\" ] || { command -v omarchy-notification-send >/dev/null 2>&1 && omarchy-notification-send -u critical \"Taildrop\" \"No online Taildrop peers available\"; exit 1; }; peers=$(printf '%s\\n' \"$status_json\" | python3 -c 'import json,sys; d=json.load(sys.stdin); su=str((d.get(\"Self\") or {}).get(\"UserID\") or \"\"); [print((p.get(\"DNSName\") or \"\").rstrip(\".\") or p.get(\"HostName\") or \"\") for p in (d.get(\"Peer\") or {}).values() if p.get(\"Online\") and not (p.get(\"DNSName\") or \"\").rstrip(\".\").endswith(\".mullvad.ts.net\") and (p.get(\"TaildropTarget\")==1 or (p.get(\"TaildropTarget\") in (None,0) and su and str(p.get(\"UserID\") or \"\")==su and not p.get(\"ExitNodeOption\"))) and ((p.get(\"DNSName\") or \"\").rstrip(\".\") or p.get(\"HostName\"))]'); [ -n \"$peers\" ] || { command -v omarchy-notification-send >/dev/null 2>&1 && omarchy-notification-send -u critical \"Taildrop\" \"No online Taildrop peers available\"; exit 1; }; peer=$(printf '%s\\n' \"$peers\" | omarchy-menu-select \"Send via Taildrop\") || exit 0; [ -n \"$peer\" ] || exit 0; exec omarchy-tailscale-send \"$peer\" \"$@\"",
+      "_",
+      "{paths}"
+    ]
+  },
+  {
+    "id": "omarchy.wallpaper",
+    "label": "Set as Omarchy Wallpaper",
+    "icon": "image",
+    "whenCommand": "omarchy-theme-bg-set",
+    "selection": "files",
+    "single": true,
+    "mimePrefixes": ["image/", "video/"],
+    "extensions": [
+      "jpg", "jpeg", "png", "gif", "bmp", "webp",
+      "mp4", "m4v", "mov", "webm", "mkv", "avi"
+    ],
+    "command": ["omarchy-theme-bg-set", "{path}"]
+  },
+  {
+    "id": "omarchy.omacut",
+    "label": "Edit in Omacut",
+    "icon": "cut",
+    "whenCommand": "omacut",
+    "selection": "files",
+    "single": true,
+    "mimePrefixes": ["video/"],
+    "extensions": ["mp4", "mkv", "mov", "webm", "avi", "mpeg", "mpg", "m4v"],
+    "command": ["omacut", "{path}"]
+  },
+  {
+    "id": "omarchy.hype",
+    "label": "Present in Hype",
+    "icon": "note",
+    "whenCommand": "hype",
+    "selection": "files",
+    "single": true,
+    "extensions": ["md", "markdown"],
+    "command": ["hype", "open", "{path}"]
+  },
+  {
+    "id": "omarchy.signed",
+    "label": "Sign in Signed",
+    "icon": "pdf",
+    "whenCommand": "signed",
+    "selection": "files",
+    "single": true,
+    "mimePrefixes": ["application/pdf"],
+    "extensions": ["pdf"],
+    "command": ["signed", "open", "{path}"]
+  },
+  {
+    "id": "omarchy.pinta",
+    "label": "Edit in Pinta",
+    "icon": "wand",
+    "whenCommand": "pinta",
+    "selection": "files",
+    "mimePrefixes": ["image/"],
+    "extensions": [
+      "bmp", "gif", "jpg", "jpeg", "png", "svg", "tif", "tiff", "ico",
+      "webp", "ora", "tga", "pcx", "ppm", "pgm", "pbm", "pnm", "xbm", "xpm"
+    ],
+    "command": ["pinta", "{paths}"]
+  }
+]

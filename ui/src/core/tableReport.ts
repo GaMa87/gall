@@ -1,11 +1,13 @@
 // CSV report of table changes (export from the table compare view). Pure, unit-tested.
 import type { SheetDiff } from "../api/types";
 
-const csvCell = (s: string) => (/[",\n;]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s);
+/** A CSV cell: quoted when it holds a separator, a quote or a line break (`\r` as well as `\n`), quotes doubled. */
+export const csvCell = (s: string) => (/[",\r\n;]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s);
 
 /** Report of every change: one line per changed cell, added or removed row. */
 export function changeReport(s: SheetDiff): string {
-  const lines = [["sheet", "change", s.key ?? "row", "column", "left", "right"].join(",")];
+  // The header holds the name of the key column, which is file data like any cell: it is escaped the same way.
+  const lines = [["sheet", "change", s.key ?? "row", "column", "left", "right"].map(csvCell).join(",")];
   const keyCol = s.key ? s.columns.findIndex((c) => c.name === s.key) : -1;
   const val = (rows: string[][], i: number | null, c: number | null) => (i == null || c == null ? "" : rows[i]?.[c] ?? "");
   for (const r of s.rows) {

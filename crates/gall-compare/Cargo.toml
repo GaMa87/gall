@@ -1,0 +1,25 @@
+[package]
+name = "gall-compare"
+description = "Portable comparison and merge models of Gall (no file system, no OS: builds for wasm32)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+# `cdylib` is what wasm-bindgen turns into the browser module; the desktop uses the rlib.
+crate-type = ["rlib", "cdylib"]
+
+[features]
+# The wasm-bindgen exports of `adapter::compare_json` and `merge::merge_json` for the browser worker.
+wasm = ["dep:wasm-bindgen"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+similar = { version = "3", features = ["inline", "unicode"] }
+imara-diff = "0.2"
+wasm-bindgen = { version = "0.2", optional = true }

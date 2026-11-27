@@ -3,20 +3,29 @@ import { ThemedSelect } from "./ThemedSelect";
 import { cloneElement, isValidElement, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api/ipc";
 import { FolderLink } from "./FolderLink";
-import type { FontFamily, OpenRule, Settings } from "../api/types";
+import { CompareAiSettings } from "./CompareAiSettings";
+import type { DefaultFileManagerStatus, FontFamily, OpenRule, Settings } from "../api/types";
+import { platformScopeNote, restoreActionLabel, unavailableExplanation } from "../core/defaultFileManager";
 import { ruleLabel } from "../core/openRules";
+import { AVAILABLE, languageName, tt } from "../i18n";
 import { ACTION_LABELS, DEFAULT_KEYMAP, KEYBOARD_PROFILES, buildKeymap, defaultKeymap, keyboardProfile, normalizeChord, type Action, type KeyboardProfile } from "../core/keymap";
 import * as A from "../state/actions";
 import { getState, useStore } from "../state/store";
+import { CUSTOM_SCOPE, GIT_RESERVED, GIT_SCOPE_LABELS, builtinKeys, gitCommandList, gitKeyName, parseGitKey } from "../core/gitCommands";
+import { CUSTOM_CONTEXTS, CUSTOM_VARIABLES, checkDefinition, joinCommandLine, splitCommandLine, type GitCommandDef, type GitCustomContext } from "../core/gitCustom";
 import { useKeyLabels } from "../state/keyLabels";
 import { AboutInfo } from "./AboutInfo";
 import { Updates } from "./Updates";
 import { join } from "../core/path";
 import { BUILTIN_THEMES } from "../themes";
+import { hasContrastLimits } from "../core/themeContrast";
 import { Icon } from "./Icon";
-import { VIEWS } from "./FolderPane";
+import { GROUP_LABEL, GROUP_ORDER_LABEL, VIEWS } from "./FolderPane";
+import { GROUP_MODES, GROUP_ORDERS } from "../core/sortGroup";
+import { worktreeLocation, type WorktreeLocation } from "../state/gitWorktree";
 
-type Opt =
+type Opt = OptBase & { when?: "omarchy" };
+type OptBase =
   /** `action`: its keys in the current mode (vim / chords) are shown as the hint. */
   | { key: keyof Settings; label: string; hint?: string; type: "bool"; action?: Action }
   | { key: keyof Settings; label: string; hint?: string; type: "number"; min?: number; max?: number; step?: number }
@@ -24,6 +33,8 @@ type Opt =
   | { key: keyof Settings; label: string; hint?: string; type: "select"; options: [string, string][] }
   | { key: keyof Settings; label: string; hint?: string; type: "theme" }
   | { key: keyof Settings; label: string; hint?: string; type: "openRules" }
+  | { key: keyof Settings; label: string; hint?: string; type: "worktreeLocation" }
+  | { key: keyof Settings; label: string; hint?: string; type: "gitCommands" }
   | { key: keyof Settings; label: string; hint?: string; type: "color" }
   | { key: keyof Settings; label: string; hint?: string; type: "list" }
   | { key: keyof Settings; label: string; hint?: string; type: "font" };
@@ -33,10 +44,14 @@ type Section = { id: string; title: string; icon: string; desc: string; groups: 
 const SECTIONS: Section[] = [
   {
     id: "appearance", title: "Appearance", icon: "wand", desc: "Colours, theme, fonts and how items look.", groups: [
+      { title: "Language", opts: [
+        { key: "language", label: "Language", hint: "Automatic follows the operating system language. English, German, Spanish and Slovenian are fully translated.", type: "select", options: [["auto", "Automatic"], ...AVAILABLE.map((c): [string, string] => [c, languageName(c)])] },
+      ] },
       { title: "Theme", opts: [
         { key: "theme", label: "Theme", type: "select", options: [["system", "Follow system"], ["dark", "Dark"], ["light", "Light"]] },
-        { key: "accent", label: "Accent colour", type: "color" },
-        { key: "customTheme", label: "Custom theme", hint: "Included themes and CSS files in <settings>/themes. Ctrl+Shift+F5 reloads the theme while you edit it.", type: "theme" },
+        { key: "accent", label: "Accent colour", hint: "Not used while the Omarchy theme is selected: the accent comes from the Omarchy theme.", type: "color" },
+        { key: "omarchyFollowFont", label: "Use Omarchy's monospace font", hint: "When no font is chosen below, follow the font set with `omarchy font set`.", type: "bool", when: "omarchy" },
+        { key: "customTheme", label: "Custom theme", hint: "Included themes and CSS files in <settings>/themes. Ctrl+Shift+F5 reloads the theme while you edit it. Contrast is adjusted for theme colour variables and gradients; custom images, direct CSS colour overrides and element opacity stay under the stylesheet's control.", type: "theme" },
         { key: "thinScrollbars", label: "Thin scrollbars", type: "bool" },
         { key: "animations", label: "Animations", type: "bool" },
       ] },
@@ -59,11 +74,14 @@ const SECTIONS: Section[] = [
   {
     id: "view", title: "View", icon: "view", desc: "What each folder shows and how it is sorted.", groups: [
       { title: "Visibility", opts: [
-        { key: "showHidden", label: "Show hidden files", type: "bool", action: "toggleHidden" },
+        { key: "showHidden", label: "Show hidden files", hint: "Default for both browsers. Press . (or Ctrl+H) to toggle the active browser only, or Ctrl+. / Ctrl+Shift+H for both.", type: "bool", action: "toggleHiddenAll" },
         { key: "hideTemp", label: "Hide temporary files", hint: "~, .tmp, .swp, .bak, .part…", type: "bool" },
       ] },
       { title: "Sorting defaults", opts: [
-        { key: "foldersOnTop", label: "Keep folders on top", type: "bool" },
+        { key: "group", label: "Grouping", hint: "What is collected before the sort: folders, files of one type, or both. The sort then orders each group.", type: "select", options: GROUP_MODES.map((m) => [m, GROUP_LABEL[m]]) },
+        { key: "groupOrder", label: "Order of the groups", type: "select", options: GROUP_ORDERS.map((o) => [o, GROUP_ORDER_LABEL[o]]) },
+        { key: "groupByKind", label: "Kinds (images, documents…) instead of extensions", type: "bool" },
+        { key: "groupHeaders", label: "Group headers", hint: "Name, number of files and total size above each group; a click collapses it. Off: a flat list in the same order.", type: "bool" },
         { key: "foldersByName", label: "Always sort folders by name", type: "bool" },
         { key: "defaultSort", label: "Default sort", type: "select", options: [["name", "Name"], ["ext", "Type"], ["modified", "Date modified"], ["created", "Date created"], ["size", "Size"]] },
         { key: "defaultDescending", label: "Descending by default", type: "bool" },
@@ -79,7 +97,7 @@ const SECTIONS: Section[] = [
       { title: "Quick Open index (Ctrl+P)", opts: [
         { key: "indexRoots", label: "Indexed folders", hint: "Separate with ; — empty = the whole system (/ or every drive). Rebuilt in the background.", type: "list" },
         { key: "indexExclude", label: "Never index or search", hint: "Comma separated names or globs (gitignore syntax), e.g. node_modules, *.iso. Applies to Quick Open, find in files and name search. Folders tagged as caches (CACHEDIR.TAG) are skipped too. Per project: a .gallignore file (gitignore syntax, also outside git) in a folder applies to it and everything below; right-click › Hide from search adds an item to it. Alt+I in a search includes all of these.", type: "list" },
-        { key: "indexHidden", label: "Index hidden files and folders", type: "bool" },
+        { key: "indexHidden", label: "Index hidden files and folders", hint: "Also applies to find in files (Ctrl+F)", type: "bool" },
         { key: "indexRespectGitignore", label: "Skip files ignored by .gitignore", type: "bool" },
         { key: "indexRefreshMinutes", label: "Re-index every (minutes)", hint: "0 = only when Quick Open finds the index older than a minute", type: "number", min: 0, max: 1440 },
       ] },
@@ -119,24 +137,45 @@ const SECTIONS: Section[] = [
       { title: "Drag & drop", opts: [
         { key: "dragBehavior", label: "Default drop action", hint: "While dragging, hold Ctrl = copy, Shift = move, Alt = symbolic link. Releasing the key returns to this default.", type: "select", options: [["consistent", "Move"], ["copy", "Copy"], ["system", "Move on same drive, copy across drives"], ["ask", "Ask (show menu)"]] },
       ] },
+      { title: "Git commits", opts: [
+        { key: "gitBranchWip", label: "Remember changes per branch", hint: "Switching branches with local changes keeps them with the branch you leave and brings them back when you return, instead of asking what to do with them. Changes that do not fit on top of a branch as it is later stay saved and can become a stash. Off by default.", type: "bool" },
+        { key: "gitDoubleClick", label: "Double-click on a commit", type: "select", options: [["details", "Show its changes"], ["checkout", "Check it out (asks first)"]] },
+        { key: "gitForecastBranches", label: "Conflict forecast up to this many branches", hint: "The branch list shows which branches would conflict when merged into the current one (Git 2.38). Not in repositories with more branches; 0 turns it off.", type: "number", min: 0, max: 1000 },
+      ] },
+      { title: "Git commands", opts: [
+        { key: "gitCommands", label: "Your Git commands", hint: "A program and its arguments, run in the repository without a shell. Variables: {hash} {branch} {tag} {stash} {file} {selection} {repo} {head}. They appear in the menu, the command palette and the key sheet; Settings › Shortcuts can rebind their keys.", type: "gitCommands" },
+      ] },
+      { title: "Git worktrees", opts: [
+        { key: "worktreeLocation", label: "Location of new worktrees", hint: "{repo} is the repository folder (its name after the start), {branch} the branch. ../{repo}-{branch} puts worktrees next to the repository. Repository tools › Worktrees overrides it for one repository.", type: "worktreeLocation" },
+      ] },
       { title: "Tabs", opts: [
         { key: "newTabPath", label: "New tab opens", hint: "Empty = copy of current tab. Supports ~ and $VARS.", type: "text", placeholder: "(clone current tab)" },
         { key: "newTabPlacement", label: "New tab position", type: "select", options: [["afterCurrent", "After current tab"], ["end", "At the end"]] },
         { key: "tabsShowFullPath", label: "Show full path on tabs", type: "bool" },
         { key: "startupPaths", label: "Start-up folders (first launch / no saved session)", hint: "Separate with ; — the first for browser 1, the second for browser 2", type: "list" },
       ] },
+      { title: "Workspaces & Tab Pairs", opts: [
+        { key: "showWorkspaces", label: "Workspace switcher in title bar", hint: "Always shows 1 2 3 +; Only with multiple hides it when just one workspace is open; Never hides it completely.", type: "select", options: [["always", "Always show"], ["multiple", "Only with multiple"], ["never", "Never show"]] },
+        { key: "liveTabPairs", label: "Live Tab Pairs bridge", hint: "Show the center bridge control in the title bar and pair actions on tabs (Linked, Tandem walk, Flow). Turning off restores classic independent panels.", type: "bool" },
+        { key: "pairGravity", label: "Pair Gravity ghost tab suggestions", hint: "Suggest a translucent ghost tab (🧲) on the opposite tab bar based on learned folder pairs and sibling Git worktrees.", type: "bool" },
+      ] },
     ],
   },
   {
     id: "window", title: "Window", icon: "window", desc: "Start-up, sidebar and notifications.", groups: [
       { title: "Start-up", opts: [
-        { key: "startMaximized", label: "Open maximized", hint: "Applies the next time Gall starts", type: "bool" },
+        { key: "startMaximized", label: "Open maximized", hint: "Applies the next time Gall starts. Tiling window managers (Hyprland, Sway, Niri) size the window themselves.", type: "bool" },
+      ] },
+      { title: "Layout and window frame", opts: [
+        { key: "adaptiveLayout", label: "Adapt layout to the window size", hint: "Wide window: two browsers side by side. Tall half-screen tile: two stacked. Small tile: one browser, with the sidebar hiding in narrow windows. Choosing a layout yourself or collapsing a browser always wins.", type: "bool" },
+        { key: "windowButtons", label: "Window buttons", hint: "Minimize, maximize and close in the title bar. Auto hides them in tiling window managers, which have their own controls.", type: "select", options: [["auto", "Automatic"], ["always", "Always show"], ["never", "Never show"]] },
+        { key: "omarchyGlassy", label: "Follow Omarchy Glassy mode", hint: "Translucent surfaces over Hyprland's blur while Omarchy's Glassy toggle is on; text and icons stay sharp. Needs the Omarchy theme.", type: "bool", when: "omarchy" },
       ] },
       { title: "Sidebar", opts: [
         { key: "showDrives", label: "Show drives", type: "bool" },
         { key: "showCloud", label: "Show cloud folders", hint: "OneDrive, Dropbox, Google Drive, iCloud and others found on this computer", type: "bool" },
         { key: "showHistory", label: "Show history", type: "bool" },
-        { key: "showSystemMonitor", label: "Show system monitor", hint: "CPU, GPU, memory, temperatures, network and disk activity at the bottom of the sidebar", type: "bool" },
+        { key: "showSystemMonitor", label: "Show system monitor", hint: "CPU, GPU, memory, temperatures, network and disk activity at the bottom of the sidebar. Steps aside while the window is too short for five History rows and returns when there is room; the toolbar button shows it anyway.", type: "bool" },
         { key: "historyCount", label: "Folders remembered in history", type: "number", min: 5, max: 200 },
       ] },
       { title: "Other", opts: [
@@ -177,6 +216,7 @@ const SECTIONS: Section[] = [
   {
     id: "advanced", title: "Advanced", icon: "settings", desc: "Rarely needed knobs.", groups: [
       { title: "File watching", opts: [{ key: "watcherDebounceMs", label: "Change debounce (ms, restart required)", type: "number", min: 50, max: 5000, step: 50 }] },
+      { title: "Comparison", opts: [{ key: "generatedPatterns", label: "Extra generated file patterns", hint: "Comma separated names or globs (e.g. *.pb.go, gen/*.rs) collapsed by default in comparisons and Git file lists.", type: "list" }] },
     ],
   },
 ];
@@ -210,12 +250,18 @@ function DraftInput({ saved, commit, live, ...rest }: {
 }
 
 function OptRow({ o, s }: { o: Opt; s: Settings }) {
+  const omarchyActive = useStore((st) => !!st.omarchy?.active);
+  // "Omarchy" is offered where Omarchy runs (and stays visible if it is already chosen).
+  if (o.key === "theme" && o.type === "select" && (omarchyActive || s.theme === "omarchy") && !o.options.some(([k]) => k === "omarchy")) {
+    o = { ...o, options: [...o.options, ["omarchy", "Omarchy (live desktop theme)"]] };
+  }
   const v = o.key === "keyboardProfile" ? keyboardProfile(s) : s[o.key] as unknown;
   const set = (val: unknown) => A.updateSettings({ [o.key]: val } as Partial<Settings>, o.type === "text" || o.type === "color");
   const keys = useKeyLabels();
+  if (o.when === "omarchy" && !omarchyActive) return null;
   let ctl: React.ReactNode;
   switch (o.type) {
-    case "bool": ctl = <input type="checkbox" className="switch" role="switch" title={o.label} checked={!!v} onChange={(e) => set(e.target.checked)} />; break;
+    case "bool": ctl = <input type="checkbox" className="switch" role="switch" title={tt(o.label)} checked={!!v} onChange={(e) => set(e.target.checked)} />; break;
     case "number": ctl = (
       <DraftInput type="number" saved={String(v)} min={o.min} max={o.max} step={o.step ?? 1}
         live={(t) => String(Number(t)) === t.trim() && Number(t) >= (o.min ?? -Infinity) && Number(t) <= (o.max ?? Infinity)}
@@ -226,11 +272,13 @@ function OptRow({ o, s }: { o: Opt; s: Settings }) {
           return true;
         }} />
     ); break;
-    case "text": ctl = <input type="text" value={v as string} placeholder={o.placeholder} onChange={(e) => set(e.target.value)} spellCheck={false} />; break;
-    case "select": ctl = <ThemedSelect value={v as string} onChange={(e) => set(e.target.value)}>{o.options.map(([k, l]) => <option key={k} value={k}>{l}</option>)}</ThemedSelect>; break;
+    case "text": ctl = <input type="text" value={v as string} placeholder={o.placeholder && tt(o.placeholder)} onChange={(e) => set(e.target.value)} spellCheck={false} />; break;
+    case "select": ctl = <ThemedSelect value={v as string} onChange={(e) => set(e.target.value)}>{o.options.map(([k, l]) => <option key={k} value={k}>{tt(l)}</option>)}</ThemedSelect>; break;
     case "theme": ctl = <ThemePicker value={v as string} set={set} />; break;
     case "font": ctl = <FontPicker value={v as string} set={set} />; break;
-    case "openRules": return <OpenRulesList rules={v as OpenRule[]} set={set} label={o.label} hint={o.hint} />;
+    case "worktreeLocation": ctl = <input type="text" value={v as string} placeholder="{repo}/.worktrees/{branch}" onChange={(e) => A.updateSettings({ worktreeLocation: e.target.value }, true)} spellCheck={false} />; break;
+    case "gitCommands": return <GitCommandsList commands={v as GitCommandDef[]} set={set} label={tt(o.label)} hint={o.hint && tt(o.hint)} />;
+    case "openRules": return <OpenRulesList rules={v as OpenRule[]} set={set} label={tt(o.label)} hint={o.hint && tt(o.hint)} />;
     case "color": ctl = <input type="color" value={v as string} onChange={(e) => set(e.target.value)} />; break;
     case "list": {
       // Paths may contain commas: those lists are separated by ";".
@@ -244,14 +292,27 @@ function OptRow({ o, s }: { o: Opt; s: Settings }) {
   }
   // A toggle with a key: say it is a key ("." alone looked like a stray dot).
   const key = o.type === "bool" && o.action ? keys.action(o.action) : null;
-  const hint = key ? `Shortcut: ${key}${o.hint ? ` · ${o.hint}` : ""}` : o.hint;
+  const hint = key ? `${tt("Shortcut:")} ${key}${o.hint ? ` · ${tt(o.hint)}` : ""}` : o.hint && tt(o.hint);
   const id = `opt-${o.key}`;
   return (
     <div className={`opt ${o.type === "bool" ? "toggle" : ""}`}>
-      <label htmlFor={id} className="opt-text"><span className="opt-label">{o.label}</span>{hint && <small>{hint}</small>}</label>
+      <label htmlFor={id} className="opt-text"><span className="opt-label">{tt(o.label)}</span>{hint && <small>{hint}</small>}{o.type === "worktreeLocation" && <WorktreePreview template={v as string} />}</label>
       <div className="opt-ctl">{withId(ctl, id)}</div>
     </div>
   );
+}
+
+/** The folder a worktree of the branch `feature/example` would get in the open folder's repository. */
+function WorktreePreview({ template }: { template: string }) {
+  const path = useStore((s) => { const b = s.session?.browsers[s.session.activeBrowser]; return b?.tabs[b.active]?.path ?? ""; });
+  const [place, setPlace] = useState<WorktreeLocation | null>(null);
+  useEffect(() => {
+    let active = true;
+    const timer = window.setTimeout(() => { void worktreeLocation(path, "feature/example", template, {}).then((value) => { if (active) setPlace(value); }).catch(() => { if (active) setPlace(null); }); }, 120);
+    return () => { active = false; window.clearTimeout(timer); };
+  }, [path, template]);
+  if (!place) return null;
+  return <small className={place.error ? "opt-preview-error" : undefined} role="status">{place.error ?? tt("Preview: {path}", { path: place.path ?? "" })}</small>;
 }
 
 /** Gives the row's control the id its label points at (clicking the label focuses / toggles it). */
@@ -272,19 +333,20 @@ function FontPicker({ value, set }: { value: string; set: (v: string) => void })
   return (
     <span className="font-pick">
       <ThemedSelect value={value} onFocus={load} onChange={(e) => set(e.target.value)} style={value ? { fontFamily: `"${value}"` } : undefined}>
-        <option value="">Default (JetBrains Mono)</option>
-        {!known && <option value={value}>{value} {fonts ? "(not installed)" : ""}</option>}
-        {fonts == null && <option disabled>Loading fonts…</option>}
-        {mono.length > 0 && <optgroup label="Fixed width">{mono.map((f) => <option key={f.name} value={f.name}>{f.name}</option>)}</optgroup>}
-        {prop.length > 0 && <optgroup label="Proportional">{prop.map((f) => <option key={f.name} value={f.name}>{f.name}</option>)}</optgroup>}
+        <option value="">{tt("Default (JetBrains Mono)")}</option>
+        {!known && <option value={value}>{value} {fonts ? tt("(not installed)") : ""}</option>}
+        {fonts == null && <option disabled>{tt("Loading fonts…")}</option>}
+        {mono.length > 0 && <optgroup label={tt("Fixed width")}>{mono.map((f) => <option key={f.name} value={f.name}>{f.name}</option>)}</optgroup>}
+        {prop.length > 0 && <optgroup label={tt("Proportional")}>{prop.map((f) => <option key={f.name} value={f.name}>{f.name}</option>)}</optgroup>}
       </ThemedSelect>
-      {cur && (!cur.bold || !cur.italic) && <small className="font-note">no {[!cur.bold && "bold", !cur.italic && "italic"].filter(Boolean).join(" or ")} face: imitated</small>}
+      {cur && (!cur.bold || !cur.italic) && <small className="font-note">{!cur.bold && !cur.italic ? tt("no bold or italic face: imitated") : !cur.bold ? tt("no bold face: imitated") : tt("no italic face: imitated")}</small>}
     </span>
   );
 }
 
 function ThemePicker({ value, set }: { value: string; set: (v: string) => void }) {
   const info = useStore((s) => s.info);
+  const contrastReport = useStore((s) => s.themeContrastReport);
   const dir = info ? join(info.configDir, "themes") : "";
   const [names, setNames] = useState<string[]>([]);
   const refresh = () => {
@@ -299,17 +361,36 @@ function ThemePicker({ value, set }: { value: string; set: (v: string) => void }
   const builtins = Object.entries(BUILTIN_THEMES);
   const files = names.filter((n) => !BUILTIN_THEMES[n]);
   const missing = value && !names.includes(value) && !BUILTIN_THEMES[value];
+  const limitNotes: string[] = [];
+  if (contrastReport && hasContrastLimits(contrastReport)) {
+    if (contrastReport.imageSurfaces.length > 0) {
+      limitNotes.push(tt("Image backgrounds ({vars}) cannot be checked automatically.", { vars: contrastReport.imageSurfaces.join(", ") }));
+    }
+    if (contrastReport.mixedGradientSurfaces.length > 0) {
+      limitNotes.push(tt("Gradients with opposing light and dark stops ({vars}) have no single 4.5:1 text colour.", { vars: contrastReport.mixedGradientSurfaces.join(", ") }));
+    }
+    if (contrastReport.customForegroundVars.length > 0) {
+      limitNotes.push(tt("Custom foreground overrides ({vars}) bypass automatic contrast and fall below 4.5:1.", { vars: contrastReport.customForegroundVars.join(", ") }));
+    }
+    if (contrastReport.hasCustomCssRules || contrastReport.hasOpacityRules) {
+      limitNotes.push(tt("Custom CSS colour or opacity rules outside :root are not rewritten automatically."));
+    }
+    if (contrastReport.translucentWindow) {
+      limitNotes.push(tt("Translucent window backgrounds depend on what sits behind Gall."));
+    }
+  }
   return (
     <span className="theme-pick">
       <ThemedSelect value={value} onFocus={refresh} onMouseDown={refresh} onChange={(e) => set(e.target.value)}>
-        <option value="">None (built-in colours)</option>
-        <optgroup label="Included">
-          {builtins.map(([k, t]) => <option key={k} value={k}>{t.label}{names.includes(k) ? " (your file)" : ""}</option>)}
+        <option value="">{tt("None (built-in colours)")}</option>
+        <optgroup label={tt("Included")}>
+          {builtins.map(([k, t]) => <option key={k} value={k}>{t.label}{names.includes(k) ? ` ${tt("(your file)")}` : ""}</option>)}
         </optgroup>
-        {files.length > 0 && <optgroup label="Themes folder">{files.map((n) => <option key={n} value={n}>{n}</option>)}</optgroup>}
-        {missing && <option value={value}>{value} (file not found)</option>}
+        {files.length > 0 && <optgroup label={tt("Themes folder")}>{files.map((n) => <option key={n} value={n}>{n}</option>)}</optgroup>}
+        {missing && <option value={value}>{value} {tt("(file not found)")}</option>}
       </ThemedSelect>
       <FolderLink path={dir} before={ensureDir} />
+      {limitNotes.length > 0 && <small className="theme-contrast-note" role="status">{limitNotes.join(" ")}</small>}
     </span>
   );
 }
@@ -325,15 +406,15 @@ function OpenRulesList({ rules, set, label, hint }: { rules: OpenRule[]; set: (v
     <div className="opt rules">
       <div className="opt-text"><span className="opt-label">{label}</span>{hint && <small>{hint}</small>}</div>
       {sorted.length === 0 ? (
-        <div className="rules-empty">None yet. Select a file, press <kbd>O</kbd> (or Ctrl+Enter), pick a program and press <kbd>Ctrl ↵</kbd>.</div>
+        <div className="rules-empty">{tt("None yet. Select a file, press O (or Ctrl+Enter), pick a program and press Ctrl ↵.")}</div>
       ) : (
         <div className="rules-list">
           {sorted.map((r) => (
             <div key={r.target + (r.dir ?? "")} className="rule">
               <span className="rule-where" title={r.dir ?? r.target}>{ruleLabel(r, home)}</span>
               <span className="rule-name">{r.name}</span>
-              <input type="text" value={r.command} spellCheck={false} title="Command; {path} = the file" onChange={(e) => update(r, { command: e.target.value })} />
-              <button className="icon-btn" title="Forget (use the system default)" onClick={() => update(r, null)}><Icon name="close" size={12} /></button>
+              <input type="text" value={r.command} spellCheck={false} title={tt("Command; {path} = the file", { path: "{path}" })} onChange={(e) => update(r, { command: e.target.value })} />
+              <button className="icon-btn" title={tt("Forget (use the system default)")} onClick={() => update(r, null)}><Icon name="close" size={12} /></button>
             </div>
           ))}
         </div>
@@ -342,32 +423,102 @@ function OpenRulesList({ rules, set, label, hint }: { rules: OpenRule[]; set: (v
   );
 }
 
+/** One argument line of a command: typed freely, kept as arguments when it splits (an unclosed quote waits). */
+function CommandLineInput({ argv, set, label }: { argv: string[]; set: (argv: string[]) => void; label: string }) {
+  const [text, setText] = useState<string | null>(null);
+  const bad = text !== null && splitCommandLine(text) === null;
+  const commit = () => { if (text === null) return; const parsed = splitCommandLine(text); if (parsed) { set(parsed); setText(null); } };
+  return <input type="text" aria-label={label} aria-invalid={bad} value={text ?? joinCommandLine(argv)} spellCheck={false} placeholder="git log --oneline {hash}" onChange={(e) => setText(e.target.value)} onBlur={commit} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); commit(); } if (e.key === "Escape" && text !== null) { e.preventDefault(); e.stopPropagation(); setText(null); } }} />;
+}
+
+/** The Git commands of the user: label, where it applies, the command, an optional key and whether to ask first. */
+function GitCommandsList({ commands, set, label, hint }: { commands: GitCommandDef[]; set: (v: GitCommandDef[]) => void; label: string; hint?: string }) {
+  const update = (id: string, patch: Partial<GitCommandDef> | null) => set(patch ? commands.map((x) => (x.id === id ? { ...x, ...patch } : x)) : commands.filter((x) => x.id !== id));
+  const add = () => set([...commands, { id: `cmd-${Date.now().toString(36)}`, label: "", context: "commit", command: [], key: "", confirm: true }]);
+  const explain = (def: GitCommandDef): string => {
+    const found = checkDefinition(def, builtinKeys(CUSTOM_SCOPE[def.context]), commands);
+    if (!found.problem) return "";
+    if (found.problem === "label") return tt("Give it a name.");
+    if (found.problem === "command") return tt("Type the program and its arguments.");
+    if (found.problem === "key") return tt("A key is one character.");
+    if (found.problem === "taken") return tt("The key {key} is already used here.", { key: found.detail ?? "" });
+    return tt("{problem} Variables: {names}", { problem: found.detail ?? "", names: CUSTOM_VARIABLES.join(" ") });
+  };
+  return (
+    <div className="opt rules gitcmds">
+      <div className="opt-text"><span className="opt-label">{label}</span>{hint && <small>{hint}</small>}</div>
+      {commands.length === 0 ? <div className="rules-empty">{tt("None yet. Add one, for example “{example}” on a commit.", { example: "git log --oneline {hash}" })}</div> : (
+        <div className="rules-list">
+          {commands.map((c) => {
+            const problem = explain(c);
+            return <div key={c.id} className="gitcmd">
+              <input type="text" aria-label={tt("Name of the command")} value={c.label} placeholder={tt("Name")} onChange={(e) => update(c.id, { label: e.target.value })} />
+              <ThemedSelect aria-label={tt("Where the command applies")} value={c.context} onChange={(e) => update(c.id, { context: e.target.value as GitCustomContext })}>{CUSTOM_CONTEXTS.map((context) => <option key={context} value={context}>{tt(context)}</option>)}</ThemedSelect>
+              <CommandLineInput argv={c.command} set={(command) => update(c.id, { command })} label={tt("Command of {name}", { name: c.label || c.id })} />
+              <input type="text" className="gitcmd-key" maxLength={1} aria-label={tt("Key of the command")} value={c.key} placeholder={tt("key")} onChange={(e) => update(c.id, { key: e.target.value.trim() })} />
+              <label className="gitcmd-ask"><input type="checkbox" checked={c.confirm} onChange={(e) => update(c.id, { confirm: e.target.checked })} />{tt("Ask first")}</label>
+              <button className="icon-btn" title={tt("Remove this command")} onClick={() => update(c.id, null)}><Icon name="close" size={12} /></button>
+              {problem && <small className="gitcmd-problem" role="alert">{problem}</small>}
+            </div>;
+          })}
+        </div>
+      )}
+      <button onClick={add}>{tt("Add a Git command")}</button>
+    </div>
+  );
+}
+
 function Shortcuts({ s, q }: { s: Settings; q: string }) {
-  const actions = (Object.keys(DEFAULT_KEYMAP) as Action[]).filter((a) => !q || ACTION_LABELS[a].toLowerCase().includes(q));
+  const actions = (Object.keys(DEFAULT_KEYMAP) as Action[]).filter((a) => !q || ACTION_LABELS[a].toLowerCase().includes(q) || tt(ACTION_LABELS[a]).toLowerCase().includes(q));
   const profile = keyboardProfile(s);
   const keymap = useMemo(() => buildKeymap(s.shortcuts, profile), [s.shortcuts, profile]);
   return (
     <>
-      {!q && <p className="section-note">Profile: <b>{KEYBOARD_PROFILES[profile]}</b>. Custom shortcuts apply to all profiles. Comma-separate several chords, e.g. <kbd>F5</kbd>, <kbd>Ctrl+R</kbd>. Enter or leaving the field saves; an empty field restores this profile's default.</p>}
+      {!q && <p className="section-note">{tt("Profile:")} <b>{KEYBOARD_PROFILES[profile]}</b>. {tt("Custom shortcuts apply to all profiles. Comma-separate several chords, e.g. F5, Ctrl+R. Enter or leaving the field saves; an empty field restores this profile's default.")}</p>}
       <div className="scard kb-card">
-      {actions.map((a) => <ShortcutRow key={a} a={a} s={s} keymap={keymap} />)}
+      {actions.map((a) => {
+        const saved = s.shortcuts[a] ?? defaultKeymap(profile)[a].join(", ");
+        // A chord of this action that another action has: the other one wins or loses it.
+        const clash = saved.split(",").map((c) => normalizeChord(c.trim())).filter(Boolean)
+          .map((c) => [c, keymap.get(c)] as const).find(([, other]) => other && other !== a);
+        return <ChordRow key={a} id={a} label={tt(ACTION_LABELS[a])} defaults={defaultKeymap(profile)[a].join(", ")} s={s}
+          clash={clash && tt("{chord} runs “{action}”", { chord: clash[0], action: tt(ACTION_LABELS[clash[1]!]) })} />;
+      })}
       </div>
+      {gitGroups(s.shortcuts, q).map(({ scope, commands }) => (
+        <section key={scope} className="sgroup">
+          <h4>{tt("Git")} · {tt(GIT_SCOPE_LABELS[scope])}</h4>
+          <div className="scard kb-card">{commands.map((command) => {
+            const reserved = (s.shortcuts[command.id] ?? "").split(",").map((c) => c.trim()).filter(Boolean).map(parseGitKey).find((key) => GIT_RESERVED.includes(key));
+            const lost = !reserved && command.keys.length === 0;
+            return <ChordRow key={command.id} id={command.id} label={tt(command.label)} defaults={command.defaults.map(gitKeyName).join(", ")} s={s}
+              clash={reserved ? tt("{key} moves between rows and panels and cannot run a command", { key: reserved }) : lost ? tt("No key: another command uses it") : undefined} />;
+          })}</div>
+        </section>
+      ))}
+      {!q && <p className="section-note">{tt("Git keys are case-sensitive: w and W are two keys. Letters work while Vim keys are on; a chord such as Ctrl+G or F6 works without them too.")}</p>}
     </>
   );
 }
 
+/** The Git commands that a search matches, by panel. */
+function gitGroups(shortcuts: Record<string, string>, q: string) {
+  return gitCommandList(shortcuts)
+    .map(({ scope, commands }) => ({ scope, commands: commands.filter((c) => !q || `git ${GIT_SCOPE_LABELS[scope]} ${tt(GIT_SCOPE_LABELS[scope])} ${c.label} ${tt(c.label)}`.toLowerCase().includes(q)) }))
+    .filter(({ commands }) => commands.length > 0);
+}
+
 /** One action's chords: edited as text and saved on Enter or blur (not on every key, so
  *  clearing the field to type a new chord does not snap back to the default). */
-function ShortcutRow({ a, s, keymap }: { a: Action; s: Settings; keymap: Map<string, Action> }) {
-  const defaults = defaultKeymap(keyboardProfile(s))[a].join(", ");
-  const saved = s.shortcuts[a] ?? defaults;
+function ChordRow({ id, label, defaults, s, clash }: { id: string; label: string; defaults: string; s: Settings; clash?: string }) {
+  const saved = s.shortcuts[id] ?? defaults;
   const [text, setText] = useState(saved);
   useEffect(() => setText(saved), [saved]);
   const commit = (t = text) => {
     const sc = { ...getState().settings!.shortcuts };
     const v = t.trim();
-    if (v === "" || v === defaults) delete sc[a];
-    else sc[a] = v;
+    if (v === "" || v === defaults) delete sc[id];
+    else sc[id] = v;
     if (JSON.stringify(sc) !== JSON.stringify(getState().settings!.shortcuts)) A.updateSettings({ shortcuts: sc });
     else setText(saved);
   };
@@ -375,13 +526,10 @@ function ShortcutRow({ a, s, keymap }: { a: Action; s: Settings; keymap: Map<str
   const latest = useRef({ text, saved, commit });
   latest.current = { text, saved, commit };
   useEffect(() => () => { const l = latest.current; if (l.text !== l.saved) l.commit(l.text); }, []);
-  // A chord of this action that another action has: the other one wins or loses it.
-  const clash = saved.split(",").map((c) => normalizeChord(c.trim())).filter(Boolean)
-    .map((c) => [c, keymap.get(c)] as const).find(([, other]) => other && other !== a);
   return (
-    <div className={`kb-row ${s.shortcuts[a] != null ? "changed" : ""}`}>
-      <span>{ACTION_LABELS[a]}{clash && <span className="kb-clash" title="Each chord runs one action"> · {clash[0]} runs “{ACTION_LABELS[clash[1]!]}”</span>}</span>
-      <input type="text" value={text} spellCheck={false}
+    <div className={`kb-row ${s.shortcuts[id] != null ? "changed" : ""}`}>
+      <span>{label}{clash && <span className="kb-clash" title={clash}> · {clash}</span>}</span>
+      <input type="text" value={text} spellCheck={false} data-shortcut={id}
         onChange={(e) => setText(e.target.value)}
         onBlur={() => commit()}
         onKeyDown={(e) => {
@@ -396,7 +544,7 @@ function ShortcutRow({ a, s, keymap }: { a: Action; s: Settings; keymap: Map<str
 function Group({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <section className="sgroup">
-      <h4>{title}</h4>
+      <h4>{tt(title)}</h4>
       <div className="scard">{children}</div>
     </section>
   );
@@ -408,6 +556,92 @@ const EXTRA_NAV = [
   { id: "shortcuts", title: "Shortcuts", icon: "list", desc: "Rebind any action. Vim keys and the leader menu are listed in the key sheet." },
 ];
 
+function FileManagerStatus() {
+  const platform = useStore((st) => st.info?.platform ?? "linux");
+  const linux = platform === "linux";
+  const [request, setRequest] = useState(0);
+  const [status, setStatus] = useState<Awaited<ReturnType<typeof api.fileManagerStatus>> | "error" | null>(null);
+  const [dfm, setDfm] = useState<DefaultFileManagerStatus | "error" | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    api.defaultFileManagerStatus().then(
+      (result) => { if (active) setDfm(result); },
+      () => { if (active) setDfm("error"); },
+    );
+    if (linux) {
+      api.fileManagerStatus().then(
+        (result) => { if (active) setStatus(result); },
+        () => { if (active) setStatus("error"); },
+      );
+    }
+    return () => { active = false; };
+  }, [linux, request]);
+
+  const refresh = () => {
+    setActionError(null);
+    setDfm(null);
+    if (linux) setStatus(null);
+    setRequest((n) => n + 1);
+  };
+
+  const apply = async (enable: boolean) => {
+    if (busy) return;
+    setBusy(true);
+    setActionError(null);
+    try {
+      const next = enable ? await api.defaultFileManagerSet() : await api.defaultFileManagerRestore();
+      setDfm(next);
+      if (linux) {
+        api.fileManagerStatus().then(
+          (result) => setStatus(result),
+          () => setStatus("error"),
+        );
+      }
+    } catch (err) {
+      setActionError(String(err instanceof Error ? err.message : err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const folderText = linux
+    ? (status === "error" ? tt("Status unavailable") : status === null ? tt("Loading…") : status.folderHandler ?? tt("None"))
+    : (dfm === "error" ? tt("Status unavailable") : dfm === null ? tt("Loading…") : dfm.currentHandler ?? tt("None"));
+  const revealText = status === "error" || (status && !status.revealAvailable)
+    ? tt("Status unavailable") : status === null ? tt("Loading…") : status.revealHandler ?? tt("None");
+  const dfmOk = dfm && dfm !== "error" ? dfm : null;
+  const activePlatform = dfmOk?.platform ?? platform;
+  const unavailable = dfmOk && !dfmOk.canSet && !dfmOk.isDefault ? unavailableExplanation(dfmOk.unavailableReason, tt) : null;
+
+  return <Group title="File manager integration">
+    <div className="opt">
+      <div className="opt-text">
+        <span className="opt-label">{tt("Default for opening folders")}</span>
+        <small data-file-manager-folder role="status">{folderText}</small>
+        <small>{platformScopeNote(activePlatform, tt)}</small>
+        {unavailable && <small className="wc-dfm-warn" role="status">{unavailable}</small>}
+        {actionError && <small className="wc-dfm-error" role="alert">{actionError}</small>}
+      </div>
+      <div className="opt-ctl fm-ctl">
+        {dfmOk && (dfmOk.isDefault
+          ? <button className="btn" disabled={busy} onClick={() => void apply(false)}>{busy ? tt("Applying…") : restoreActionLabel(dfmOk, tt)}</button>
+          : <button className="btn primary" disabled={busy || !dfmOk.canSet} title={unavailable ?? undefined} onClick={() => void apply(true)}>{busy ? tt("Applying…") : tt("Set Gall as default")}</button>
+        )}
+        <button className="btn" disabled={busy} onClick={refresh}>{tt("Refresh")}</button>
+      </div>
+    </div>
+    {linux && (
+      <div className="opt">
+        <div className="opt-text"><span className="opt-label">{tt("Running app for Show in Folder")}</span>
+          <small data-file-manager-reveal role="status">{revealText}</small></div>
+      </div>
+    )}
+  </Group>;
+}
+
 export function SettingsDialog({ section: initial }: { section?: string }) {
   const s = useStore((st) => st.settings)!;
   const [section, setSection] = useState(initial ?? "appearance");
@@ -417,30 +651,37 @@ export function SettingsDialog({ section: initial }: { section?: string }) {
   const filtered = useMemo(() => {
     if (!query) return null;
     return SECTIONS.flatMap((sec) => sec.groups.map((g) => ({
-      title: `${sec.title} › ${g.title}`,
-      opts: g.opts.filter((o) => (o.label + " " + (o.hint ?? "") + " " + g.title + " " + sec.title).toLowerCase().includes(query)),
+      title: `${tt(sec.title)} › ${tt(g.title)}`,
+      opts: g.opts.filter((o) => [o.label, o.hint ?? "", g.title, sec.title].some((x) => `${x} ${tt(x)}`.toLowerCase().includes(query))),
     }))).filter((g) => g.opts.length);
   }, [query]);
-  const shortcutHits = query ? (Object.keys(DEFAULT_KEYMAP) as Action[]).some((a) => ACTION_LABELS[a].toLowerCase().includes(query)) : false;
+  const shortcutHits = query ? (Object.keys(DEFAULT_KEYMAP) as Action[]).some((a) => ACTION_LABELS[a].toLowerCase().includes(query) || tt(ACTION_LABELS[a]).toLowerCase().includes(query)) || gitGroups(s.shortcuts, query).length > 0 : false;
+  const updateOpt: Opt = {
+    key: "autoDownloadUpdates",
+    label: "Download updates automatically",
+    hint: "Download and verify new releases in the background, then prompt to restart when ready. Turn off to only show a notification.",
+    type: "bool",
+  };
+  const updateHit = query ? (`updates ${updateOpt.label} ${tt(updateOpt.label)} ${updateOpt.hint} ${tt(updateOpt.hint ?? "")}`).toLowerCase().includes(query) : false;
   const cur = SECTIONS.find((x) => x.id === section);
   const extra = EXTRA_NAV.find((x) => x.id === section);
   const go = (id: string) => { setQ(""); setSection(id); };
   const navItem = (x: { id: string; title: string; icon: string }) => (
     <button key={x.id} className={!query && section === x.id ? "on" : ""} onClick={() => go(x.id)}>
-      <Icon name={x.icon} size={15} /><span>{x.title}</span>
+      <Icon name={x.icon} size={15} /><span>{tt(x.title)}</span>
     </button>
   );
   return (
     <div className="backdrop center" onMouseDown={() => A.openOverlay(null)}>
       <div className="modal settings" onMouseDown={(e) => e.stopPropagation()} tabIndex={-1} onKeyDown={(e) => { e.stopPropagation(); if (e.key === "Escape") A.openOverlay(null); }}>
         <div className="shead">
-          <div className="shead-title"><Icon name="settings" size={17} /><b>Settings</b></div>
+          <div className="shead-title"><Icon name="settings" size={17} /><b>{tt("Settings")}</b></div>
           <label className="ssearch">
             <Icon name="search" size={14} />
-            <input type="text" autoFocus placeholder="Search settings…" value={q} onChange={(e) => setQ(e.target.value)} spellCheck={false} />
-            {q && <button className="icon-btn" title="Clear" onClick={() => setQ("")}><Icon name="close" size={12} /></button>}
+            <input type="text" autoFocus placeholder={tt("Search settings…")} value={q} onChange={(e) => setQ(e.target.value)} spellCheck={false} />
+            {q && <button className="icon-btn" title={tt("Clear")} onClick={() => setQ("")}><Icon name="close" size={12} /></button>}
           </label>
-          <button className="btn primary" onClick={() => A.openOverlay(null)}>Done</button>
+          <button className="btn primary" onClick={() => A.openOverlay(null)}>{tt("Done")}</button>
         </div>
         <div className="sbody">
           <nav>
@@ -448,14 +689,15 @@ export function SettingsDialog({ section: initial }: { section?: string }) {
             <div className="nav-sep" />
             {EXTRA_NAV.map(navItem)}
           </nav>
-          <div className="panel" key={query ? "search" : section}>
+          <div className="panel">
             {filtered ? (
               <>
-                <div className="section-head"><h2>Search</h2><p>{filtered.reduce((n, g) => n + g.opts.length, 0) || "No"} settings match “{q.trim()}”</p></div>
+                <div className="section-head"><h2>{tt("Search")}</h2><p>{tt("{count} settings match “{query}”", { count: filtered.reduce((n, g) => n + g.opts.length, 0) + (updateHit ? 1 : 0) || tt("No"), query: q.trim() })}</p></div>
                 {filtered.map((g) => <Group key={g.title} title={g.title}>{g.opts.map((o) => <OptRow key={o.key} o={o} s={s} />)}</Group>)}
+                {updateHit && <Group title="Updates"><OptRow o={updateOpt} s={s} /></Group>}
                 {shortcutHits && (
                   <section className="sgroup">
-                    <h4>Shortcuts</h4>
+                    <h4>{tt("Shortcuts")}</h4>
                     <Shortcuts s={s} q={query} />
                   </section>
                 )}
@@ -465,9 +707,10 @@ export function SettingsDialog({ section: initial }: { section?: string }) {
             ) : (
               <>
                 <div className="section-head">
-                  <h2>{cur?.title ?? extra?.title}</h2>
-                  {(cur?.desc ?? extra?.desc) && <p>{cur?.desc ?? extra?.desc}</p>}
+                  <h2>{tt((cur?.title ?? extra?.title)!)}</h2>
+                  {(cur?.desc ?? extra?.desc) && <p>{tt((cur?.desc ?? extra?.desc)!)}</p>}
                 </div>
+                {section === "openWith" && <FileManagerStatus />}
                 {section === "updates" ? (
                   <Updates />
                 ) : section === "shortcuts" ? (
@@ -478,24 +721,29 @@ export function SettingsDialog({ section: initial }: { section?: string }) {
                 {section === "view" && (
                   <Group title="Forget">
                     <div className="opt">
-                      <div className="opt-text"><span className="opt-label">Folder views</span><small>Every folder goes back to the default sort and view</small></div>
-                      <div className="opt-ctl"><button className="btn" onClick={() => A.forgetFolderViews()}>Forget</button></div>
+                      <div className="opt-text"><span className="opt-label">{tt("Folder views")}</span><small>{tt("Every folder goes back to the default sort and view")}</small></div>
+                      <div className="opt-ctl"><button className="btn" onClick={() => A.forgetFolderViews()}>{tt("Forget")}</button></div>
                     </div>
                   </Group>
                 )}
+                {section === "advanced" && <Group title="Local explanation model"><CompareAiSettings /></Group>}
                 {section === "advanced" && (
                   <Group title="Factory reset">
                     <div className="opt">
-                      <div className="opt-text"><span className="opt-label">Reset all settings</span><small>Every setting, shortcut, folder colour, remembered program and folder view back to the default. Favourites, colour tags, history and open tabs stay.</small></div>
-                      <div className="opt-ctl"><button className="btn danger" onClick={() => A.resetAllSettings()}>Reset…</button></div>
+                      <div className="opt-text"><span className="opt-label">{tt("Reset all settings")}</span><small>{tt("Every setting, shortcut, folder colour, remembered program and folder view back to the default. Favourites, colour tags, history and open tabs stay.")}</small></div>
+                      <div className="opt-ctl"><button className="btn danger" onClick={() => A.resetAllSettings()}>{tt("Reset…")}</button></div>
                     </div>
                   </Group>
                 )}
                 {section === "window" && (
                   <Group title="Favourites">
                     <div className="opt">
-                      <div className="opt-text"><span className="opt-label">Default sidebar folders</span><small>Recreate the default group of standard folders (Home, Documents, Downloads…)</small></div>
-                      <div className="opt-ctl"><button className="btn" onClick={() => A.favCmd({ op: "restoreDefault" })}>Create</button></div>
+                      <div className="opt-text"><span className="opt-label">{tt("Default sidebar folders")}</span><small>{tt("Recreate the default group of standard folders (Home, Documents, Downloads…)")}</small></div>
+                      <div className="opt-ctl"><button className="btn" onClick={() => A.favCmd({ op: "restoreDefault" })}>{tt("Create")}</button></div>
+                    </div>
+                    <div className="opt">
+                      <div className="opt-text"><span className="opt-label">{tt("Import favorites")}</span><small>{tt("Take over the places of other file managers (GTK bookmarks, KDE Places) as a new group; existing favorites stay as they are")}</small></div>
+                      <div className="opt-ctl"><button className="btn" onClick={() => A.openOverlay({ type: "favoritesImport" })}>{tt("Import…")}</button></div>
                     </div>
                   </Group>
                 )}

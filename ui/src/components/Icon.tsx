@@ -2,6 +2,7 @@
 // Catppuccin icon theme (MIT), see core/fileIcons.ts and public/icons/catppuccin/LICENSE.
 import { useEffect, useState, useSyncExternalStore, type CSSProperties } from "react";
 import { fileIconId, folderEmblem, folderIconId, iconUrl, isPlainFolder } from "../core/fileIcons";
+import { folderGeometry } from "../core/folderGlyph";
 import { useStore } from "../state/store";
 
 const P: Record<string, string> = {
@@ -18,6 +19,7 @@ const P: Record<string, string> = {
   extract: "M4 9h16v11H4z M3 5h18v4H3z M12 12v6 M9 15l3 3 3-3",
   note: "M5 4h14v12l-4 4H5z M15 20v-4h4 M8 9h8 M8 12h6",
   link: "M10 14a4 4 0 0 0 5.66 0l3-3a4 4 0 0 0-5.66-5.66l-1 1 M14 10a4 4 0 0 0-5.66 0l-3 3a4 4 0 0 0 5.66 5.66l1-1",
+  wifiOff: "M3 3l18 18 M2 9a16 16 0 0 1 4-2.3 M10.7 5.6A16 16 0 0 1 22 9 M5.5 12.5a10.5 10.5 0 0 1 4.4-2.2 M15.4 10.6a10.5 10.5 0 0 1 3.1 1.9 M9 16a4.7 4.7 0 0 1 4.6-1 M12 20h.01",
   drive: "M3 14l2.5-8h13L21 14v4H3z M3 14h18 M17 16.5h.01",
   home: "M4 11l8-7 8 7v9h-5v-6H9v6H4z",
   trash: "M5 7h14 M9 7V4h6v3 M7 7l1 13h8l1-13",
@@ -76,6 +78,13 @@ const P: Record<string, string> = {
   cloud: "M7 18a4.5 4.5 0 0 1-.6-8.96A6 6 0 0 1 17.8 8.5 4.75 4.75 0 0 1 17.25 18z",
   bell: "M6 16V11a6 6 0 0 1 12 0v5l2 2H4z M10 20a2 2 0 0 0 4 0",
   eye: "M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z M12 9a3 3 0 1 0 0 6a3 3 0 1 0 0-6z",
+  eyeOff: "M3 3l18 18 M10.6 10.6a3 3 0 0 0 4.2 4.2 M9.9 5.2A10.4 10.4 0 0 1 12 5c6 0 10 7 10 7a17.6 17.6 0 0 1-3.2 4.1 M6.6 6.6C4 8.4 2 12 2 12s4 7 10 7a10.4 10.4 0 0 0 3.4-.6",
+  paneLeft: "M3 4h18v16H3z M12 4v16 M6 8h3 M6 12h3 M6 16h3",
+  paneRight: "M3 4h18v16H3z M12 4v16 M15 8h3 M15 12h3 M15 16h3",
+  paneBoth: "M3 4h18v16H3z M12 4v16 M6 9h3 M6 15h3 M15 9h3 M15 15h3",
+  paneTop: "M3 4h18v16H3z M3 12h18 M7 8h10",
+  paneBottom: "M3 4h18v16H3z M3 12h18 M7 16h10",
+  paneBothV: "M3 4h18v16H3z M3 12h18 M7 8h10 M7 16h10",
 };
 
 export function Icon({ name, size = 16, color, style, title }: { name: string; size?: number; color?: string; style?: CSSProperties; title?: string }) {
@@ -103,11 +112,12 @@ type IconEntry = { isDir: boolean; ext: string; isSymlink?: boolean; name?: stri
 
 // Filled folder in a 16×16 box, like Explorer's: a darker back with the tab, a lighter front.
 const FOLDER_BACK = "M1 3.5A1.5 1.5 0 0 1 2.5 2h3.4a1.5 1.5 0 0 1 1.06.44L8.03 3.5h5.47A1.5 1.5 0 0 1 15 5v7.5a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 1 12.5z";
-const FOLDER_FRONT = "M1 6.4A1.4 1.4 0 0 1 2.4 5h11.2A1.4 1.4 0 0 1 15 6.4v6.1a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 1 12.5z";
 const FOLDER_FRONT_OPEN = "M3.3 6.5h11.3a.8.8 0 0 1 .77 1.02L13.9 12.9a1.5 1.5 0 0 1-1.44 1.1H2.1a.8.8 0 0 1-.78-.98l1.2-5.9a.8.8 0 0 1 .78-.62z";
 
 /** A filled folder in `color` (default: the theme's folder colour), with the emblem of
- *  a special folder (src, .git, …) taken from its Catppuccin icon. */
+ *  a special folder (src, .git, …) taken from its Catppuccin icon. It is drawn in whole device pixels
+ *  (see core/folderGlyph.ts): scaled from a 16-unit viewBox at 125 % or 150 % every edge sat on a
+ *  fraction of a pixel and the icon was soft. */
 export function FolderGlyph({ size, color, url, emblem, open = false }: { size: number; color?: string; url: string; emblem: boolean; open?: boolean }) {
   const [markup, setMarkup] = useState("");
   useEffect(() => {
@@ -117,21 +127,36 @@ export function FolderGlyph({ size, color, url, emblem, open = false }: { size: 
     return () => { live = false; };
   }, [url, emblem]);
   const c = color ?? "var(--folder)";
+  // The list re-renders (new icon size) when the display scale changes, so reading it here is enough.
+  const dpr = window.devicePixelRatio || 1;
+  const g = folderGeometry(Math.round(size * dpr));
+  const back = `color-mix(in oklch, ${c} 80%, #000)`;
   return (
-    <svg className="ficon-folder" data-tint={color} width={size} height={size} viewBox="0 0 16 16" aria-hidden>
-      <path d={FOLDER_BACK} fill={`color-mix(in oklch, ${c} 80%, #000)`} />
-      <path className="ff" d={open ? FOLDER_FRONT_OPEN : FOLDER_FRONT} fill={c} />
-      {!open && <path d="M2.4 5.55h11.2" stroke="#fff" strokeOpacity={0.35} strokeWidth={0.6} strokeLinecap="round" />}
-      {markup && (
+    <svg className="ficon-folder" data-tint={color} width={size} height={size} viewBox={`0 0 ${g.size} ${g.size}`} aria-hidden style={{ "--fe-halo": `${g.emblem.halo}px` } as CSSProperties}>
+      {open ? (
+        // The open folder (current folder in a tree) keeps the 16-unit art, scaled.
+        <g transform={`scale(${g.size / 16})`}>
+          <path d={FOLDER_BACK} fill={back} />
+          <path className="ff" d={FOLDER_FRONT_OPEN} fill={c} />
+        </g>
+      ) : (
         <>
+          <path d={g.back} fill={back} />
+          <path className="ff" d={g.front} fill={c} />
+          <path d={`M${g.line.x1} ${g.line.y}H${g.line.x2}`} stroke="#fff" strokeOpacity={0.22} strokeWidth={1} shapeRendering="crispEdges" />
+        </>
+      )}
+      {markup && (
+        // The emblem sits in the folder's bottom-right corner at a whole number of device pixels per
+        // unit, inside the icon's box, so its 1-unit strokes are whole pixels wide and not blurred.
+        <g data-emblem transform={g.emblem.transform}>
           <g className="fe-halo" dangerouslySetInnerHTML={{ __html: markup }} />
           <g dangerouslySetInnerHTML={{ __html: markup }} />
-        </>
+        </g>
       )}
     </svg>
   );
 }
-
 /** Catppuccin (Zed) icon for a file, or a filled folder; by name when known, else by extension. */
 export function FileIcon({ entry, size = 16, open = false }: { entry: IconEntry; size?: number; open?: boolean }) {
   const light = useLightTheme();

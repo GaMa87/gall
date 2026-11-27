@@ -2,14 +2,17 @@
 // ripgrep-powered content search with live results grouped by file and a
 // context preview of the selected match.
 import { useEffect, useMemo, useRef, useState } from "react";
+import { tt } from "../i18n";
 import { api, events } from "../api/ipc";
-import type { FileMatches, GrepOptions, GrepStats } from "../api/types";
+import type { FileMatches, GrepOptions, GrepStats, HiddenCount } from "../api/types";
+import { emptyHiddenText, footerHiddenText } from "../core/hiddenHint";
 import { ancestors, basename, linuxHome, parent, tildify } from "../core/path";
 import * as A from "../state/actions";
 import { controller } from "../state/controllers";
 import { pushRecent, useStore } from "../state/store";
 import { FileIcon, Icon } from "./Icon";
 import { primaryMod } from "../core/keymap";
+import { platformLabel } from "../core/keymap";
 
 type Scope = "folder" | "home" | "root";
 const ROW_H = 24;
@@ -52,6 +55,7 @@ export function FindInFiles({ root, scope: initialScope }: { root: string; scope
   const [collapsed, setCollapsed] = useState<Set<number>>(new Set());
   const [running, setRunning] = useState(false);
   const [done, setDone] = useState<{ stats: GrepStats; cancelled: boolean } | null>(null);
+  const [hiddenCount, setHiddenCount] = useState<HiddenCount | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [sel, setSel] = useState<{ fi: number; mi: number } | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
@@ -77,12 +81,17 @@ export function FindInFiles({ root, scope: initialScope }: { root: string; scope
       setDone({ stats: d.stats, cancelled: d.cancelled });
       setError(d.error);
     });
+    const un3 = events.grepHidden((h) => {
+      if (h.id !== id.current) return;
+      setHiddenCount(h.count > 0 ? { count: h.count, capped: h.capped } : null);
+    });
     const ro = new ResizeObserver(() => setViewH(listRef.current?.clientHeight ?? 400));
     if (listRef.current) ro.observe(listRef.current);
     return () => {
       api.grepCancel();
       un1.then((f) => f());
       un2.then((f) => f());
+      un3.then((f) => f());
       ro.disconnect();
     };
   }, []);
@@ -93,6 +102,7 @@ export function FindInFiles({ root, scope: initialScope }: { root: string; scope
       api.grepCancel();
       id.current = 0;
       setFiles([]);
+      setHiddenCount(null);
       setRunning(false);
       setDone(null);
       setError(null);
@@ -101,6 +111,7 @@ export function FindInFiles({ root, scope: initialScope }: { root: string; scope
     const t = setTimeout(() => {
       id.current = grepSeq++;
       setFiles([]);
+      setHiddenCount(null);
       setCollapsed(new Set());
       setSel(null);
       setDone(null);
@@ -115,7 +126,7 @@ export function FindInFiles({ root, scope: initialScope }: { root: string; scope
         regex: opts.regex,
         include: split(include),
         exclude: split(exclude),
-        respectGitignore: !opts.everything,
+        respectGitignore: true,
         everything: opts.everything,
         maxMatches: 20000,
       };
@@ -200,10 +211,10 @@ export function FindInFiles({ root, scope: initialScope }: { root: string; scope
     if (k === "ArrowUp" || (k === "F4" && e.shiftKey) || (e.ctrlKey && (k === "k" || k === "p"))) { e.preventDefault(); step(-1); return; }
     if (k === "Enter" && (e.target as HTMLElement).tagName === "INPUT" && (e.target as HTMLElement).dataset.role !== "query") return;
     if (k === "Enter") { e.preventDefault(); open(primaryMod(e) ? "reveal" : e.shiftKey ? "other" : "open"); return; }
-    if (e.altKey && k.toLowerCase() === "c") { e.preventDefault(); setOpts((o) => ({ ...o, caseSensitive: !o.caseSensitive })); }
-    if (e.altKey && k.toLowerCase() === "w") { e.preventDefault(); setOpts((o) => ({ ...o, wholeWord: !o.wholeWord })); }
-    if (e.altKey && k.toLowerCase() === "r") { e.preventDefault(); setOpts((o) => ({ ...o, regex: !o.regex })); }
-    if (e.altKey && k.toLowerCase() === "i") { e.preventDefault(); setOpts((o) => ({ ...o, everything: !o.everything })); }
+    if (e.altKey && !e.ctrlKey && !e.metaKey && k.toLowerCase() === "c") { e.preventDefault(); setOpts((o) => ({ ...o, caseSensitive: !o.caseSensitive })); }
+    if (e.altKey && !e.ctrlKey && !e.metaKey && k.toLowerCase() === "w") { e.preventDefault(); setOpts((o) => ({ ...o, wholeWord: !o.wholeWord })); }
+    if (e.altKey && !e.ctrlKey && !e.metaKey && k.toLowerCase() === "r") { e.preventDefault(); setOpts((o) => ({ ...o, regex: !o.regex })); }
+    if (e.altKey && !e.ctrlKey && !e.metaKey && k.toLowerCase() === "i") { e.preventDefault(); setOpts((o) => ({ ...o, everything: !o.everything })); }
   };
 
   const first = Math.max(0, Math.floor(scrollTop / ROW_H) - 10);
@@ -211,6 +222,7 @@ export function FindInFiles({ root, scope: initialScope }: { root: string; scope
   const home = info.home;
   const tilde = (p: string) => tildify(p, home);
   const elapsed = done ? done.stats.elapsedMs : running ? performance.now() - startedAt : 0;
+  const showHiddenHint = !!pattern && !opts.everything && !!hiddenCount && hiddenCount.count > 0;
 
   return (
     <div className="backdrop glass center" onMouseDown={close}>
@@ -218,12 +230,12 @@ export function FindInFiles({ root, scope: initialScope }: { root: string; scope
         <div className="fif-head">
           <div className="fif-query">
             <Icon name="search" size={17} />
-            <input ref={inputRef} data-role="query" value={pattern} spellCheck={false} placeholder="Find in files…" onChange={(e) => setPattern(e.target.value)} />
-            <button className={`tgl ${opts.caseSensitive ? "on" : ""}`} title="Match case (Alt+C)" onClick={() => setOpts((o) => ({ ...o, caseSensitive: !o.caseSensitive }))}>Aa</button>
-            <button className={`tgl ${opts.wholeWord ? "on" : ""}`} title="Whole word (Alt+W)" onClick={() => setOpts((o) => ({ ...o, wholeWord: !o.wholeWord }))}><u>ab</u></button>
-            <button className={`tgl ${opts.regex ? "on" : ""}`} title="Regular expression (Alt+R)" onClick={() => setOpts((o) => ({ ...o, regex: !o.regex }))}>.*</button>
-            <button className={`tgl ${opts.everything ? "on" : ""}`} title="Also search ignored files: node_modules and the other excluded folders, .gitignore, .gallignore, cache folders (Alt+I)" onClick={() => setOpts((o) => ({ ...o, everything: !o.everything }))}><Icon name="eye" size={15} /></button>
-            <button className={`tgl ${showFilters || include || exclude ? "on" : ""}`} title="Include / exclude files" onClick={() => setShowFilters((v) => !v)}><Icon name="more" size={15} /></button>
+            <input ref={inputRef} data-role="query" value={pattern} spellCheck={false} placeholder={tt("Find in files…")} onChange={(e) => setPattern(e.target.value)} />
+            <button className={`tgl ${opts.caseSensitive ? "on" : ""}`} title={tt("Match case (Alt+C)")} onClick={() => setOpts((o) => ({ ...o, caseSensitive: !o.caseSensitive }))}>Aa</button>
+            <button className={`tgl ${opts.wholeWord ? "on" : ""}`} title={tt("Whole word (Alt+W)")} onClick={() => setOpts((o) => ({ ...o, wholeWord: !o.wholeWord }))}><u>ab</u></button>
+            <button className={`tgl ${opts.regex ? "on" : ""}`} title={tt("Regular expression (Alt+R)")} onClick={() => setOpts((o) => ({ ...o, regex: !o.regex }))}>.*</button>
+            <button className={`tgl ${opts.everything ? "on" : ""}`} title={tt("Also search ignored files: node_modules and the other excluded folders, .gitignore, .gallignore, cache folders (Alt+I)")} onClick={() => setOpts((o) => ({ ...o, everything: !o.everything }))}><Icon name="eye" size={15} /></button>
+            <button className={`tgl ${showFilters || include || exclude ? "on" : ""}`} title={tt("Include / exclude files")} onClick={() => setShowFilters((v) => !v)}><Icon name="more" size={15} /></button>
           </div>
           <div className="qo-scope-wrap">
           <div className="seg" role="tablist">
@@ -234,7 +246,7 @@ export function FindInFiles({ root, scope: initialScope }: { root: string; scope
               </button>
             ))}
           </div>
-          <kbd className="scope-key" title="Switch scope (Shift+Tab goes back)">Tab</kbd>
+          <kbd className="scope-key" title={tt("Switch scope (Shift+Tab goes back)")}>Tab</kbd>
           </div>
           {showFilters && (
             <div className="fif-filters">
@@ -245,44 +257,61 @@ export function FindInFiles({ root, scope: initialScope }: { root: string; scope
         </div>
 
         <div className="fif-body">
-          <div className="fif-list" ref={listRef} onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}>
-            <div style={{ height: rows.length * ROW_H, position: "relative" }}>
-              {rows.slice(first, last).map((r, k) => {
-                const i = first + k;
-                const style = { top: i * ROW_H, height: ROW_H };
-                if (r.kind === "file") {
-                  const dir = parent(r.file.path) ?? "";
+          <div className="fif-list-col">
+            <div className="fif-list" ref={listRef} onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}>
+              <div style={{ height: rows.length * ROW_H, position: "relative" }}>
+                {rows.slice(first, last).map((r, k) => {
+                  const i = first + k;
+                  const style = { top: i * ROW_H, height: ROW_H };
+                  if (r.kind === "file") {
+                    const dir = parent(r.file.path) ?? "";
+                    return (
+                      <div key={"f" + r.fi} className={`fif-file ${r.file.hidden ? "is-hidden" : ""}`} style={style} onClick={() => setCollapsed((c) => { const n = new Set(c); n.has(r.fi) ? n.delete(r.fi) : n.add(r.fi); return n; })}>
+                        <Icon name={collapsed.has(r.fi) ? "chevronRight" : "chevronDown"} size={12} />
+                        <FileIcon entry={entryOf(r.file.path)} size={15} />
+                        <span className="n">{basename(r.file.path)}</span>
+                        {r.file.hidden && <span className="hidden-badge">hidden</span>}
+                        <span className="d"><bdi>{tilde(dir)}</bdi></span>
+                        <span className="badge">{r.file.matches.length}</span>
+                      </div>
+                    );
+                  }
+                  const m = r.file.matches[r.mi];
+                  const on = sel?.fi === r.fi && sel?.mi === r.mi;
                   return (
-                    <div key={"f" + r.fi} className="fif-file" style={style} onClick={() => setCollapsed((c) => { const n = new Set(c); n.has(r.fi) ? n.delete(r.fi) : n.add(r.fi); return n; })}>
-                      <Icon name={collapsed.has(r.fi) ? "chevronRight" : "chevronDown"} size={12} />
-                      <FileIcon entry={entryOf(r.file.path)} size={15} />
-                      <span className="n">{basename(r.file.path)}</span>
-                      <span className="d"><bdi>{tilde(dir)}</bdi></span>
-                      <span className="badge">{r.file.matches.length}</span>
+                    <div key={`m${r.fi}:${r.mi}`} className={`fif-match ${on ? "on" : ""} ${r.file.hidden ? "is-hidden" : ""}`} style={style}
+                      onClick={() => setSel({ fi: r.fi, mi: r.mi })} onDoubleClick={() => open("open")}>
+                      <span className="ln">{m.line}</span>
+                      <span className="t"><Ranges text={m.text} ranges={m.ranges} /></span>
                     </div>
                   );
-                }
-                const m = r.file.matches[r.mi];
-                const on = sel?.fi === r.fi && sel?.mi === r.mi;
-                return (
-                  <div key={`m${r.fi}:${r.mi}`} className={`fif-match ${on ? "on" : ""}`} style={style}
-                    onClick={() => setSel({ fi: r.fi, mi: r.mi })} onDoubleClick={() => open("open")}>
-                    <span className="ln">{m.line}</span>
-                    <span className="t"><Ranges text={m.text} ranges={m.ranges} /></span>
-                  </div>
-                );
-              })}
-            </div>
-            {!rows.length && (
-              <div className="fif-empty">
-                {error ? <span className="err">⚠ {error}</span>
-                  : !pattern ? <>
-                      <Icon name="search" size={34} />
-                      <div>Search the contents of every text file in <b>{tilde(searchRoot)}</b></div>
-                      <small>{opts.everything ? "Searching ignored files too" : "Respects .gitignore and .gallignore"} · skips binary files · <kbd>Alt+C</kbd> case <kbd>Alt+W</kbd> word <kbd>Alt+R</kbd> regex <kbd>Alt+I</kbd> ignored files</small>
-                    </>
-                  : running ? "Searching…" : "No results"}
+                })}
               </div>
+              {!rows.length && (
+                <div className="fif-empty">
+                  {error ? <span className="err">⚠ {error}</span>
+                    : !pattern ? <>
+                        <Icon name="search" size={34} />
+                        <div>{tt("Search the contents of every text file in")} <b>{tilde(searchRoot)}</b></div>
+                        <small>{opts.everything ? "Searching ignored files too" : "Respects .gitignore and .gallignore"} · skips binary files · <kbd>{platformLabel("Alt+C")}</kbd> case <kbd>{platformLabel("Alt+W")}</kbd> word <kbd>{platformLabel("Alt+R")}</kbd> regex <kbd>{platformLabel("Alt+I")}</kbd> {tt("ignored files")}</small>
+                      </>
+                    : running ? "Searching…"
+                    : showHiddenHint ? (
+                      <>
+                        <div>{tt("No results.")} <b>{emptyHiddenText(hiddenCount!)}</b>.</div>
+                        <button className="hidden-action" onClick={() => { setOpts((o) => ({ ...o, everything: true })); inputRef.current?.focus(); }}>
+                          {tt("Press")} <kbd>{platformLabel("Alt+I")}</kbd> {tt("to include hidden files")}
+                        </button>
+                      </>
+                    ) : "No results"}
+                </div>
+              )}
+            </div>
+            {rows.length > 0 && showHiddenHint && (
+              <button className="hidden-bar" onClick={() => { setOpts((o) => ({ ...o, everything: true })); inputRef.current?.focus(); }}>
+                <Icon name="eye" size={13} />
+                <span>{footerHiddenText(hiddenCount!)}, <kbd>{platformLabel("Alt+I")}</kbd> {tt("to include")}</span>
+              </button>
             )}
           </div>
           <ContextPreview file={selFile?.path ?? null} line={selMatch?.line ?? 0} pattern={pattern} opts={opts} tilde={tilde} />
@@ -296,17 +325,17 @@ export function FindInFiles({ root, scope: initialScope }: { root: string; scope
               ? <span><b>{totalMatches.toLocaleString()}</b> {totalMatches === 1 ? "match" : "matches"} in <b>{files.length.toLocaleString()}</b> {files.length === 1 ? "file" : "files"}
                   {done && <> · {done.stats.searched.toLocaleString()} searched</>}
                   {done && done.stats.cloudOnly > 0 && (
-                    <span title="Files kept only in the cloud (OneDrive and the like) are not searched: reading them would download every one. Make them available offline to search them.">
+                    <span title={tt("Files kept only in the cloud (OneDrive and the like) are not searched: reading them would download every one. Make them available offline to search them.")}>
                       {" "}· {A.items(done.stats.cloudOnly)} only in the cloud, not searched
                     </span>
                   )}
                   {elapsed > 0 && <> · {(elapsed / 1000).toFixed(1)} s</>}
-                  {done?.stats.truncated && <> · <span className="warn">limit reached</span></>}
+                  {done?.stats.truncated && <> · <span className="warn">{tt("limit reached")}</span></>}
                   {done?.cancelled && <> · stopped</>}</span>
               : <span>Scope: {tilde(searchRoot)}</span>}
-            {running && <button className="link" onClick={() => api.grepCancel()}>Stop</button>}
+            {running && <button className="link" onClick={() => api.grepCancel()}>{tt("Stop")}</button>}
           </span>
-          <span className="qo-hints"><kbd>↑↓</kbd> next match <kbd>↵</kbd> open <kbd>Ctrl ↵</kbd> reveal <kbd>⇧ ↵</kbd> other side <kbd>Esc</kbd> {running ? "stop" : "close"}</span>
+          <span className="qo-hints"><kbd>↑↓</kbd> {tt("next match")} <kbd>↵</kbd> open <kbd>{platformLabel("Ctrl ↵")}</kbd> reveal <kbd>⇧ ↵</kbd> {tt("other side")} <kbd>Esc</kbd> {running ? "stop" : "close"}</span>
         </div>
       </div>
     </div>

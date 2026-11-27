@@ -33,7 +33,11 @@ fn unpackaged() -> &'static str {
 /// beside the start, not in it.
 fn packaged() -> &'static str {
     #[cfg(target_os = "linux")]
-    if let Ok(exe) = std::env::current_exe() {
+    if let Some(exe) = std::env::var_os(gall_core::updater::BASE_EXE_ENV)
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::current_exe().ok())
+    {
         for (command, query, kind) in [("dpkg-query", "-S", "deb"), ("rpm", "-qf", "rpm")] {
             if std::process::Command::new(command)
                 .arg(query)
@@ -50,11 +54,24 @@ fn packaged() -> &'static str {
     unpackaged()
 }
 
+fn format_installation(base: &str) -> String {
+    if let Ok(base_ver) = std::env::var(gall_core::updater::BASE_VERSION_ENV) {
+        let trimmed = base_ver.trim();
+        if !trimmed.is_empty() {
+            return format!(
+                "{base} (overlay {} over {trimmed})",
+                crate::updates::running_version()
+            );
+        }
+    }
+    base.to_string()
+}
+
 fn identity(
     dirs: &gall_core::util::appdirs::AppDirs,
 ) -> std::collections::BTreeMap<String, String> {
     [
-        ("version", env!("CARGO_PKG_VERSION").to_string()),
+        ("version", crate::updates::running_version()),
         (
             "revision",
             option_env!("GALL_BUILD_REVISION")
@@ -65,7 +82,9 @@ fn identity(
         ("arch", std::env::consts::ARCH.into()),
         (
             "installation",
-            installation(dirs).unwrap_or("not known yet").into(),
+            installation(dirs)
+                .map(format_installation)
+                .unwrap_or_else(|| "not known yet".into()),
         ),
         (
             "desktop",
@@ -99,11 +118,11 @@ pub fn init(dirs: &gall_core::util::appdirs::AppDirs) {
     )));
     if installation(dirs).is_none() {
         std::thread::spawn(|| {
-            let kind = packaged();
+            let kind = format_installation(packaged());
             if let Some(d) = DIAGNOSTICS.get() {
                 d.lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .set_identity("installation", kind);
+                    .set_identity("installation", &kind);
             }
         });
     }
@@ -137,6 +156,16 @@ pub fn init(dirs: &gall_core::util::appdirs::AppDirs) {
         old(info);
     }));
 }
+fn short_error_message(message: &str) -> String {
+    message
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("Unknown error")
+        .chars()
+        .take(1000)
+        .collect()
+}
+
 pub fn record(kind: &str, message: &str) {
     if let Some(lock) = DIAGNOSTICS.get() {
         // A panic may come from a thread that holds the lock: never wait there. Everything
@@ -162,13 +191,7 @@ pub fn record(kind: &str, message: &str) {
                     .collect::<Vec<_>>()
                     .join(" ")
             } else if matches!(kind, "error" | "panic") {
-                message
-                    .lines()
-                    .find(|line| !line.trim().is_empty())
-                    .unwrap_or("Unknown error")
-                    .chars()
-                    .take(1000)
-                    .collect()
+                short_error_message(message)
             } else {
                 let frames = message
                     .lines()
@@ -242,6 +265,7 @@ pub struct Snapshot {
     pub tab_count: Option<u32>,
     pub selection_count: Option<u32>,
     pub task_count: Option<u32>,
+    pub trigger_error: Option<String>,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -303,7 +327,11 @@ pub fn bug_report_prepare(
     let metadata = session.identity.clone();
     let meta = |key: &str| metadata.get(key).map(String::as_str).unwrap_or("unknown");
     let events = session.events.iter().cloned().collect::<Vec<_>>();
-    let last_error = session.latest_error().map(str::to_owned);
+    let last_error = snapshot
+        .trigger_error
+        .filter(|_| !previous)
+        .map(|error| format!("error: {}", sanitize(&short_error_message(&error))))
+        .or_else(|| session.latest_error().map(str::to_owned));
     drop(d);
     let known = |v: Option<String>, allowed: &[&str]| {
         v.filter(|s| allowed.contains(&s.as_str()))

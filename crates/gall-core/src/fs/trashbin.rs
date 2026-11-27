@@ -31,7 +31,7 @@ pub struct TrashEntry {
 ))]
 mod imp {
     use super::*;
-    use crate::fs::ops::{list_trash, restore_trash_items, with_trash};
+    use crate::fs::ops::{list_trash, list_trash_items, restore_trash_items, with_trash};
     use std::path::{Path, PathBuf};
     use trash::os_limited;
 
@@ -149,7 +149,8 @@ mod imp {
     }
 
     pub fn empty() -> Result<()> {
-        with_trash(|| os_limited::list().and_then(os_limited::purge_all))
+        let items = list_trash_items()?;
+        with_trash(move || os_limited::purge_all(items))
     }
 }
 
@@ -305,14 +306,12 @@ mod tests {
     #[test]
     fn items_with_non_utf8_names_are_told_apart() {
         use std::os::unix::ffi::OsStrExt;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs::ops::test_support::test_dir();
         let a = dir.path().join(std::ffi::OsStr::from_bytes(b"\xff.txt"));
         let b = dir.path().join(std::ffi::OsStr::from_bytes(b"\xfe.txt"));
         std::fs::write(&a, "a").unwrap();
         std::fs::write(&b, "b").unwrap();
-        if trash::delete_all([&a, &b]).is_err() {
-            return; // no trash here
-        }
+        crate::fs::ops::trash_items(&[a, b], &crate::fs::ops::UndoJournal::default()).unwrap();
         let parent = dir.path().to_string_lossy().into_owned();
         let mine = || -> Vec<_> {
             super::list()

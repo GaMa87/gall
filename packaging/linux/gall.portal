@@ -1,0 +1,5 @@
+[portal]
+DBusName=org.freedesktop.impl.portal.desktop.gall
+Interfaces=org.freedesktop.impl.portal.FileChooser
+# Not picked by default: opt in with `org.freedesktop.impl.portal.FileChooser=gall;gtk` in a portals.conf.
+UseIn=gall
