@@ -140,7 +140,7 @@ fn gnu_patch_applies_what_gall_writes_in_every_format() {
             let out = run(
                 dir.path(),
                 "patch",
-                &[flag, "--batch", "-i", "p.patch", name],
+                &[flag, "--batch", "--binary", "-i", "p.patch", name],
             );
             assert!(
                 out.status.success(),
@@ -235,7 +235,7 @@ fn gall_refuses_what_gnu_patch_would_also_reject() {
     let out = run(
         dir.path(),
         "patch",
-        &["-u", "--batch", "-i", "p.patch", "f.txt"],
+        &["-u", "--batch", "--binary", "-i", "p.patch", "f.txt"],
     );
     assert!(!out.status.success());
     let patches = parse(Format::Unified, &text).unwrap();
@@ -278,7 +278,7 @@ fn gnu_patch_finds_the_files_by_the_names_gall_writes() {
             let out = run(
                 dir.path(),
                 "patch",
-                &[flag, "-p1", "--batch", "-i", "p.patch"],
+                &[flag, "-p1", "--batch", "--binary", "-i", "p.patch"],
             );
             assert!(
                 out.status.success(),
