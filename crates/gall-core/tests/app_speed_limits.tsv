@@ -42,44 +42,44 @@ linux	sort 100 000 entries by date	1.224
 linux	sort 100 000 entries by date, grouped by type	1.110
 linux	tag 1 000 files	0.053
 linux	tags of a folder among 100 000 tags	0.030
-macos	Quick Open: file01234	0.097
-macos	Quick Open: no match	0.221
-macos	Quick Open: one letter	0.325
-macos	Quick Open: two words	0.397
-macos	build the file index (115 000 entries)	4.177
+macos	Quick Open: file01234	0.248
+macos	Quick Open: no match	0.273
+macos	Quick Open: one letter	0.348
+macos	Quick Open: two words	0.542
+macos	build the file index (115 000 entries)	5.614
 macos	compare a tree of 60 000 files with a profile folder, many folders (hidden files not shown)	15.327
 macos	compare two folders of 5 000 files (content)	1.656
-macos	compare two folders of 5 000 files (content, read again)	3.213
+macos	compare two folders of 5 000 files (content, read again)	4.648
 macos	compare two folders of 5 000 files (filtered)	0.530
-macos	compare two folders of 5 000 files (sizes and times)	0.563
+macos	compare two folders of 5 000 files (sizes and times)	0.612
 macos	compress a folder of 5 000 files to a tar.gz	2.355
 macos	compress a folder of 5 000 files to a zip	4.116
-macos	diff two files of 40 000 lines	1.590
+macos	diff two files of 40 000 lines	1.954
 macos	diff two files of 40 000 lines by tokens (structural)	1.806
 macos	extract a zip of 5 000 files	23.935
-macos	find names: *.md in 60 000 files	1.483
+macos	find names: *.md in 60 000 files	2.225
 macos	find names: file01234*	1.349
 macos	highlight 40 000 lines	27.704
-macos	list AppData/Local (3 000 folders)	0.178
-macos	list a 7z archive of 5 000 files	0.112
-macos	list a folder of 46 500 entries, hidden shown	1.937
-macos	list a tar.gz archive of 20 000 files	0.816
-macos	list a zip archive of 50 000 entries	0.694
+macos	list AppData/Local (3 000 folders)	0.215
+macos	list a 7z archive of 5 000 files	0.120
+macos	list a folder of 46 500 entries, hidden shown	3.000
+macos	list a tar.gz archive of 20 000 files	0.988
+macos	list a zip archive of 50 000 entries	1.087
 macos	list one application folder	0.001
-macos	list the same, folders only (tree column)	0.652
+macos	list the same, folders only (tree column)	1.194
 macos	list the same, hidden not shown	4.765
 macos	open an early file inside a tar.gz archive of 20 000 files	0.849
 macos	open one file inside a 7z archive of 5 000 files	0.218
-macos	open one file inside a zip archive of 50 000 entries	1.486
-macos	rename 100 tagged files among 100 000 tags	0.769
+macos	open one file inside a zip archive of 50 000 entries	1.769
+macos	rename 100 tagged files among 100 000 tags	0.799
 macos	search content: a common word	0.972
-macos	search content: a rare word	50.841
-macos	search content: a regex	19.340
-macos	search content: no match	12.981
-macos	size of a folder of 60 000 files	2.894
-macos	sort 100 000 entries by date	0.750
+macos	search content: a rare word	118.977
+macos	search content: a regex	75.855
+macos	search content: no match	25.023
+macos	size of a folder of 60 000 files	3.394
+macos	sort 100 000 entries by date	0.823
 macos	sort 100 000 entries by date, grouped by type	1.060
-macos	tag 1 000 files	0.024
+macos	tag 1 000 files	0.046
 macos	tags of a folder among 100 000 tags	0.006
 windows	Quick Open: file01234	0.364
 windows	Quick Open: no match	0.339
