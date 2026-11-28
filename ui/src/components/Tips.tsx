@@ -66,6 +66,7 @@ const TIP_GROUPS: { title: string; icon: string; tips: Tip[] }[] = [
   {
     title: "Preview & compare", icon: "compare", tips: [
       { title: "Peek inside", body: (k) => <>{k("preview")} previews the file: Markdown is rendered, source code coloured, video and PDF played and paged, STL 3D models turned with the mouse.</> },
+      { title: "Large videos stay lazy", body: () => <>Selecting a video or audio file shows its poster and details without copying the file into a temporary cache. Press play to stream it; on Linux, FFmpeg also handles codecs the webview lacks, and very large files ask for confirmation before playback when FFmpeg is missing.</> },
       { title: "Compare two files", body: (k) => <>Select two files and press {k("compare")}; the context menu also compares with the clipboard, with Git HEAD or with any commit ({k("compareGitCommit")}).</> },
       { title: "Sync two folders", body: (k) => <>{k("compareFolders")} compares the folders of both browsers and copies what differs: <kbd>&gt;</kbd> / <kbd>&lt;</kbd> copy the selection, <kbd>c</kbd> compares contents.</> },
       { title: "Keys in compare views", body: () => <><kbd>n</kbd> / <kbd>N</kbd> jump between changes, <kbd>u</kbd> switches split and unified, <kbd>{platformLabel("Alt+→")}</kbd> / <kbd>{platformLabel("Alt+←")}</kbd> copy a change across and <kbd>{platformLabel("Ctrl+S")}</kbd> saves. Binary files open in a hex compare; three or more files give a similarity matrix.</> },

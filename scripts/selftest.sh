@@ -115,6 +115,7 @@ if [ "${1:-}" = "--file-groups" ]; then MODE=file-groups; shift; fi
 if [ "${1:-}" = "--structural-diff" ]; then MODE=structural-diff; shift; fi
 if [ "${1:-}" = "--git-rebase-submodules" ]; then MODE=git-rebase-submodules; shift; fi
 if [ "${1:-}" = "--compare-scale" ]; then MODE=e2e-compare-scale; shift; fi
+if [ "${1:-}" = "--video-preview" ]; then MODE=video-preview; shift; fi
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 IS_MACOS=0
 [ "$(uname -s)" = "Darwin" ] && IS_MACOS=1
@@ -196,7 +197,7 @@ if [ -d "$APP_INPUT" ] && [ -x "$APP_INPUT/Contents/MacOS/gall" ]; then
   APP_INPUT="$APP_INPUT/Contents/MacOS/gall"
 fi
 APP="$(resolve_path "$APP_INPUT")"
-if [ "$MODE" = "e2e-compare-scale" ] || [ "$MODE" = "themed-select" ] || [ "$MODE" = "updates" ] || [ "$MODE" = "quick-open" ] || [ "$MODE" = "search-hidden" ] || [ "$MODE" = "bug-report" ] || [ "$MODE" = "bug-report-entry" ] || [ "$MODE" = "notifications" ] || [ "$MODE" = "linux-live" ] || [ "$MODE" = "settings-sections" ] || [ "$MODE" = "window-overlays" ] || [ "$MODE" = "titlebar" ] || [ "$MODE" = "keyboard" ] || [ "$MODE" = "key-help" ] || [ "$MODE" = "popup-placement" ] || [ "$MODE" = "key-profiles" ] || [ "$MODE" = "git-compare" ] || [ "$MODE" = "file-groups" ] || [ "$MODE" = "git-baseline" ] || [ "$MODE" = "git-workspace" ] || [ "$MODE" = "standalone-merge" ] || [ "$MODE" = "merge-ai" ] || [ "$MODE" = "compare-ai" ] || [ "$MODE" = "outline-generated" ] || [ "$MODE" = "rich-formats" ] || [ "$MODE" = "patch-import" ] || [ "$MODE" = "doc-compare" ] || [ "$MODE" = "compare-tabs" ] || [ "$MODE" = "git-scrubber" ] || [ "$MODE" = "git-rebase-submodules" ] || [ "$MODE" = "structural-diff" ] || [ "$MODE" = "omarchy" ] || [ "$MODE" = "adaptive-layout" ] || [ "$MODE" = "workspaces-pairs" ] || [ "$MODE" = "e2e-adaptive-density" ] || [ "$MODE" = "rendering" ] || [ "$MODE" = "i18n" ]; then
+if [ "$MODE" = "video-preview" ] || [ "$MODE" = "e2e-compare-scale" ] || [ "$MODE" = "themed-select" ] || [ "$MODE" = "updates" ] || [ "$MODE" = "quick-open" ] || [ "$MODE" = "search-hidden" ] || [ "$MODE" = "bug-report" ] || [ "$MODE" = "bug-report-entry" ] || [ "$MODE" = "notifications" ] || [ "$MODE" = "linux-live" ] || [ "$MODE" = "settings-sections" ] || [ "$MODE" = "window-overlays" ] || [ "$MODE" = "titlebar" ] || [ "$MODE" = "keyboard" ] || [ "$MODE" = "key-help" ] || [ "$MODE" = "popup-placement" ] || [ "$MODE" = "key-profiles" ] || [ "$MODE" = "git-compare" ] || [ "$MODE" = "file-groups" ] || [ "$MODE" = "git-baseline" ] || [ "$MODE" = "git-workspace" ] || [ "$MODE" = "standalone-merge" ] || [ "$MODE" = "merge-ai" ] || [ "$MODE" = "compare-ai" ] || [ "$MODE" = "outline-generated" ] || [ "$MODE" = "rich-formats" ] || [ "$MODE" = "patch-import" ] || [ "$MODE" = "doc-compare" ] || [ "$MODE" = "compare-tabs" ] || [ "$MODE" = "git-scrubber" ] || [ "$MODE" = "git-rebase-submodules" ] || [ "$MODE" = "structural-diff" ] || [ "$MODE" = "omarchy" ] || [ "$MODE" = "adaptive-layout" ] || [ "$MODE" = "workspaces-pairs" ] || [ "$MODE" = "e2e-adaptive-density" ] || [ "$MODE" = "rendering" ] || [ "$MODE" = "i18n" ]; then
   # This focused test has isolated config/data and must preserve an existing user session.
   export GALL_MULTI_INSTANCE=1
 elif pgrep -x gall >/dev/null; then echo "Gall is running; close it first."; exit 2; fi
@@ -970,6 +971,13 @@ printf 'first\nsecond\n' > Projects/Alpha/notes.txt
 mkdir -p Many
 for i in $(seq 1 400); do printf 'needle %s\n' "$i" > "Many/item_$i.txt"; done
 touch_days_ago 45 Documents/file20.txt; touch_days_ago 400 Documents/file10.txt
+fi
+if [ "$MODE" = "video-preview" ]; then
+  mkdir -p Projects
+  if command -v ffmpeg >/dev/null 2>&1; then
+    ffmpeg -v error -f lavfi -i "testsrc=duration=3:size=438x162:rate=24" -c:v libx264 -pix_fmt yuv420p -y clip.mp4
+    ffmpeg -v error -f lavfi -i "sine=frequency=440:duration=2" -c:a flac -y tone.flac
+  fi
 fi
 if [ "$MODE" = "search-hidden" ]; then
   mkdir -p Projects src gen dist node_modules/pkg

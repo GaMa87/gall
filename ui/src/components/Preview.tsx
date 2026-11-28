@@ -1,8 +1,25 @@
 // File previews (P-02…P-08). Used by the details pane and the preview window.
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { tt } from "../i18n";
-import { api, fileSrc, mediaSrc } from "../api/ipc";
+import { api, fileSrc, getMediaBase, mediaSrc } from "../api/ipc";
 import type { FileEntry, PreviewInfo, SyntaxHighlight, VideoProbe } from "../api/types";
+import {
+  FFMPEG_AUDIO_CHANNELS,
+  FFMPEG_AUDIO_RATE,
+  MjpegFrameParser,
+  PcmStereoChunker,
+  choosePlaybackFps,
+  ffmpegAudioUrl,
+  ffmpegFrameUrl,
+  ffmpegVideoUrl,
+} from "../core/ffmpegStream";
+import {
+  decideMediaViewMode,
+  detectPlatform,
+  formatCodecLabel,
+  formatMediaDuration,
+  formatMediaMeta,
+} from "../core/mediaPreview";
 import { imageRefresh, loadImageSnapshot } from "../core/imageRefresh";
 import { onFolderChanged } from "../state/controllers";
 import { segments } from "../core/diffRows";
@@ -72,7 +89,7 @@ export function Preview({ entry, info, big }: { entry: FileEntry; info: PreviewI
       return <ImagePreview key={entry.path} path={src} w={info.width} h={info.height} />;
     case "video":
     case "audio":
-      return <MediaPreview key={entry.path} path={src} kind={kind} big={big} />;
+      return <MediaPreview key={entry.path} path={src} size={entry.size} kind={kind} big={big} preferFfmpeg={info.useFfmpeg} />;
     case "pdf":
       return <PdfPreview key={entry.path} path={src} />;
     case "model":
@@ -189,7 +206,7 @@ const MD_EXTS = new Set(["md", "markdown", "mdown", "mkd"]);
 /** The rendered view reads the whole file (the preview text is truncated); above this it is cut. */
 const MD_MAX_CHARS = 4 << 20;
 
-/** Rendered Markdown with a Source toggle. Links: #anchors scroll, URLs open in the browser, relative paths open with the default app. */
+/** Rendered Markdown with a Source toggle. Links: #anchors scroll, URLs open in the browser, relative paths open with the default app after confirmation. */
 function MarkdownPreview({ entry, fallback }: { entry: FileEntry; fallback: string }) {
   const box = useRef<HTMLDivElement>(null);
   const [text, setText] = useState<string | null>(null);
@@ -217,25 +234,47 @@ function MarkdownPreview({ entry, fallback }: { entry: FileEntry; fallback: stri
     return () => { alive = false; };
   }, [text, source, entry.path]);
 
+  const closestLink = (target: EventTarget | null) =>
+    (target instanceof Element ? target : null)?.closest("a, area, [href], [xlink\\:href]") ?? null;
+
+  const onAuxClick = (e: React.MouseEvent) => {
+    if (closestLink(e.target)) e.preventDefault();
+  };
+
   const onClick = async (e: React.MouseEvent) => {
-    const a = (e.target as HTMLElement).closest("a");
-    const href = a?.getAttribute("href");
-    if (!a || !href) return;
+    const link = closestLink(e.target);
+    if (!link) return;
+    // Always prevent default WebView navigation, even for empty href="" links.
     e.preventDefault();
-    if (href.startsWith("#")) {
-      box.current?.querySelector(`#${CSS.escape(decodeURIComponent(href.slice(1)))}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
-      return;
-    }
-    if (/^(https?|mailto):/i.test(href)) {
-      const { openUrl } = await import("@tauri-apps/plugin-opener");
-      openUrl(href).catch(() => {});
-      return;
-    }
-    const { resolveRel, isRunnable } = await import("../core/markdown");
-    const local = resolveRel(parent(entry.path) ?? entry.path, href);
-    if (!local) return;
-    if (isRunnable(local) && !(await A.confirm("Run this file?", `The link opens “${basename(local)}”, which runs as a program. Open it only if you trust where this document came from.`, "Open", true))) return;
-    api.openPath(local).catch(() => {});
+    const href = link.getAttribute("href") ?? link.getAttribute("xlink:href");
+    if (!href) return;
+    const { activateMarkdownLink } = await import("../core/markdown");
+    await activateMarkdownLink(parent(entry.path) ?? entry.path, href, {
+      scrollToAnchor: (id) => {
+        if (!id) return;
+        box.current?.querySelector(`#${CSS.escape(id)}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
+      },
+      openExternal: async (url) => {
+        const { openUrl } = await import("@tauri-apps/plugin-opener");
+        openUrl(url).catch(() => {});
+      },
+      confirmLocal: (local, runnable) => (runnable
+        ? A.confirm(
+          tt("Run this file?"),
+          tt("The link opens “{name}”, which runs as a program. Open it only if you trust where this document came from.", { name: basename(local) }),
+          "Open",
+          true,
+        )
+        : A.confirm(
+          tt("Open local file?"),
+          tt("The link opens “{name}” with its default application:\n\n{path}\n\nLocal files can still run programs or scripts. Open it only if you trust where this document came from.", { name: basename(local), path: local }),
+          "Open",
+          false,
+        )),
+      openLocal: (local) => {
+        api.openPath(local).catch(() => {});
+      },
+    });
   };
 
   if (err) return <pre className="pv-text">{text}</pre>;
@@ -243,7 +282,7 @@ function MarkdownPreview({ entry, fallback }: { entry: FileEntry; fallback: stri
     <>
       {source
         ? <CodePreview name={entry.name} text={text ?? ""} />
-        : <div className="pv-md" onClick={onClick}><article className="md-body" ref={box} /></div>}
+        : <div className="pv-md" onClick={onClick} onAuxClick={onAuxClick}><article className="md-body" ref={box} /></div>}
       <div className="pv-badge">
         <button title={tt("Show the Markdown source or the rendered page")} onClick={() => setSource((s) => !s)}>{source ? "Rendered" : "Source"}</button>
       </div>
@@ -369,11 +408,33 @@ function ImagePreview({ path, w, h }: { path: string; w: number | null; h: numbe
   );
 }
 
-/** Video/audio with keyboard seeking (P-05): ←/→ seek, [ / ] frame step. */
-function MediaPreview({ path, kind, big }: { path: string; kind: "video" | "audio"; big?: boolean }) {
+/**
+ * Native `<video>` / `<audio>` element, mounted only after explicit play (or preview-window
+ * autoplay) and torn down eagerly on unmount so WebKitGTK's GStreamer `downloadbuffer`
+ * stops spooling immediately when the user moves away.
+ */
+function NativeMediaPlayer({
+  path,
+  kind,
+  big,
+  autoPlay,
+  initialSeekSec,
+  onError,
+}: {
+  path: string;
+  kind: "video" | "audio";
+  big?: boolean;
+  autoPlay: boolean;
+  initialSeekSec: number;
+  onError: (err: string) => void;
+}) {
   const settings = useStore((s) => s.settings)!;
   const ref = useRef<HTMLVideoElement & HTMLAudioElement>(null);
-  const [err, setErr] = useState<string | null>(null);
+  const loadedRef = useRef(false);
+  const onErrorRef = useRef(onError);
+  onErrorRef.current = onError;
+  const initialSeekDoneRef = useRef(false);
+
   const seek = (dir: number) => {
     const m = ref.current;
     if (!m || !isFinite(m.duration)) return;
@@ -392,77 +453,775 @@ function MediaPreview({ path, kind, big }: { path: string; kind: "video" | "audi
     e.preventDefault();
     e.stopPropagation();
   };
-  // React's autoFocus only works on form controls, so the player is focused by hand: in the
-  // preview window k, ←/→ and [ ] then work at once, as the hint bar says.
+
+  // Focus the player in the preview window (or after activation) so k, arrows and [ ] work at once.
   useEffect(() => {
-    if (big && !err) ref.current?.focus();
-  }, [big, err, path]);
-  if (err) return <MediaFallback path={path} kind={kind} err={err} />;
+    if (big || autoPlay) ref.current?.focus();
+  }, [big, autoPlay, path]);
+
+  // Eagerly release the media pipeline on unmount/path change: without pause + removeAttribute +
+  // load, WebKitGTK can keep a GStreamer downloadbuffer writing to /var/tmp until GC runs.
+  useEffect(() => {
+    const el = ref.current;
+    return () => {
+      if (!el) return;
+      try {
+        el.pause();
+        el.removeAttribute("src");
+        el.load();
+      } catch {
+        // Ignore teardown errors on detached elements.
+      }
+    };
+  }, [path]);
+
+  // WebKitGTK can leave <video>/<audio> stuck at readyState 0 without firing onError when a
+  // GStreamer demuxer/decoder plugin is missing. Detect the stall and hand off to fallback.
+  useEffect(() => {
+    loadedRef.current = false;
+    initialSeekDoneRef.current = false;
+    const check = (hard: boolean) => {
+      if (loadedRef.current) return;
+      const m = ref.current;
+      if (!m) return;
+      if (m.error) {
+        const what = ["", "aborted", "network error", "decoding failed", "format or codec not supported"][m.error.code] || "unsupported format";
+        onErrorRef.current(m.error.message ? `${what}: ${m.error.message}` : what);
+        return;
+      }
+      if (m.readyState > 0) {
+        loadedRef.current = true;
+        return;
+      }
+      if (hard || m.networkState !== HTMLMediaElement.NETWORK_LOADING) {
+        onErrorRef.current("format or codec not supported");
+      }
+    };
+    const fast = setTimeout(() => check(false), 700);
+    const slow = setTimeout(() => check(true), 3000);
+    return () => { clearTimeout(fast); clearTimeout(slow); };
+  }, [path]);
+
+  const markLoaded = () => {
+    loadedRef.current = true;
+    const m = ref.current;
+    if (m && initialSeekSec > 0 && !initialSeekDoneRef.current && isFinite(m.duration)) {
+      initialSeekDoneRef.current = true;
+      m.currentTime = Math.min(m.duration, initialSeekSec);
+    }
+  };
   const common = {
     ref,
     src: mediaSrc(path),
     controls: true,
-    autoPlay: big && settings.autoplayMedia,
+    preload: (autoPlay ? "auto" : "metadata") as "auto" | "metadata",
+    autoPlay,
     onKeyDown: onKey,
+    onLoadedMetadata: markLoaded,
+    onLoadedData: markLoaded,
+    onCanPlay: markLoaded,
     tabIndex: 0,
     onError: () => {
       const me = ref.current?.error;
       const what = ["", "aborted", "network error", "decoding failed", "format or codec not supported"][me?.code ?? 0] || "unsupported format";
-      setErr(me?.message ? `${what}: ${me.message}` : what);
+      onErrorRef.current(me?.message ? `${what}: ${me.message}` : what);
     },
     className: "pv-media",
   };
   return kind === "video" ? <video {...common} /> : <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 12 }}><Icon name="audio" size={64} /><audio {...common} /></div>;
 }
 
-const CODEC_NAMES: Record<string, string> = {
-  prores: "Apple ProRes", dnxhd: "Avid DNxHD/DNxHR", hevc: "H.265 / HEVC", h264: "H.264", cfhd: "GoPro CineForm",
-  mpeg2video: "MPEG-2", mpeg4: "MPEG-4 Part 2", mjpeg: "Motion JPEG", av1: "AV1", vp9: "VP9", qtrle: "QuickTime Animation",
-};
-
 /**
- * The built-in player failed (codec not available to the webview). With FFmpeg installed:
- * a still frame, the codec and which package to install; always "Open in player".
+ * Zero-spool video/audio preview (P-05):
+ * - On hover/selection (and in the preview modal when autoplayMedia is off), shows a cached
+ *   poster frame + metadata + Play button without mounting `<video>`/`<audio>`, so WebKitGTK
+ *   never copies gigabytes into `/var/tmp/WebKit-Media-*`.
+ * - On explicit Play, routes large Linux media (or missing GStreamer plugins) through the
+ *   zero-spool FFmpeg streaming player, or guards multi-hundred-MB files when FFmpeg is absent.
  */
-function MediaFallback({ path, kind, err }: { path: string; kind: "video" | "audio"; err: string }) {
-  const [p, setP] = useState<VideoProbe | null>(null);
-  const [probing, setProbing] = useState(kind === "video");
+function MediaPreview({
+  path,
+  size,
+  kind,
+  big,
+  preferFfmpeg,
+}: {
+  path: string;
+  size: number;
+  kind: "video" | "audio";
+  big?: boolean;
+  preferFfmpeg?: boolean;
+}) {
+  const settings = useStore((s) => s.settings)!;
+  const standbyRef = useRef<HTMLDivElement>(null);
+  const [probe, setProbe] = useState<VideoProbe | null>(null);
+  const [probing, setProbing] = useState(true);
+  const [activated, setActivated] = useState(false);
+  const [autoPlayOnStart, setAutoPlayOnStart] = useState(false);
+  const [initialSeekSec, setInitialSeekSec] = useState(0);
+  const [allowLargeNative, setAllowLargeNative] = useState(false);
+  const [nativeErr, setNativeErr] = useState<string | null>(null);
+  const [ffFailed, setFfFailed] = useState(false);
+
   useEffect(() => {
-    if (kind !== "video") return;
     let alive = true;
-    api.videoProbe(path).then((r) => alive && setP(r)).catch(() => {}).finally(() => alive && setProbing(false));
+    setProbe(null);
+    setProbing(true);
+    setActivated(false);
+    setAutoPlayOnStart(false);
+    setInitialSeekSec(0);
+    setAllowLargeNative(false);
+    setNativeErr(null);
+    setFfFailed(false);
+    api.videoProbe(path)
+      .then((r) => alive && setProbe(r))
+      .catch(() => {})
+      .finally(() => alive && setProbing(false));
     return () => { alive = false; };
   }, [path, kind]);
 
-  const codec = p?.codec ? `${CODEC_NAMES[p.codec] ?? p.codecLong ?? p.codec}${p.profile ? ` ${p.profile}` : ""}` : null;
-  const platform = p?.platform ?? (navigator.userAgent.includes("Windows") ? "windows" : navigator.userAgent.includes("Mac") ? "macos" : "linux");
-  const meta = [p?.width && p.height ? `${p.width} × ${p.height}` : "", p?.duration ? formatDuration(p.duration) : ""].filter(Boolean).join(" · ");
-  return (
-    <div className="pv-fallback">
-      {p?.poster ? <img className="pv-poster" src={fileSrc(p.poster)} draggable={false} /> : <Icon name={kind} size={56} />}
-      <div className="pv-fb-card">
-        <b>{codec ? `Can't play ${codec} here` : `Can't play this ${kind}`}</b>
-        {meta && <span className="pv-fb-meta">{meta}</span>}
-        <small>
-          {platform === "linux"
-            ? <>{tt("Playback uses the system's GStreamer codecs. Install")} <code>gstreamer1.0-libav</code> (Debian/Ubuntu), <code>gstreamer1-libav</code> (Fedora) or <code>gst-libav</code> (Arch), then restart Gall.</>
-            : platform === "windows"
-              ? <>{tt("The built-in player (WebView2) only plays H.264, VP8/VP9 and AV1 video.")}</>
-              : <>{tt("The built-in player cannot decode this format.")}</>}
-          {!probing && kind === "video" && !p?.ffmpeg && <> {tt("Install FFmpeg to see a still frame and the codec here.")}</>}
-        </small>
-        <div className="pv-fb-actions">
-          <button className="btn primary" onClick={() => api.openPath(path).catch(() => {})}>{tt("Open in player")}</button>
+  const mediaBase = getMediaBase();
+  const platform = detectPlatform(probe);
+  const mode = decideMediaViewMode({
+    activated,
+    big: Boolean(big),
+    autoplayMedia: settings.autoplayMedia,
+    preferFfmpeg: Boolean(preferFfmpeg),
+    probe,
+    probing,
+    mediaBase,
+    sizeBytes: size,
+    isLinux: platform === "linux",
+    allowLargeNative,
+    nativeErr,
+    ffFailed,
+  });
+
+  useEffect(() => {
+    if (big && mode === "standby") standbyRef.current?.focus();
+  }, [big, mode, path]);
+
+  const activate = (playNow: boolean, seekSec = 0) => {
+    setAutoPlayOnStart(playNow);
+    setInitialSeekSec(Math.max(0, seekSec));
+    setActivated(true);
+  };
+
+  const onStandbyKey = (e: React.KeyboardEvent) => {
+    const duration = probe?.duration && Number.isFinite(probe.duration) && probe.duration > 0 ? probe.duration : 0;
+    const step = settings.videoSeek === "fraction" && duration > 0
+      ? duration / Math.max(2, settings.videoSeekFraction)
+      : settings.videoSeekSeconds;
+    const fps = choosePlaybackFps(probe?.fps);
+    if (e.key === "k" || e.key === "K" || e.key === "Enter") activate(true, 0);
+    else if (e.key === "ArrowRight") activate(true, step);
+    else if (e.key === "ArrowLeft") activate(false, 0);
+    else if (e.key === "]" && kind === "video") activate(false, 1 / fps);
+    else if (e.key === "[" && kind === "video") activate(false, 0);
+    else return;
+    e.preventDefault();
+    e.stopPropagation();
+  };
+
+  if (mode === "ffmpeg" && probe && mediaBase) {
+    return (
+      <FfmpegMediaPlayer
+        path={path}
+        kind={kind}
+        probe={probe}
+        big={big}
+        mediaBase={mediaBase}
+        initialPlaying={autoPlayOnStart || Boolean(big && settings.autoplayMedia)}
+        initialSeekSec={initialSeekSec}
+        onFatal={() => setFfFailed(true)}
+      />
+    );
+  }
+
+  if (mode === "native") {
+    return (
+      <NativeMediaPlayer
+        path={path}
+        kind={kind}
+        big={big}
+        autoPlay={autoPlayOnStart || Boolean(big && settings.autoplayMedia)}
+        initialSeekSec={initialSeekSec}
+        onError={(msg) => setNativeErr(msg)}
+      />
+    );
+  }
+
+  if (mode === "large-guardrail") {
+    const meta = formatMediaMeta(probe, size);
+    return (
+      <div className="pv-fallback pv-guardrail">
+        {probe?.poster ? <img className="pv-poster" src={fileSrc(probe.poster)} draggable={false} /> : <Icon name={kind} size={56} />}
+        <div className="pv-fb-card">
+          <b>{kind === "video" ? tt("Large video ({size})", { size: formatSize(size) }) : tt("Large audio ({size})", { size: formatSize(size) })}</b>
+          {meta && <span className="pv-fb-meta">{meta}</span>}
+          <small>
+            {tt("Built-in Linux playback buffers HTTP streams to /var/tmp. Open it in an external player for zero-copy playback, or install")} <code>ffmpeg</code> {tt("for zero-copy in-app playback.")}
+          </small>
+          <div className="pv-fb-actions">
+            <button type="button" className="btn primary" onClick={() => api.openPath(path).catch(() => {})}>{tt("Open in player")}</button>
+            <button type="button" className="btn" onClick={() => setAllowLargeNative(true)}>{tt("Play here anyway")}</button>
+          </div>
         </div>
-        <small className="pv-fb-err" title={tt("Error from the built-in player")}>{err}</small>
+      </div>
+    );
+  }
+
+  if (mode === "fallback") {
+    return (
+      <MediaFallbackCard
+        path={path}
+        kind={kind}
+        probe={probe}
+        probing={probing}
+        err={nativeErr ?? "format or codec not supported"}
+      />
+    );
+  }
+
+  // Standby zero-spool poster/card mode.
+  const meta = formatMediaMeta(probe, size);
+  const waitingForPlay = activated && probing;
+  return (
+    <div className="pv-standby" ref={standbyRef} tabIndex={0} onKeyDown={onStandbyKey}>
+      {kind === "video" ? (
+        <div className="pv-poster-stage" onClick={() => activate(true)}>
+          {probe?.poster ? (
+            <img className="pv-poster-img" src={fileSrc(probe.poster)} draggable={false} />
+          ) : (
+            <div className="pv-standby-placeholder">
+              <Icon name="video" size={big ? 72 : 52} />
+            </div>
+          )}
+          <button
+            type="button"
+            className="pv-play-overlay"
+            title={tt("Play (k)")}
+            aria-label={tt("Play (k)")}
+            onClick={(e) => { e.stopPropagation(); activate(true); }}
+          >
+            {waitingForPlay ? "…" : "▶"}
+          </button>
+        </div>
+      ) : (
+        <div className="pv-audio-standby" onClick={() => activate(true)}>
+          <Icon name="audio" size={big ? 64 : 48} />
+          <button
+            type="button"
+            className="btn primary pv-audio-play-btn"
+            title={tt("Play (k)")}
+            onClick={(e) => { e.stopPropagation(); activate(true); }}
+          >
+            {waitingForPlay ? tt("Loading preview…") : `▶ ${tt("Play")}`}
+          </button>
+        </div>
+      )}
+      <div className="pv-meta-bar" onClick={(e) => e.stopPropagation()}>
+        <span className="pv-fb-meta">{meta || (probing ? tt("Loading preview…") : "")}</span>
+        <button
+          type="button"
+          className="pv-open-ext"
+          title={tt("Open in player")}
+          onClick={() => api.openPath(path).catch(() => {})}
+        >
+          {tt("Open in player")}
+        </button>
       </div>
     </div>
   );
 }
 
-function formatDuration(s: number): string {
-  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = Math.floor(s % 60);
-  return h ? `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}` : `${m}:${String(sec).padStart(2, "0")}`;
+async function drawJpegOnCanvas(canvas: HTMLCanvasElement, bytes: Uint8Array): Promise<void> {
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  const copy = new Uint8Array(bytes.byteLength);
+  copy.set(bytes);
+  const blob = new Blob([copy], { type: "image/jpeg" });
+  if (typeof createImageBitmap === "function") {
+    try {
+      const bmp = await createImageBitmap(blob);
+      try {
+        if (canvas.width !== bmp.width || canvas.height !== bmp.height) {
+          canvas.width = bmp.width;
+          canvas.height = bmp.height;
+        }
+        ctx.drawImage(bmp, 0, 0);
+      } finally {
+        bmp.close();
+      }
+      return;
+    } catch {
+      // Fall through to HTMLImageElement decoding.
+    }
+  }
+  const url = URL.createObjectURL(blob);
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => {
+        if (canvas.width !== img.naturalWidth || canvas.height !== img.naturalHeight) {
+          canvas.width = img.naturalWidth;
+          canvas.height = img.naturalHeight;
+        }
+        ctx.drawImage(img, 0, 0);
+        resolve();
+      };
+      img.onerror = () => reject(new Error("frame decode failed"));
+      img.src = url;
+    });
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+/**
+ * FFmpeg-backed fallback player: streams decoded JPEG frames onto <canvas> and stereo PCM audio
+ * into Web Audio when the webview's built-in player lacks codecs (for example missing GStreamer
+ * plugins on Linux or ProRes/HEVC/MKV/FLAC files).
+ */
+function FfmpegMediaPlayer({
+  path,
+  kind,
+  probe,
+  big,
+  mediaBase,
+  initialPlaying,
+  initialSeekSec = 0,
+  onFatal,
+}: {
+  path: string;
+  kind: "video" | "audio";
+  probe: VideoProbe;
+  big?: boolean;
+  mediaBase: string;
+  initialPlaying: boolean;
+  initialSeekSec?: number;
+  onFatal: () => void;
+}) {
+  const settings = useStore((s) => s.settings)!;
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const duration = probe.duration && Number.isFinite(probe.duration) && probe.duration > 0 ? probe.duration : 0;
+  const hasVideo = probe.hasVideo ?? kind === "video";
+  const hasAudio = probe.hasAudio ?? kind === "audio";
+  const fps = choosePlaybackFps(probe.fps);
+  const maxWidth = big ? 1280 : 720;
+  const clampedStart = duration > 0 ? Math.max(0, Math.min(duration, initialSeekSec)) : Math.max(0, initialSeekSec);
+
+  const [playing, setPlaying] = useState(initialPlaying);
+  const [time, setTime] = useState(clampedStart);
+  const [muted, setMuted] = useState(false);
+  const [hasFrame, setHasFrame] = useState(false);
+  const startAtRef = useRef(clampedStart);
+  const timeRef = useRef(clampedStart);
+  const mutedRef = useRef(false);
+  const gainRef = useRef<GainNode | null>(null);
+  const onFatalRef = useRef(onFatal);
+  onFatalRef.current = onFatal;
+  const [playNonce, setPlayNonce] = useState(0);
+  const [frameNonce, setFrameNonce] = useState(clampedStart > 0 ? 1 : 0);
+
+  useEffect(() => {
+    mutedRef.current = muted;
+    if (gainRef.current) gainRef.current.gain.value = muted ? 0 : 1;
+  }, [muted]);
+
+  useEffect(() => {
+    if (big || initialPlaying) wrapRef.current?.focus();
+  }, [big, initialPlaying, path]);
+
+  // Draw a single paused frame on paused seek/step (or initial paused load when no poster was
+  // cached). When a cached poster already exists at t=0, show it directly without spawning an
+  // extra ffmpeg process.
+  useEffect(() => {
+    if (playing || !hasVideo) return;
+    if (frameNonce === 0 && probe.poster) return;
+    const ctl = new AbortController();
+    const url = ffmpegFrameUrl(mediaBase, path, { timeSec: timeRef.current, maxWidth });
+    fetch(url, { signal: ctl.signal })
+      .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(String(r.status)))))
+      .then(async (buf) => {
+        if (ctl.signal.aborted || !canvasRef.current) return;
+        await drawJpegOnCanvas(canvasRef.current, new Uint8Array(buf));
+        if (!ctl.signal.aborted) setHasFrame(true);
+      })
+      .catch(() => {});
+    return () => ctl.abort();
+  }, [frameNonce, path, hasVideo, mediaBase, maxWidth, playing, probe.poster]);
+
+  // Stream video frames and/or stereo PCM audio while playing.
+  useEffect(() => {
+    if (!playing) return;
+    const ctl = new AbortController();
+    const startSec = startAtRef.current;
+    let disposed = false;
+    let rafId = 0;
+    let audioCtx: AudioContext | null = null;
+    let audioOrigin: number | null = null;
+    let videoDone = !hasVideo;
+    let audioDone = !hasAudio;
+    let wallStart: number | null = null;
+    let shownIdx = -1;
+    let framesDelivered = 0;
+    let drawing = false;
+    const queue: Uint8Array[] = [];
+    let wakeDrain: (() => void) | null = null;
+
+    const finishIfDone = () => {
+      if (disposed || !videoDone || !audioDone) return;
+      const endSec = duration > 0 ? duration : timeRef.current;
+      timeRef.current = endSec;
+      startAtRef.current = endSec;
+      setTime(endSec);
+      setPlaying(false);
+    };
+
+    const elapsed = (): number => {
+      // Only follow AudioContext when its clock is actually advancing: on Linux without
+      // gst-plugins-good (`autoaudiosink`), WebKitGTK's AudioContext can stay stuck at 0.
+      if (
+        audioCtx &&
+        audioOrigin !== null &&
+        audioCtx.state === "running" &&
+        audioCtx.currentTime > audioOrigin + 0.01
+      ) {
+        return Math.max(0, audioCtx.currentTime - audioOrigin);
+      }
+      if (wallStart === null) return 0;
+      return Math.max(0, (performance.now() - wallStart) / 1000);
+    };
+
+    if (hasAudio && typeof AudioContext !== "undefined") {
+      try {
+        audioCtx = new AudioContext({ sampleRate: FFMPEG_AUDIO_RATE });
+        const gain = audioCtx.createGain();
+        gain.gain.value = mutedRef.current ? 0 : 1;
+        gain.connect(audioCtx.destination);
+        gainRef.current = gain;
+        void audioCtx.resume().catch(() => {});
+        const ctx = audioCtx;
+        const audioUrl = ffmpegAudioUrl(mediaBase, path, startSec);
+        void (async () => {
+          try {
+            const resp = await fetch(audioUrl, { signal: ctl.signal });
+            if (!resp.ok || !resp.body) {
+              audioDone = true;
+              finishIfDone();
+              return;
+            }
+            const reader = resp.body.getReader();
+            const chunker = new PcmStereoChunker();
+            let nextAt = 0;
+            for (;;) {
+              const { done, value } = await reader.read();
+              if (disposed || ctl.signal.aborted) break;
+              if (done) break;
+              if (!value) continue;
+              const pcm = chunker.push(value);
+              if (!pcm) continue;
+              const ab = ctx.createBuffer(FFMPEG_AUDIO_CHANNELS, pcm.left.length, FFMPEG_AUDIO_RATE);
+              ab.getChannelData(0).set(pcm.left);
+              ab.getChannelData(1).set(pcm.right);
+              const now = ctx.currentTime;
+              if (audioOrigin === null) {
+                audioOrigin = now + 0.04;
+                nextAt = audioOrigin;
+                if (wallStart === null) wallStart = performance.now();
+              } else if (nextAt < now - 0.1) {
+                nextAt = now + 0.02;
+              }
+              const src = ctx.createBufferSource();
+              src.buffer = ab;
+              src.connect(gain);
+              src.start(nextAt);
+              nextAt += ab.duration;
+              // Keep at most ~0.75 s buffered ahead when the audio clock is advancing.
+              const waitStarted = performance.now();
+              while (
+                !disposed &&
+                !ctl.signal.aborted &&
+                nextAt - ctx.currentTime > 0.75 &&
+                performance.now() - waitStarted < 1500
+              ) {
+                if (ctx.currentTime <= 0 && performance.now() - waitStarted > 300) break;
+                await new Promise((r) => setTimeout(r, 80));
+              }
+            }
+            if (!disposed && !ctl.signal.aborted && ctx.currentTime > 0 && nextAt > ctx.currentTime) {
+              await new Promise((r) => setTimeout(r, Math.min(2000, (nextAt - ctx.currentTime) * 1000 + 30)));
+            }
+          } catch {
+            // Aborted or stream ended.
+          } finally {
+            audioDone = true;
+            finishIfDone();
+          }
+        })();
+      } catch {
+        audioDone = true;
+      }
+    } else {
+      audioDone = true;
+    }
+
+    if (hasVideo) {
+      const videoUrl = ffmpegVideoUrl(mediaBase, path, { startSec, fps, maxWidth });
+      void (async () => {
+        try {
+          const resp = await fetch(videoUrl, { signal: ctl.signal });
+          if (!resp.ok || !resp.body) {
+            if (!disposed && !ctl.signal.aborted && framesDelivered === 0) onFatalRef.current();
+            videoDone = true;
+            finishIfDone();
+            return;
+          }
+          const reader = resp.body.getReader();
+          const parser = new MjpegFrameParser();
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (disposed || ctl.signal.aborted) break;
+            if (done) break;
+            if (!value) continue;
+            for (const frame of parser.push(value)) {
+              queue.push(frame);
+              if (wallStart === null) wallStart = performance.now();
+            }
+            while (!disposed && !ctl.signal.aborted && queue.length >= 4) {
+              await new Promise<void>((resolve) => { wakeDrain = resolve; });
+            }
+          }
+          if (!disposed && !ctl.signal.aborted && framesDelivered === 0 && queue.length === 0) {
+            onFatalRef.current();
+          }
+        } catch {
+          // Aborted on pause/seek/unmount.
+        } finally {
+          videoDone = true;
+          if (queue.length === 0) finishIfDone();
+        }
+      })();
+    }
+
+    const tick = () => {
+      if (disposed) return;
+      const el = elapsed();
+      const cur = duration > 0 ? Math.min(duration, startSec + el) : startSec + el;
+      if (wallStart !== null) {
+        timeRef.current = cur;
+        setTime(cur);
+      }
+
+      if (hasVideo && !drawing && queue.length > 0 && canvasRef.current) {
+        const targetIdx = Math.floor(el * fps);
+        if (shownIdx < 0 || targetIdx > shownIdx) {
+          let frame = queue.shift()!;
+          shownIdx++;
+          // Drop stale buffered frames if decoding fell behind real time.
+          while (queue.length > 0 && shownIdx < targetIdx) {
+            frame = queue.shift()!;
+            shownIdx++;
+          }
+          if (wakeDrain && queue.length < 4) {
+            const w = wakeDrain;
+            wakeDrain = null;
+            w();
+          }
+          framesDelivered++;
+          drawing = true;
+          const canvas = canvasRef.current;
+          void drawJpegOnCanvas(canvas, frame)
+            .then(() => { if (!disposed) setHasFrame(true); })
+            .catch(() => {})
+            .finally(() => {
+              drawing = false;
+              if (videoDone && queue.length === 0) finishIfDone();
+            });
+        }
+      } else if (hasVideo && videoDone && queue.length === 0 && !drawing) {
+        finishIfDone();
+      }
+      rafId = requestAnimationFrame(tick);
+    };
+    rafId = requestAnimationFrame(tick);
+
+    return () => {
+      disposed = true;
+      ctl.abort();
+      cancelAnimationFrame(rafId);
+      if (wakeDrain) {
+        const w = wakeDrain;
+        wakeDrain = null;
+        w();
+      }
+      gainRef.current = null;
+      if (audioCtx) void audioCtx.close().catch(() => {});
+    };
+  }, [playing, playNonce, path, hasVideo, hasAudio, fps, maxWidth, duration, mediaBase]);
+
+  const seekTo = (nextSec: number, keepPlaying = playing) => {
+    const clamped = duration > 0 ? Math.max(0, Math.min(duration, nextSec)) : Math.max(0, nextSec);
+    timeRef.current = clamped;
+    startAtRef.current = clamped;
+    setTime(clamped);
+    setPlaying(keepPlaying);
+    if (keepPlaying) setPlayNonce((n) => n + 1);
+    else setFrameNonce((n) => n + 1);
+  };
+
+  const togglePlay = () => {
+    if (playing) {
+      startAtRef.current = timeRef.current;
+      setPlaying(false);
+    } else {
+      const start = duration > 0 && timeRef.current >= duration - 0.08 ? 0 : timeRef.current;
+      timeRef.current = start;
+      startAtRef.current = start;
+      setTime(start);
+      setPlaying(true);
+      setPlayNonce((n) => n + 1);
+    }
+  };
+
+  const stepSeek = (dir: number) => {
+    const step = settings.videoSeek === "fraction" && duration > 0
+      ? duration / Math.max(2, settings.videoSeekFraction)
+      : settings.videoSeekSeconds;
+    seekTo(timeRef.current + dir * step, playing);
+  };
+
+  const onKey = (e: React.KeyboardEvent) => {
+    if (e.key === "ArrowRight") stepSeek(1);
+    else if (e.key === "ArrowLeft") stepSeek(-1);
+    else if (e.key === "]" && hasVideo) seekTo(timeRef.current + 1 / fps, false);
+    else if (e.key === "[" && hasVideo) seekTo(timeRef.current - 1 / fps, false);
+    else if (e.key === "k" || e.key === "K") togglePlay();
+    else return;
+    e.preventDefault();
+    e.stopPropagation();
+  };
+
+  const codecLabel = formatCodecLabel(probe);
+
+  return (
+    <div className="pv-ff-player" ref={wrapRef} tabIndex={0} onKeyDown={onKey}>
+      {hasVideo ? (
+        <div className="pv-ff-stage" onClick={togglePlay}>
+          {!hasFrame && probe.poster && (
+            <img className="pv-ff-canvas" src={fileSrc(probe.poster)} draggable={false} />
+          )}
+          <canvas
+            ref={canvasRef}
+            className="pv-ff-canvas"
+            style={hasFrame ? undefined : { position: "absolute", opacity: 0, pointerEvents: "none" }}
+          />
+        </div>
+      ) : (
+        <div className="pv-ff-audio-card">
+          <Icon name="audio" size={56} />
+          {codecLabel && <span className="pv-fb-meta">{codecLabel}</span>}
+        </div>
+      )}
+      <div className="pv-ff-controls" onClick={(e) => e.stopPropagation()}>
+        <button
+          type="button"
+          className="pv-ff-btn"
+          title={playing ? tt("Pause (k)") : tt("Play (k)")}
+          onClick={togglePlay}
+        >
+          {playing ? "❚❚" : "▶"}
+        </button>
+        <input
+          type="range"
+          className="pv-ff-scrub"
+          min={0}
+          max={duration > 0 ? duration : 1}
+          step={0.05}
+          value={Math.min(time, duration > 0 ? duration : 1)}
+          disabled={duration <= 0}
+          onChange={(e) => seekTo(Number(e.target.value), playing)}
+          aria-label={tt("Seek")}
+        />
+        <span className="pv-ff-time">
+          {formatMediaDuration(time)}{duration > 0 ? ` / ${formatMediaDuration(duration)}` : ""}
+        </span>
+        {hasAudio && (
+          <button
+            type="button"
+            className="pv-ff-btn"
+            title={muted ? tt("Unmute") : tt("Mute")}
+            onClick={() => setMuted((m) => !m)}
+          >
+            {muted ? "🔇" : "🔊"}
+          </button>
+        )}
+        <button
+          type="button"
+          className="pv-ff-btn"
+          title={tt("Open in player")}
+          aria-label={tt("Open in player")}
+          onClick={() => api.openPath(path).catch(() => {})}
+        >
+          ↗
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Fallback card when neither the built-in player nor FFmpeg could play the file: shows a still
+ * frame (if available), the codec and which packages to install, plus "Open in player".
+ */
+function MediaFallbackCard({
+  path,
+  kind,
+  probe,
+  probing,
+  err,
+}: {
+  path: string;
+  kind: "video" | "audio";
+  probe: VideoProbe | null;
+  probing: boolean;
+  err: string;
+}) {
+  if (probing) {
+    return (
+      <div className="pv-icon">
+        <Icon name={kind} size={56} />
+        <span>{tt("Loading preview…")}</span>
+      </div>
+    );
+  }
+
+  const codec = formatCodecLabel(probe);
+  const platform = detectPlatform(probe);
+  const meta = [probe?.width && probe.height ? `${probe.width} × ${probe.height}` : "", probe?.duration ? formatMediaDuration(probe.duration) : ""].filter(Boolean).join(" · ");
+  return (
+    <div className="pv-fallback">
+      {probe?.poster ? <img className="pv-poster" src={fileSrc(probe.poster)} draggable={false} /> : <Icon name={kind} size={56} />}
+      <div className="pv-fb-card">
+        <b>{codec ? `Can't play ${codec} here` : `Can't play this ${kind}`}</b>
+        {meta && <span className="pv-fb-meta">{meta}</span>}
+        <small>
+          {platform === "linux"
+            ? <>{tt("Playback uses the system's GStreamer codecs. Install")} <code>gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav</code> (Debian/Ubuntu), <code>gstreamer1-plugins-base gstreamer1-plugins-good gstreamer1-libav</code> (Fedora), <code>gst-plugins-base gst-plugins-good gst-libav</code> (Arch) or <code>ffmpeg</code>, then restart Gall.</>
+            : platform === "windows"
+              ? <>{tt("The built-in player (WebView2) only plays H.264, VP8/VP9 and AV1 video.")}</>
+              : <>{tt("The built-in player cannot decode this format.")}</>}
+          {!probe?.ffmpeg && <> {tt("Install FFmpeg to enable fallback playback and codec details here.")}</>}
+        </small>
+        <div className="pv-fb-actions">
+          <button type="button" className="btn primary" onClick={() => api.openPath(path).catch(() => {})}>{tt("Open in player")}</button>
+        </div>
+        <small className="pv-fb-err" title={tt("Error from the built-in player")}>{err}</small>
+      </div>
+    </div>
+  );
 }
 
 /** PDF via pdf.js: ←/→ change page; fit width / page toggle (P-04). */

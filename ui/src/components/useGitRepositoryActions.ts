@@ -40,7 +40,7 @@ export function targetCommit(target: GitTarget | null): string | null {
   return target?.kind === "commit" ? target.id : target?.kind === "reference" ? target.ref.id : target?.kind === "stash" ? target.stash.id : null;
 }
 
-export function useGitRepositoryActions(path: string, repository: Repository | null, reload: () => Promise<void>, checkout: (target: string, branch: boolean, fresh?: boolean) => Promise<void>, onHistoryChange: (head: string) => void) {
+export function useGitRepositoryActions(path: string, repository: Repository | null, reload: () => Promise<void>, checkout: (target: string, branch: boolean, fresh?: boolean) => Promise<void>, onHistoryChange: (head: string, mergePrepared: boolean) => void, onRemoteTagsChanged: () => void) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [output, setOutput] = useState("");
@@ -55,7 +55,32 @@ export function useGitRepositoryActions(path: string, repository: Repository | n
     return id;
   };
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; if (activeJob.current) void invoke("git_network_cancel", { id: activeJob.current }); }; }, []);
-  const refreshHistory = async () => { await reload(); const state = await invoke<Repository>("git_repository", { path }); if (mounted.current && state.head) onHistoryChange(state.head); };
+  const refreshHistory = async (openMergeChanges = false) => {
+    await reload();
+    const state = await invoke<Repository>("git_repository", { path });
+    if (mounted.current && state.head) onHistoryChange(state.head, openMergeChanges && state.operation === "merge" && !state.conflicts.length);
+  };
+  const runNetwork = async (action: string, remote: string, expected: string, branchName: string | null, lease: string | null = null) => {
+    const id = crypto.randomUUID();
+    activeJob.current = id; setJob(id); setOutput("");
+    const phase = action === "fetch" ? "Fetching from remote" : action.startsWith("pull") ? "Pulling from remote" : "Pushing to remote";
+    beginProgress(id, action, phase, true, remote);
+    let unlisten: (() => void) | undefined;
+    try {
+      unlisten = await listen<{ id: string; text: string }>("git-network-progress", (event) => {
+        if (event.payload.id === id && mounted.current) setOutput((text) => (text + event.payload.text).slice(-12000));
+      });
+      if (!mounted.current) return;
+      const text = await invoke<string>("git_network", { path, id, remote, action, expected, lease, branchName });
+      if (mounted.current) {
+        setOutput(text);
+        if (remote === "origin" && (action === "pushTag" || action === "deleteTag")) onRemoteTagsChanged();
+      }
+    } finally {
+      unlisten?.(); activeJob.current = null;
+      if (mounted.current) { setJob(null); setProgressTask(null); }
+    }
+  };
   const perform = async (action: string, target: GitTarget | null) => {
     if (active.current || !repository) return;
     const commit = targetCommit(target);
@@ -69,6 +94,7 @@ export function useGitRepositoryActions(path: string, repository: Repository | n
     active.current = true; setBusy(true); setError("");
     try {
       let request: GitRequest | null = null;
+      let tagPush: { name: string; target: string; origin: GitRemote } | undefined;
       if (action.startsWith("quick:") && commit) {
         const operation = action.slice(6);
         const label = ({ fixup: "Fixup into its parent", squash: "Squash into its parent", drop: "Drop this commit", moveEarlier: "Move this commit earlier", moveLater: "Move this commit later" } as Record<string, string>)[operation];
@@ -141,9 +167,19 @@ export function useGitRepositoryActions(path: string, repository: Repository | n
         if (await A.confirm("Delete local branch?", `Delete ${targetLabel}? Git will refuse a branch that is not merged or is checked out in a worktree.`, "Delete branch", true)) request = { action, name };
       } else if (action === "createTag") {
         const value = await A.promptText(`Tag ${targetLabel || "HEAD"}`, "", "Next");
-        if (value?.trim()) {
-          const message = await A.promptText("Tag description (empty creates a lightweight tag)", "", "Create tag");
-          if (message !== null) request = { action, name: value.trim(), target: commit ?? repository.head, message };
+        const newTag = value?.trim();
+        if (newTag) {
+          const origin = repository.operation ? undefined : repository.remotes.find((item) => item.name === "origin");
+          const choice = await A.dialog({
+            title: "Tag description (empty creates a lightweight tag)",
+            input: { value: "" },
+            checkbox: origin ? { label: tt("Push tag to origin immediately") } : undefined,
+            buttons: [{ id: "cancel", label: tt("Cancel") }, { id: "ok", label: "Create tag", primary: true }],
+          });
+          if (choice?.button !== "ok") return;
+          const target = commit ?? repository.head;
+          request = { action, name: newTag, target, message: choice.value };
+          if (choice.checked && origin) tagPush = { name: newTag, target, origin };
         }
       } else if (action === "deleteTag" && reference?.kind === "tag") {
         if (await A.confirm("Delete local tag?", `Delete ${targetLabel}? Remote tags are unchanged.`, "Delete tag", true)) request = { action, name };
@@ -176,6 +212,7 @@ export function useGitRepositoryActions(path: string, repository: Repository | n
             { id: "cancel", label: tt("Cancel") },
             { id: "merge", label: tt("Merge"), key: "m" },
             { id: "noFastForward", label: tt("Create a merge commit"), key: "n" },
+            { id: "noCommit", label: tt("Merge without committing"), key: "c" },
             { id: "fastForwardOnly", label: tt("Fast-forward only"), key: "f" },
             { id: "squash", label: tt("Squash merge"), key: "s" },
           ],
@@ -202,7 +239,13 @@ export function useGitRepositoryActions(path: string, repository: Repository | n
         }
       } else if (["continue", "skip", "abort"].includes(action)) {
         if (!repository.operation) throw new Error("No Git operation is in progress.");
-        if (action === "continue" || await A.confirm(`${action === "abort" ? "Abort" : "Skip a step of"} ${repository.operation}?`, action === "abort" ? "Git restores the operation's original state. Resolution edits may be removed." : "Git discards this operation's current conflicting step and continues with the next commit.", action === "abort" ? "Abort operation" : "Skip step", true)) request = { action };
+        if (action === "continue") request = { action };
+        else if (action === "abort") {
+          const message = repository.operation === "merge"
+            ? tt("Git restores the state before the merge. Changes staged during the merge and conflict resolutions may be removed.")
+            : "Git restores the operation's original state. Resolution edits may be removed.";
+          if (await A.confirm(`Abort ${repository.operation}?`, message, "Abort operation", true)) request = { action };
+        } else if (await A.confirm(`Skip a step of ${repository.operation}?`, "Git discards this operation's current conflicting step and continues with the next commit.", "Skip step", true)) request = { action };
       } else if (action.startsWith("resolve") && target?.kind === "conflict") {
         const side = action === "resolveOurs" ? "ours" : action === "resolveTheirs" ? "theirs" : "mark";
         if (await A.confirm("Resolve conflict?", side === "mark" ? `Stage your current resolution of ${target.file}? Check that conflict markers have been removed.` : `Replace ${target.file} with the ${side} Git side and stage it? During rebase, ours is the rebased destination and theirs is the commit being replayed.`, "Resolve file", side !== "mark")) request = { action: "resolve", file: target.file, side };
@@ -262,18 +305,32 @@ export function useGitRepositoryActions(path: string, repository: Repository | n
         if (action === "forcePush") {
           if (!await A.confirm("Force push with lease", `Your branch has diverged from the remote branch. Press Esc to cancel, or Enter to force push with lease.\n\n${owner.name} · ${owner.pushUrl}\nThe lease expects the remote branch at ${lease}; the push fails if someone else has pushed since.`, "Force push with lease", true)) return;
         } else if (action === "push" && !await A.confirm(`Push ${repository.branch ?? "detached HEAD"}?`, `Publish to ${owner.name}\n${owner.pushUrl}\n\nThis changes the remote branch. Hooks are disabled.`, "Push")) return;
-        const id = crypto.randomUUID(); activeJob.current = id; setJob(id); setOutput("");
-        const netPhase = networkAction === "fetch" ? "Fetching from remote" : networkAction.startsWith("pull") ? "Pulling from remote" : "Pushing to remote";
-        beginProgress(id, networkAction, netPhase, true, owner.name);
-        const unlisten = await listen<{ id: string; text: string }>("git-network-progress", (event) => { if (event.payload.id === id && mounted.current) setOutput((text) => (text + event.payload.text).slice(-12000)); });
-        try { const text = await invoke<string>("git_network", { path, id, remote: owner.name, action: networkAction, expected: repository.token, lease, branchName }); if (mounted.current) setOutput(text); }
-        finally { unlisten(); activeJob.current = null; if (mounted.current) { setJob(null); setProgressTask(null); } }
+        await runNetwork(networkAction, owner.name, repository.token, branchName, lease);
         await reload(); return;
       }
       if (request) {
         const reqPhase: Record<string, string> = { merge: "Merging", mergeWithMode: "Merging", rebase: "Rebasing", revert: "Reverting", integrateMerge: "Cherry-picking", reset: "Resetting working tree", stashSave: "Saving stash", stashApply: "Applying stash", stashPop: "Popping stash", stashBranch: "Creating branch from stash", continue: "Continuing operation", skip: "Skipping step", abort: "Aborting operation" };
         const progressId = beginProgress(createProgressId("repo"), request.action, reqPhase[request.action] ?? "Running Git operation");
-        const result = await invoke<string>("git_repository_action", { path, request, expected: repository.token, progressId }); if (mounted.current) setOutput(result); if (["merge", "mergeWithMode", "integrateMerge", "rebase", "revert", "reset", "continue", "abort", "skip"].includes(request.action)) await refreshHistory(); else await reload();
+        const result = await invoke<string>("git_repository_action", { path, request, expected: repository.token, progressId });
+        if (mounted.current) setOutput(result);
+        if (tagPush && mounted.current) {
+          const { name, target, origin } = tagPush;
+          try {
+            // Creating the tag changes the token. Check the selected ref and destination again.
+            const state = await invoke<Repository>("git_repository", { path });
+            const currentOrigin = state.remotes.find((item) => item.name === origin.name);
+            const tag = state.refs.find((ref) => ref.kind === "tag" && ref.name === name);
+            if (currentOrigin?.pushUrl !== origin.pushUrl || tag?.id !== target) {
+              throw new Error(tt("The tag or origin changed after creation. Review the tag and remote before pushing."));
+            }
+            await runNetwork("pushTag", origin.name, state.token, name);
+          } catch (failure) {
+            if (mounted.current) setError(tt("Tag {tag} was created locally, but could not be pushed to origin.\n\n{error}", { tag: name, error: String(failure) }));
+          }
+        }
+        if (["merge", "mergeWithMode", "integrateMerge", "rebase", "revert", "reset", "continue", "abort", "skip"].includes(request.action)) {
+          await refreshHistory(request.action === "mergeWithMode" && request.mode === "noCommit");
+        } else await reload();
       }
     } catch (e) {
       const text = String(e);

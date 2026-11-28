@@ -31,6 +31,7 @@ finish-args:
   - --filesystem=xdg-run/gvfs
   - --filesystem=xdg-run/gvfsd
   - --talk-name=org.gtk.vfs.*
+  - --talk-name=org.kde.KIOFuse
   - --talk-name=org.freedesktop.UDisks2
   # "Open with", "Terminal here", editors and Git run on the host: the app starts them with
   # `flatpak-spawn --host` when /.flatpak-info exists (crates/gall-core/src/util/hostspawn.rs).

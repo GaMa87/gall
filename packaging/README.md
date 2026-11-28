@@ -42,6 +42,45 @@ publication, and the required real upgrade checks are in
 across all supported operating systems must be verified with signed release builds;
 local unit tests alone do not establish that a published upgrade works.
 
+## Runtime security updates
+
+Native Linux packages use the distribution's WebKitGTK. Flatpak uses the GNOME
+runtime's WebKitGTK. For AppImage, update to a build that includes the patched
+WebKitGTK library. On Windows, keep the WebView2 Runtime current. On macOS,
+install operating system security updates for the system webview.
+
+Update the Git executable Gall launches through its package manager or
+installer. With Flatpak, update Git on the host. Also update Git in each WSL
+distribution used by Gall.
+
+The November 2026 updates require WebKitGTK 2.54.3 or the distribution's
+equivalent security backport, and Git 2.56.1 or a patched maintenance release.
+[WebKitGTK advisory](https://www.webkitgtk.org/security/WSA-2026-0007.html)
+[Git security release](https://github.blog/open-source/git/git-security-vulnerabilities-announced-7/)
+
+### Linux AppImage WebKitGTK baseline and runtime compatibility
+
+Official Linux releases (`x86_64` and `aarch64` AppImages, `.deb`, `.rpm`, and
+Linux self-update archives) are built in a Debian 13 (`trixie`) container so
+both AppImages bundle Debian Security's patched `libwebkit2gtk-4.1-0` and
+`libjavascriptcoregtk-4.1-0` (`>= 2.54.3`, addressing WSA-2026-0007 /
+CVE-2026-112623; Ubuntu Jammy ignored and Noble/Resolute deferred this fix).
+Release CI runs [`scripts/verify-appimage-webkitgtk.sh`](../scripts/verify-appimage-webkitgtk.sh)
+before and after bundling to reject affected versions, confirm the bundled ELF
+Build IDs match the verified vendor packages, and record the bundled engine
+identity (`Gall_<version>_linux_<arch>_webkitgtk.txt`) plus the maximum
+required `GLIBC_*` symbol version.
+
+Because the build environment moved from Ubuntu 22.04 (`glibc 2.35`) to
+Debian 13 (`trixie`, `glibc 2.41`; `libwebkit2gtk-4.1-0 2.54.3-1~deb13u1`
+requires `libc6 >= 2.38`), the official Linux release binaries and AppImages no
+longer target Ubuntu 22.04 or Debian 12. They target modern distributions with
+compatible `glibc` (Debian 13+, Fedora 42+, Arch/Omarchy, Ubuntu 26.04+; verify
+Ubuntu 24.04 `glibc 2.39` and Fedora 41 `glibc 2.40` against the recorded
+all-ELF `GLIBC_*` floor in the release provenance file). Users on older LTS
+distributions should use Flatpak (which ships its own GNOME WebKitGTK runtime)
+or build Gall from source against their distribution's packages.
+
 ## Status
 
 | Channel | Platform | Status | Files here |
@@ -204,7 +243,7 @@ scripts/copr-build.sh 0.3.0 --submit    # uploads the SRPM to gama87/gall (COPR_
 A local run with a new version also rewrites `copr/gall.spec`; commit that if you want the template to follow.
 
 The `copr` job of the *Packaging* workflow runs the same build on Fedora, installs the package and checks
-that it starts. The `.rpm` from Releases is built on Ubuntu, so it needs no more than the Fedora system
+that it starts. The `.rpm` from Releases is built in Debian 13 (`trixie`), so it needs no more than the Fedora system
 libraries (`webkit2gtk4.1`, `gtk3`); if a release ever fails to start on Fedora, build from source in COPR instead.
 
 ### AppImageHub
@@ -243,5 +282,7 @@ Until then, the own tap and the `.dmg` from Releases are the options.
   the `package-managed` marker). `gall-bin` under `aur/` stays the binary alternative.
 - `packaging/omarchy-pkgs/package.json`: template for `omacom/omarchy-pkgs` (verify the schema there).
 - `packaging/omarchy/README.md`: the file-by-file pull request for making Gall Omarchy's file manager.
-- `release.yml` builds Linux on `ubuntu-22.04` and, natively, on `ubuntu-24.04-arm`; the `aarch64`
-  self-update archive is added to `latest.json` as `linux-aarch64-bin` when it was uploaded.
+- `release.yml` builds Linux inside `debian:trixie` containers on `ubuntu-24.04` (`x86_64`) and
+  `ubuntu-24.04-arm` (`aarch64`), verifying bundled WebKitGTK/JavaScriptCore (`>= 2.54.3`) and
+  recording `Gall_<version>_linux_<arch>_webkitgtk.txt`; the `aarch64` self-update archive is
+  added to `latest.json` as `linux-aarch64-bin` when it was uploaded.

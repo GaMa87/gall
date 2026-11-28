@@ -2,7 +2,7 @@
 
 use serde::Serialize;
 use std::path::Path;
-use sysinfo::Disks;
+use sysinfo::{DiskRefreshKind, Disks};
 
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -55,6 +55,33 @@ const PSEUDO_FS: &[&str] = &[
     "binfmt_misc",
 ];
 
+/// Remote mounts whose `statvfs` waits on the network: an rclone, sshfs or SMB mount
+/// with a slow or gone remote can block a refresh for tens of seconds. Their capacity
+/// is not a local drive's, and cloud folders are listed separately (see `fs::cloud`).
+const NETWORK_FS: &[&str] = &[
+    "cifs",
+    "smb3",
+    "smbfs",
+    "nfs",
+    "nfs4",
+    "davfs",
+    "davfs2",
+    "afs",
+    "ceph",
+    "glusterfs",
+    "fuse.rclone",
+    "fuse.sshfs",
+    "fuse.smbnetfs",
+    "fuse.davfs2",
+    "fuse.gvfsd-fuse",
+    "fuse.portal",
+];
+
+/// Whether a mount belongs in the Drives list: user storage that is cheap to query.
+fn is_listed(mount: &str, fs: &str) -> bool {
+    is_user_visible(mount, fs) && !NETWORK_FS.contains(&fs)
+}
+
 fn is_user_visible(mount: &str, fs: &str) -> bool {
     if PSEUDO_FS.contains(&fs) {
         return false;
@@ -98,19 +125,30 @@ fn short_name(mount: &str, label: &str) -> String {
 /// Returns visible drives. The home directory is always listed first on Unix
 /// because it is where users actually work, followed by `/`, then the rest.
 pub fn list_drives() -> Vec<Drive> {
-    let disks = match Disks::new_with_refreshed_list() {
+    // List the mounts without their capacity first: `statvfs` on a network or FUSE
+    // mount waits on the remote, so only the mounts that are shown are queried.
+    let mut disks = match Disks::new_with_refreshed_list_specifics(DiskRefreshKind::nothing()) {
         Ok(d) => Some(d),
         Err(e) => {
             log::warn!("cannot list disks: {e}");
             None
         }
     };
+    if let Some(disks) = disks.as_mut() {
+        for d in disks.iter_mut() {
+            let mount = d.mount_point().to_string_lossy().into_owned();
+            let fs = d.file_system().to_string_lossy().into_owned();
+            if is_listed(&mount, &fs) {
+                d.refresh_specifics(DiskRefreshKind::everything());
+            }
+        }
+    }
     let mut seen = std::collections::HashSet::new();
     let mut out: Vec<Drive> = Vec::new();
     for d in disks.iter().flat_map(|disks| disks.iter()) {
         let mount = d.mount_point().to_string_lossy().into_owned();
         let fs = d.file_system().to_string_lossy().into_owned();
-        if !is_user_visible(&mount, &fs) || !seen.insert(mount.clone()) {
+        if !is_listed(&mount, &fs) || !seen.insert(mount.clone()) {
             continue;
         }
         let device = d.name().to_string_lossy().into_owned();
@@ -1444,6 +1482,23 @@ pub fn folder_gone(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_mounts_are_not_listed() {
+        // An rclone (Google Drive) or sshfs mount waits on the network: `statvfs` on a
+        // stalled remote blocked a drive refresh for 34 s, so these are never queried.
+        assert!(!is_listed("/home/me/GoogleDrive", "fuse.rclone"));
+        assert!(!is_listed("/mnt/nas", "nfs4"));
+        assert!(!is_listed("/mnt/share", "cifs"));
+        assert!(!is_listed(
+            "/run/user/1000/gvfs/google-drive:host=x",
+            "fuse.gvfsd-fuse"
+        ));
+        // Local storage, including a FUSE NTFS stick, still is a drive.
+        assert!(is_listed("/", "btrfs"));
+        assert!(is_listed("/run/media/me/Stick", "fuseblk"));
+        assert!(is_listed("/home/me/GoogleDrive", "ext4"));
+    }
 
     #[test]
     fn iso9660_usb_stick_under_run_media_is_listed() {

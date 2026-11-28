@@ -11,11 +11,15 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 /// Most bytes read per request head; real browsers send well under 2 KB.
 const MAX_HEAD: usize = 16 * 1024;
 const CHUNK: usize = 256 * 1024;
+/// Maximum size of a single JPEG frame returned by `/_ff/frame/`.
+const MAX_SINGLE_FRAME: usize = 8 * 1024 * 1024;
+const MJPEG_BOUNDARY: &str = "gallframe";
 
 /// Starts the server on a free loopback port and returns the URL prefix
 /// (`http://127.0.0.1:PORT/TOKEN/`). The path of the file follows, percent-encoded.
@@ -57,6 +61,7 @@ struct Request {
     target: String,
     range: Option<String>,
     host: Option<String>,
+    origin: Option<String>,
 }
 
 fn parse_request(head: &str) -> Option<Request> {
@@ -67,7 +72,7 @@ fn parse_request(head: &str) -> Option<Request> {
     if method != "GET" && method != "HEAD" {
         return None;
     }
-    let (mut range, mut host) = (None, None);
+    let (mut range, mut host, mut origin) = (None, None, None);
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
             continue;
@@ -75,6 +80,7 @@ fn parse_request(head: &str) -> Option<Request> {
         match name.trim().to_ascii_lowercase().as_str() {
             "range" => range = Some(value.trim().to_string()),
             "host" => host = Some(value.trim().to_string()),
+            "origin" => origin = Some(value.trim().to_string()),
             _ => {}
         }
     }
@@ -83,7 +89,271 @@ fn parse_request(head: &str) -> Option<Request> {
         target,
         range,
         host,
+        origin,
     })
+}
+
+/// Returns CORS headers for `fetch()` requests that already passed the loopback `Host` check and
+/// the per-session 192-bit secret token in the URL path. WebKitGTK sends `Origin: null` for
+/// custom-scheme (`tauri://localhost`) fetches, so `*` is required after token verification.
+fn cors_headers(origin: Option<&str>) -> String {
+    if origin.is_some() {
+        "Access-Control-Allow-Origin: *\r\n".to_string()
+    } else {
+        String::new()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct FfQuery {
+    start_sec: f64,
+    fps: f64,
+    max_width: u32,
+}
+
+impl Default for FfQuery {
+    fn default() -> Self {
+        Self {
+            start_sec: 0.0,
+            fps: 24.0,
+            max_width: 1280,
+        }
+    }
+}
+
+fn parse_ff_query(query: Option<&str>) -> FfQuery {
+    let mut out = FfQuery::default();
+    let Some(q) = query else {
+        return out;
+    };
+    for pair in q.split('&') {
+        let Some((k, v)) = pair.split_once('=') else {
+            continue;
+        };
+        match k {
+            "t" => {
+                if let Ok(sec) = v.parse::<f64>() {
+                    if sec.is_finite() {
+                        out.start_sec = sec.clamp(0.0, 864_000.0);
+                    }
+                }
+            }
+            "fps" => {
+                if let Ok(fps) = v.parse::<f64>() {
+                    if fps.is_finite() {
+                        out.fps = fps.clamp(1.0, 30.0);
+                    }
+                }
+            }
+            "w" => {
+                if let Ok(w) = v.parse::<u32>() {
+                    out.max_width = w.clamp(64, 1920);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FfMode {
+    Frame,
+    Video,
+    Audio,
+}
+
+fn split_ff_route(rest: &str) -> (Option<FfMode>, &str) {
+    if let Some(p) = rest.strip_prefix("_ff/frame/") {
+        (Some(FfMode::Frame), p)
+    } else if let Some(p) = rest.strip_prefix("_ff/video/") {
+        (Some(FfMode::Video), p)
+    } else if let Some(p) = rest.strip_prefix("_ff/audio/") {
+        (Some(FfMode::Audio), p)
+    } else {
+        (None, rest)
+    }
+}
+
+struct KillOnDrop(Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn ffmpeg_command(args: &[String]) -> Command {
+    let argv: Vec<String> = std::iter::once("ffmpeg".to_string())
+        .chain(args.iter().cloned())
+        .collect();
+    let wrapped = gall_core::util::hostspawn::wrap_argv(argv, None, &[]);
+    let mut cmd = Command::new(&wrapped[0]);
+    cmd.args(&wrapped[1..])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+fn serve_ffmpeg(
+    stream: &mut TcpStream,
+    mode: FfMode,
+    path: &Path,
+    q: FfQuery,
+    head_only: bool,
+    cors: &str,
+) -> std::io::Result<()> {
+    let path_str = path.to_string_lossy().into_owned();
+    let ss = format!("{:.3}", q.start_sec);
+    let scale = format!("scale='min({},iw)':-2", q.max_width);
+    match mode {
+        FfMode::Frame => {
+            let args = vec![
+                "-v".into(),
+                "error".into(),
+                "-nostdin".into(),
+                "-ss".into(),
+                ss,
+                "-i".into(),
+                path_str,
+                "-an".into(),
+                "-sn".into(),
+                "-dn".into(),
+                "-frames:v".into(),
+                "1".into(),
+                "-vf".into(),
+                scale,
+                "-pix_fmt".into(),
+                "yuvj420p".into(),
+                "-c:v".into(),
+                "mjpeg".into(),
+                "-q:v".into(),
+                "4".into(),
+                "-f".into(),
+                "image2pipe".into(),
+                "pipe:1".into(),
+            ];
+            let Ok(child) = ffmpeg_command(&args).spawn() else {
+                return reply(stream, "503 Service Unavailable", cors);
+            };
+            let mut guard = KillOnDrop(child);
+            let Some(stdout) = guard.0.stdout.take() else {
+                return reply(stream, "500 Internal Server Error", cors);
+            };
+            let mut jpeg = Vec::new();
+            let _ = stdout
+                .take(MAX_SINGLE_FRAME as u64 + 1)
+                .read_to_end(&mut jpeg);
+            if jpeg.is_empty() || jpeg.len() > MAX_SINGLE_FRAME {
+                return reply(stream, "404 Not Found", cors);
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n{cors}\r\n",
+                jpeg.len()
+            );
+            stream.write_all(head.as_bytes())?;
+            if !head_only {
+                stream.write_all(&jpeg)?;
+            }
+            Ok(())
+        }
+        FfMode::Video | FfMode::Audio => {
+            let args = match mode {
+                FfMode::Video => {
+                    let vf = format!("fps={:.2},{scale}", q.fps);
+                    vec![
+                        "-v".into(),
+                        "error".into(),
+                        "-nostdin".into(),
+                        "-ss".into(),
+                        ss,
+                        "-i".into(),
+                        path_str,
+                        "-an".into(),
+                        "-sn".into(),
+                        "-dn".into(),
+                        "-vf".into(),
+                        vf,
+                        "-pix_fmt".into(),
+                        "yuvj420p".into(),
+                        "-c:v".into(),
+                        "mjpeg".into(),
+                        "-q:v".into(),
+                        "5".into(),
+                        "-f".into(),
+                        "mpjpeg".into(),
+                        "-boundary_tag".into(),
+                        MJPEG_BOUNDARY.into(),
+                        "pipe:1".into(),
+                    ]
+                }
+                FfMode::Audio => vec![
+                    "-v".into(),
+                    "error".into(),
+                    "-nostdin".into(),
+                    "-ss".into(),
+                    ss,
+                    "-i".into(),
+                    path_str,
+                    "-vn".into(),
+                    "-sn".into(),
+                    "-dn".into(),
+                    "-ac".into(),
+                    "2".into(),
+                    "-ar".into(),
+                    "44100".into(),
+                    "-f".into(),
+                    "f32le".into(),
+                    "-acodec".into(),
+                    "pcm_f32le".into(),
+                    "pipe:1".into(),
+                ],
+                FfMode::Frame => unreachable!(),
+            };
+            let Ok(child) = ffmpeg_command(&args).spawn() else {
+                return reply(stream, "503 Service Unavailable", cors);
+            };
+            let mut guard = KillOnDrop(child);
+            let Some(mut stdout) = guard.0.stdout.take() else {
+                return reply(stream, "500 Internal Server Error", cors);
+            };
+            // Always use `application/octet-stream` + RFC 9112 chunked transfer: WebKitGTK/libsoup3
+            // aborts `fetch()` ReadableStream on `multipart/x-mixed-replace` or unframed HTTP/1.1
+            // bodies with `TypeError: Load failed`.
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\nCache-Control: no-store\r\nConnection: close\r\n{cors}\r\n"
+            );
+            stream.write_all(head.as_bytes())?;
+            if head_only {
+                return Ok(());
+            }
+            let mut buf = vec![0u8; 32 * 1024];
+            loop {
+                let n = stdout.read(&mut buf)?;
+                if n == 0 {
+                    let _ = stream.write_all(b"0\r\n\r\n");
+                    let _ = stream.flush();
+                    break;
+                }
+                let chunk_head = format!("{n:x}\r\n");
+                if stream.write_all(chunk_head.as_bytes()).is_err()
+                    || stream.write_all(&buf[..n]).is_err()
+                    || stream.write_all(b"\r\n").is_err()
+                {
+                    break;
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 fn percent_decode(s: &str) -> Option<Vec<u8>> {
@@ -200,9 +470,15 @@ fn serve(mut stream: TcpStream, prefix: &str, expected_host: &str) -> std::io::R
     let Some(rest) = req.target.strip_prefix(prefix) else {
         return reply(&mut stream, "403 Forbidden", "");
     };
-    let rest = rest.split(['?', '#']).next().unwrap_or("");
-    let Some(path) = percent_decode(rest).and_then(|b| String::from_utf8(b).ok()) else {
-        return reply(&mut stream, "400 Bad Request", "");
+    let cors = cors_headers(req.origin.as_deref());
+    let rest_no_hash = rest.split('#').next().unwrap_or("");
+    let (route_path, query) = match rest_no_hash.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (rest_no_hash, None),
+    };
+    let (ff_mode, encoded_path) = split_ff_route(route_path);
+    let Some(path) = percent_decode(encoded_path).and_then(|b| String::from_utf8(b).ok()) else {
+        return reply(&mut stream, "400 Bad Request", &cors);
     };
     // The path is absolute; the URL may or may not repeat the slash after the token.
     let path = format!("/{}", path.trim_start_matches('/'));
@@ -210,10 +486,14 @@ fn serve(mut stream: TcpStream, prefix: &str, expected_host: &str) -> std::io::R
     // Checked before opening: opening a FIFO would block this thread.
     let len = match std::fs::metadata(path) {
         Ok(m) if m.is_file() => m.len(),
-        _ => return reply(&mut stream, "404 Not Found", ""),
+        _ => return reply(&mut stream, "404 Not Found", &cors),
     };
+    if let Some(mode) = ff_mode {
+        let q = parse_ff_query(query);
+        return serve_ffmpeg(&mut stream, mode, path, q, req.head_only, &cors);
+    }
     let Ok(mut file) = File::open(path) else {
-        return reply(&mut stream, "404 Not Found", "");
+        return reply(&mut stream, "404 Not Found", &cors);
     };
     let (status, start, end) = match &req.range {
         None => ("200 OK", 0, len.saturating_sub(1)),
@@ -223,14 +503,14 @@ fn serve(mut stream: TcpStream, prefix: &str, expected_host: &str) -> std::io::R
                 return reply(
                     &mut stream,
                     "416 Range Not Satisfiable",
-                    &format!("Content-Range: bytes */{len}\r\n"),
+                    &format!("Content-Range: bytes */{len}\r\n{cors}"),
                 )
             }
         },
     };
     let count = if len == 0 { 0 } else { end - start + 1 };
     let mut out = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {}\r\nContent-Length: {count}\r\nAccept-Ranges: bytes\r\nCache-Control: no-store\r\nConnection: close\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: {}\r\nContent-Length: {count}\r\nAccept-Ranges: bytes\r\nCache-Control: no-store\r\nConnection: close\r\n{cors}",
         content_type(path)
     );
     if status.starts_with("206") {
@@ -293,6 +573,166 @@ mod tests {
         assert_eq!(r.host.as_deref(), Some("127.0.0.1:1"));
         assert!(!r.head_only);
         assert!(parse_request("POST / HTTP/1.1\r\n\r\n").is_none());
+    }
+
+    #[test]
+    fn parses_ff_routes_queries_and_cors_origins() {
+        assert_eq!(
+            split_ff_route("_ff/video/home/u/a.mp4"),
+            (Some(FfMode::Video), "home/u/a.mp4")
+        );
+        assert_eq!(
+            split_ff_route("_ff/frame/home/u/a.mp4"),
+            (Some(FfMode::Frame), "home/u/a.mp4")
+        );
+        assert_eq!(
+            split_ff_route("_ff/audio/home/u/a.flac"),
+            (Some(FfMode::Audio), "home/u/a.flac")
+        );
+        assert_eq!(split_ff_route("home/u/a.mp4"), (None, "home/u/a.mp4"));
+
+        assert_eq!(
+            parse_ff_query(Some("t=3.5&fps=24&w=960")),
+            FfQuery {
+                start_sec: 3.5,
+                fps: 24.0,
+                max_width: 960,
+            }
+        );
+        assert_eq!(
+            parse_ff_query(Some("t=-5&fps=999&w=10")),
+            FfQuery {
+                start_sec: 0.0,
+                fps: 30.0,
+                max_width: 64,
+            }
+        );
+        assert_eq!(parse_ff_query(None), FfQuery::default());
+
+        assert_eq!(
+            cors_headers(Some("http://tauri.localhost")),
+            "Access-Control-Allow-Origin: *\r\n"
+        );
+        assert_eq!(
+            cors_headers(Some("null")),
+            "Access-Control-Allow-Origin: *\r\n"
+        );
+        assert!(cors_headers(None).is_empty());
+    }
+
+    #[test]
+    fn streams_ffmpeg_frame_video_and_audio_when_ffmpeg_is_installed() {
+        if Command::new("ffmpeg")
+            .arg("-version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_err()
+        {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("gall-media-ff-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mp4 = dir.join("clip.mp4");
+        let generated = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=blue:s=64x64:d=0.4:r=10",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=0.4",
+                "-c:v",
+                "mpeg4",
+                "-c:a",
+                "aac",
+                "-shortest",
+                "-y",
+            ])
+            .arg(&mp4)
+            .stdin(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(generated, "ffmpeg failed to create test mp4");
+
+        let base = start().unwrap();
+        let url = base.strip_prefix("http://").unwrap();
+        let (host, prefix) = url.split_once('/').unwrap();
+        let enc = mp4.to_string_lossy().trim_start_matches('/').to_string();
+
+        let fetch = |sub: &str, origin: &str| -> (String, Vec<u8>) {
+            let mut s = TcpStream::connect(host).unwrap();
+            write!(
+                s,
+                "GET /{prefix}{sub} HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}\r\n\r\n"
+            )
+            .unwrap();
+            let mut raw = Vec::new();
+            s.read_to_end(&mut raw).unwrap();
+            let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            (
+                String::from_utf8_lossy(&raw[..split]).into_owned(),
+                raw[split..].to_vec(),
+            )
+        };
+
+        let (head, body) = fetch(&format!("_ff/frame/{enc}?t=0.0&w=64"), "null");
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert!(head.contains("Content-Type: image/jpeg"), "{head}");
+        assert!(head.contains("Access-Control-Allow-Origin: *"), "{head}");
+        assert!(
+            body.len() > 100 && body[0] == 0xFF && body[1] == 0xD8,
+            "expected JPEG frame"
+        );
+
+        let decode_chunked = |raw: &[u8]| -> Vec<u8> {
+            let mut out = Vec::new();
+            let mut i = 0;
+            while i < raw.len() {
+                let end = raw[i..].windows(2).position(|w| w == b"\r\n").unwrap() + i;
+                let size_str = std::str::from_utf8(&raw[i..end]).unwrap().trim();
+                let size = usize::from_str_radix(size_str, 16).unwrap();
+                i = end + 2;
+                if size == 0 {
+                    break;
+                }
+                out.extend_from_slice(&raw[i..i + size]);
+                i += size + 2;
+            }
+            out
+        };
+
+        let (head, raw_body) = fetch(
+            &format!("_ff/video/{enc}?t=0.0&fps=10&w=64"),
+            "tauri://localhost",
+        );
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert!(
+            head.contains("Content-Type: application/octet-stream"),
+            "{head}"
+        );
+        assert!(head.contains("Transfer-Encoding: chunked"), "{head}");
+        let body = decode_chunked(&raw_body);
+        assert!(body.windows(11).any(|w| w == b"--gallframe"));
+        assert!(body.windows(2).any(|w| w == [0xFF, 0xD8]));
+
+        let (head, raw_body) = fetch(&format!("_ff/audio/{enc}?t=0.0"), "null");
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert!(
+            head.contains("Content-Type: application/octet-stream"),
+            "{head}"
+        );
+        assert!(head.contains("Transfer-Encoding: chunked"), "{head}");
+        let body = decode_chunked(&raw_body);
+        assert!(body.len() >= 1024 && body.len() % 8 == 0);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     fn get(base: &str, path_and_query: &str, range: Option<&str>) -> (String, Vec<u8>) {

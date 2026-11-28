@@ -20,6 +20,7 @@ mod gitfacts;
 pub mod gitforecast;
 pub mod gitgraph;
 pub mod gitimages;
+pub mod gitindex;
 pub mod gitinspect;
 pub mod gitjournal;
 pub mod gitlocation;
@@ -44,6 +45,7 @@ pub mod index;
 pub mod listing;
 #[cfg(target_os = "macos")]
 pub mod mactrash;
+pub mod native_index;
 pub mod ops;
 pub mod patch;
 pub mod search;

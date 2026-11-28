@@ -370,11 +370,20 @@ async function zoxideQuickOpen(t: T) {
   const want = live[0];
   const name = basename(want);
   t.typeInto(input, name);
-  const row = await t.until(() => t.$$(".qo-row").find((r) => r.querySelector(".hidden-badge")?.textContent === "zoxide" && r.querySelector(".qo-name")?.textContent === name), 5000);
-  t.log(!!row, `zoxide: the zoxide folder ${name} is listed in Quick Open with a zoxide badge`);
+  // The live scan may list the folder as an ordinary hit (the zoxide duplicate is then skipped), so
+  // accept any row for it and identify the right one by its preview path.
+  const named = () => t.$$(".qo-row").filter((r) => r.querySelector(".qo-name")?.textContent === name);
+  let row: HTMLElement | undefined;
+  for (let i = 0; i < 25 && !row; i++) {
+    for (const r of named()) {
+      t.mouse(r, "mousemove");
+      await t.sleep(150);
+      if (t.$(".qo-pv-path")?.textContent === want) { row = r; break; }
+    }
+    if (!row) await t.sleep(200);
+  }
+  t.log(!!row, `zoxide: the zoxide folder ${name} is listed in Quick Open`);
   if (!row) { A.openOverlay(null); return; }
-  t.mouse(row, "mousemove");
-  await t.sleep(150);
   t.key("Enter", {}, input);
   const arrived = await t.until(() => t.activePath(A.activeBrowser()) === want, 5000);
   t.log(!!arrived, `zoxide: Enter navigated the browser to ${want}`, t.activePath(A.activeBrowser()));

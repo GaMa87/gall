@@ -20,6 +20,181 @@ permissions:
   contents: write
 
 jobs:
+  # Linux packages (AppImage, deb, rpm, and self-update archive) build inside Debian 13
+  # (trixie) on native x86_64 and aarch64 runners so both AppImages bundle Debian Security's
+  # patched WebKitGTK & JavaScriptCore (>= 2.54.3, WSA-2026-0007 / CVE-2026-112623).
+  build-linux:
+    # Only on the public repo: the private development repo runs no CI/CD.
+    if: github.repository == 'GaMa87/gall' && (startsWith(github.ref, 'refs/tags/v') || inputs.dry_run)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-24.04
+            arch: x86_64
+          # Linux aarch64 (Arch Linux ARM, Asahi, Raspberry Pi): native arm runner.
+          - platform: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.platform }}
+    container:
+      image: debian:trixie
+    steps:
+      - name: Install Tauri system dependencies (Linux)
+        shell: bash
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          SUDO=""
+          if [[ $(id -u) -ne 0 ]] && command -v sudo >/dev/null 2>&1; then SUDO=sudo; fi
+          $SUDO apt-get update
+          # Install GTK/WebKit dev packages with Recommends enabled so linuxdeploy-plugin-gtk
+          # has runtime modules such as librsvg2-common, libgtk-3-bin, and glib-networking.
+          $SUDO apt-get install -y \
+            ca-certificates curl git build-essential pkg-config libssl-dev file xz-utils \
+            python3 binutils squashfs-tools \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev \
+            libayatana-appindicator3-dev librsvg2-dev patchelf rpm
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none --profile minimal
+          fi
+          if [[ -n "${GITHUB_PATH:-}" ]]; then
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+      - uses: actions/checkout@v7
+      - name: Verify Linux WebKitGTK security baseline
+        shell: bash
+        run: ./scripts/verify-appimage-webkitgtk.sh --check-host
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            ui/package-lock.json
+      - run: npm ci && npm ci --prefix ui
+      - name: Prepare signed updater build
+        id: updater
+        shell: bash
+        env:
+          GALL_UPDATER_PUBLIC_KEY: ${{ vars.GALL_UPDATER_PUBLIC_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          WORKSPACE: ${{ github.workspace }}
+        run: |
+          if [[ -z "$GALL_UPDATER_PUBLIC_KEY" || -z "$TAURI_SIGNING_PRIVATE_KEY" ]]; then
+            echo "Configure GALL_UPDATER_PUBLIC_KEY and TAURI_SIGNING_PRIVATE_KEY before releasing." >&2
+            exit 1
+          fi
+          # Fail in seconds, not after the build. A stray character from copy and paste
+          # (such as the zsh prompt's trailing %) or a wrong file makes signing fail at
+          # the very end. The key values are never printed.
+          # The overlay also carries the public key: after signing, the bundler checks
+          # plugins.updater.pubkey, which is empty in tauri.conf.json.
+          node -e '
+            const fs = require("fs");
+            const text = (n) => Buffer.from((process.env[n] || "").trim(), "base64").toString();
+            const expected = { GALL_UPDATER_PUBLIC_KEY: "public key", TAURI_SIGNING_PRIVATE_KEY: "secret key" };
+            for (const [n, kind] of Object.entries(expected)) {
+              const v = process.env[n] || "";
+              const first = text(n).split("\n")[0];
+              if (!/^[A-Za-z0-9+\/=\s]+$/.test(v) || !first.startsWith("untrusted comment:") || !first.includes(kind)) {
+                console.error(n + " is not a valid Tauri " + kind + ": copy it from the .key / .key.pub file without extra characters such as a trailing %");
+                process.exit(1);
+              }
+            }
+            fs.writeFileSync(".updater-release.json", JSON.stringify({
+              bundle: { createUpdaterArtifacts: true },
+              plugins: { updater: { pubkey: process.env.GALL_UPDATER_PUBLIC_KEY.trim() } },
+            }));
+          '
+          # Not $(pwd): Git Bash on Windows gives /d/a/..., which tauri-action cannot open.
+          # Forward slashes: backslashes can be eaten when tauri-action splits its arguments.
+          echo "config=${WORKSPACE//\\//}/.updater-release.json" >> "$GITHUB_OUTPUT"
+      # Build Linux bundles locally without uploading yet so an AppImage that fails
+      # WebKitGTK verification is never attached to the draft release or latest.json.
+      - name: Build signed Linux bundles
+        shell: bash
+        env:
+          GALL_UPDATER_PUBLIC_KEY: ${{ vars.GALL_UPDATER_PUBLIC_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPIMAGE_EXTRACT_AND_RUN: '1'
+          NO_STRIP: 'true'
+        run: npm run tauri build -- --config "${{ steps.updater.outputs.config }}"
+      - name: Verify bundled AppImage WebKitGTK identity
+        shell: bash
+        run: |
+          shopt -s nullglob
+          appimages=(target/release/bundle/appimage/*.AppImage)
+          if [[ ${#appimages[@]} -ne 1 ]]; then
+            echo "Expected exactly one AppImage, found ${#appimages[@]}" >&2
+            exit 1
+          fi
+          VERSION=$(node -e 'console.log(require("fs").readFileSync("Cargo.toml","utf8").match(/^version\s*=\s*"([^"]+)"/m)[1])')
+          case "$(uname -m)" in aarch64|arm64) LARCH=aarch64 ;; *) LARCH=x86_64 ;; esac
+          mkdir -p dist
+          ./scripts/verify-appimage-webkitgtk.sh --check-appimage "${appimages[0]}" \
+            --output "dist/Gall_${VERSION}_linux_${LARCH}_webkitgtk.txt"
+      - name: Build signed Linux self-update archive
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          VERSION=$(node -e 'console.log(require("fs").readFileSync("Cargo.toml","utf8").match(/^version\s*=\s*"([^"]+)"/m)[1])')
+          STAGE=$(mktemp -d)
+          cp target/release/gall "$STAGE/gall"
+          chmod +x "$STAGE/gall"
+          npm run --silent tauri -- signer sign --app-version "$VERSION" "$STAGE/gall"
+          mkdir -p dist
+          case "$(uname -m)" in aarch64|arm64) LARCH=aarch64 ;; *) LARCH=x86_64 ;; esac
+          OUT="dist/Gall_${VERSION}_linux_${LARCH}_update.tar.gz"
+          tar -czf "$OUT" -C "$STAGE" gall gall.sig
+          npm run --silent tauri -- signer sign --app-version "$VERSION" "$OUT"
+          rm -rf "$STAGE"
+      # Hand verified Linux assets to the single `checksums` job via workflow artifacts so
+      # Linux jobs never race on `gh release create --draft` and zero Linux assets reach the
+      # draft release unless every Linux architecture passes WebKitGTK verification.
+      - name: Stage verified Linux release assets
+        if: startsWith(github.ref, 'refs/tags/') && inputs.dry_run != true
+        shell: bash
+        run: |
+          shopt -s nullglob
+          mkdir -p dist/verified-release
+          files=(
+            target/release/bundle/appimage/*.AppImage
+            target/release/bundle/appimage/*.AppImage.sig
+            target/release/bundle/deb/*.deb
+            target/release/bundle/deb/*.deb.sig
+            target/release/bundle/rpm/*.rpm
+            target/release/bundle/rpm/*.rpm.sig
+            dist/*_update.tar.gz
+            dist/*_update.tar.gz.sig
+            dist/*_webkitgtk.txt
+          )
+          if (( ${#files[@]} == 0 )); then
+            echo "No verified Linux release assets found to stage." >&2
+            exit 1
+          fi
+          cp "${files[@]}" dist/verified-release/
+      - name: Upload verified Linux release assets as artifact
+        if: startsWith(github.ref, 'refs/tags/') && inputs.dry_run != true
+        uses: actions/upload-artifact@v7
+        with:
+          name: verified-linux-${{ matrix.arch }}
+          path: dist/verified-release/*
+          if-no-files-found: error
+      - name: Keep the packages of a dry run as build artifacts
+        if: inputs.dry_run == true
+        uses: actions/upload-artifact@v7
+        with:
+          name: dry-run-linux-${{ matrix.arch }}
+          path: |
+            target/release/bundle/**
+            dist/*_update.*
+            dist/*_webkitgtk.txt
+          if-no-files-found: error
+
   build:
     # Only on the public repo: the private development repo runs no CI/CD.
     if: github.repository == 'GaMa87/gall' && (startsWith(github.ref, 'refs/tags/v') || inputs.dry_run)
@@ -27,11 +202,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: ubuntu-22.04
-            args: ''
-          # Linux aarch64 (Arch Linux ARM, Asahi, Raspberry Pi): native arm runner.
-          - platform: ubuntu-24.04-arm
-            args: ''
           - platform: windows-latest
             args: ''
           - platform: macos-latest
@@ -41,12 +211,6 @@ jobs:
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v7
-      - name: Install Tauri system dependencies (Linux)
-        if: startsWith(matrix.platform, 'ubuntu')
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev \
-            libayatana-appindicator3-dev librsvg2-dev patchelf rpm
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ startsWith(matrix.platform, 'macos') && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
@@ -118,24 +282,6 @@ jobs:
         if: startsWith(matrix.platform, 'windows')
         shell: pwsh
         run: ./scripts/portable.ps1 -NoBuild
-      - name: Build signed Linux self-update archive
-        if: startsWith(matrix.platform, 'ubuntu')
-        shell: bash
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: |
-          VERSION=$(node -e 'console.log(require("fs").readFileSync("Cargo.toml","utf8").match(/^version\s*=\s*"([^"]+)"/m)[1])')
-          STAGE=$(mktemp -d)
-          cp target/release/gall "$STAGE/gall"
-          chmod +x "$STAGE/gall"
-          npm run --silent tauri -- signer sign --app-version "$VERSION" "$STAGE/gall"
-          mkdir -p dist
-          case "$(uname -m)" in aarch64|arm64) LARCH=aarch64 ;; *) LARCH=x86_64 ;; esac
-          OUT="dist/Gall_${VERSION}_linux_${LARCH}_update.tar.gz"
-          tar -czf "$OUT" -C "$STAGE" gall gall.sig
-          npm run --silent tauri -- signer sign --app-version "$VERSION" "$OUT"
-          rm -rf "$STAGE"
       - name: Build signed Windows self-update archive
         if: startsWith(matrix.platform, 'windows')
         shell: pwsh
@@ -206,18 +352,31 @@ jobs:
           name: gall-windows-portable
           path: dist/*-portable.zip
 
-  # Augment latest.json with per-binary update targets and generate SHA256SUMS.
+  # Upload verified Linux release assets, augment latest.json, and generate SHA256SUMS.
   checksums:
-    needs: build
+    needs: [build-linux, build]
     if: startsWith(github.ref, 'refs/tags/') && inputs.dry_run != true
     runs-on: ubuntu-latest
     steps:
-      - name: Augment updater manifest and hash release assets
+      - name: Download verified Linux release assets
+        uses: actions/download-artifact@v7
+        with:
+          pattern: verified-linux-*
+          path: linux-assets
+          merge-multiple: true
+      - name: Upload verified Linux assets, augment updater manifest, and hash release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
+          shopt -s nullglob
+          linux_files=(linux-assets/*)
+          if (( ${#linux_files[@]} == 0 )); then
+            echo "Missing verified Linux release artifacts." >&2
+            exit 1
+          fi
+          gh release upload "$TAG" "${linux_files[@]}" --clobber
           mkdir assets && cd assets
           gh release download "$TAG" --pattern '*' --skip-existing
           node <<'NODE'
@@ -227,14 +386,22 @@ jobs:
             const manifest = JSON.parse(fs.readFileSync("latest.json", "utf8"));
             const ver = (manifest.version || tag.replace(/^v/, "")).replace(/^v/, "");
             const extras = {
+              "linux-x86_64": `Gall_${ver}_amd64.AppImage`,
+              "linux-x86_64-appimage": `Gall_${ver}_amd64.AppImage`,
+              "linux-x86_64-deb": `Gall_${ver}_amd64.deb`,
+              "linux-x86_64-rpm": `Gall-${ver}-1.x86_64.rpm`,
               "linux-x86_64-bin": `Gall_${ver}_linux_x86_64_update.tar.gz`,
               "windows-x86_64-bin": `Gall_${ver}_windows_x64_update.zip`,
               "darwin-aarch64-app": `Gall_${ver}_darwin_aarch64_update.tar.gz`,
               "darwin-x86_64-app": `Gall_${ver}_darwin_x86_64_update.tar.gz`,
             };
             manifest.platforms = manifest.platforms || {};
-            // Optional targets: added when their signed archive was uploaded (older tags have none).
+            // Optional targets: added when their signed asset was uploaded (older tags have none).
             const optionalExtras = {
+              "linux-aarch64": `Gall_${ver}_aarch64.AppImage`,
+              "linux-aarch64-appimage": `Gall_${ver}_aarch64.AppImage`,
+              "linux-aarch64-deb": `Gall_${ver}_arm64.deb`,
+              "linux-aarch64-rpm": `Gall-${ver}-1.aarch64.rpm`,
               "linux-aarch64-bin": `Gall_${ver}_linux_aarch64_update.tar.gz`,
             };
             for (const [key, file] of Object.entries(optionalExtras)) {

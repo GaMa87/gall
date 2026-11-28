@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+## 0.3.2 — 2026-11-28
+
+- Fixed: selecting or hovering video and audio files in the preview pane no longer mounts `<video>`/`<audio>` or triggers WebKitGTK's GStreamer `downloadbuffer` to copy entire multi-GB files into `/var/tmp/WebKit-Media-*`. Previews now open in a zero-spool poster and metadata standby view (reusing an in-memory `(path, size, mtime)` probe cache, cached FFmpeg posters, and existing Linux FreeDesktop `~/.cache/thumbnails/` thumbnails when FFmpeg is absent), tear down native media elements eagerly on unmount, route Linux playback of files over 32 MiB directly through the zero-spool FFmpeg streaming player when FFmpeg is installed, and guard files over 128 MiB behind an explicit *Open in player* / *Play here anyway* prompt when FFmpeg is not installed.
+
+- Quick Open now searches right after start from a cached index (saved after each completed scan) and learns folders as you browse them, so new files appear without a rescan. Added building blocks for a zero-walk Git index reader and system indexers (`plocate`, Spotlight, Everything).
+
+- Fixed: Linux video and audio previews now fall back automatically to an FFmpeg-powered player (streaming decoded frames to `<canvas>` and stereo PCM to Web Audio with play/pause, seeking, mute, and `[`/`]` frame-stepping) whenever the webview's built-in GStreamer player reports an error or stalls silently due to missing GStreamer plugins (such as `gst-plugins-good`/`gst-libav`) or unsupported codecs, and updated the missing-codec hint to list `gst-plugins-base`, `gst-plugins-good`, `gst-libav`, and `ffmpeg`.
+
+- Fixed: Linux **Connect to server…** and the sidebar **Network** section now support KDE `kio-fuse` (`org.kde.KIOFuse.VFS.mountUrl` over D-Bus) alongside GVFS — preferring `kio-fuse` on KDE Plasma (matching Dolphin, including host-only `nfs://host` browsing and `webdav://`/`webdavs://` schemes) and falling back between `kio-fuse` and `gio mount` automatically, opening the mounted share right after connecting, guarding `fuse.kio-fuse` paths as slow/remote mounts, sanitizing AppImage/Flatpak environments when invoking `gio`, and showing clear non-reportable setup messages instead of raw `gio: ...: volume doesn't implement mount` errors with a *Report a bug* button.
+
+- Switched Linux release builds (`x86_64` and `aarch64`) to Debian 13 (`trixie`) so AppImages bundle Debian Security's patched WebKitGTK and JavaScriptCore (`>= 2.54.3`, fixing WSA-2026-0007 / CVE-2026-112623), and added CI provenance verification (`scripts/verify-appimage-webkitgtk.sh`) that records the bundled engine identity and rejects affected versions. Official Linux release binaries and AppImages now require a modern `glibc` runtime instead of Ubuntu 22.04 (`glibc 2.35`).
+
+- Hardened the archive preview cache to use a validated private (`0700`) cache root, exclusive private (`0600`) staging and member files, a random private temporary fallback on Unix when no user cache directory is available, and safe retirement of the legacy cache without following symbolic links or removing user data.
+
+- Hardened TAR and ZIP extraction so all published symlinks and hardlinks stay inside the extraction boundary (including after Smart single-folder unwrapping), stripped special Unix mode bits on TAR extraction, and switched archive compression and extraction publication to atomic no-clobber renames so concurrent destination files are never overwritten.
+
+- Hardened Markdown previews so every local link asks for explicit confirmation before opening (retaining the stronger runnable-file warning for executable extensions) and stripped embedded `<audio>`, `<video>`, `<source>`, and `<track>` media tags from rendered Markdown HTML.
+
+- Hardened ZIP extraction so files are written before symbolic links are restored. Extracted ZIP files keep ordinary permissions without inheriting special mode bits.
+
+- Fixed: the Drives list no longer queries `statvfs` on network and FUSE mounts (rclone, sshfs, SMB, gvfs), where a stalled remote blocked a refresh for tens of seconds (an rclone Google Drive mount held it for 34 s); capacity is read only for the local mounts that are shown, and cloud folders stay under Cloud.
+
+- Added an option to push a tag to `origin` immediately when creating it.
+
+- Added **Merge without committing** to Git. Review and stage additional changes in Working Changes, then finish the merge with a custom commit message.
+
 ## 0.3.1 — 2026-11-27
 
 - Fixed: removed the misleading open-left/open-right pane picker icons and "Open in new tab / other browser" menu items from Trash in the sidebar (Trash always opens in its own window); on Linux, unlocking an encrypted volume now checks for a saved desktop-keyring passphrase in both KDE KWallet (`SolidLuks` via `kwallet-query`, matching Dolphin/Solid) and GNOME Keyring (`gvfs-luks-uuid` via `secret-tool`) before prompting, offers an optional "Remember passphrase in system keyring" checkbox to save verified passphrases into the active desktop's keyring, waits briefly for desktop automount before issuing a second `udisksctl mount` (avoiding redundant polkit prompts), stops looping the passphrase dialog when polkit authorization is cancelled, and explains the separate polkit authorization prompt on internal partitions.

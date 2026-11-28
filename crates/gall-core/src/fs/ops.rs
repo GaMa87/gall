@@ -88,13 +88,23 @@ fn unique_path_avoiding(
     name: &str,
     taken: &std::collections::HashSet<PathBuf>,
 ) -> PathBuf {
+    unique_path_avoiding_kind(dir, name, None, taken)
+}
+
+fn unique_path_avoiding_kind(
+    dir: &Path,
+    name: &str,
+    known_dir: Option<bool>,
+    taken: &std::collections::HashSet<PathBuf>,
+) -> PathBuf {
     let free = |p: &PathBuf| !exists_no_follow(p) && !taken.contains(p);
     let first = dir.join(name);
     if free(&first) {
         return first;
     }
     // A folder has no extension: "my.project" → "my.project (2)".
-    let (stem, ext) = if fs::metadata(&first).is_ok_and(|m| m.is_dir()) {
+    let treat_as_dir = known_dir.unwrap_or_else(|| fs::metadata(&first).is_ok_and(|m| m.is_dir()));
+    let (stem, ext) = if treat_as_dir {
         (name, "")
     } else {
         split_ext(name)
@@ -123,6 +133,34 @@ fn unique_path_avoiding(
         .map(|n| dir.join(name_n(n)))
         .find(free)
         .expect("unbounded range")
+}
+
+/// Atomically publishes `from` into `dir` under `name` (or a ` (2)`, ` (3)`, … sibling
+/// when `name` is already taken) without replacing a destination created concurrently.
+pub(crate) fn publish_unique(from: &Path, dir: &Path, name: &str) -> Result<PathBuf> {
+    publish_unique_with(from, dir, name, rename_noreplace)
+}
+
+pub(crate) fn publish_unique_with(
+    from: &Path,
+    dir: &Path,
+    name: &str,
+    mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> Result<PathBuf> {
+    const MAX_ATTEMPTS: usize = 1024;
+    let is_dir = fs::symlink_metadata(from).is_ok_and(|m| m.is_dir());
+    let mut taken = std::collections::HashSet::new();
+    for _ in 0..MAX_ATTEMPTS {
+        let dest = unique_path_avoiding_kind(dir, name, Some(is_dir), &taken);
+        match rename(from, &dest) {
+            Ok(()) => return Ok(dest),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                taken.insert(dest);
+            }
+            Err(e) => return Err(CoreError::io("move", &dest, e)),
+        }
+    }
+    Err(CoreError::AlreadyExists(dir.join(name)))
 }
 
 /// Where Ctrl+D puts the copies of `sources`: next to each, with a free " (n)" name.
@@ -5264,6 +5302,89 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(fs::read_to_string(source).unwrap(), "source data");
         assert_eq!(fs::read_to_string(destination).unwrap(), "unrelated data");
+    }
+
+    #[test]
+    fn publish_unique_retries_when_destination_appears_concurrently() {
+        let d = test_dir();
+        let staged = d.path().join(".staged.part");
+        fs::write(&staged, "new archive").unwrap();
+        let mut raced = false;
+        let published = publish_unique_with(&staged, d.path(), "report.zip", |from, to| {
+            if !raced {
+                raced = true;
+                // Simulate another process creating `to` after unique_path chose it.
+                fs::write(to, "concurrent data").unwrap();
+            }
+            rename_noreplace(from, to)
+        })
+        .unwrap();
+        assert_eq!(published, d.path().join("report (2).zip"));
+        assert_eq!(
+            fs::read_to_string(d.path().join("report.zip")).unwrap(),
+            "concurrent data"
+        );
+        assert_eq!(fs::read_to_string(&published).unwrap(), "new archive");
+        assert!(!staged.exists());
+    }
+
+    #[test]
+    fn publish_unique_preserves_folder_name_with_dot_on_concurrent_collision() {
+        let d = test_dir();
+        let staged = d.path().join(".staged-dir");
+        fs::create_dir(&staged).unwrap();
+        fs::write(staged.join("item.txt"), "folder data").unwrap();
+        let mut raced = false;
+        let published = publish_unique_with(&staged, d.path(), "my.project", |from, to| {
+            if !raced {
+                raced = true;
+                fs::write(to, "concurrent file").unwrap();
+            }
+            rename_noreplace(from, to)
+        })
+        .unwrap();
+        assert_eq!(published, d.path().join("my.project (2)"));
+        assert_eq!(
+            fs::read_to_string(d.path().join("my.project")).unwrap(),
+            "concurrent file"
+        );
+        assert_eq!(
+            fs::read_to_string(published.join("item.txt")).unwrap(),
+            "folder data"
+        );
+    }
+
+    #[test]
+    fn publish_unique_preserves_file_extension_when_colliding_with_directory() {
+        let d = test_dir();
+        let staged = d.path().join(".staged.part");
+        fs::write(&staged, "archive bytes").unwrap();
+        fs::create_dir(d.path().join("photos.zip")).unwrap();
+        let published = publish_unique(&staged, d.path(), "photos.zip").unwrap();
+        assert_eq!(published, d.path().join("photos (2).zip"));
+        assert!(d.path().join("photos.zip").is_dir());
+        assert_eq!(fs::read_to_string(&published).unwrap(), "archive bytes");
+    }
+
+    #[test]
+    fn publish_unique_propagates_non_conflict_errors_without_clobbering() {
+        let d = test_dir();
+        let staged = d.path().join(".staged.part");
+        fs::write(&staged, "new data").unwrap();
+        let err = publish_unique_with(&staged, d.path(), "out.zip", |_from, to| {
+            fs::write(to, "existing data").unwrap();
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "no-replace unsupported",
+            ))
+        })
+        .unwrap_err();
+        assert!(matches!(err, CoreError::Io { .. }));
+        assert_eq!(
+            fs::read_to_string(d.path().join("out.zip")).unwrap(),
+            "existing data"
+        );
+        assert_eq!(fs::read_to_string(&staged).unwrap(), "new data");
     }
 
     #[test]

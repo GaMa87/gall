@@ -263,6 +263,91 @@ async function step(name: string, fn: () => Promise<void>) {
   }
 }
 
+let videoPreviewRunning = false;
+async function runVideoPreviewSelfTest() {
+  if (videoPreviewRunning) return;
+  videoPreviewRunning = true;
+  results.push(`Runtime: ${window.location.origin}`);
+  const A = await import("./state/actions");
+  const root = activePath(0);
+  const errors: string[] = [];
+  window.addEventListener("unhandledrejection", (e) => errors.push(String(e.reason)));
+  window.addEventListener("error", (e) => errors.push(e.message));
+  const canvasPainted = (sel: string) => {
+    const c = $<HTMLCanvasElement>(sel);
+    if (!c || c.width === 0 || c.height === 0) return false;
+    const data = c.getContext("2d")?.getImageData(0, 0, c.width, c.height).data;
+    if (!data) return false;
+    for (let i = 0; i < data.length; i += 16) {
+      if (data[i] > 10 || data[i + 1] > 10 || data[i + 2] > 10) return true;
+    }
+    return false;
+  };
+  try {
+    await getCurrentWindow().setFocus().catch(() => {});
+    await getCurrentWindow().unmaximize().catch(() => {});
+    await setWindowSize(1100, 760);
+    await updateSettings({ indexRoots: [root], keyboardProfile: "explorer", shortcuts: {}, theme: "dark", autoplayMedia: false });
+    await A.sessionCmd({ op: "layout", layout: "classic" });
+    await A.sessionCmd({ op: "details", b: 0, on: true });
+    await until(() => $(".details"), 10000);
+    await focusPane(0);
+    await selectRow(0, "clip.mp4");
+    const standbyReady = await until(
+      () => !!$(".details .pv-standby") && (!!$(".details .pv-poster-img") || !!$(".details .pv-standby-placeholder")),
+      10000,
+    );
+    log(
+      !!standbyReady && !$(".details video.pv-media"),
+      "video hover/select renders zero-spool poster standby without mounting <video>",
+      $(".details .preview")?.textContent?.slice(0, 120) ?? "",
+    );
+    await shot("video-preview-details");
+    const playOverlay = $<HTMLButtonElement>(".details .pv-play-overlay");
+    playOverlay?.click();
+    const ready = await until(
+      () => canvasPainted(".details .pv-ff-player canvas") || ($<HTMLVideoElement>(".details video.pv-media")?.readyState ?? 0) >= 2,
+      10000,
+    );
+    const usedFfmpeg = !!$(".details .pv-ff-player");
+    log(!!ready, `video playback starts clip.mp4 (${usedFfmpeg ? "FFmpeg player" : "native <video>"})`, $(".details .preview")?.textContent?.slice(0, 120) ?? "");
+    if (usedFfmpeg) {
+      const advanced = await until(() => {
+        const scrub = $<HTMLInputElement>(".details .pv-ff-scrub");
+        return scrub ? Number(scrub.value) >= 0.4 : false;
+      }, 6000);
+      log(!!advanced && canvasPainted(".details .pv-ff-player canvas"), "FFmpeg video player advances playback time and paints frames", $(".details .pv-ff-time")?.textContent ?? "");
+      await shot("video-preview-playing");
+      // Pause via k
+      const player = $<HTMLElement>(".details .pv-ff-player");
+      player?.focus();
+      key("k", {}, player);
+      await sleep(150);
+      log($(".details .pv-ff-controls .pv-ff-btn")?.textContent?.trim() === "▶", "k pauses the FFmpeg player");
+    }
+    // Preview modal (Space) — starts in zero-spool standby when autoplayMedia is false
+    A.openOverlay({ type: "previewWindow", b: 0 });
+    const modalReady = await until(
+      () => !!$(".pw .pv-standby") && (!!$(".pw .pv-poster-img") || !!$(".pw .pv-standby-placeholder")),
+      10000,
+    );
+    log(!!modalReady && !$(".pw video.pv-media"), "preview modal renders zero-spool poster for clip.mp4");
+    await shot("video-preview-modal");
+    A.openOverlay(null);
+    await until(() => !getState().overlay, 3000);
+    // Audio preview — also starts in zero-spool standby
+    await selectRow(0, "tone.flac");
+    const audioReady = await until(() => !!$(".details .pv-audio-standby"), 10000);
+    log(!!audioReady && !$(".details audio.pv-media"), "audio preview renders zero-spool standby for tone.flac", $(".details .preview")?.textContent?.slice(0, 120) ?? "");
+    await shot("audio-preview-details");
+    log(errors.length === 0, "no unhandled preview errors", errors.join("; "));
+  } catch (e) {
+    log(false, "video preview integration", String(e));
+    await shot("video-preview-error");
+  }
+  await api.selftestDone(results.join("\n") + `\n\n${failures} failure(s)`);
+}
+
 let previewShortcutsRunning = false;
 async function runPreviewShortcutsSelfTest() {
   if (previewShortcutsRunning) return;
@@ -592,6 +677,7 @@ export async function runSelfTest() {
   if (mode === "git-workspace") return (await import("./selftestGitWorkspace")).runGitWorkspaceSelfTest(gitSelftest);
   if (mode === "popup-placement") return (await import("./selftestPopups")).runPopupPlacementSelfTest(gitSelftest);
   if (mode === "preview-shortcuts") return runPreviewShortcutsSelfTest();
+  if (mode === "video-preview") return runVideoPreviewSelfTest();
   if (mode === "quick-open") return runQuickOpenSelfTest();
   if (mode === "search-hidden") return runSearchHiddenSelfTest();
   if (mode === "key-profiles") return runKeyboardProfilesSelfTest();

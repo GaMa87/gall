@@ -644,6 +644,11 @@
   "Use Git pull settings",
   "Merge commit?",
   "Create a merge commit",
+  "Merge without committing",
+  "Commit merge",
+  "All conflicts are resolved. Press Enter to review the merge in Working Changes.",
+  "Commit merge with Git’s message",
+  "Git restores the state before the merge. Changes staged during the merge and conflict resolutions may be removed.",
   "Fast-forward only",
   "Squash merge",
   "Choose the mainline parent",
@@ -652,6 +657,9 @@
   "Rename stash…",
   "Push tag…",
   "Push tag {tag}?",
+  "Push tag to origin immediately",
+  "The tag or origin changed after creation. Review the tag and remote before pushing.",
+  "Tag {tag} was created locally, but could not be pushed to origin.\n\n{error}",
   "Choose the remote that should receive this tag.",
   "Delete remote tag…",
   "Delete remote tag {tag}?",
@@ -1088,5 +1096,9 @@
   "Updates the Freedesktop inode/directory default (mimeapps.list) for your user account.",
   "Install Gall.app in Applications to set it as the system default file manager.",
   "Gall could not locate its executable path in this environment.",
-  "Setting the default file manager is not supported on this operating system."
+  "Setting the default file manager is not supported on this operating system.",
+  "Run this file?",
+  "The link opens “{name}”, which runs as a program. Open it only if you trust where this document came from.",
+  "Open local file?",
+  "The link opens “{name}” with its default application:\n\n{path}\n\nLocal files can still run programs or scripts. Open it only if you trust where this document came from."
 ]

@@ -35,6 +35,9 @@ describe("operation feedback", () => {
     ["no-trash: The drive has no trash.", "error"],
     ["zip: invalid archive", "error"],
     ["clipboard unavailable: no display server", "error"],
+    ["gio: nfs://192.168.0.101: volume doesn't implement mount", "error"],
+    ["Cannot connect to nfs://192.168.0.101: neither KDE kio-fuse nor GVFS is available. Install kio-fuse or gvfs-nfs (or gvfs-backends).", "error"],
+    ["failed to disconnect /run/user/1000/gvfs/smb-share:server=nas,share=x", "error"],
     ["rename failed for '/tmp/draft': Permission denied (os error 13)", "error"],
   ])("treats %s as an expected %s", (raw, kind) => {
     expect(operationError(raw, "linux")).toMatchObject({ kind, reportable: false });

@@ -25,7 +25,7 @@ import { createProgressId } from "../core/gitProgress";
 import { GitProgressBar, useGitProgress, useLocalProgress, type GitProgressSeed } from "./GitProgressBar";
 
 type Change = { path: string; original: string | null; index: string; worktree: string };
-type Workspace = { root: string; editStop: boolean; changes: Change[]; token: string; head: string; subject: string; message: string };
+type Workspace = { root: string; editStop: boolean; merging: boolean; changes: Change[]; token: string; head: string; subject: string; message: string };
 type PatchLine = { index: number; text: string; kind: "added" | "deleted" | "context" | "header"; hunk: number | null };
 type Patch = { text: string; token: string; selectable: boolean; reason: string | null; lines: PatchLine[] };
 type Action = "stage" | "unstage" | "commit" | "amend" | "stageAll" | "unstageAll" | "discard" | "ignore" | "exclude";
@@ -242,8 +242,10 @@ export function GitChanges({ path, onBusy, onChanged, onBack, onClose, onCustom 
     catch (e) { setError(String(e)); }
     finally { gate.current = false; setBusy(false); onBusy(false); }
   };
-  const canCommit = !!state && !!message.trim() && (amend || (!!stagedCount && !state.editStop));
-  const commitNow = () => { if (canCommit && !busy) void act(amend ? "amend" : "commit"); };
+  const canAmend = !!state?.head && !state.merging;
+  const amending = amend && canAmend;
+  const canCommit = !!state && !!message.trim() && (amending || (!state.editStop && (stagedCount > 0 || state.merging)));
+  const commitNow = () => { if (canCommit && !busy) void act(amending ? "amend" : "commit"); };
   const toggleAmend = (value: boolean) => {
     setAmend(value);
     if (value) { if (!message) setMessage(state?.message ?? ""); }
@@ -254,7 +256,7 @@ export function GitChanges({ path, onBusy, onChanged, onBack, onClose, onCustom 
     if (key === " ") void act(current?.staged ? "unstage" : "stage");
     else if (key === "a") void act(unstagedCount ? "stageAll" : "unstageAll");
     else if (key === "c") messageRef.current?.focus();
-    else if (key === "A" && state?.head) toggleAmend(!amend);
+    else if (key === "A" && canAmend) toggleAmend(!amend);
     else if (key === "d" && current && !current.staged) void act("discard");
     else if (key === "i" && current) {
       const row = root.current?.querySelector(".gc-file.selected");
@@ -313,7 +315,7 @@ export function GitChanges({ path, onBusy, onChanged, onBack, onClose, onCustom 
       {patch.selectable && ["added", "deleted"].includes(entry.kind) ? <input type="checkbox" aria-label={tt("Select changed line {line}", { line: entry.index + 1 })} checked={selectedLines.has(entry.index)} disabled={busy} onFocus={() => setLine(entry.index)} onClick={(e) => { if (e.shiftKey && lastClick.current !== null) { e.preventDefault(); setSelectedLines(new Set([...selectedLines, ...changedIn(lastClick.current, entry.index)])); } lastClick.current = entry.index; }} onChange={() => toggleLines([entry.index])} /> : patch.selectable && entry.text.startsWith("@@ ") ? <button className="gc-hunk" disabled={busy} onClick={() => toggleLines(patch.lines.filter((l) => l.hunk === entry.hunk && ["added", "deleted"].includes(l.kind)).map((l) => l.index))} aria-label={tt("Select hunk {hunk}", { hunk: (entry.hunk ?? 0) + 1 })} title={tt("Select or deselect all changed lines in this hunk")}>±</button> : <span className="gc-line-spacer" />}
       <span><PatchText text={entry.text || " "} spans={marks?.[entry.index]} /></span>{"\n"}
     </span>) : tt("No textual difference") : tt("Select a file to review its changes")}</pre></>}</div></div>}
-    <div className="gc-commit"><div className="gc-message"><textarea ref={messageRef} aria-label={tt("Commit message")} placeholder={tt("Commit message (Enter = new line, Ctrl+Enter commits)")} value={message} onChange={(e) => writeMessage(e.target.value)} disabled={busy} /><label className="gc-amend"><input type="checkbox" checked={amend} disabled={busy || !state?.head} onChange={(e) => toggleAmend(e.target.checked)} />{tt("Amend latest commit")}{amend && state ? ` · ${state.head.slice(0, 8)}` : ""}</label></div><div><button disabled={busy || !message.trim() || (!amend && (!stagedCount || state?.editStop))} onClick={() => void act(amend ? "amend" : "commit")}>{amend ? tt("Amend commit…") : tt("Commit staged")}</button><small>{tt("Only staged changes · unsigned · hooks disabled · Ctrl+Enter commits")}</small></div></div>
+    <div className="gc-commit"><div className="gc-message"><textarea ref={messageRef} aria-label={tt("Commit message")} placeholder={tt("Commit message (Enter = new line, Ctrl+Enter commits)")} value={message} onChange={(e) => writeMessage(e.target.value)} disabled={busy} /><label className="gc-amend"><input type="checkbox" checked={amending} disabled={busy || !canAmend} onChange={(e) => toggleAmend(e.target.checked)} />{tt("Amend latest commit")}{amending && state ? ` · ${state.head.slice(0, 8)}` : ""}</label></div><div><button disabled={busy || !canCommit} onClick={commitNow}>{amending ? tt("Amend commit…") : state?.merging ? tt("Commit merge") : tt("Commit staged")}</button><small>{tt("Only staged changes · unsigned · hooks disabled · Ctrl+Enter commits")}</small></div></div>
     <div className="gc-key-help">{vim ? `${gitKeys.hints("files").map((hint) => `${hint.name === "Space" ? tt("Space") : hint.name} ${tt(hint.label)}`).join(" · ")} · ${tt("j/k files · l diff · ? keys")}` : tt("Arrow keys navigate · Tab selects controls · Space toggles selected changes · Ctrl+Enter commits")}</div>
     {busy && (actionProgress ? <GitProgressBar progress={actionProgress} compact /> : <p role="status">{tt("Updating Git index…")}</p>)}
   </div>;

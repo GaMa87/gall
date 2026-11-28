@@ -299,11 +299,21 @@ pub async fn set_settings(app: AppHandle, settings: Settings) -> R<()> {
 // ───────────────────────── listing / drives / prefs ─────────────────────────
 
 #[tauri::command]
-pub async fn list_dir(path: String, opts: ListOptions) -> R<Vec<FileEntry>> {
+pub async fn list_dir(
+    state: State<'_, AppState>,
+    path: String,
+    opts: ListOptions,
+) -> R<Vec<FileEntry>> {
+    let index = state.index.clone();
     tauri::async_runtime::spawn_blocking(move || {
         // A stopped WSL distribution is started first, with a timeout and a clear message.
         gall_core::fs::wsl::prepare(Path::new(&path)).map_err(e)?;
-        listing::list_dir(Path::new(&path), opts).map_err(e)
+        let list = listing::list_dir(Path::new(&path), opts).map_err(e)?;
+        // Quick Open learns what the pane just read, so new files appear without a rescan.
+        let children: Vec<(String, bool)> =
+            list.iter().map(|f| (f.name.clone(), f.is_dir)).collect();
+        index.upsert_dir(Path::new(&path), &children);
+        Ok(list)
     })
     .await
     .map_err(e)?
@@ -3368,6 +3378,11 @@ static INDEX_CANCEL: AtomicBool = AtomicBool::new(false);
 /// over, so the request is never dropped. The request is recorded in the index before anything
 /// else: `status().building` is then true without a gap from the request to the end of the
 /// build that includes it, which is what callers wait for.
+/// Where the finished index is kept so the next start can search before its first scan ends.
+pub fn index_cache_path() -> Option<PathBuf> {
+    dirs::cache_dir().map(|d| d.join("gall").join("index.cache"))
+}
+
 pub fn index_rebuild_bg(app: &AppHandle, state: &AppState, max_age_s: u64) -> bool {
     let idx = state.index.clone();
     let forced = max_age_s == 0;
@@ -3398,6 +3413,9 @@ pub fn index_rebuild_bg(app: &AppHandle, state: &AppState, max_age_s: u64) -> bo
             };
             let ran = thread_idx.rebuild(&roots, &opts, &INDEX_CANCEL);
             if ran {
+                if let Some(cache) = index_cache_path() {
+                    let _ = thread_idx.save_cache(&cache);
+                }
                 let _ = app.emit("index-updated", thread_idx.status());
             }
             // Another build owns the disk walk and the requests: it reruns if one came later.
@@ -5247,7 +5265,111 @@ pub async fn new_window(
     crate::open_window(&app, None, cli_args)
 }
 
-// ───────────────────────── GVFS / network mounts ─────────────────────────
+// ───────────────────────── GVFS / KIO-Fuse network mounts ─────────────────────────
+
+#[cfg(target_os = "linux")]
+enum KioMountError {
+    Unavailable,
+    UnsupportedProtocol(String),
+    Failed(String),
+}
+
+#[cfg(target_os = "linux")]
+impl KioMountError {
+    fn detail(&self) -> Option<&str> {
+        match self {
+            Self::Unavailable => None,
+            Self::UnsupportedProtocol(msg) | Self::Failed(msg) => Some(msg.as_str()),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn classify_kio_dbus_error(err: &zbus::Error) -> KioMountError {
+    match err {
+        zbus::Error::MethodError(name, msg, _) => {
+            let err_name = name.as_str();
+            let detail = msg
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(err_name)
+                .to_string();
+            if matches!(
+                err_name,
+                "org.freedesktop.DBus.Error.ServiceUnknown"
+                    | "org.freedesktop.DBus.Error.NameHasNoOwner"
+                    | "org.freedesktop.DBus.Error.AccessDenied"
+                    | "org.freedesktop.DBus.Error.Spawn.ExecFailed"
+                    | "org.freedesktop.DBus.Error.Spawn.FileInvalid"
+                    | "org.freedesktop.DBus.Error.Spawn.ChildExited"
+                    | "org.freedesktop.DBus.Error.Spawn.ChildSignaled"
+            ) {
+                return KioMountError::Unavailable;
+            }
+            if matches!(
+                err_name,
+                "org.freedesktop.DBus.Error.NoReply" | "org.freedesktop.DBus.Error.Timeout"
+            ) {
+                return KioMountError::Failed("kio-fuse did not answer within 60 s".into());
+            }
+            let lower = detail.to_ascii_lowercase();
+            if err_name.ends_with("UnsupportedProtocol")
+                || lower.contains("unsupported protocol")
+                || lower.contains("unknown protocol")
+                || lower.contains("cannot create io-slave")
+                || lower.contains("protocol not supported")
+            {
+                return KioMountError::UnsupportedProtocol(detail);
+            }
+            KioMountError::Failed(detail)
+        }
+        zbus::Error::InputOutput(io) if io.kind() == std::io::ErrorKind::TimedOut => {
+            KioMountError::Failed("kio-fuse did not answer within 60 s".into())
+        }
+        zbus::Error::InputOutput(_) | zbus::Error::Address(_) | zbus::Error::Handshake(_) => {
+            KioMountError::Unavailable
+        }
+        other => KioMountError::Failed(other.to_string()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn mount_via_kio_fuse(uri: &str) -> std::result::Result<String, KioMountError> {
+    let kio_uri = gall_core::fs::gvfs::kio_fuse_uri_for(uri);
+    let connection = zbus::connection::Builder::session()
+        .map_err(|_| KioMountError::Unavailable)?
+        .method_timeout(std::time::Duration::from_secs(60))
+        .build()
+        .await
+        .map_err(|_| KioMountError::Unavailable)?;
+    let proxy = zbus::Proxy::new(
+        &connection,
+        "org.kde.KIOFuse",
+        "/org/kde/KIOFuse",
+        "org.kde.KIOFuse.VFS",
+    )
+    .await
+    .map_err(|_| KioMountError::Unavailable)?;
+    match proxy.call::<_, _, String>("mountUrl", &(kio_uri,)).await {
+        Ok(local_path) => {
+            let trimmed = local_path.trim();
+            let normalized = if trimmed.len() > 1 {
+                trimmed.trim_end_matches('/')
+            } else {
+                trimmed
+            };
+            if normalized.is_empty() || !Path::new(normalized).is_absolute() {
+                Err(KioMountError::Failed(
+                    "kio-fuse returned an invalid mount path".into(),
+                ))
+            } else {
+                Ok(normalized.to_string())
+            }
+        }
+        Err(err) => Err(classify_kio_dbus_error(&err)),
+    }
+}
 
 #[tauri::command]
 pub async fn gvfs_network_mounts() -> R<Vec<gall_core::fs::gvfs::NetworkMount>> {
@@ -5257,11 +5379,80 @@ pub async fn gvfs_network_mounts() -> R<Vec<gall_core::fs::gvfs::NetworkMount>> 
 }
 
 #[tauri::command]
-pub async fn connect_server(uri: String) -> R<()> {
-    tauri::async_runtime::spawn_blocking(move || gall_core::fs::gvfs::connect_server(&uri))
-        .await
-        .map_err(e)?
-        .map_err(e)
+pub async fn connect_server(uri: String) -> R<Option<String>> {
+    let valid = gall_core::fs::gvfs::validate_connect_uri(&uri).map_err(e)?;
+    #[cfg(target_os = "linux")]
+    {
+        use gall_core::fs::gvfs::{
+            connect_server_gvfs, format_connect_error, is_kde_desktop, preferred_connect_backend,
+            register_kio_fuse_mount, ConnectBackend, GioConnectError,
+        };
+        let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+        let is_kde = is_kde_desktop(&desktop);
+        match preferred_connect_backend(&desktop) {
+            ConnectBackend::KioFuse => match mount_via_kio_fuse(&valid).await {
+                Ok(local_path) => {
+                    register_kio_fuse_mount(&valid, &local_path);
+                    Ok(Some(local_path))
+                }
+                Err(
+                    kio_err @ (KioMountError::Unavailable | KioMountError::UnsupportedProtocol(_)),
+                ) => {
+                    let uri_for_gvfs = valid.clone();
+                    let gio_res = tauri::async_runtime::spawn_blocking(move || {
+                        connect_server_gvfs(&uri_for_gvfs)
+                    })
+                    .await
+                    .map_err(e)?;
+                    match gio_res {
+                        Ok(mount_path) => Ok(mount_path),
+                        Err(gio_err) => Err(format_connect_error(
+                            &valid,
+                            Some(&gio_err),
+                            kio_err.detail(),
+                            is_kde,
+                        )),
+                    }
+                }
+                Err(kio_err @ KioMountError::Failed(_)) => {
+                    Err(format_connect_error(&valid, None, kio_err.detail(), is_kde))
+                }
+            },
+            ConnectBackend::Gvfs => {
+                let uri_for_gvfs = valid.clone();
+                let gio_res = tauri::async_runtime::spawn_blocking(move || {
+                    connect_server_gvfs(&uri_for_gvfs)
+                })
+                .await
+                .map_err(e)?;
+                match gio_res {
+                    Ok(mount_path) => Ok(mount_path),
+                    Err(
+                        gio_err @ (GioConnectError::Unavailable(_)
+                        | GioConnectError::SchemeUnsupported(_)
+                        | GioConnectError::NfsMissingExport(_)),
+                    ) => match mount_via_kio_fuse(&valid).await {
+                        Ok(local_path) => {
+                            register_kio_fuse_mount(&valid, &local_path);
+                            Ok(Some(local_path))
+                        }
+                        Err(kio_err) => Err(format_connect_error(
+                            &valid,
+                            Some(&gio_err),
+                            kio_err.detail(),
+                            is_kde,
+                        )),
+                    },
+                    Err(gio_err) => Err(format_connect_error(&valid, Some(&gio_err), None, is_kde)),
+                }
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = valid;
+        Err("Network server mounts are only supported on Linux".into())
+    }
 }
 
 #[tauri::command]

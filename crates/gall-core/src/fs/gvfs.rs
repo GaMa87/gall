@@ -1,9 +1,9 @@
-//! GVFS mount discovery, classification (Devices vs. Network), connect/disconnect/eject,
-//! and non-blocking slow-mount guards.
+//! GVFS and KDE KIO-Fuse mount discovery, classification (Devices vs. Network),
+//! connect/disconnect/eject, and non-blocking slow-mount guards.
 //!
 //! - `mtp:` / `gphoto2:` mounts are surfaced in `Drives` via [`gvfs_drives`].
-//! - `smb-share:` / `nfs:` / `sftp:` / `dav:` / `ftp:` / `afp:` mounts are surfaced in
-//!   `Network` via [`list_network_mounts`].
+//! - `smb-share:` / `nfs:` / `sftp:` / `dav:` / `ftp:` / `afp:` GVFS mounts and active
+//!   KDE `kio-fuse` mounts are surfaced in `Network` via [`list_network_mounts`].
 //! - `google-drive:` / `onedrive:` remain handled exclusively by [`super::cloud::classify_gvfs`].
 
 use super::drives::Drive;
@@ -560,7 +560,7 @@ pub fn is_gvfs_mount_path_with(
     is_run_user_gvfs_components(&parts, true)
 }
 
-/// Validates a remote server URI before passing it to `gio mount`.
+/// Validates a remote server URI before passing it to `kio-fuse` or `gio mount`.
 pub fn validate_connect_uri(uri: &str) -> Result<String> {
     let trimmed = uri.trim();
     if trimmed.is_empty() || trimmed.starts_with('-') || trimmed.contains(['\0', '\r', '\n']) {
@@ -580,6 +580,8 @@ pub fn validate_connect_uri(uri: &str) -> Result<String> {
             | "nfs"
             | "dav"
             | "davs"
+            | "webdav"
+            | "webdavs"
             | "ftp"
             | "ftps"
             | "ftpes"
@@ -592,7 +594,7 @@ pub fn validate_connect_uri(uri: &str) -> Result<String> {
         )));
     }
     let authority = rest.split('/').next().unwrap_or("");
-    // A password in the address would show in the process list and in error messages: gio asks for it.
+    // A password in the address would show in the process list and in error messages: gio/KIO asks for it.
     if authority
         .rsplit_once('@')
         .is_some_and(|(user, _)| user.contains(':'))
@@ -622,6 +624,470 @@ pub fn validate_connect_uri(uri: &str) -> Result<String> {
         return Err(CoreError::Other("server URI is missing a host name".into()));
     }
     Ok(trimmed.to_string())
+}
+
+/// Which Linux desktop VFS backend should be tried first when connecting to a server URI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectBackend {
+    Gvfs,
+    KioFuse,
+}
+
+/// True when `XDG_CURRENT_DESKTOP` (colon-separated) identifies KDE Plasma.
+pub fn is_kde_desktop(xdg_current_desktop: &str) -> bool {
+    xdg_current_desktop
+        .split(':')
+        .any(|part| part.trim().eq_ignore_ascii_case("KDE"))
+}
+
+/// Selects the primary backend for "Connect to server…": KDE Plasma prefers `kio-fuse` so
+/// mounts share Dolphin's KIO workers and KWallet credentials (including host-only `nfs://host`);
+/// other desktops prefer GVFS (`gio mount`) and fall back to `kio-fuse` when GVFS is unavailable.
+pub fn preferred_connect_backend(xdg_current_desktop: &str) -> ConnectBackend {
+    if is_kde_desktop(xdg_current_desktop) {
+        ConnectBackend::KioFuse
+    } else {
+        ConnectBackend::Gvfs
+    }
+}
+
+/// Translates a validated server URI into the scheme expected by KDE KIO / `kio-fuse`.
+pub fn kio_fuse_uri_for(uri: &str) -> String {
+    let Some((scheme, rest)) = uri.split_once("://") else {
+        return uri.to_string();
+    };
+    let mapped = match scheme.to_ascii_lowercase().as_str() {
+        "dav" => "webdav",
+        "davs" => "webdavs",
+        "ssh" => "sftp",
+        other => return format!("{other}://{rest}"),
+    };
+    format!("{mapped}://{rest}")
+}
+
+/// Translates a validated server URI into the scheme expected by GVFS (`gio mount`).
+pub fn gvfs_uri_for(uri: &str) -> String {
+    let Some((scheme, rest)) = uri.split_once("://") else {
+        return uri.to_string();
+    };
+    let mapped = match scheme.to_ascii_lowercase().as_str() {
+        "webdav" => "dav",
+        "webdavs" => "davs",
+        other => return format!("{other}://{rest}"),
+    };
+    format!("{mapped}://{rest}")
+}
+
+/// True when `uri` is an `nfs://host` URI without an export path (only `/` or empty).
+pub fn is_host_only_nfs_uri(uri: &str) -> bool {
+    parse_uri_parts(uri).is_some_and(|p| p.scheme == "nfs" && p.path.trim_matches('/').is_empty())
+}
+
+/// Environment variables removed when spawning system `gio` from inside an AppImage so `gio`
+/// loads the host's GLib and GVFS modules instead of failing with "volume doesn't implement mount".
+pub fn appimage_gio_env_removals(in_appimage: bool) -> &'static [&'static str] {
+    if in_appimage {
+        &[
+            "APPIMAGE",
+            "APPDIR",
+            "ARGV0",
+            "OWD",
+            "LD_LIBRARY_PATH",
+            "GIO_MODULE_DIR",
+            "GIO_EXTRA_MODULES",
+            "GSETTINGS_SCHEMA_DIR",
+        ]
+    } else {
+        &[]
+    }
+}
+
+fn is_kio_fuse_component(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|s| s == "kio-fuse" || s.starts_with("kio-fuse-"))
+}
+
+/// Pure, cross-platform helper checking whether `path` lies inside a KDE `kio-fuse` mount root.
+pub fn is_kio_fuse_path_with(path: &Path, runtime_dir: Option<&Path>) -> bool {
+    if let Some(rt) = runtime_dir.filter(|p| !p.as_os_str().is_empty()) {
+        if let Ok(rel) = path.strip_prefix(rt) {
+            if let Some(Component::Normal(first)) = rel.components().next() {
+                if is_kio_fuse_component(first) {
+                    return true;
+                }
+            }
+        }
+    }
+    let parts: Vec<Component<'_>> = path.components().collect();
+    matches!(
+        parts.as_slice(),
+        [
+            Component::RootDir,
+            Component::Normal(r),
+            Component::Normal(u),
+            Component::Normal(uid),
+            Component::Normal(kf),
+            ..
+        ] if *r == "run"
+            && *u == "user"
+            && uid.to_str().is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            && is_kio_fuse_component(kf)
+    )
+}
+
+/// True when `path` lies inside a KDE `kio-fuse` mount on Linux.
+pub fn is_kio_fuse_path(path: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let rt = std::env::var_os("XDG_RUNTIME_DIR")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
+        if is_kio_fuse_path_with(path, rt.as_deref()) {
+            return true;
+        }
+        kio_fuse_roots().iter().any(|root| path.starts_with(root))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+/// Extracts active `fuse.kio-fuse` mount roots from `/proc/self/mounts` text.
+pub fn parse_kio_fuse_roots(mounts_text: &str) -> Vec<PathBuf> {
+    let unescape = |s: &str| -> String {
+        let b = s.as_bytes();
+        let mut out = Vec::with_capacity(b.len());
+        let mut i = 0;
+        while i < b.len() {
+            let octal = b
+                .get(i + 1..i + 4)
+                .filter(|d| d.iter().all(|c| (b'0'..=b'7').contains(c)));
+            if let (b'\\', Some(d)) = (b[i], octal) {
+                out.push(
+                    d.iter()
+                        .fold(0u8, |v, c| v.wrapping_mul(8).wrapping_add(c - b'0')),
+                );
+                i += 4;
+                continue;
+            }
+            out.push(b[i]);
+            i += 1;
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    };
+    let mut roots = Vec::new();
+    for line in mounts_text.lines() {
+        let mut fields = line.split(' ');
+        let Some(_dev) = fields.next() else { continue };
+        let Some(point) = fields.next() else { continue };
+        let Some(kind) = fields.next() else { continue };
+        if kind == "fuse.kio-fuse" {
+            let path = PathBuf::from(unescape(point));
+            if !roots.contains(&path) {
+                roots.push(path);
+            }
+        }
+    }
+    roots
+}
+
+fn normalize_display_scheme(raw: &str) -> Option<&'static str> {
+    match raw.to_ascii_lowercase().as_str() {
+        "smb" => Some("smb"),
+        "nfs" => Some("nfs"),
+        "sftp" | "ssh" | "fish" => Some("sftp"),
+        "dav" | "webdav" => Some("dav"),
+        "davs" | "webdavs" => Some("davs"),
+        "ftp" => Some("ftp"),
+        "ftps" => Some("ftps"),
+        "ftpes" => Some("ftpes"),
+        "afp" => Some("afp"),
+        _ => None,
+    }
+}
+
+/// Builds a [`NetworkMount`] from a depth-2 `kio-fuse` directory (`<root>/<scheme>/<authority>`).
+pub fn parse_kio_fuse_entry(
+    scheme_dir: &str,
+    authority: &str,
+    mount_path: &Path,
+) -> Option<NetworkMount> {
+    let scheme = normalize_display_scheme(scheme_dir)?;
+    if authority.is_empty() {
+        return None;
+    }
+    Some(NetworkMount {
+        name: authority.to_string(),
+        scheme: scheme.to_string(),
+        uri: format!("{scheme}://{authority}"),
+        mount_path: mount_path.to_string_lossy().into_owned(),
+    })
+}
+
+/// Builds a [`NetworkMount`] from a user-supplied URI and the local path returned by `kio-fuse`.
+pub fn network_mount_from_kio_uri(uri: &str, mount_path: &Path) -> NetworkMount {
+    let mount_path_str = mount_path.to_string_lossy().into_owned();
+    let Some(parts) = parse_uri_parts(uri) else {
+        return NetworkMount {
+            name: uri.to_string(),
+            scheme: "network".to_string(),
+            uri: uri.to_string(),
+            mount_path: mount_path_str,
+        };
+    };
+    let scheme = normalize_display_scheme(&parts.scheme)
+        .unwrap_or("network")
+        .to_string();
+    let host = parts.host.as_deref().unwrap_or("");
+    let trimmed_path = parts.path.trim_end_matches('/');
+    let name = match scheme.as_str() {
+        "smb" => {
+            let share = trimmed_path
+                .trim_start_matches('/')
+                .split('/')
+                .next()
+                .unwrap_or("");
+            match (share.is_empty(), host.is_empty()) {
+                (false, false) => format!("{share} on {host}"),
+                (false, true) => share.to_string(),
+                (true, false) => host.to_string(),
+                (true, true) => uri.to_string(),
+            }
+        }
+        "nfs" => match (host.is_empty(), trimmed_path.is_empty()) {
+            (false, false) => format!("{host}:{trimmed_path}"),
+            (false, true) => host.to_string(),
+            _ => uri.to_string(),
+        },
+        _ => match (parts.user.as_deref(), host.is_empty()) {
+            (Some(u), false) if !u.is_empty() => format!("{u}@{host}"),
+            (_, false) => host.to_string(),
+            _ => uri.to_string(),
+        },
+    };
+    NetworkMount {
+        name,
+        scheme,
+        uri: uri.to_string(),
+        mount_path: mount_path_str,
+    }
+}
+
+/// Merges depth-2 discovered `kio-fuse` mounts with explicitly registered `kio-fuse` mounts,
+/// suppressing dismissed paths and parent authority entries already covered by a deeper mount.
+pub fn merge_kio_fuse_mounts(
+    discovered: Vec<NetworkMount>,
+    registered: &[NetworkMount],
+    dismissed: &std::collections::HashSet<String>,
+) -> Vec<NetworkMount> {
+    let mut out: Vec<NetworkMount> = registered
+        .iter()
+        .filter(|m| !dismissed.contains(&m.mount_path))
+        .cloned()
+        .collect();
+    for item in discovered {
+        if dismissed.contains(&item.mount_path) {
+            continue;
+        }
+        let covered = out.iter().any(|existing| {
+            existing.mount_path == item.mount_path
+                || existing
+                    .mount_path
+                    .strip_prefix(&item.mount_path)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        });
+        if !covered {
+            out.push(item);
+        }
+    }
+    out
+}
+
+/// Structured failure from `gio mount` so callers know whether to fall back to `kio-fuse`
+/// and how to explain the failure without raw GLib jargon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GioConnectError {
+    /// GVFS daemon/module is missing, `gio` is unavailable, or no D-Bus session is reachable.
+    Unavailable(String),
+    /// GVFS is active, but the backend package for this URI scheme (e.g. `gvfs-nfs`) is missing.
+    SchemeUnsupported(String),
+    /// GVFS NFS rejected a host-only `nfs://host` URI that lacks an export path.
+    NfsMissingExport(String),
+    /// Remote host, credentials, timeout, or other real connection failure.
+    Failed(String),
+}
+
+fn strip_gio_prefix(uri: &str, stderr: &str) -> String {
+    let trimmed = stderr.trim();
+    if let Some(rest) = trimmed.strip_prefix("gio:") {
+        let rest = rest.trim_start();
+        if let Some(after_uri) = rest.strip_prefix(uri) {
+            if let Some(msg) = after_uri
+                .trim_start_matches('/')
+                .strip_prefix(':')
+                .map(str::trim)
+            {
+                if !msg.is_empty() {
+                    return msg.to_string();
+                }
+            }
+        }
+        if let Some(idx) = rest.find(": ") {
+            let after = rest[idx + 2..].trim();
+            if !after.is_empty() {
+                return after.to_string();
+            }
+        }
+        return rest.to_string();
+    }
+    trimmed.to_string()
+}
+
+/// Classifies `gio mount` stderr (running under `LC_ALL=C`) into a structured [`GioConnectError`].
+pub fn classify_gio_connect_stderr(uri: &str, stderr: &str) -> GioConnectError {
+    let normalized = stderr.replace('\u{2019}', "'");
+    let lower = normalized.to_ascii_lowercase();
+    if lower.contains("volume doesn't implement mount")
+        || lower.contains("cannot run gio")
+        || lower.contains("no such file or directory") && lower.contains("gio")
+    {
+        return GioConnectError::Unavailable(strip_gio_prefix(uri, &normalized));
+    }
+    if lower.contains("location is not mountable") || lower.contains("operation not supported") {
+        return GioConnectError::SchemeUnsupported(strip_gio_prefix(uri, &normalized));
+    }
+    if is_host_only_nfs_uri(uri)
+        && (lower.contains("mount point does not exist") || lower.contains("permission denied"))
+    {
+        return GioConnectError::NfsMissingExport(strip_gio_prefix(uri, &normalized));
+    }
+    GioConnectError::Failed(strip_gio_prefix(uri, &normalized))
+}
+
+fn gvfs_package_hint(scheme: &str) -> &'static str {
+    match scheme {
+        "nfs" => "gvfs-nfs (or gvfs-backends)",
+        "smb" => "gvfs-smb (or gvfs-backends)",
+        "afp" => "gvfs-afp (or gvfs-backends)",
+        _ => "gvfs (or gvfs-backends)",
+    }
+}
+
+/// Formats an actionable, user-facing connection error combining GVFS and KIO-Fuse outcomes.
+pub fn format_connect_error(
+    uri: &str,
+    gio_err: Option<&GioConnectError>,
+    kio_err: Option<&str>,
+    is_kde: bool,
+) -> String {
+    let parts = parse_uri_parts(uri);
+    let scheme = parts
+        .as_ref()
+        .map(|p| p.scheme.as_str())
+        .unwrap_or("network");
+    let host = parts
+        .as_ref()
+        .and_then(|p| p.host.as_deref())
+        .unwrap_or("host");
+    let pkg = gvfs_package_hint(scheme);
+
+    if let Some(kio) = kio_err.map(str::trim).filter(|s| !s.is_empty()) {
+        if matches!(
+            gio_err,
+            None | Some(
+                GioConnectError::Unavailable(_)
+                    | GioConnectError::SchemeUnsupported(_)
+                    | GioConnectError::NfsMissingExport(_)
+            )
+        ) {
+            return format!("Cannot connect to {uri}: {kio}");
+        }
+    }
+
+    match gio_err {
+        Some(GioConnectError::Unavailable(_)) => {
+            if is_kde {
+                format!(
+                    "Cannot connect to {uri}: neither KDE kio-fuse nor GVFS is available. Install kio-fuse or {pkg}."
+                )
+            } else {
+                format!(
+                    "Cannot connect to {uri}: GVFS is not available on this system. Install {pkg} (or kio-fuse) and ensure a D-Bus user session is running."
+                )
+            }
+        }
+        Some(GioConnectError::SchemeUnsupported(_)) => {
+            format!(
+                "Cannot connect to {uri}: the {scheme}:// mount backend is not installed. Install {pkg} (or kio-fuse) and try again."
+            )
+        }
+        Some(GioConnectError::NfsMissingExport(_)) => {
+            format!(
+                "Cannot connect to {uri}: GVFS NFS requires the full export path (for example nfs://{host}/export), or install kio-fuse to browse server exports."
+            )
+        }
+        Some(GioConnectError::Failed(detail)) if !detail.is_empty() => {
+            format!("Cannot connect to {uri}: {detail}")
+        }
+        _ => {
+            if let Some(kio) = kio_err.map(str::trim).filter(|s| !s.is_empty()) {
+                format!("Cannot connect to {uri}: {kio}")
+            } else {
+                format!("Cannot connect to {uri}")
+            }
+        }
+    }
+}
+
+/// Finds the best matching mounted local path in `mounts` for a recently connected `uri`.
+pub fn find_mount_path_for_uri(mounts: &[NetworkMount], uri: &str) -> Option<String> {
+    let target = parse_uri_parts(uri)?;
+    let target_host = target
+        .host
+        .as_deref()?
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    let target_path = target.path.trim_end_matches('/');
+
+    mounts
+        .iter()
+        .filter_map(|m| {
+            let mp = parse_uri_parts(&m.uri)?;
+            let scheme_pts = scheme_compatible(&mp.scheme, &target.scheme)?;
+            let mh = mp
+                .host
+                .as_deref()?
+                .trim_start_matches('[')
+                .trim_end_matches(']');
+            if !mh.eq_ignore_ascii_case(target_host) {
+                return None;
+            }
+            let mut score = scheme_pts + 10;
+            let mp_path = mp.path.trim_end_matches('/');
+            if !target_path.is_empty() {
+                if mp_path.eq_ignore_ascii_case(target_path) {
+                    score += 8;
+                } else if !mp_path.is_empty()
+                    && !target_path
+                        .strip_prefix(mp_path)
+                        .is_some_and(|rest| rest.starts_with('/'))
+                {
+                    return None;
+                }
+            }
+            if let (Some(mu), Some(tu)) = (mp.user.as_deref(), target.user.as_deref()) {
+                if mu == tu {
+                    score += 3;
+                } else {
+                    return None;
+                }
+            }
+            Some((score, m.mount_path.clone()))
+        })
+        .max_by_key(|(s, _)| *s)
+        .map(|(_, path)| path)
 }
 
 /// Candidate GVFS daemon directories on Linux (empty on other platforms).
@@ -684,13 +1150,14 @@ pub fn is_gvfs_mount_path(mount: &str) -> bool {
     }
 }
 
-/// Non-blocking guard: returns true if `path` is on a GVFS or remote mount that must not
+/// Non-blocking guard: returns true if `path` is on a GVFS, KIO-Fuse, or remote mount that must not
 /// trigger file watchers, recursive index scans, or deleted-folder cleanup.
 /// Performs zero blocking syscalls on `path` itself.
 pub fn is_slow_or_gvfs_mount(path: &Path) -> bool {
     #[cfg(target_os = "linux")]
     {
         is_gvfs_path(path)
+            || is_kio_fuse_path(path)
             || super::index::remote_mounts()
                 .iter()
                 .any(|m| path.starts_with(m))
@@ -706,6 +1173,116 @@ pub fn is_slow_or_gvfs_mount(path: &Path) -> bool {
         let _ = path;
         false
     }
+}
+
+#[cfg(target_os = "linux")]
+fn gio_command(args: &[&str]) -> std::process::Command {
+    let argv: Vec<String> = std::iter::once("gio".to_string())
+        .chain(args.iter().map(|s| (*s).to_string()))
+        .collect();
+    let wrapped = crate::util::hostspawn::wrap_argv(argv, None, &[("LC_ALL", "C")]);
+    let mut cmd = std::process::Command::new(&wrapped[0]);
+    cmd.args(&wrapped[1..]);
+    if !crate::util::hostspawn::in_flatpak() {
+        cmd.env("LC_ALL", "C");
+        for var in appimage_gio_env_removals(std::env::var_os("APPIMAGE").is_some()) {
+            cmd.env_remove(var);
+        }
+    }
+    cmd
+}
+
+#[cfg(target_os = "linux")]
+fn kio_fuse_roots() -> Vec<PathBuf> {
+    std::fs::read_to_string("/proc/self/mounts")
+        .map(|text| parse_kio_fuse_roots(&text))
+        .unwrap_or_default()
+}
+
+#[cfg(target_os = "linux")]
+static REGISTERED_KIO_MOUNTS: std::sync::Mutex<Vec<NetworkMount>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(target_os = "linux")]
+static DISMISSED_KIO_MOUNTS: std::sync::Mutex<Option<HashSet<String>>> =
+    std::sync::Mutex::new(None);
+
+/// Records a KIO-Fuse mount returned by `org.kde.KIOFuse.VFS.mountUrl` so it appears in the
+/// Network sidebar with its exact URI and mount path (even when mounted below `<root>/<scheme>/<authority>`).
+pub fn register_kio_fuse_mount(uri: &str, mount_path: &str) -> NetworkMount {
+    let mount = network_mount_from_kio_uri(uri, Path::new(mount_path));
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(mut dismissed) = DISMISSED_KIO_MOUNTS.lock() {
+            if let Some(set) = dismissed.as_mut() {
+                set.remove(mount_path);
+            }
+        }
+        let mut reg = REGISTERED_KIO_MOUNTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reg.retain(|m| m.mount_path != mount.mount_path);
+        reg.push(mount.clone());
+    }
+    mount
+}
+
+#[cfg(target_os = "linux")]
+fn read_kio_fuse_mounts() -> Vec<NetworkMount> {
+    let roots = kio_fuse_roots();
+    if roots.is_empty() {
+        if let Ok(mut reg) = REGISTERED_KIO_MOUNTS.lock() {
+            reg.clear();
+        }
+        if let Ok(mut dismissed) = DISMISSED_KIO_MOUNTS.lock() {
+            *dismissed = None;
+        }
+        return Vec::new();
+    }
+
+    // Only read depth 1 (<root>/<scheme>) and depth 2 (<root>/<scheme>/<authority>), which
+    // kio-fuse serves strictly from its in-memory tree of already-mounted origins without touching
+    // the remote server.
+    let mut discovered = Vec::new();
+    for root in &roots {
+        let Ok(schemes) = std::fs::read_dir(root) else {
+            continue;
+        };
+        for scheme_entry in schemes.flatten() {
+            let scheme_name = scheme_entry.file_name().to_string_lossy().into_owned();
+            if normalize_display_scheme(&scheme_name).is_none() {
+                continue;
+            }
+            let Ok(authorities) = std::fs::read_dir(scheme_entry.path()) else {
+                continue;
+            };
+            for auth_entry in authorities.flatten() {
+                let auth_name = auth_entry.file_name().to_string_lossy().into_owned();
+                let mount_path = auth_entry.path();
+                if let Some(m) = parse_kio_fuse_entry(&scheme_name, &auth_name, &mount_path) {
+                    discovered.push(m);
+                }
+            }
+        }
+    }
+
+    let registered = {
+        let mut reg = REGISTERED_KIO_MOUNTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reg.retain(|m| {
+            let p = Path::new(&m.mount_path);
+            roots.iter().any(|r| p.starts_with(r))
+        });
+        reg.clone()
+    };
+    let dismissed = DISMISSED_KIO_MOUNTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .unwrap_or_default();
+
+    merge_kio_fuse_mounts(discovered, &registered, &dismissed)
 }
 
 #[cfg(target_os = "linux")]
@@ -734,10 +1311,8 @@ fn read_gvfs_entries() -> Vec<ParsedGvfsEntry> {
 #[cfg(target_os = "linux")]
 fn query_gio_mount_list() -> Vec<GioMountInfo> {
     use std::io::Read;
-    use std::process::{Command, Stdio};
-    let Ok(mut child) = Command::new("gio")
-        .args(["mount", "-l"])
-        .env("LC_ALL", "C")
+    use std::process::Stdio;
+    let Ok(mut child) = gio_command(&["mount", "-l"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -816,11 +1391,24 @@ fn resolve_live_gvfs() -> (Vec<Drive>, Vec<NetworkMount>) {
     resolve_gvfs_mounts(&entries, &gio)
 }
 
-/// Lists GVFS network mounts (`smb`, `nfs`, `sftp`, `dav`, `ftp`, `afp`).
+/// Lists GVFS and KDE KIO-Fuse network mounts (`smb`, `nfs`, `sftp`, `dav`, `ftp`, `afp`).
 pub fn list_network_mounts() -> Vec<NetworkMount> {
     #[cfg(target_os = "linux")]
     {
-        resolve_live_gvfs().1
+        let mut mounts = resolve_live_gvfs().1;
+        let mut seen: HashSet<String> = mounts.iter().map(|m| m.mount_path.clone()).collect();
+        for m in read_kio_fuse_mounts() {
+            if seen.insert(m.mount_path.clone()) {
+                mounts.push(m);
+            }
+        }
+        mounts.sort_by(|a, b| {
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then_with(|| a.mount_path.cmp(&b.mount_path))
+        });
+        mounts
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -845,9 +1433,8 @@ pub fn gvfs_drives() -> Vec<Drive> {
 #[cfg(target_os = "linux")]
 fn run_gio(args: &[&str], timeout: std::time::Duration) -> Result<(bool, String)> {
     use std::io::Read;
-    use std::process::{Command, Stdio};
-    let mut child = Command::new("gio")
-        .args(args)
+    use std::process::Stdio;
+    let mut child = gio_command(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -878,32 +1465,47 @@ fn run_gio(args: &[&str], timeout: std::time::Duration) -> Result<(bool, String)
     }
 }
 
-/// Mounts a remote GVFS location via `gio mount -- <uri>`.
-pub fn connect_server(uri: &str) -> Result<()> {
-    let valid = validate_connect_uri(uri)?;
+/// Mounts a remote GVFS location via `gio mount -- <uri>`, returning the local GVFS mount path
+/// when discovered and a structured [`GioConnectError`] on failure.
+pub fn connect_server_gvfs(uri: &str) -> std::result::Result<Option<String>, GioConnectError> {
+    let valid = validate_connect_uri(uri).map_err(|e| GioConnectError::Failed(e.to_string()))?;
+    let gvfs_uri = gvfs_uri_for(&valid);
     #[cfg(target_os = "linux")]
     {
-        let (ok, stderr) = run_gio(&["mount", "--", &valid], std::time::Duration::from_secs(60))?;
+        let (ok, stderr) = match run_gio(
+            &["mount", "--", &gvfs_uri],
+            std::time::Duration::from_secs(60),
+        ) {
+            Ok(out) => out,
+            Err(err) => return Err(classify_gio_connect_stderr(&gvfs_uri, &err.to_string())),
+        };
         invalidate_gio_cache();
         if ok || stderr.to_ascii_lowercase().contains("already mounted") {
-            return Ok(());
+            let mounts = resolve_live_gvfs().1;
+            return Ok(find_mount_path_for_uri(&mounts, &gvfs_uri));
         }
-        Err(CoreError::Other(if stderr.is_empty() {
-            format!("failed to connect to {valid}")
-        } else {
-            stderr
-        }))
+        Err(classify_gio_connect_stderr(&gvfs_uri, &stderr))
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = valid;
-        Err(CoreError::Other(
+        let _ = gvfs_uri;
+        Err(GioConnectError::Failed(
             "GVFS server mounts are only supported on Linux".into(),
         ))
     }
 }
 
-/// Unmounts a GVFS network mount or URI via `gio mount -u`.
+/// Mounts a remote GVFS location via `gio mount -- <uri>`.
+pub fn connect_server(uri: &str) -> Result<Option<String>> {
+    let valid = validate_connect_uri(uri)?;
+    let is_kde = std::env::var("XDG_CURRENT_DESKTOP")
+        .map(|d| is_kde_desktop(&d))
+        .unwrap_or(false);
+    connect_server_gvfs(&valid)
+        .map_err(|err| CoreError::Other(format_connect_error(&valid, Some(&err), None, is_kde)))
+}
+
+/// Disconnects a GVFS or KDE KIO-Fuse network mount.
 pub fn disconnect_mount(mount_path_or_uri: &str) -> Result<()> {
     let target = mount_path_or_uri.trim();
     if target.is_empty() || target.starts_with('-') || target.contains('\0') {
@@ -911,6 +1513,19 @@ pub fn disconnect_mount(mount_path_or_uri: &str) -> Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
+        if is_kio_fuse_path(Path::new(target)) {
+            let mut reg = REGISTERED_KIO_MOUNTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reg.retain(|m| m.mount_path != target);
+            let mut dismissed = DISMISSED_KIO_MOUNTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            dismissed
+                .get_or_insert_with(HashSet::new)
+                .insert(target.to_string());
+            return Ok(());
+        }
         let (ok, stderr) = run_gio(
             &["mount", "-u", "--", target],
             std::time::Duration::from_secs(30),
@@ -943,9 +1558,8 @@ pub fn eject_gvfs(mount_path: &str) -> Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
-        use std::process::{Command, Stdio};
-        let eject_out = Command::new("gio")
-            .args(["mount", "-e", "--", target])
+        use std::process::Stdio;
+        let eject_out = gio_command(&["mount", "-e", "--", target])
             .stdin(Stdio::null())
             .output();
         invalidate_gio_cache();
@@ -954,8 +1568,7 @@ pub fn eject_gvfs(mount_path: &str) -> Result<()> {
                 return Ok(());
             }
         }
-        let unmount_out = Command::new("gio")
-            .args(["mount", "-u", "--", target])
+        let unmount_out = gio_command(&["mount", "-u", "--", target])
             .stdin(Stdio::null())
             .output()
             .map_err(|e| CoreError::Other(format!("eject failed: {e}")))?;
@@ -1227,5 +1840,199 @@ Mount(4): boot -> file:///boot
         assert_eq!(network.len(), 1);
         assert_eq!(network[0].name, "Lab Box");
         assert_eq!(network[0].uri, "sftp://[fe80::1]:2222/");
+    }
+
+    #[test]
+    fn backend_preference_and_uri_scheme_mapping() {
+        assert!(is_kde_desktop("KDE"));
+        assert!(is_kde_desktop("fedora:KDE"));
+        assert!(!is_kde_desktop("GNOME"));
+        assert!(!is_kde_desktop("Hyprland"));
+        assert_eq!(preferred_connect_backend("KDE"), ConnectBackend::KioFuse);
+        assert_eq!(
+            preferred_connect_backend("fedora:KDE"),
+            ConnectBackend::KioFuse
+        );
+        assert_eq!(preferred_connect_backend("Hyprland"), ConnectBackend::Gvfs);
+        assert_eq!(preferred_connect_backend(""), ConnectBackend::Gvfs);
+
+        assert_eq!(
+            kio_fuse_uri_for("nfs://192.168.0.101"),
+            "nfs://192.168.0.101"
+        );
+        assert_eq!(
+            kio_fuse_uri_for("davs://cloud.example/remote.php/dav"),
+            "webdavs://cloud.example/remote.php/dav"
+        );
+        assert_eq!(kio_fuse_uri_for("dav://nas/dav"), "webdav://nas/dav");
+        assert_eq!(kio_fuse_uri_for("ssh://alice@srv"), "sftp://alice@srv");
+
+        assert_eq!(
+            gvfs_uri_for("webdavs://cloud.example/dav"),
+            "davs://cloud.example/dav"
+        );
+        assert_eq!(gvfs_uri_for("webdav://nas/dav"), "dav://nas/dav");
+        assert_eq!(gvfs_uri_for("nfs://192.168.0.101"), "nfs://192.168.0.101");
+
+        assert!(is_host_only_nfs_uri("nfs://192.168.0.101"));
+        assert!(is_host_only_nfs_uri("nfs://192.168.0.101/"));
+        assert!(!is_host_only_nfs_uri("nfs://192.168.0.101/mnt/mx500"));
+        assert!(!is_host_only_nfs_uri("smb://192.168.0.101"));
+
+        assert!(validate_connect_uri("webdavs://cloud.example/dav").is_ok());
+        assert!(validate_connect_uri("webdav://nas/dav").is_ok());
+        assert!(validate_connect_uri("nfs://192.168.0.101").is_ok());
+    }
+
+    #[test]
+    fn kio_fuse_paths_roots_entries_and_merging() {
+        let rt = Some(Path::new("/tmp/rt"));
+        assert!(is_kio_fuse_path_with(
+            Path::new("/tmp/rt/kio-fuse-AbCdEf/nfs/192.168.0.101"),
+            rt
+        ));
+        assert!(is_kio_fuse_path_with(
+            Path::new("/run/user/1000/kio-fuse-xyz123/nfs/192.168.0.101/mnt/mx500"),
+            None
+        ));
+        assert!(!is_kio_fuse_path_with(
+            Path::new("/run/user/1000/gvfs/nfs:host=192.168.0.101"),
+            None
+        ));
+        assert!(!is_kio_fuse_path_with(
+            Path::new("/run/user/1000/kio-fuse2/nfs/x"),
+            None
+        ));
+
+        let mounts_txt = "\
+kio-fuse /run/user/1000/kio-fuse-AbCdEf fuse.kio-fuse rw,nosuid,nodev 0 0\n\
+gvfsd-fuse /run/user/1000/gvfs fuse.gvfsd-fuse rw 0 0\n\
+kio-fuse /run/user/1000/kio-fuse\\040test fuse.kio-fuse rw 0 0\n";
+        let roots = parse_kio_fuse_roots(mounts_txt);
+        assert_eq!(
+            roots,
+            vec![
+                PathBuf::from("/run/user/1000/kio-fuse-AbCdEf"),
+                PathBuf::from("/run/user/1000/kio-fuse test"),
+            ]
+        );
+
+        let nfs_host = parse_kio_fuse_entry(
+            "nfs",
+            "192.168.0.101",
+            Path::new("/run/user/1000/kio-fuse-AbCdEf/nfs/192.168.0.101"),
+        )
+        .unwrap();
+        assert_eq!(nfs_host.name, "192.168.0.101");
+        assert_eq!(nfs_host.scheme, "nfs");
+        assert_eq!(nfs_host.uri, "nfs://192.168.0.101");
+
+        let webdav = parse_kio_fuse_entry(
+            "webdavs",
+            "cloud.example",
+            Path::new("/run/user/1000/kio-fuse-AbCdEf/webdavs/cloud.example"),
+        )
+        .unwrap();
+        assert_eq!(webdav.scheme, "davs");
+        assert!(parse_kio_fuse_entry("trash", "foo", Path::new("/x")).is_none());
+
+        let registered_smb = network_mount_from_kio_uri(
+            "smb://nas.local/Media",
+            Path::new("/run/user/1000/kio-fuse-AbCdEf/smb/nas.local/Media"),
+        );
+        assert_eq!(registered_smb.name, "Media on nas.local");
+        assert_eq!(registered_smb.scheme, "smb");
+
+        let bare_smb = parse_kio_fuse_entry(
+            "smb",
+            "nas.local",
+            Path::new("/run/user/1000/kio-fuse-AbCdEf/smb/nas.local"),
+        )
+        .unwrap();
+        let dismissed: std::collections::HashSet<String> =
+            [webdav.mount_path.clone()].into_iter().collect();
+        let merged = merge_kio_fuse_mounts(
+            vec![nfs_host.clone(), bare_smb, webdav],
+            std::slice::from_ref(&registered_smb),
+            &dismissed,
+        );
+        assert_eq!(merged.len(), 2);
+        assert!(merged.contains(&registered_smb));
+        assert!(merged.contains(&nfs_host));
+    }
+
+    #[test]
+    fn gio_error_classification_formatting_and_appimage_env_hygiene() {
+        assert!(appimage_gio_env_removals(false).is_empty());
+        let removed = appimage_gio_env_removals(true);
+        assert!(removed.contains(&"LD_LIBRARY_PATH"));
+        assert!(removed.contains(&"GIO_MODULE_DIR"));
+        assert!(removed.contains(&"APPIMAGE"));
+
+        let unavail_ascii = classify_gio_connect_stderr(
+            "nfs://192.168.0.101",
+            "gio: nfs://192.168.0.101: volume doesn't implement mount",
+        );
+        assert!(matches!(unavail_ascii, GioConnectError::Unavailable(_)));
+
+        let unavail_curly = classify_gio_connect_stderr(
+            "nfs://192.168.0.101",
+            "gio: nfs://192.168.0.101: volume doesn\u{2019}t implement mount",
+        );
+        assert!(matches!(unavail_curly, GioConnectError::Unavailable(_)));
+
+        let unsupported = classify_gio_connect_stderr(
+            "davs://127.0.0.1/dav",
+            "gio: davs://127.0.0.1/dav: Location is not mountable",
+        );
+        assert!(matches!(unsupported, GioConnectError::SchemeUnsupported(_)));
+
+        let missing_export = classify_gio_connect_stderr(
+            "nfs://192.168.0.101",
+            "gio: nfs://192.168.0.101/: Mount point does not exist",
+        );
+        assert!(matches!(
+            missing_export,
+            GioConnectError::NfsMissingExport(_)
+        ));
+
+        let with_export = classify_gio_connect_stderr(
+            "nfs://192.168.0.101/mnt/mx500",
+            "gio: nfs://192.168.0.101/mnt/mx500: Mount point does not exist",
+        );
+        assert_eq!(
+            with_export,
+            GioConnectError::Failed("Mount point does not exist".into())
+        );
+
+        let kde_msg = format_connect_error("nfs://192.168.0.101", Some(&unavail_ascii), None, true);
+        assert!(kde_msg.contains("kio-fuse"));
+        assert!(kde_msg.contains("gvfs-nfs"));
+
+        let export_msg =
+            format_connect_error("nfs://192.168.0.101", Some(&missing_export), None, false);
+        assert!(export_msg.contains("nfs://192.168.0.101/export"));
+
+        let kio_real_err = format_connect_error(
+            "nfs://192.168.0.101",
+            Some(&unavail_ascii),
+            Some("Could not connect to host 192.168.0.101"),
+            true,
+        );
+        assert_eq!(
+            kio_real_err,
+            "Cannot connect to nfs://192.168.0.101: Could not connect to host 192.168.0.101"
+        );
+
+        let mounts = vec![NetworkMount {
+            name: "192.168.0.101:/mnt/mx500".into(),
+            scheme: "nfs".into(),
+            uri: "nfs://192.168.0.101/mnt/mx500".into(),
+            mount_path: "/run/user/1000/gvfs/nfs:host=192.168.0.101,path=%2Fmnt%2Fmx500".into(),
+        }];
+        assert_eq!(
+            find_mount_path_for_uri(&mounts, "nfs://192.168.0.101/mnt/mx500").as_deref(),
+            Some("/run/user/1000/gvfs/nfs:host=192.168.0.101,path=%2Fmnt%2Fmx500")
+        );
     }
 }

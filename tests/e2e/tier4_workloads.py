@@ -13,7 +13,7 @@ import urllib.parse
 from pathlib import Path
 from typing import Any
 
-from harness.assertions import assert_desktop_valid, assert_xml_valid, read_mock_calls
+from harness.assertions import assert_desktop_valid, assert_xml_valid, read_mock_calls, system_prefix_binary_args
 from harness.mocks import MockRegistry
 from harness.sandbox import SandboxEnv
 from harness.types import E2ECase, E2EResult, RunContext, Status
@@ -606,6 +606,7 @@ raise SystemExit(1)
                 marker_dir = sb.tmp / "usr_share_gall"
                 marker_dir.mkdir()
                 (marker_dir / "package-managed").write_text("arch\n", encoding="utf-8")
+                bin_args, bin_target = system_prefix_binary_args(ctx.binary_path)
                 proc = sb.run(
                     [
                         "bwrap",
@@ -613,7 +614,8 @@ raise SystemExit(1)
                         "--overlay-src", "/usr/share", "--tmp-overlay", "/usr/share",
                         "--dir", "/usr/share/gall",
                         "--bind", str(marker_dir), "/usr/share/gall",
-                        str(ctx.binary_path),
+                        *bin_args,
+                        bin_target,
                     ],
                     env_overrides=env_ov,
                     timeout=60.0,

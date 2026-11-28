@@ -96,7 +96,7 @@ export function operationError(raw: string, platform?: string): OperationError {
   if (/^(?:no terminal found;|application .+ not found$|choose the application in the system dialog$)/i.test(raw)) {
     return expected(raw[0].toUpperCase() + raw.slice(1), "warn");
   }
-  if (/^(?:trash:|zip:|7z:|tar:|zstd:|clipboard unavailable:|cannot start '|windows shortcut chain is cyclic or too long$|git does not refuse this folder$|error: could not (?:lock|write) config file |eject failed: the drive is in use by )/i.test(raw)
+  if (/^(?:trash:|zip:|7z:|tar:|zstd:|clipboard unavailable:|cannot start '|windows shortcut chain is cyclic or too long$|git does not refuse this folder$|error: could not (?:lock|write) config file |eject failed: the drive is in use by |gio:|kio-fuse:|cannot connect to |failed to connect to |failed to disconnect |gio did not answer within |(?:gvfs|network)(?: server)? mounts are only supported on linux$|server uri |unsupported server uri scheme |do not put the password in the address |invalid (?:server uri|mount ))/i.test(raw)
     || / is not (?:a supported archive|an archive Gall can browse)$/.test(raw)
     || osReason(raw, platform)) {
     return expected(raw);

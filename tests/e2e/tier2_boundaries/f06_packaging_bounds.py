@@ -7,7 +7,7 @@ import json
 import re
 from pathlib import Path
 
-from harness.assertions import assert_desktop_valid, assert_xml_valid
+from harness.assertions import assert_desktop_valid, assert_xml_valid, system_prefix_binary_args
 from harness.sandbox import SandboxEnv
 from harness.types import E2ECase, E2EResult, RunContext, Status
 
@@ -156,13 +156,15 @@ def _t2_f6_03_package_managed_overrides_overlay(ctx: RunContext) -> E2EResult:
 
         out_dir = sb.logs / "selftest-updates"
         out_dir.mkdir(parents=True)
+        bin_args, bin_target = system_prefix_binary_args(ctx.binary_path)
         cmd = [
             "bwrap",
             "--dev-bind", "/", "/",
             "--overlay-src", "/usr/share", "--tmp-overlay", "/usr/share",
             "--dir", "/usr/share/gall",
             "--bind", str(marker_dir), "/usr/share/gall",
-            str(ctx.binary_path),
+            *bin_args,
+            bin_target,
         ]
         proc = sb.run(
             cmd,

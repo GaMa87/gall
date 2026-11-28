@@ -12,7 +12,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Read};
-use std::path::{Path, PathBuf, MAIN_SEPARATOR};
+use std::path::{Component, Path, PathBuf, MAIN_SEPARATOR};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, SystemTime};
 
@@ -523,13 +524,387 @@ pub fn folder_totals(archive: &Path, inner: &str) -> Result<(usize, u64)> {
 
 // ───────────────────────────── extraction ─────────────────────────────
 
+const PRIVATE_CACHE_DIR_NAME: &str = "archives-private";
+const LEGACY_CACHE_DIR_NAME: &str = "archives";
+const WINDOWS_PRIVATE_CACHE_DIR_NAME: &str = "gall-archives-private";
+const WINDOWS_LEGACY_CACHE_DIR_NAME: &str = "gall-archives";
+
+static STAGING_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Removes an exclusive staging file on drop unless disarmed after publication.
+struct StagingFile(Option<PathBuf>);
+
+impl StagingFile {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for StagingFile {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = fs::remove_file(&p);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn current_euid() -> u32 {
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+/// Normalizes a path by stripping trailing slashes and `.` segments so `lstat`
+/// (`fs::symlink_metadata`) never follows a symlink due to a trailing `/`.
+fn strip_trailing_separators(path: &Path) -> PathBuf {
+    path.components().collect()
+}
+
+/// Validates a parent directory that may be shared with other user caches (`~/.cache`,
+/// `~/.cache/gall`): it must be a real directory (not a symlink), owned by the current
+/// user on Unix, and not world-writable.
+fn validate_parent_dir(path: &Path) -> Result<()> {
+    let path = strip_trailing_separators(path);
+    let meta = fs::symlink_metadata(&path).ctx("stat", &path)?;
+    if meta.file_type().is_symlink() {
+        return Err(CoreError::Other(format!(
+            "unsafe archive cache root: {} is a symbolic link",
+            path.display()
+        )));
+    }
+    if !meta.file_type().is_dir() {
+        return Err(CoreError::Other(format!(
+            "unsafe archive cache root: {} is not a directory",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let euid = current_euid();
+        if meta.uid() != euid {
+            return Err(CoreError::Other(format!(
+                "unsafe archive cache root: {} is not owned by the current user",
+                path.display()
+            )));
+        }
+        if meta.mode() & 0o002 != 0 {
+            return Err(CoreError::Other(format!(
+                "unsafe archive cache root: {} is world-writable",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validates a system/temporary base directory (`TMPDIR`, `/tmp`, `%TEMP%`):
+/// strips trailing separators so symlinks are detected, rejects symlinks and non-dirs,
+/// and on Unix requires ownership by the current user or root plus the sticky bit
+/// whenever the directory is world-writable.
+fn validate_temp_dir(raw_temp: &Path) -> Result<PathBuf> {
+    let temp = strip_trailing_separators(raw_temp);
+    if temp.as_os_str().is_empty() {
+        return Err(CoreError::Other(
+            "unsafe archive cache root: temporary directory path is empty".into(),
+        ));
+    }
+    let meta = fs::symlink_metadata(&temp).ctx("stat", &temp)?;
+    if meta.file_type().is_symlink() {
+        return Err(CoreError::Other(format!(
+            "unsafe archive cache root: {} is a symbolic link",
+            temp.display()
+        )));
+    }
+    if !meta.file_type().is_dir() {
+        return Err(CoreError::Other(format!(
+            "unsafe archive cache root: {} is not a directory",
+            temp.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let euid = current_euid();
+        let uid = meta.uid();
+        if uid != euid && uid != 0 {
+            return Err(CoreError::Other(format!(
+                "unsafe archive cache root: {} is not owned by the current user or root",
+                temp.display()
+            )));
+        }
+        let mode = meta.mode();
+        if (mode & 0o002 != 0) && (mode & 0o1000 == 0) {
+            return Err(CoreError::Other(format!(
+                "unsafe archive cache root: {} is world-writable without the sticky bit",
+                temp.display()
+            )));
+        }
+    }
+    Ok(temp)
+}
+
+/// Validates a private archive cache directory (`archives-private`, per-archive buckets,
+/// `entries`, and member subdirectories): must be a real directory (not a symlink) and,
+/// on Unix, owned by the current user with no group or world permissions (`0o077 == 0`).
+fn validate_private_dir(path: &Path) -> Result<()> {
+    let path = strip_trailing_separators(path);
+    let meta = fs::symlink_metadata(&path).ctx("stat", &path)?;
+    if meta.file_type().is_symlink() {
+        return Err(CoreError::Other(format!(
+            "unsafe archive cache directory: {} is a symbolic link",
+            path.display()
+        )));
+    }
+    if !meta.file_type().is_dir() {
+        return Err(CoreError::Other(format!(
+            "unsafe archive cache directory: {} is not a directory",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let euid = current_euid();
+        if meta.uid() != euid {
+            return Err(CoreError::Other(format!(
+                "unsafe archive cache directory: {} is not owned by the current user",
+                path.display()
+            )));
+        }
+        if meta.mode() & 0o077 != 0 {
+            return Err(CoreError::Other(format!(
+                "unsafe archive cache directory: {} has non-private permissions ({:04o})",
+                path.display(),
+                meta.mode() & 0o7777
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validates a cached regular file (not a symlink, and on Unix owned by the current user
+/// with no group or world permissions).
+fn validate_private_file(path: &Path) -> Result<fs::Metadata> {
+    let meta = fs::symlink_metadata(path).ctx("stat", path)?;
+    if meta.file_type().is_symlink() {
+        return Err(CoreError::Other(format!(
+            "unsafe archive cache file: {} is a symbolic link",
+            path.display()
+        )));
+    }
+    if !meta.file_type().is_file() {
+        return Err(CoreError::Other(format!(
+            "unsafe archive cache file: {} is not a regular file",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let euid = current_euid();
+        if meta.uid() != euid {
+            return Err(CoreError::Other(format!(
+                "unsafe archive cache file: {} is not owned by the current user",
+                path.display()
+            )));
+        }
+        if meta.mode() & 0o077 != 0 {
+            return Err(CoreError::Other(format!(
+                "unsafe archive cache file: {} has non-private permissions ({:04o})",
+                path.display(),
+                meta.mode() & 0o7777
+            )));
+        }
+    }
+    Ok(meta)
+}
+
+fn create_dir_mode_700(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new().mode(0o700).create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::DirBuilder::new().create(path)
+    }
+}
+
+/// Ensures `path` exists as a validated private (`0o700`) directory without following symlinks.
+fn ensure_private_dir(path: &Path) -> Result<()> {
+    let path = strip_trailing_separators(path);
+    match create_dir_mode_700(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(CoreError::io("create", &path, e)),
+    }
+    validate_private_dir(&path)
+}
+
+/// Ensures the user's cache root exists component-by-component, rejecting non-OS
+/// symbolic link ancestors and rejecting any symlink at the leaf `cache_root` itself.
+fn ensure_cache_root(raw_root: &Path) -> Result<PathBuf> {
+    let root = strip_trailing_separators(raw_root);
+    if root.as_os_str().is_empty() {
+        return Err(CoreError::Other(
+            "unsafe archive cache root: cache directory path is empty".into(),
+        ));
+    }
+    let comps: Vec<Component<'_>> = root.components().collect();
+    let mut cur = PathBuf::new();
+    for (idx, comp) in comps.iter().enumerate() {
+        cur.push(comp.as_os_str());
+        if matches!(comp, Component::Prefix(_) | Component::RootDir) {
+            continue;
+        }
+        let check_meta = |meta: &fs::Metadata| -> Result<()> {
+            if meta.file_type().is_symlink() {
+                // Allow only top-level root-owned OS layout symlinks (e.g. macOS `/var` ->
+                // `/private/var`, immutable Linux `/home` -> `/var/home`), never deeper or leaf links.
+                #[cfg(unix)]
+                let allowed_os_ancestor = {
+                    use std::os::unix::fs::MetadataExt;
+                    let is_leaf = idx + 1 == comps.len();
+                    !is_leaf
+                        && idx == 1
+                        && matches!(comps.first(), Some(Component::RootDir))
+                        && meta.uid() == 0
+                };
+                #[cfg(not(unix))]
+                let allowed_os_ancestor = {
+                    let _ = idx;
+                    false
+                };
+                if !allowed_os_ancestor {
+                    return Err(CoreError::Other(format!(
+                        "unsafe archive cache root: {} is a symbolic link",
+                        cur.display()
+                    )));
+                }
+            } else if !meta.file_type().is_dir() {
+                return Err(CoreError::Other(format!(
+                    "unsafe archive cache root: {} is not a directory",
+                    cur.display()
+                )));
+            }
+            Ok(())
+        };
+        match fs::symlink_metadata(&cur) {
+            Ok(meta) => check_meta(&meta)?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => match create_dir_mode_700(&cur) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    let meta = fs::symlink_metadata(&cur).ctx("stat", &cur)?;
+                    check_meta(&meta)?;
+                }
+                Err(e) => return Err(CoreError::io("create", &cur, e)),
+            },
+            Err(e) => return Err(CoreError::io("stat", &cur, e)),
+        }
+    }
+    validate_parent_dir(&root)?;
+    Ok(root)
+}
+
+/// Ensures a direct child parent directory (`<cache_root>/gall`) exists without following symlinks.
+fn ensure_parent_dir(path: &Path) -> Result<()> {
+    let path = strip_trailing_separators(path);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => validate_parent_dir(&path),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            match create_dir_mode_700(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(CoreError::io("create", &path, e)),
+            }
+            validate_parent_dir(&path)
+        }
+        Err(e) => Err(CoreError::io("stat", &path, e)),
+    }
+}
+
+/// Ensures every directory component of `rel` under validated private directory `base`
+/// exists as a validated private (`0o700`) directory, never traversing symlinks.
+fn ensure_private_dir_chain(base: &Path, rel: &Path) -> Result<()> {
+    validate_private_dir(base)?;
+    let mut cur = base.to_path_buf();
+    for part in rel.components() {
+        let Component::Normal(name) = part else {
+            return Err(CoreError::Other(format!(
+                "unsafe archive cache path component in {}",
+                rel.display()
+            )));
+        };
+        cur.push(name);
+        ensure_private_dir(&cur)?;
+    }
+    Ok(())
+}
+
+/// Validates every existing ancestor directory of `rel` under `base` without creating anything.
+fn validate_existing_dir_chain(base: &Path, rel: &Path) -> Result<()> {
+    validate_private_dir(base)?;
+    let mut cur = base.to_path_buf();
+    for part in rel.components() {
+        let Component::Normal(name) = part else {
+            return Err(CoreError::Other(format!(
+                "unsafe archive cache path component in {}",
+                rel.display()
+            )));
+        };
+        cur.push(name);
+        match fs::symlink_metadata(&cur) {
+            Ok(_) => validate_private_dir(&cur)?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(CoreError::io("stat", &cur, e)),
+        }
+    }
+    Ok(())
+}
+
+/// Creates a uniquely named, exclusive (`O_CREAT | O_EXCL`), private (`0o600`) staging
+/// file directly inside validated private directory `root`.
+fn create_private_staging_file(root: &Path) -> Result<(PathBuf, fs::File)> {
+    validate_private_dir(root)?;
+    let pid = std::process::id();
+    for _ in 0..1024 {
+        let seq = STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let candidate = root.join(format!(".gall-part-{pid}-{seq:x}-{nanos:x}"));
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        match opts.open(&candidate) {
+            Ok(file) => return Ok((candidate, file)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(CoreError::io("create", &candidate, e)),
+        }
+    }
+    Err(CoreError::AlreadyExists(root.join(".gall-part")))
+}
+
 /// One cache root per archive version (see `cache_base`). Members live under
 /// `entries/`, separate from the root's bookkeeping and staging files.
-fn cache_root(archive: &Path) -> Result<PathBuf> {
+fn cache_root_in(base: &Path, archive: &Path) -> Result<PathBuf> {
     let st = stamp(archive)?;
     let mut h = DefaultHasher::new();
     ("member-cache-v2", archive, st.0, st.1).hash(&mut h);
-    Ok(cache_base().join(format!("{:016x}", h.finish())))
+    Ok(base.join(format!("{:016x}", h.finish())))
+}
+
+#[cfg(test)]
+fn cache_root(archive: &Path) -> Result<PathBuf> {
+    let base = cache_base()?;
+    cache_root_in(&base, archive)
 }
 
 fn extraction_lock(root: &Path) -> Arc<Mutex<()>> {
@@ -600,36 +975,453 @@ fn member_paths(items: &[Item]) -> HashMap<String, PathBuf> {
     paths
 }
 
-/// Windows: the per-user temp folder. Elsewhere `/tmp` is shared by all users (another
-/// user could own `gall-archives`) and often a small tmpfs, so the user's cache folder.
-fn cache_base() -> PathBuf {
-    if cfg!(windows) {
-        return std::env::temp_dir().join("gall-archives");
-    }
-    dirs::cache_dir()
-        .map(|d| d.join("gall").join("archives"))
-        .unwrap_or_else(|| std::env::temp_dir().join("gall-archives"))
+struct CachePaths {
+    base: PathBuf,
+    legacy: Option<PathBuf>,
+    fallback_parent: Option<PathBuf>,
 }
 
-/// Removes extracted archive folders not used for a day (once per run).
-fn prune_once() {
-    static DONE: OnceLock<()> = OnceLock::new();
-    DONE.get_or_init(|| {
-        let Ok(rd) = fs::read_dir(cache_base()) else {
-            return;
-        };
-        let day = Duration::from_secs(24 * 3600);
-        for e in rd.flatten() {
-            let old = fs::metadata(e.path().join(".used"))
-                .or_else(|_| e.metadata())
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.elapsed().ok())
-                .is_some_and(|age| age > day);
-            if old {
-                let _ = fs::remove_dir_all(e.path());
+/// Creates a process-private random directory (`0o700` on Unix) under validated `temp_dir`
+/// for Unix hosts where `dirs::cache_dir()` is unavailable, avoiding predictable names in `/tmp`.
+fn create_fallback_cache_dir(temp_dir: &Path) -> Result<PathBuf> {
+    let temp = validate_temp_dir(temp_dir)?;
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("gall-archives-").rand_bytes(12);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(fs::Permissions::from_mode(0o700));
+    }
+    let dir = builder
+        .tempdir_in(&temp)
+        .map_err(|e| CoreError::io("create", &temp, e))?;
+    let path = dir.keep();
+    validate_private_dir(&path)?;
+    Ok(path)
+}
+
+fn process_fallback_cache_base(temp_dir: &Path) -> Result<PathBuf> {
+    static FALLBACK: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+    let mut slot = FALLBACK.get_or_init(Default::default).lock().unwrap();
+    if let Some(existing) = slot.as_ref() {
+        if validate_private_dir(existing).is_ok() {
+            return Ok(existing.clone());
+        }
+    }
+    let fresh = create_fallback_cache_dir(temp_dir)?;
+    *slot = Some(fresh.clone());
+    Ok(fresh)
+}
+
+/// Resolves and validates the private archive cache base (creating it with `0o700` on Unix)
+/// and returns any legacy cache path that should be safely retired.
+fn resolve_cache_paths(
+    user_cache_dir: Option<PathBuf>,
+    temp_dir: &Path,
+    fallback_dir: impl FnOnce(&Path) -> Result<PathBuf>,
+) -> Result<CachePaths> {
+    if cfg!(windows) {
+        let temp = validate_temp_dir(temp_dir)?;
+        let base = temp.join(WINDOWS_PRIVATE_CACHE_DIR_NAME);
+        ensure_private_dir(&base)?;
+        return Ok(CachePaths {
+            base,
+            legacy: Some(temp.join(WINDOWS_LEGACY_CACHE_DIR_NAME)),
+            fallback_parent: None,
+        });
+    }
+    match user_cache_dir {
+        Some(cache_root) => {
+            let cache_root = ensure_cache_root(&cache_root)?;
+            let gall_dir = cache_root.join("gall");
+            ensure_parent_dir(&gall_dir)?;
+            let base = gall_dir.join(PRIVATE_CACHE_DIR_NAME);
+            ensure_private_dir(&base)?;
+            Ok(CachePaths {
+                base,
+                legacy: Some(gall_dir.join(LEGACY_CACHE_DIR_NAME)),
+                fallback_parent: None,
+            })
+        }
+        None => {
+            let temp = validate_temp_dir(temp_dir)?;
+            Ok(CachePaths {
+                base: fallback_dir(&temp)?,
+                legacy: None,
+                fallback_parent: Some(temp),
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+fn cache_base() -> Result<PathBuf> {
+    let temp = std::env::temp_dir();
+    Ok(resolve_cache_paths(dirs::cache_dir(), &temp, process_fallback_cache_base)?.base)
+}
+
+fn is_cache_bucket_name(name: &std::ffi::OsStr) -> bool {
+    let Some(s) = name.to_str() else {
+        return false;
+    };
+    s.len() == 16 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+#[cfg(unix)]
+mod unix_dir {
+    use super::current_euid;
+    use std::ffi::{CStr, CString, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    const OPEN_DIR_FLAGS: libc::c_int =
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+
+    fn fstat_owned_dir(fd: libc::c_int, euid: u32) -> bool {
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `fd` is an open descriptor and `st` is valid for writes.
+        if unsafe { libc::fstat(fd, st.as_mut_ptr()) } != 0 {
+            return false;
+        }
+        // SAFETY: initialized by successful `fstat`.
+        let st = unsafe { st.assume_init() };
+        (st.st_mode & libc::S_IFMT) == libc::S_IFDIR && st.st_uid == euid
+    }
+
+    fn open_root_dir(path: &Path, euid: u32) -> Option<libc::c_int> {
+        let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+        // SAFETY: `c_path` is NUL-terminated; `O_DIRECTORY | O_NOFOLLOW` never follows symlinks.
+        let fd = unsafe { libc::open(c_path.as_ptr(), OPEN_DIR_FLAGS) };
+        if fd < 0 {
+            return None;
+        }
+        if !fstat_owned_dir(fd, euid) {
+            // SAFETY: closes owned fd.
+            unsafe { libc::close(fd) };
+            return None;
+        }
+        Some(fd)
+    }
+
+    fn open_child_dir(parent_fd: libc::c_int, name: &CStr, euid: u32) -> Option<libc::c_int> {
+        // SAFETY: `name` is NUL-terminated; `openat` pins lookup to `parent_fd` with `O_NOFOLLOW`.
+        let fd = unsafe { libc::openat(parent_fd, name.as_ptr(), OPEN_DIR_FLAGS) };
+        if fd < 0 {
+            return None;
+        }
+        if !fstat_owned_dir(fd, euid) {
+            // SAFETY: closes owned fd.
+            unsafe { libc::close(fd) };
+            return None;
+        }
+        Some(fd)
+    }
+
+    fn fstatat_child(parent_fd: libc::c_int, name: &CStr) -> Option<libc::stat> {
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `parent_fd` is open, `name` is NUL-terminated, `AT_SYMLINK_NOFOLLOW` never follows symlinks.
+        if unsafe {
+            libc::fstatat(
+                parent_fd,
+                name.as_ptr(),
+                st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return None;
+        }
+        // SAFETY: initialized by successful `fstatat`.
+        Some(unsafe { st.assume_init() })
+    }
+
+    /// Reads entry names from `dir_fd` (consuming `dir_fd` via `fdopendir` / `closedir`).
+    fn read_names_from_fd(dir_fd: libc::c_int) -> Vec<CString> {
+        // SAFETY: `fdopendir` takes ownership of `dir_fd` on success.
+        let dir = unsafe { libc::fdopendir(dir_fd) };
+        if dir.is_null() {
+            // SAFETY: `fdopendir` failed, so caller still owns `dir_fd`.
+            unsafe { libc::close(dir_fd) };
+            return Vec::new();
+        }
+        let mut names = Vec::new();
+        loop {
+            // SAFETY: `dir` is a valid open `DIR*`.
+            let entry = unsafe { libc::readdir(dir) };
+            if entry.is_null() {
+                break;
+            }
+            // SAFETY: `d_name` is a NUL-terminated string inside the directory entry.
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+            if name.to_bytes() != b"." && name.to_bytes() != b".." {
+                names.push(name.to_owned());
             }
         }
+        // SAFETY: closes `dir` and its underlying `dir_fd`.
+        unsafe { libc::closedir(dir) };
+        names
+    }
+
+    /// Recursively removes owned regular files and real directories inside pinned `dir_fd`
+    /// without ever re-resolving paths or following symlinks.
+    fn clear_dir_fd(dir_fd: libc::c_int, euid: u32) {
+        // Duplicate the fd for `fdopendir` so `dir_fd` stays valid for `fstatat`/`openat`/`unlinkat`.
+        // SAFETY: `F_DUPFD_CLOEXEC` duplicates an open descriptor.
+        let iter_fd = unsafe { libc::fcntl(dir_fd, libc::F_DUPFD_CLOEXEC, 0) };
+        if iter_fd < 0 {
+            return;
+        }
+        for name in read_names_from_fd(iter_fd) {
+            let Some(st) = fstatat_child(dir_fd, &name) else {
+                continue;
+            };
+            if st.st_uid != euid {
+                continue;
+            }
+            match st.st_mode & libc::S_IFMT {
+                libc::S_IFLNK => continue,
+                libc::S_IFREG => {
+                    // SAFETY: unlinks regular file directly inside pinned `dir_fd`.
+                    let _ = unsafe { libc::unlinkat(dir_fd, name.as_ptr(), 0) };
+                }
+                libc::S_IFDIR => {
+                    if let Some(child_fd) = open_child_dir(dir_fd, &name, euid) {
+                        clear_dir_fd(child_fd, euid);
+                        // SAFETY: closes owned child fd.
+                        unsafe { libc::close(child_fd) };
+                        // SAFETY: removes child dir only if empty, directly inside pinned `dir_fd`.
+                        let _ =
+                            unsafe { libc::unlinkat(dir_fd, name.as_ptr(), libc::AT_REMOVEDIR) };
+                    }
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    fn has_bucket_signature_fd(bucket_fd: libc::c_int) -> bool {
+        let check = |name: &CStr, kind: libc::mode_t| {
+            fstatat_child(bucket_fd, name).is_some_and(|st| (st.st_mode & libc::S_IFMT) == kind)
+        };
+        check(c".used", libc::S_IFREG)
+            || check(c"entries", libc::S_IFDIR)
+            || check(c".gall-part", libc::S_IFREG)
+    }
+
+    pub(super) fn remove_real_tree_no_follow(dir: &Path) {
+        let euid = current_euid();
+        let Some(fd) = open_root_dir(dir, euid) else {
+            return;
+        };
+        clear_dir_fd(fd, euid);
+        // SAFETY: closes owned fd.
+        unsafe { libc::close(fd) };
+        let _ = std::fs::remove_dir(dir);
+    }
+
+    pub(super) fn retire_legacy_cache(old_base: &Path) {
+        let euid = current_euid();
+        let Some(base_fd) = open_root_dir(old_base, euid) else {
+            return;
+        };
+        // SAFETY: duplicate fd for directory iteration while keeping `base_fd` pinned.
+        let iter_fd = unsafe { libc::fcntl(base_fd, libc::F_DUPFD_CLOEXEC, 0) };
+        if iter_fd >= 0 {
+            for name in read_names_from_fd(iter_fd) {
+                if !super::is_cache_bucket_name(OsStr::from_bytes(name.as_bytes())) {
+                    continue;
+                }
+                let Some(bucket_fd) = open_child_dir(base_fd, &name, euid) else {
+                    continue;
+                };
+                let is_bucket = has_bucket_signature_fd(bucket_fd);
+                if is_bucket {
+                    clear_dir_fd(bucket_fd, euid);
+                }
+                // SAFETY: closes owned fd.
+                unsafe { libc::close(bucket_fd) };
+                if is_bucket {
+                    // SAFETY: removes empty bucket directly inside pinned `base_fd`.
+                    let _ = unsafe { libc::unlinkat(base_fd, name.as_ptr(), libc::AT_REMOVEDIR) };
+                }
+            }
+        }
+        // SAFETY: closes owned fd.
+        unsafe { libc::close(base_fd) };
+        // Only succeeds when every item inside `old_base` was a recognized Gall cache bucket.
+        let _ = std::fs::remove_dir(old_base);
+    }
+}
+
+#[cfg(not(unix))]
+fn has_legacy_bucket_signature(bucket: &Path) -> bool {
+    let is_real_file = |name: &str| {
+        fs::symlink_metadata(bucket.join(name))
+            .is_ok_and(|m| !m.file_type().is_symlink() && m.file_type().is_file())
+    };
+    let is_real_dir = |name: &str| {
+        fs::symlink_metadata(bucket.join(name))
+            .is_ok_and(|m| !m.file_type().is_symlink() && m.file_type().is_dir())
+    };
+    is_real_file(".used") || is_real_dir("entries") || is_real_file(".gall-part")
+}
+
+/// Recursively removes regular files and real subdirectories inside `dir` without ever
+/// following symbolic links. Symlinks (and directories containing them) are left untouched.
+fn remove_real_tree_no_follow(dir: &Path) {
+    let dir = strip_trailing_separators(dir);
+    #[cfg(unix)]
+    {
+        unix_dir::remove_real_tree_no_follow(&dir);
+    }
+    #[cfg(not(unix))]
+    {
+        let Ok(meta) = fs::symlink_metadata(&dir) else {
+            return;
+        };
+        if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+            return;
+        }
+        let Ok(rd) = fs::read_dir(&dir) else {
+            return;
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let Ok(child_meta) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if child_meta.file_type().is_symlink() {
+                continue;
+            }
+            if child_meta.file_type().is_dir() {
+                remove_real_tree_no_follow(&path);
+            } else if child_meta.file_type().is_file() {
+                let _ = fs::remove_file(&path);
+            }
+        }
+        let _ = fs::remove_dir(&dir);
+    }
+}
+
+/// Safely retires the legacy (`archives` / `gall-archives`) cache directory without
+/// following symlinks or deleting non-cache user data.
+fn retire_legacy_cache(old_base: &Path) {
+    let old_base = strip_trailing_separators(old_base);
+    #[cfg(unix)]
+    {
+        unix_dir::retire_legacy_cache(&old_base);
+    }
+    #[cfg(not(unix))]
+    {
+        let Ok(meta) = fs::symlink_metadata(&old_base) else {
+            return;
+        };
+        if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+            return;
+        }
+        let Ok(rd) = fs::read_dir(&old_base) else {
+            return;
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if !is_cache_bucket_name(&entry.file_name()) {
+                continue;
+            }
+            let Ok(bucket_meta) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if bucket_meta.file_type().is_symlink() || !bucket_meta.file_type().is_dir() {
+                continue;
+            }
+            if has_legacy_bucket_signature(&path) {
+                remove_real_tree_no_follow(&path);
+            }
+        }
+        let _ = fs::remove_dir(&old_base);
+    }
+}
+
+/// Removes extracted archive folders not used for a day without following symlinks.
+fn prune_cache_base(base: &Path) {
+    if validate_private_dir(base).is_err() {
+        return;
+    }
+    let Ok(rd) = fs::read_dir(base) else {
+        return;
+    };
+    let day = Duration::from_secs(24 * 3600);
+    for e in rd.flatten() {
+        let path = e.path();
+        if !is_cache_bucket_name(&e.file_name()) {
+            continue;
+        }
+        let Ok(bucket_meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if bucket_meta.file_type().is_symlink() || !bucket_meta.file_type().is_dir() {
+            continue;
+        }
+        let used_meta = fs::symlink_metadata(path.join(".used"))
+            .ok()
+            .filter(|m| !m.file_type().is_symlink() && m.file_type().is_file());
+        let old = used_meta
+            .as_ref()
+            .unwrap_or(&bucket_meta)
+            .modified()
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > day);
+        if old {
+            remove_real_tree_no_follow(&path);
+        }
+    }
+}
+
+/// Prunes expired private fallback cache directories (`gall-archives-*`) created by
+/// earlier processes when no user cache directory was available.
+fn prune_stale_fallback_dirs(temp_dir: &Path, current_base: &Path) {
+    let Ok(rd) = fs::read_dir(temp_dir) else {
+        return;
+    };
+    let day = Duration::from_secs(24 * 3600);
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path == current_base {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name.starts_with("gall-archives-") {
+            continue;
+        }
+        if validate_private_dir(&path).is_err() {
+            continue;
+        }
+        // Read `mtime` before pruning children, because removing a child updates the parent's `mtime`.
+        let was_old = fs::symlink_metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > day);
+        prune_cache_base(&path);
+        if was_old {
+            let _ = fs::remove_dir(&path);
+        }
+    }
+}
+
+/// Removes extracted archive folders not used for a day and retires the legacy cache (once per run).
+fn prune_once(paths: &CachePaths) {
+    static DONE: OnceLock<()> = OnceLock::new();
+    DONE.get_or_init(|| {
+        if let Some(legacy) = paths.legacy.as_deref() {
+            retire_legacy_cache(legacy);
+        }
+        if let Some(parent) = paths.fallback_parent.as_deref() {
+            prune_stale_fallback_dirs(parent, &paths.base);
+        }
+        prune_cache_base(&paths.base);
     });
 }
 
@@ -637,9 +1429,6 @@ fn prune_once() {
 /// extracted into the cache once, and its cached path returned in the same order.
 /// Ordinary paths are returned unchanged, so callers can pass a mixed selection.
 pub fn materialize(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
-    prune_once();
-    let mut out = paths.to_vec();
-    // Group the virtual paths by archive: one pass over each archive.
     let mut by_archive: HashMap<PathBuf, Vec<(usize, String)>> = HashMap::new();
     for (i, p) in paths.iter().enumerate() {
         if let Some((ar, inner)) = split(p) {
@@ -649,10 +1438,51 @@ pub fn materialize(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
             by_archive.entry(ar).or_default().push((i, inner));
         }
     }
+    if by_archive.is_empty() {
+        return Ok(paths.to_vec());
+    }
+    let temp = std::env::temp_dir();
+    let cache = resolve_cache_paths(dirs::cache_dir(), &temp, process_fallback_cache_base)?;
+    prune_once(&cache);
+    materialize_grouped(paths, by_archive, &cache.base)
+}
+
+#[cfg(test)]
+fn materialize_in(paths: &[PathBuf], base: &Path) -> Result<Vec<PathBuf>> {
+    let mut by_archive: HashMap<PathBuf, Vec<(usize, String)>> = HashMap::new();
+    for (i, p) in paths.iter().enumerate() {
+        if let Some((ar, inner)) = split(p) {
+            if inner.is_empty() {
+                continue;
+            }
+            by_archive.entry(ar).or_default().push((i, inner));
+        }
+    }
+    if by_archive.is_empty() {
+        return Ok(paths.to_vec());
+    }
+    materialize_grouped(paths, by_archive, base)
+}
+
+fn materialize_grouped(
+    paths: &[PathBuf],
+    by_archive: HashMap<PathBuf, Vec<(usize, String)>>,
+    base: &Path,
+) -> Result<Vec<PathBuf>> {
+    validate_private_dir(base)?;
+    let mut out = paths.to_vec();
     for (archive, wanted) in by_archive {
-        let root = cache_root(&archive)?;
+        let root = cache_root_in(base, &archive)?;
         let lock = extraction_lock(&root);
         let _guard = lock.lock().unwrap();
+        // Validate existing cache roots before reusing or writing into them.
+        if fs::symlink_metadata(&root).is_ok() {
+            validate_private_dir(&root)?;
+        }
+        let entries_dir = root.join("entries");
+        if fs::symlink_metadata(&entries_dir).is_ok() {
+            validate_private_dir(&entries_dir)?;
+        }
         let (items, unique_files) = index_info(&archive)?;
         let members = member_paths(&items);
         let mut need: Vec<String> = Vec::new();
@@ -661,18 +1491,36 @@ pub fn materialize(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
                 .iter()
                 .find(|it| &it.name == inner)
                 .ok_or_else(|| CoreError::NotFound(PathBuf::from(virtual_path(&archive, inner))))?;
-            let target = root.join("entries").join(&members[inner]);
+            let member_rel = &members[inner];
+            let target = entries_dir.join(member_rel);
+            if fs::symlink_metadata(&entries_dir).is_ok() {
+                if let Some(parent_rel) = member_rel.parent().filter(|p| !p.as_os_str().is_empty())
+                {
+                    validate_existing_dir_chain(&entries_dir, parent_rel)?;
+                }
+            }
             // A folder is re-extracted each time (cheap to check, hard to know if complete);
-            // a file is reused when it is already there with the right size.
-            let ready = !it.is_dir
-                && fs::metadata(&target).is_ok_and(|m| m.is_file() && m.len() == it.size);
+            // a file is reused only when it is a validated private regular file of the right size.
+            let ready = if it.is_dir {
+                if fs::symlink_metadata(&target).is_ok() {
+                    validate_private_dir(&target)?;
+                }
+                false
+            } else {
+                match fs::symlink_metadata(&target) {
+                    Ok(_) => validate_private_file(&target)?.len() == it.size,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+                    Err(e) => return Err(CoreError::io("stat", &target, e)),
+                }
+            };
             if !ready {
                 need.push(inner.clone());
             }
             out[*i] = target;
         }
         if !need.is_empty() {
-            fs::create_dir_all(&root).ctx("create", &root)?;
+            ensure_private_dir(&root)?;
+            ensure_private_dir(&entries_dir)?;
             // Tar and 7z archives are read from the start: when every name occurs once,
             // reading stops after the last wanted file instead of at the end.
             let files = unique_files.then(|| {
@@ -687,21 +1535,30 @@ pub fn materialize(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
                     .iter()
                     .filter(|it| it.is_dir && wanted_by(&it.name, &need))
                 {
-                    let dir = root.join("entries").join(&members[&it.name]);
-                    fs::create_dir_all(&dir).ctx("create", &dir)?;
+                    ensure_private_dir_chain(&entries_dir, &members[&it.name])?;
                 }
             }
             extract_entries(&archive, &root, &need, &members, files)?;
         }
-        let _ = filetime_touch(&root);
+        if fs::symlink_metadata(&root).is_ok() {
+            let _ = filetime_touch(&root);
+        }
     }
     Ok(out)
 }
 
-/// Marks a cache folder as used, outside the extracted members' namespace.
-fn filetime_touch(dir: &Path) -> io::Result<()> {
-    let f = dir.join(".used");
-    fs::write(f, b"")
+/// Marks a cache folder as used via an exclusive private file, outside the members' namespace.
+fn filetime_touch(dir: &Path) -> Result<()> {
+    let used = dir.join(".used");
+    if fs::symlink_metadata(&used).is_ok() {
+        validate_private_file(&used)?;
+    }
+    let (tmp, file) = create_private_staging_file(dir)?;
+    let guard = StagingFile(Some(tmp.clone()));
+    drop(file);
+    fs::rename(&tmp, &used).ctx("move", &used)?;
+    guard.disarm();
+    Ok(())
 }
 
 /// Does `name` belong to one of `wanted` (the item itself or inside a wanted folder)?
@@ -715,7 +1572,8 @@ fn wanted_by(name: &str, wanted: &[String]) -> bool {
 }
 
 /// Extracts the wanted entries (and folders' contents) of `archive` under `root`,
-/// each file written to a temporary name first so readers never see half a file.
+/// each file written to an exclusive private staging file first so readers never see
+/// half a file or non-private permissions.
 fn extract_entries(
     archive: &Path,
     root: &Path,
@@ -724,6 +1582,9 @@ fn extract_entries(
     // The number of wanted files, when reading may stop after that many (see `materialize`).
     files: Option<usize>,
 ) -> Result<()> {
+    validate_private_dir(root)?;
+    let entries_dir = root.join("entries");
+    ensure_private_dir(&entries_dir)?;
     let mut left = files;
     // One wanted file was written; true when it was the last one.
     let mut last_written = |is_dir: bool| match left.as_mut() {
@@ -736,22 +1597,54 @@ fn extract_entries(
     let (format, _) = detect(archive).ok_or_else(|| not_archive(archive))?;
     let file = fs::File::open(archive).ctx("open", archive)?;
     let err = |what: &str, e: &dyn std::fmt::Display| CoreError::Other(format!("{what}: {e}"));
-    let write = |name: &str, is_dir: bool, data: &mut dyn Read| -> Result<()> {
-        let out = root.join("entries").join(&members[name]);
-        if is_dir {
-            return fs::create_dir_all(&out).ctx("create", &out);
+    enum WriteErr {
+        Stream(CoreError),
+        Cache(CoreError),
+    }
+    impl WriteErr {
+        fn into_core(self) -> CoreError {
+            match self {
+                Self::Stream(e) | Self::Cache(e) => e,
+            }
         }
-        if let Some(p) = out.parent() {
-            fs::create_dir_all(p).ctx("create", p)?;
+        fn or_wrong_password(self, archive: &Path) -> CoreError {
+            match self {
+                Self::Cache(e) => e,
+                Self::Stream(e) => {
+                    if password_for(archive).is_some() {
+                        need_password(archive)
+                    } else {
+                        e
+                    }
+                }
+            }
         }
-        // Writes are serialized per root; no archive member can alias this file.
-        let tmp = root.join(".gall-part");
-        {
-            let mut w = fs::File::create(&tmp).ctx("create", &tmp)?;
-            io::copy(data, &mut w).ctx("write", &tmp)?;
-        }
-        fs::rename(&tmp, &out).ctx("move", &out)
-    };
+    }
+    let write =
+        |name: &str, is_dir: bool, data: &mut dyn Read| -> std::result::Result<(), WriteErr> {
+            let member_rel = &members[name];
+            let out = entries_dir.join(member_rel);
+            if is_dir {
+                return ensure_private_dir_chain(&entries_dir, member_rel).map_err(WriteErr::Cache);
+            }
+            if let Some(parent_rel) = member_rel.parent().filter(|p| !p.as_os_str().is_empty()) {
+                ensure_private_dir_chain(&entries_dir, parent_rel).map_err(WriteErr::Cache)?;
+            }
+            if fs::symlink_metadata(&out).is_ok() {
+                validate_private_file(&out).map_err(WriteErr::Cache)?;
+            }
+            let (tmp, mut w) = create_private_staging_file(root).map_err(WriteErr::Cache)?;
+            let guard = StagingFile(Some(tmp.clone()));
+            io::copy(data, &mut w)
+                .ctx("write", &tmp)
+                .map_err(WriteErr::Stream)?;
+            drop(w);
+            fs::rename(&tmp, &out)
+                .ctx("move", &out)
+                .map_err(WriteErr::Cache)?;
+            guard.disarm();
+            Ok(())
+        };
     match format {
         ArchiveFormat::Zip => {
             let mut z =
@@ -770,12 +1663,9 @@ fn extract_entries(
                     let mut f = zip_entry(&mut z, i, archive)?;
                     let is_dir = f.is_dir();
                     if let Err(e) = write(&name, is_dir, &mut f) {
-                        // A wrong ZipCrypto password shows up as a bad checksum while reading.
-                        return Err(if password_for(archive).is_some() {
-                            need_password(archive)
-                        } else {
-                            e
-                        });
+                        // A wrong ZipCrypto password shows up as a bad checksum while reading,
+                        // whereas cache validation errors must always surface directly.
+                        return Err(e.or_wrong_password(archive));
                     }
                 }
             }
@@ -802,7 +1692,7 @@ fn extract_entries(
                 }
             }
             let threads = std::thread::available_parallelism().map_or(1, |n| n.get() as u32);
-            let mut failed: Option<CoreError> = None;
+            let mut failed: Option<WriteErr> = None;
             for (&block, &last) in &last_in_block {
                 let mut at = ar.stream_map.block_first_file_index[block];
                 sevenz_rust2::BlockDecoder::new(threads, block, &ar, &password, &mut file)
@@ -824,12 +1714,9 @@ fn extract_entries(
                 }
             }
             if let Some(e) = failed {
-                // With a wrong password decryption yields garbage the decoder rejects.
-                return Err(if password_for(archive).is_some() {
-                    need_password(archive)
-                } else {
-                    e
-                });
+                // With a wrong password decryption yields garbage the decoder rejects,
+                // whereas cache validation errors must always surface directly.
+                return Err(e.or_wrong_password(archive));
             }
             // Folders and empty files have no data and belong to no block. They are
             // written last, so one whose name comes again later in the archive is left
@@ -843,7 +1730,8 @@ fn extract_entries(
             for (at, name) in wanted_at.iter().enumerate() {
                 if let (Some(name), None) = (name, block_of.get(at).copied().flatten()) {
                     if last_of[name.as_str()] == at {
-                        write(name, ar.files[at].is_directory(), &mut io::empty())?;
+                        write(name, ar.files[at].is_directory(), &mut io::empty())
+                            .map_err(WriteErr::into_core)?;
                     }
                 }
             }
@@ -857,7 +1745,7 @@ fn extract_entries(
                 };
                 let kind = e.header().entry_type();
                 if (kind.is_file() || kind.is_dir()) && wanted_by(&name, wanted) {
-                    write(&name, kind.is_dir(), &mut e)?;
+                    write(&name, kind.is_dir(), &mut e).map_err(WriteErr::into_core)?;
                     if last_written(kind.is_dir()) {
                         break;
                     }
@@ -1043,7 +1931,7 @@ mod tests {
         let whole = fs::read(&ar).unwrap();
         fs::write(&ar, &whole[..512 + 512 + 512 + 100]).unwrap();
         let root = t.path().join("out");
-        fs::create_dir_all(&root).unwrap();
+        ensure_private_dir(&root).unwrap();
         let wanted = ["first.txt".to_string()];
         extract_entries(&ar, &root, &wanted, &members, Some(1)).unwrap();
         assert_eq!(
@@ -1138,7 +2026,7 @@ mod tests {
         let items = index(&ar).unwrap();
         let members = member_paths(&items);
         let root = t.path().join("out");
-        fs::create_dir_all(&root).unwrap();
+        ensure_private_dir(&root).unwrap();
         let wanted = ["x.txt".to_string(), "y.txt".to_string()];
         extract_entries(&ar, &root, &wanted, &members, None).unwrap();
         let read = |name: &str| fs::read(root.join("entries").join(name)).unwrap();
@@ -1407,6 +2295,286 @@ mod tests {
             let got = materialize(&[ar.join("src").join("docs").join("n.md")]).unwrap();
             assert_eq!(fs::read_to_string(&got[0]).unwrap(), "# hi", "{ext}");
             let _ = fs::remove_dir_all(cache_root(&ar).unwrap());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialized_cache_and_staging_stay_private_under_permissive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Isolate `umask(0o000)` in a child process so it never races with parallel tests.
+        if std::env::var_os("GALL_TEST_UMASK_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "fs::archive_view::tests::materialized_cache_and_staging_stay_private_under_permissive_umask",
+                    "--nocapture",
+                ])
+                .env("GALL_TEST_UMASK_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "isolated umask child test failed");
+            return;
+        }
+
+        // SAFETY: runs inside a single-test isolated child process.
+        unsafe {
+            libc::umask(0o000);
+        }
+
+        let t = tempfile::tempdir().unwrap();
+        let user_cache = t.path().join("cache");
+        let ar = zip_with_entries(t.path(), &[("nested/secret.txt", b"confidential")]);
+        let resolved =
+            resolve_cache_paths(Some(user_cache), t.path(), create_fallback_cache_dir).unwrap();
+
+        let got = materialize_in(&[ar.join("nested/secret.txt")], &resolved.base).unwrap();
+        let cached_file = &got[0];
+        assert_eq!(fs::read(cached_file).unwrap(), b"confidential");
+
+        let root = cache_root_in(&resolved.base, &ar).unwrap();
+        for dir in [
+            resolved.base.as_path(),
+            root.as_path(),
+            &root.join("entries"),
+            &root.join("entries/nested"),
+        ] {
+            let mode = fs::symlink_metadata(dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "dir {} must be 0700", dir.display());
+        }
+        for file in [cached_file.as_path(), &root.join(".used")] {
+            let mode = fs::symlink_metadata(file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "file {} must be 0600", file.display());
+        }
+
+        // Exclusive staging file creation also stays 0600 and cleans up on drop.
+        let (tmp_path, tmp_file) = create_private_staging_file(&root).unwrap();
+        let guard = StagingFile(Some(tmp_path.clone()));
+        assert_eq!(
+            fs::symlink_metadata(&tmp_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        drop(tmp_file);
+        drop(guard);
+        assert!(!tmp_path.exists());
+
+        // Missing user cache fallback also stays 0700/0600 under umask 0000.
+        let shared_tmp = t.path().join("sticky-tmp");
+        fs::create_dir(&shared_tmp).unwrap();
+        fs::set_permissions(&shared_tmp, fs::Permissions::from_mode(0o1777)).unwrap();
+        let fallback = resolve_cache_paths(None, &shared_tmp, create_fallback_cache_dir).unwrap();
+        assert_eq!(
+            fs::symlink_metadata(&fallback.base)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let fb_got = materialize_in(&[ar.join("nested/secret.txt")], &fallback.base).unwrap();
+        assert_eq!(
+            fs::symlink_metadata(&fb_got[0])
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        // Second materialization reuses the cached file without re-extracting.
+        let reused = materialize_in(&[ar.join("nested/secret.txt")], &resolved.base).unwrap();
+        assert_eq!(reused, got);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_and_non_private_cache_roots_and_entries() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let t = tempfile::tempdir().unwrap();
+        let ar = zip_with_entries(t.path(), &[("secret.txt", b"top-secret")]);
+
+        // 1. Symlinked user cache root (with and without trailing slash) and symlinked ancestor are rejected.
+        let real_target = t.path().join("real-target");
+        fs::create_dir(&real_target).unwrap();
+        let sym_cache = t.path().join("sym-cache");
+        std::os::unix::fs::symlink(&real_target, &sym_cache).unwrap();
+        assert!(
+            resolve_cache_paths(Some(sym_cache.clone()), t.path(), create_fallback_cache_dir)
+                .is_err()
+        );
+        let sym_with_slash = PathBuf::from(format!("{}/", sym_cache.display()));
+        assert!(
+            resolve_cache_paths(Some(sym_with_slash), t.path(), create_fallback_cache_dir).is_err()
+        );
+        assert!(resolve_cache_paths(
+            Some(sym_cache.join("subcache")),
+            t.path(),
+            create_fallback_cache_dir
+        )
+        .is_err());
+        assert!(!real_target.join("subcache").exists());
+
+        // 2. World-writable user cache root is rejected.
+        let ww_cache = t.path().join("ww-cache");
+        fs::create_dir(&ww_cache).unwrap();
+        fs::set_permissions(&ww_cache, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(resolve_cache_paths(Some(ww_cache), t.path(), create_fallback_cache_dir).is_err());
+
+        // 3. Symlinked `archives-private` directory is rejected.
+        let cache_a = t.path().join("cache-a");
+        fs::create_dir_all(cache_a.join("gall")).unwrap();
+        std::os::unix::fs::symlink(
+            &real_target,
+            cache_a.join("gall").join(PRIVATE_CACHE_DIR_NAME),
+        )
+        .unwrap();
+        assert!(resolve_cache_paths(Some(cache_a), t.path(), create_fallback_cache_dir).is_err());
+
+        // 4. Group/world-readable `archives-private` directory is rejected.
+        let cache_b = t.path().join("cache-b");
+        let unsafe_base = cache_b.join("gall").join(PRIVATE_CACHE_DIR_NAME);
+        fs::create_dir_all(&unsafe_base).unwrap();
+        fs::set_permissions(&unsafe_base, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(resolve_cache_paths(Some(cache_b), t.path(), create_fallback_cache_dir).is_err());
+
+        // 5. Symlinked or world-writable non-sticky temp_dir is rejected on Unix fallback.
+        let sym_tmp = t.path().join("sym-tmp");
+        std::os::unix::fs::symlink(&real_target, &sym_tmp).unwrap();
+        let sym_tmp_slash = PathBuf::from(format!("{}/", sym_tmp.display()));
+        assert!(resolve_cache_paths(None, &sym_tmp_slash, create_fallback_cache_dir).is_err());
+        let non_sticky_tmp = t.path().join("non-sticky-tmp");
+        fs::create_dir(&non_sticky_tmp).unwrap();
+        fs::set_permissions(&non_sticky_tmp, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(resolve_cache_paths(None, &non_sticky_tmp, create_fallback_cache_dir).is_err());
+
+        // 6. Symlinked cached member inside an otherwise valid root is rejected on reuse.
+        let cache_c = t.path().join("cache-c");
+        let resolved =
+            resolve_cache_paths(Some(cache_c), t.path(), create_fallback_cache_dir).unwrap();
+        let cached = materialize_in(&[ar.join("secret.txt")], &resolved.base).unwrap()[0].clone();
+        let decoy = t.path().join("decoy.txt");
+        fs::write(&decoy, "0123456789").unwrap();
+        fs::remove_file(&cached).unwrap();
+        std::os::unix::fs::symlink(&decoy, &cached).unwrap();
+        assert!(materialize_in(&[ar.join("secret.txt")], &resolved.base).is_err());
+        assert_eq!(fs::read_to_string(&decoy).unwrap(), "0123456789");
+    }
+
+    #[test]
+    fn materialize_passes_ordinary_paths_through_without_touching_cache() {
+        let t = tempfile::tempdir().unwrap();
+        let plain = t.path().join("plain.txt");
+        fs::write(&plain, "ordinary").unwrap();
+        let missing_base = t.path().join("does-not-exist");
+        let got = materialize_in(std::slice::from_ref(&plain), &missing_base).unwrap();
+        assert_eq!(got, vec![plain]);
+        assert!(!missing_base.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_user_cache_dir_uses_private_random_fallback_and_reuses_entries() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let t = tempfile::tempdir().unwrap();
+        let shared_tmp = t.path().join("shared-tmp");
+        fs::create_dir(&shared_tmp).unwrap();
+        // Plant an untrusted entry at the old predictable shared-temp path.
+        let predictable = shared_tmp.join("gall-archives");
+        fs::write(&predictable, "attacker-owned").unwrap();
+
+        let ar = zip_with_entries(t.path(), &[("notes.txt", b"hello fallback")]);
+        let resolved = resolve_cache_paths(None, &shared_tmp, create_fallback_cache_dir).unwrap();
+        assert_ne!(resolved.base, predictable);
+        assert!(resolved.base.starts_with(&shared_tmp));
+        assert_eq!(
+            fs::symlink_metadata(&resolved.base)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert!(resolved.legacy.is_none());
+
+        let first = materialize_in(&[ar.join("notes.txt")], &resolved.base).unwrap();
+        assert_eq!(fs::read(&first[0]).unwrap(), b"hello fallback");
+        let second = materialize_in(&[ar.join("notes.txt")], &resolved.base).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(fs::read_to_string(&predictable).unwrap(), "attacker-owned");
+    }
+
+    #[test]
+    fn retire_legacy_cache_removes_buckets_and_preserves_user_data_and_links() {
+        let t = tempfile::tempdir().unwrap();
+        let legacy = t.path().join("archives");
+        fs::create_dir_all(&legacy).unwrap();
+
+        // Recognized legacy cache bucket.
+        let bucket = legacy.join("0123456789abcdef");
+        fs::create_dir_all(bucket.join("entries")).unwrap();
+        fs::write(bucket.join(".used"), b"").unwrap();
+        fs::write(bucket.join("entries/old.txt"), b"old cached data").unwrap();
+
+        // Non-cache user data inside legacy dir.
+        let user_file = legacy.join("my-notes.txt");
+        fs::write(&user_file, "keep me").unwrap();
+        let user_dir = legacy.join("user-folder");
+        fs::create_dir(&user_dir).unwrap();
+        fs::write(user_dir.join("keep.txt"), "still here").unwrap();
+
+        // Untrusted symlinks must never be followed or have their targets deleted.
+        let external = t.path().join("external-user-dir");
+        fs::create_dir(&external).unwrap();
+        fs::write(external.join("precious.txt"), "do not delete").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&external, legacy.join("fedcba9876543210")).unwrap();
+            let linked_bucket = legacy.join("1111222233334444");
+            fs::create_dir_all(linked_bucket.join("entries")).unwrap();
+            fs::write(linked_bucket.join(".used"), b"").unwrap();
+            std::os::unix::fs::symlink(&external, linked_bucket.join("entries/escape")).unwrap();
+        }
+
+        retire_legacy_cache(&legacy);
+
+        assert!(!bucket.exists(), "genuine legacy cache bucket is retired");
+        assert_eq!(fs::read_to_string(&user_file).unwrap(), "keep me");
+        assert_eq!(
+            fs::read_to_string(user_dir.join("keep.txt")).unwrap(),
+            "still here"
+        );
+        assert_eq!(
+            fs::read_to_string(external.join("precious.txt")).unwrap(),
+            "do not delete"
+        );
+
+        // A clean legacy cache containing only buckets is removed completely.
+        let clean_legacy = t.path().join("clean-archives");
+        let clean_bucket = clean_legacy.join("abcdef0123456789");
+        fs::create_dir_all(clean_bucket.join("entries")).unwrap();
+        fs::write(clean_bucket.join(".used"), b"").unwrap();
+        fs::write(clean_bucket.join("entries/a.txt"), b"a").unwrap();
+        retire_legacy_cache(&clean_legacy);
+        assert!(!clean_legacy.exists());
+
+        // A symlinked legacy root itself is never followed or deleted.
+        #[cfg(unix)]
+        {
+            let sym_legacy = t.path().join("sym-archives");
+            std::os::unix::fs::symlink(&external, &sym_legacy).unwrap();
+            retire_legacy_cache(&sym_legacy);
+            assert!(fs::symlink_metadata(&sym_legacy).is_ok());
+            assert_eq!(
+                fs::read_to_string(external.join("precious.txt")).unwrap(),
+                "do not delete"
+            );
         }
     }
 }

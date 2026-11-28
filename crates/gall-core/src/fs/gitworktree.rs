@@ -21,13 +21,14 @@ pub struct Change {
 pub struct Workspace {
     pub root: String,
     pub edit_stop: bool,
+    pub merging: bool,
     pub changes: Vec<Change>,
     pub token: String,
     pub head: String,
     pub subject: String,
     pub message: String,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum IndexAction {
     Stage,
@@ -56,8 +57,14 @@ fn protect_filtered_path(root: &Path, file: &str) -> Result<()> {
 }
 
 fn native_index_root(path: &Path) -> Result<PathBuf> {
+    index_root(path, false).map(|(root, _)| root)
+}
+
+fn index_root(path: &Path, allow_merge: bool) -> Result<(PathBuf, Option<Vec<u8>>)> {
+    use super::gitrepository::{marker_content, marker_exists};
     let p = root(path)?;
     let listed = super::gitfacts::markers(&p);
+    let mut merge_heads = None;
     for marker in [
         "MERGE_HEAD",
         "CHERRY_PICK_HEAD",
@@ -66,15 +73,16 @@ fn native_index_root(path: &Path) -> Result<PathBuf> {
         "rebase-apply",
         "BISECT_START",
     ] {
-        // One listing of the Git directory answers for all markers (see `gitfacts::Markers`).
-        let present = match &listed {
-            Some(listed) => listed.exists(marker),
-            None => {
-                let value = git(&p, &["rev-parse", "--git-path", marker])?;
-                p.join(super::gitexec::host_path(&p, value.trim())).exists()
+        if marker_exists(&p, listed.as_ref(), marker)? {
+            if marker == "MERGE_HEAD" && allow_merge {
+                merge_heads =
+                    Some(marker_content(&p, listed.as_ref(), marker)?.ok_or_else(|| {
+                        CoreError::Other(
+                            "The merge state changed. Refresh and review the changes again".into(),
+                        )
+                    })?);
+                continue;
             }
-        };
-        if present {
             if marker == "rebase-merge" && super::gitrewrite::is_edit_stop(&p) {
                 continue;
             }
@@ -83,7 +91,7 @@ fn native_index_root(path: &Path) -> Result<PathBuf> {
             ));
         }
     }
-    Ok(p)
+    Ok((p, merge_heads))
 }
 fn head(path: &Path) -> String {
     if let Some(id) = super::gitfacts::head_id(path) {
@@ -149,15 +157,13 @@ fn see(path: &Path) -> Result<Seen> {
     })
 }
 
-fn token(path: &Path) -> Result<String> {
-    token_of(path, &see(path)?)
-}
 /// The state `seen` and the content of every changed file as one value: equal tokens mean
 /// that nothing a commit, stage or discard depends on changed in between.
-fn token_of(path: &Path, seen: &Seen) -> Result<String> {
+fn token_of(path: &Path, seen: &Seen, merge_heads: Option<&[u8]>) -> Result<String> {
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     seen.head.hash(&mut hash);
     seen.index.hash(&mut hash);
+    merge_heads.hash(&mut hash);
     let list = &seen.changes;
     for change in list {
         change.path.hash(&mut hash);
@@ -248,13 +254,13 @@ fn content_digest(file: &Path) -> Result<u64> {
     Ok(hash.finish())
 }
 fn verify_token(path: &Path, expected: &str) -> Result<()> {
-    verified(path, expected).map(|_| ())
+    verified(path, expected, None).map(|_| ())
 }
 /// Checks the token and returns the state it was computed from, so the action that
 /// follows does not ask Git for HEAD and the changes a second time.
-fn verified(path: &Path, expected: &str) -> Result<Seen> {
+fn verified(path: &Path, expected: &str, merge_heads: Option<&[u8]>) -> Result<Seen> {
     let seen = see(path)?;
-    if token_of(path, &seen)? != expected {
+    if token_of(path, &seen, merge_heads)? != expected {
         return Err(CoreError::Other(
             "The index, HEAD or working files changed. Refresh and review the changes again".into(),
         ));
@@ -291,7 +297,7 @@ fn changes(path: &Path) -> Result<Vec<Change>> {
     Ok(out)
 }
 pub fn workspace(path: &Path) -> Result<Workspace> {
-    let root = native_index_root(path)?;
+    let (root, merge_heads) = index_root(path, true)?;
     super::gitfacts::keep_commit_graph(&root);
     std::thread::scope(|scope| {
         // Subject and full message in one query, next to the state.
@@ -303,7 +309,8 @@ pub fn workspace(path: &Path) -> Result<Workspace> {
         Ok(Workspace {
             root: root.to_string_lossy().into_owned(),
             edit_stop: super::gitrewrite::is_edit_stop(&root),
-            token: token_of(&root, &seen)?,
+            merging: merge_heads.is_some(),
+            token: token_of(&root, &seen, merge_heads.as_deref())?,
             head: seen.head,
             changes: seen.changes,
             subject: subject.trim_end().to_owned(),
@@ -323,30 +330,49 @@ pub fn index_action(
         let subject = message.trim().lines().next().unwrap_or_default();
         subject.chars().take(100).collect::<String>()
     };
-    let operation = match action {
-        IndexAction::Commit => Some((Kind::Commit, label())),
-        IndexAction::Amend => Some((Kind::Amend, label())),
-        _ => None,
+    let _busy = super::gitfacts::mutating();
+    let allow_merge = matches!(
+        action,
+        IndexAction::Stage
+            | IndexAction::Unstage
+            | IndexAction::StageAll
+            | IndexAction::UnstageAll
+            | IndexAction::Commit
+    );
+    let (root, merge_heads) = index_root(path, allow_merge)?;
+    let run = || {
+        index_action_now(
+            &root,
+            action,
+            file,
+            message,
+            expected,
+            merge_heads.as_deref(),
+        )
     };
-    super::gitjournal::around(path, operation, || {
-        index_action_now(path, action, file, message, expected)
-    })
+    match action {
+        IndexAction::Commit if merge_heads.is_some() => {
+            super::gitjournal::around_control(&root, run)
+        }
+        IndexAction::Commit => super::gitjournal::around(&root, Some((Kind::Commit, label())), run),
+        IndexAction::Amend => super::gitjournal::around(&root, Some((Kind::Amend, label())), run),
+        _ => run(),
+    }
 }
 
 fn index_action_now(
-    path: &Path,
+    root: &Path,
     action: IndexAction,
     file: Option<&str>,
     message: &str,
     expected: &str,
+    merge_heads: Option<&[u8]>,
 ) -> Result<()> {
-    let _busy = super::gitfacts::mutating();
-    let root = native_index_root(path)?;
     if let (IndexAction::Discard, Some(file)) = (&action, file) {
-        protect_filtered_path(&root, file)?;
+        protect_filtered_path(root, file)?;
     }
-    let seen = verified(&root, expected)?;
-    if matches!(action, IndexAction::Commit) && super::gitrewrite::is_edit_stop(&root) {
+    let seen = verified(root, expected, merge_heads)?;
+    if matches!(action, IndexAction::Commit) && super::gitrewrite::is_edit_stop(root) {
         return Err(CoreError::Other(
             "Use Amend at this interactive edit stop, then Continue the rebase".into(),
         ));
@@ -367,6 +393,7 @@ fn index_action_now(
             // Staged: the index column of the status says so (what
             // `diff --cached --name-only` lists).
             if matches!(action, IndexAction::Commit)
+                && merge_heads.is_none()
                 && !seen
                     .changes
                     .iter()
@@ -375,12 +402,12 @@ fn index_action_now(
                 return Err(CoreError::Other("Stage changes before committing".into()));
             }
             if matches!(action, IndexAction::Amend) {
-                let previous = head(&root);
+                let previous = head(root);
                 if previous.is_empty() {
                     return Err(CoreError::Other("There is no commit to amend".into()));
                 }
                 git(
-                    &root,
+                    root,
                     &[
                         "update-ref",
                         "--no-deref",
@@ -388,12 +415,21 @@ fn index_action_now(
                         &previous,
                     ],
                 )?;
-                git(&root, &["commit", "--amend", "-m", message])?;
-                super::gitgraph::drop_recovery(&root, &previous);
+                git(root, &["commit", "--amend", "-m", message])?;
+                super::gitgraph::drop_recovery(root, &previous);
             } else {
-                git(&root, &["commit", "-m", message])?;
+                // Quitting a merge can leave HEAD, the index and all working files unchanged.
+                let listed = super::gitfacts::markers(root);
+                let current =
+                    super::gitrepository::marker_content(root, listed.as_ref(), "MERGE_HEAD")?;
+                if current.as_deref() != merge_heads {
+                    return Err(CoreError::Other(
+                        "The merge state changed. Refresh and review the changes again".into(),
+                    ));
+                }
+                git(root, &["commit", "-m", message])?;
             }
-            super::gitgraph::retain_detached(&root).map_err(|e| {
+            super::gitgraph::retain_detached(root).map_err(|e| {
                 CoreError::Other(format!(
                     "Commit created, but its recovery reference could not be saved: {e}"
                 ))
@@ -403,7 +439,7 @@ fn index_action_now(
             super::gitprogress::report_phase("Staging changes", None);
             // Submodule pointers are not listed in the changes, so they are not staged blindly.
             let mut args = vec!["add".to_owned(), "--all".into(), "--".into(), ".".into()];
-            for line in git(&root, &["ls-files", "--stage", "-z"])?.split('\0') {
+            for line in git(root, &["ls-files", "--stage", "-z"])?.split('\0') {
                 if let Some((_, name)) = line
                     .strip_prefix("160000 ")
                     .and_then(|rest| rest.split_once('\t'))
@@ -412,18 +448,18 @@ fn index_action_now(
                 }
             }
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
-            git(&root, &args)?;
+            git(root, &args)?;
         }
         IndexAction::UnstageAll => {
             super::gitprogress::report_phase("Unstaging changes", None);
-            if head(&root).is_empty() {
-                git(&root, &["rm", "--cached", "-r", "--", "."])?;
+            if head(root).is_empty() {
+                git(root, &["rm", "--cached", "-r", "--", "."])?;
             } else {
-                git(&root, &["restore", "--staged", "--", "."])?;
+                git(root, &["restore", "--staged", "--", "."])?;
             }
         }
         IndexAction::Discard | IndexAction::Ignore | IndexAction::Exclude => {
-            let list = changes(&root)?;
+            let list = changes(root)?;
             let entry = list
                 .iter()
                 .find(|entry| Some(entry.path.as_str()) == file)
@@ -431,7 +467,7 @@ fn index_action_now(
                     CoreError::Other("This file is no longer in the change list".into())
                 })?;
             if matches!(action, IndexAction::Discard) {
-                discard(&root, entry, expected)?;
+                discard(root, entry, expected)?;
             } else {
                 if entry.index != '?' {
                     return Err(CoreError::Other(
@@ -439,7 +475,7 @@ fn index_action_now(
                             .into(),
                     ));
                 }
-                ignore(&root, &entry.path, matches!(action, IndexAction::Exclude))?;
+                ignore(root, &entry.path, matches!(action, IndexAction::Exclude))?;
             }
         }
         IndexAction::Stage | IndexAction::Unstage => {
@@ -465,7 +501,7 @@ fn index_action_now(
                 _ => vec!["restore", "--staged", "--"],
             };
             args.extend(paths.iter().map(String::as_str));
-            git(&root, &args)?;
+            git(root, &args)?;
         }
     }
     Ok(())
@@ -589,7 +625,7 @@ fn append_rule(target: &Path, rule: &str, same: &[String]) -> Result<()> {
         .map_err(|e| CoreError::Other(e.to_string()))
 }
 pub fn patch(path: &Path, file: &str, staged: bool) -> Result<String> {
-    let root = native_index_root(path)?;
+    let (root, _) = index_root(path, true)?;
     patch_of(&root, &changes(&root)?, file, staged)
 }
 /// The patch of `file`, one entry of the change `list` of the work tree `root`.
@@ -664,7 +700,9 @@ pub struct SelectionPatch {
     pub lines: Vec<PatchLine>,
 }
 fn patch_token(path: &Path, file: &str, staged: bool, text: &str) -> Result<String> {
-    Ok(patch_token_of(&token(path)?, file, staged, text))
+    let (_, merge_heads) = index_root(path, true)?;
+    let token = token_of(path, &see(path)?, merge_heads.as_deref())?;
+    Ok(patch_token_of(&token, file, staged, text))
 }
 fn patch_token_of(token: &str, file: &str, staged: bool, text: &str) -> String {
     let mut hash = std::collections::hash_map::DefaultHasher::new();
@@ -685,12 +723,12 @@ pub fn selection_patch(path: &Path, file: &str, staged: bool) -> Result<Selectio
     }
 }
 fn selection_patch_once(path: &Path, file: &str, staged: bool) -> Result<SelectionPatch> {
-    let root = native_index_root(path)?;
+    let (root, merge_heads) = index_root(path, true)?;
     // The patch must describe one state: the state is read, then the patch, then the
     // state again, and the two have to agree. Each state is read once (it used to be read
     // three times, and the list of changes five times).
     let seen = see(&root)?;
-    let before = token_of(&root, &seen)?;
+    let before = token_of(&root, &seen, merge_heads.as_deref())?;
     let on_disk = stamp(&root.join(file));
     let text = patch_of(&root, &seen.changes, file, staged)?;
     // What this patch is made of must not have moved while it was read: HEAD, the index
@@ -950,7 +988,7 @@ pub fn apply_selection(
     expected: &str,
 ) -> Result<()> {
     let _busy = super::gitfacts::mutating();
-    let root = native_index_root(path)?;
+    let (root, _) = index_root(path, true)?;
     let patch = selection_patch(&root, file, staged)?;
     if patch.token != expected {
         return Err(CoreError::Other(

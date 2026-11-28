@@ -209,6 +209,7 @@ pub enum ResolveSide {
 #[serde(rename_all = "camelCase")]
 pub enum MergeMode {
     NoFastForward,
+    NoCommit,
     FastForwardOnly,
     Squash,
 }
@@ -570,7 +571,7 @@ fn git_path(path: &Path, name: &str) -> Result<PathBuf> {
 
 /// Whether the operation marker `name` exists, from `listed` (one listing of the Git
 /// directory, see `gitfacts::Markers`) where there is one.
-fn marker_exists(
+pub(super) fn marker_exists(
     path: &Path,
     listed: Option<&super::gitfacts::Markers>,
     name: &str,
@@ -582,7 +583,7 @@ fn marker_exists(
 }
 
 /// The content of the operation marker `name`, if it exists (see [`marker_exists`]).
-fn marker_content(
+pub(super) fn marker_content(
     path: &Path,
     listed: Option<&super::gitfacts::Markers>,
     name: &str,
@@ -2461,13 +2462,14 @@ pub fn execute(path: &Path, request: Request, expected: &str) -> Result<String> 
 }
 
 fn execute_now(path: &Path, request: Request, expected: &str) -> Result<String> {
-    let merge_flag = match &request {
-        Request::MergeWithMode { mode, .. } => Some(match mode {
-            MergeMode::NoFastForward => "--no-ff",
-            MergeMode::FastForwardOnly => "--ff-only",
-            MergeMode::Squash => "--squash",
-        }),
-        _ => None,
+    let merge_flags: &[&str] = match &request {
+        Request::MergeWithMode { mode, .. } => match mode {
+            MergeMode::NoFastForward => &["--no-ff"],
+            MergeMode::NoCommit => &["--no-ff", "--no-commit"],
+            MergeMode::FastForwardOnly => &["--ff-only"],
+            MergeMode::Squash => &["--squash"],
+        },
+        _ => &[],
     };
     let _busy = super::gitfacts::mutating();
     let p = root(path)?;
@@ -2840,7 +2842,7 @@ fn execute_now(path: &Path, request: Request, expected: &str) -> Result<String> 
             if super::gitprogress::is_active() {
                 args.push("--progress");
             }
-            args.extend(merge_flag);
+            args.extend_from_slice(merge_flags);
             args.push(&target);
             git(&p, &args)
         }
@@ -3187,9 +3189,133 @@ mod tests {
     }
 
     #[test]
+    fn merge_without_committing_stages_changes_and_accepts_a_custom_commit() {
+        use super::super::gitworktree::{index_action, workspace, IndexAction};
+
+        let d = repository();
+        let p = d.path();
+        let base = commit(p, "base", "base\n");
+        git(p, &["switch", "-qc", "topic"]).unwrap();
+        let target = commit(p, "topic change", "topic\n");
+        git(p, &["switch", "-q", "main"]).unwrap();
+        let merge = || {
+            act(
+                p,
+                Request::MergeWithMode {
+                    target: target.clone(),
+                    mode: MergeMode::NoCommit,
+                },
+            )
+        };
+
+        merge().unwrap();
+        assert_eq!(head(p), base);
+        assert_eq!(snapshot(p).unwrap().operation.as_deref(), Some("merge"));
+        assert_eq!(git(p, &["rev-parse", "MERGE_HEAD"]).unwrap().trim(), target);
+        assert_eq!(git(p, &["show", ":file.txt"]).unwrap(), "topic\n");
+        assert_eq!(
+            std::fs::read_to_string(p.join("file.txt")).unwrap(),
+            "topic\n"
+        );
+        let prepared = workspace(p).unwrap();
+        assert!(prepared.merging);
+
+        // Quitting keeps HEAD and the index. An old merge token must still be refused.
+        git(p, &["merge", "--quit"]).unwrap();
+        assert!(
+            index_action(p, IndexAction::Commit, None, "Stale merge", &prepared.token).is_err()
+        );
+        assert_eq!(head(p), base);
+        git(p, &["reset", "--hard", "HEAD"]).unwrap();
+        merge().unwrap();
+        std::fs::write(p.join("extra.txt"), "extra\n").unwrap();
+        std::fs::write(p.join("unstaged.txt"), "leave out\n").unwrap();
+        let state = workspace(p).unwrap();
+        assert!(index_action(p, IndexAction::Amend, None, "Amend", &state.token).is_err());
+        index_action(p, IndexAction::Stage, Some("extra.txt"), "", &state.token).unwrap();
+        let state = workspace(p).unwrap();
+        index_action(
+            p,
+            IndexAction::Commit,
+            None,
+            "Custom merge\n\nExtra context",
+            &state.token,
+        )
+        .unwrap();
+
+        assert_eq!(snapshot(p).unwrap().operation, None);
+        assert_eq!(
+            git(p, &["show", "-s", "--format=%P", "HEAD"])
+                .unwrap()
+                .trim(),
+            format!("{base} {target}")
+        );
+        assert_eq!(
+            git(p, &["show", "-s", "--format=%B", "HEAD"])
+                .unwrap()
+                .trim(),
+            "Custom merge\n\nExtra context"
+        );
+        assert_eq!(git(p, &["show", "HEAD:extra.txt"]).unwrap(), "extra\n");
+        assert!(git(p, &["show", "HEAD:unstaged.txt"]).is_err());
+        assert_eq!(
+            std::fs::read_to_string(p.join("unstaged.txt")).unwrap(),
+            "leave out\n"
+        );
+        let journal = super::super::gitjournal::view(p).unwrap();
+        assert!(matches!(
+            journal.entries.last().unwrap().kind,
+            super::super::gitjournal::Kind::Merge
+        ));
+    }
+
+    #[test]
+    fn merge_without_committing_allows_a_custom_commit_for_an_identical_tree() {
+        use super::super::gitworktree::{index_action, workspace, IndexAction};
+
+        let d = repository();
+        let p = d.path();
+        commit(p, "base", "same\n");
+        git(p, &["switch", "-qc", "topic"]).unwrap();
+        git(p, &["commit", "--allow-empty", "-m", "topic"]).unwrap();
+        let target = head(p);
+        git(p, &["switch", "-q", "main"]).unwrap();
+        act(
+            p,
+            Request::MergeWithMode {
+                target: target.clone(),
+                mode: MergeMode::NoCommit,
+            },
+        )
+        .unwrap();
+        let state = workspace(p).unwrap();
+        assert!(state.merging);
+        assert!(state.changes.is_empty());
+        index_action(
+            p,
+            IndexAction::Commit,
+            None,
+            "Merge identical tree",
+            &state.token,
+        )
+        .unwrap();
+        assert_eq!(git(p, &["rev-parse", "HEAD^2"]).unwrap().trim(), target);
+        act(
+            p,
+            Request::MergeWithMode {
+                target,
+                mode: MergeMode::NoCommit,
+            },
+        )
+        .unwrap();
+        assert!(!workspace(p).unwrap().merging);
+    }
+
+    #[test]
     fn explicit_merge_modes_keep_git_ancestry_and_index_semantics() {
         for mode in [
             MergeMode::NoFastForward,
+            MergeMode::NoCommit,
             MergeMode::FastForwardOnly,
             MergeMode::Squash,
         ] {
@@ -3226,10 +3352,13 @@ mod tests {
                         format!("{base} {target}")
                     );
                 }
-                MergeMode::Squash => {
+                MergeMode::Squash | MergeMode::NoCommit => {
                     assert_eq!(head(p), base);
                     assert_eq!(git(p, &["show", ":file.txt"]).unwrap(), "topic\n");
-                    assert!(!p.join(".git/MERGE_HEAD").exists());
+                    assert_eq!(
+                        p.join(".git/MERGE_HEAD").exists(),
+                        matches!(mode, MergeMode::NoCommit)
+                    );
                 }
             }
         }

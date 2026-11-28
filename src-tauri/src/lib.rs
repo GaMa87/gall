@@ -864,6 +864,9 @@ pub fn run() {
             // Build the Quick Open index shortly after start (unless set to 0 = "only on demand"),
             // then keep it fresh at the configured interval.
             let h4 = handle.clone();
+            if let Some(cache) = commands::index_cache_path() {
+                handle.state::<state::AppState>().index.load_cache(&cache);
+            }
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_secs(2));
                 loop {

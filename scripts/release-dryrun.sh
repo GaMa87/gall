@@ -6,8 +6,8 @@
 #   scripts/release-dryrun.sh --quick    # lint workflow + key checks only (seconds)
 #
 # It takes the real steps out of .github/workflows/release.yml (so the two cannot drift),
-# runs them in an ubuntu:22.04 container like the CI runner, with a throwaway signing key,
-# and checks the packages. It cannot build Windows or macOS: for those, run the Release
+# runs them in a debian:trixie container like the Linux release CI job, with a throwaway
+# signing key, verifies the bundled WebKitGTK security baseline, and checks the packages. It cannot build Windows or macOS: for those, run the Release
 # workflow on GitHub with "dry_run" ticked (see the header of release.yml).
 #
 # --quick needs no container engine: it lints with a native `actionlint` when there is one (else
@@ -112,7 +112,7 @@ echo "ok"
 
 if (( quick )); then echo; echo "Quick checks passed (no build was run)."; exit 0; fi
 
-step "Linux build in ubuntu:22.04 ($engine)"
+step "Linux build in debian:trixie ($engine)"
 src="$work/src"; mkdir -p "$src"
 tar --exclude=./target --exclude=./node_modules --exclude=./ui/node_modules --exclude=./ui/dist \
     --exclude=./.git --exclude=./.worktrees --exclude=./.claude -cf - . | tar -xf - -C "$src"
@@ -122,17 +122,14 @@ set -euo pipefail
 # Ensure host cleanup of /work succeeds when running under a root Docker daemon.
 trap 'rm -rf /work/src/node_modules /work/src/ui/node_modules /work/src/ui/dist /work/src/dist /work/keys /work/.updater-release.json /work/out.txt 2>/dev/null || true' EXIT
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq curl ca-certificates git build-essential file xz-utils sudo rpm >/dev/null
+export PATH=/root/.cargo/bin:$PATH
+bash -e -o pipefail /work/steps/deps.sh >/dev/null
 curl -fsSL https://deb.nodesource.com/setup_22.x | bash - >/dev/null
 apt-get install -y -qq nodejs >/dev/null
-bash -e /work/steps/deps.sh >/dev/null
-if [[ ! -x /root/.cargo/bin/rustup ]]; then
-  curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal >/dev/null
-fi
-export PATH=/root/.cargo/bin:$PATH
-rustup update stable --no-self-update >/dev/null 2>&1 || true
+rustup toolchain install stable --profile minimal >/dev/null
+rustup default stable >/dev/null
 cd /work/src
+./scripts/verify-appimage-webkitgtk.sh --check-host
 npm ci --no-audit --no-fund >/dev/null && npm ci --prefix ui --no-audit --no-fund >/dev/null
 # Throwaway signing key, no password: the real one never enters the container.
 npm run --silent tauri -- signer generate -w /work/keys/dry.key -p "" -f --ci >/dev/null
@@ -140,6 +137,7 @@ export GALL_UPDATER_PUBLIC_KEY="$(cat /work/keys/dry.key.pub)"
 export TAURI_SIGNING_PRIVATE_KEY="$(cat /work/keys/dry.key)"
 export TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""
 export WORKSPACE=/work/src GITHUB_OUTPUT=/work/out.txt
+export APPIMAGE_EXTRACT_AND_RUN=1 NO_STRIP=true
 : > "$GITHUB_OUTPUT"
 bash -e -o pipefail /work/steps/prepare.sh
 config=$(sed -n 's/^config=//p' "$GITHUB_OUTPUT")
@@ -154,6 +152,7 @@ b=target/release/bundle
 shopt -s nullglob
 deb=($b/deb/*.deb); rpm=($b/rpm/*.rpm); img=($b/appimage/*.AppImage); upd=(dist/*_linux_x86_64_update.tar.gz)
 [[ ${#deb[@]} -eq 1 && ${#rpm[@]} -eq 1 && ${#img[@]} -eq 1 && ${#upd[@]} -eq 1 ]] || { echo "missing deb, rpm, AppImage, or update archive"; exit 1; }
+./scripts/verify-appimage-webkitgtk.sh --check-appimage "${img[0]}"
 for f in "${img[0]}" "${upd[0]}"; do
   [[ -s "$f.sig" ]] || { echo "missing signature for $f"; exit 1; }
 done
@@ -172,6 +171,6 @@ INSIDE
   -v "$work":/work \
   -v gall-dryrun-cargo:/root/.cargo -v gall-dryrun-rustup:/root/.rustup \
   -v gall-dryrun-npm:/root/.npm -v gall-dryrun-target:/work/src/target \
-  docker.io/library/ubuntu:22.04 bash /work/inside.sh || fail "the Linux build failed (see above)"
+  docker.io/library/debian:trixie bash /work/inside.sh || fail "the Linux build failed (see above)"
 
 echo; echo "Dry run passed. Windows and macOS still need the GitHub dry run (Actions > Release)."

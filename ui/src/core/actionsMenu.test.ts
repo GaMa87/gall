@@ -6,7 +6,19 @@ const def = (o: Partial<ActionDef>): ActionDef => ({ id: "x", label: "Send", ...
 
 describe("validateServerUri", () => {
   it("accepts the supported schemes", () => {
-    for (const s of ["smb://nas/share", "sftp://me@host/home", "nfs://10.0.0.2/export", "davs://cloud/remote.php/dav", "ftp://host"]) {
+    for (const s of [
+      "smb://nas/share",
+      "sftp://me@host/home",
+      "ssh://me@host/home",
+      "nfs://192.168.0.101",
+      "nfs://10.0.0.2/export",
+      "dav://cloud/dav",
+      "davs://cloud/remote.php/dav",
+      "webdav://cloud/dav",
+      "webdavs://cloud/remote.php/dav",
+      "ftp://host",
+      "ftps://host",
+    ]) {
       expect(validateServerUri(`  ${s} `)).toEqual({ ok: true, uri: s });
     }
     expect(validateServerUri("SMB://Nas/Share")).toEqual({ ok: true, uri: "smb://Nas/Share" });

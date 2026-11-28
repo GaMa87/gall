@@ -188,7 +188,7 @@ Download packages for Linux, Windows, and macOS from **[GitHub Releases](https:/
 
 - **Portable (Windows):** Unzip `Gall-<version>-windows-x64-portable.zip` anywhere and run `gall.exe`; settings stay in `%APPDATA%\gall` and signed updates replace the binary in place inside writable folders. For a USB stick, create an empty file named `portable` next to `gall.exe` to store everything in `./UserData` beside it. Build it yourself with `./scripts/portable.ps1` (Windows) or `./scripts/portable.sh` (Linux with [cargo-xwin](https://github.com/rust-cross/cargo-xwin)).
 - **Default file manager (Linux):** `.deb` and `.rpm` packages register Gall as a file manager (and Gall's Welcome wizard / *Settings › Open with* can set it as default on Linux, Windows, and macOS). On KDE Plasma, choosing Gall in *Default Applications › File manager* also binds `Meta+E`.
-- **Video preview (Linux):** Uses the webview's system GStreamer codecs (Fedora: `gstreamer1-plugins-good`, `gstreamer1-libav`; Debian/Ubuntu: `gstreamer1.0-plugins-good`, `gstreamer1.0-libav`).
+- **Video preview (Linux):** Uses the webview's system GStreamer codecs (Fedora: `gstreamer1-plugins-good`, `gstreamer1-libav`; Debian/Ubuntu: `gstreamer1.0-plugins-good`, `gstreamer1.0-libav`). Large media stays in a poster and metadata standby until you play it, so browsing never copies whole files into a temporary cache; with FFmpeg installed, playback streams directly and also covers codecs the webview lacks. Without FFmpeg, files over 128 MiB ask before playback.
 
 </details>
 
@@ -355,6 +355,8 @@ Everything works via buttons and context menus; with Vim keys enabled, contextua
 <summary><b>Branches, stashes, remotes, conflicts &amp; conflict forecast</b></summary>
 
 - Create/rename/delete merged branches, set upstreams, create lightweight or annotated tags, and run merge, rebase, cherry-pick, revert, or soft/mixed/hard reset. History rewrites retain the prior `HEAD` under `refs/gall/recovery/` until completion; hard reset refuses untracked/ignored files.
+- When creating a tag, select **Push tag to origin immediately** to publish it as soon as it is created. If the push fails, the local tag is available to retry from the Tags panel.
+- **Merge without committing** stages the merge and opens Working Changes when the merge is clean. To finish, stage any additional changes, enter your message, and choose **Commit merge**. For a conflicted merge, resolve the conflicts first and then open Working Changes.
 - **Conflicts:** In-progress operations show **Continue**, **Skip** (unavailable for merge), and **Abort**. Pick Ours, Theirs, or Both with a live Result preview, or **Edit** manually before marking resolved.
 - **Conflict forecast:** The branch list flags branches that would conflict if merged into the current branch without merging anything (requires Git 2.38+, configurable branch cap default 50).
 - **Remotes &amp; stashes:** Add/rename/edit/remove remotes; **Pull** fast-forwards only; **Push** sets upstream; **Force push with explicit lease…** requires reviewing the remote commit lease. Stash stack (`z`) supports search (`/`), diff preview, partial stash (`S`), branch creation (`n`), apply (`Space`), pop (`g`), and drop (`d`, with recovery ref).

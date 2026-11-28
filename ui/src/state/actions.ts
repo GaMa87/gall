@@ -2602,12 +2602,14 @@ export async function connectToServer(initial = "") {
     if (!v.ok) { notify(v.error, "warn"); continue; }
     notify(tt("Connecting to {uri}…", { uri: v.uri }));
     try {
-      await api.connectServer(v.uri);
+      const mountPath = await api.connectServer(v.uri);
       notify(tt("Connected to {uri}", { uri: v.uri }), "success");
+      await refreshNetwork();
+      if (mountPath) navigate(activeBrowser(), mountPath);
     } catch (e) {
       fail(e);
+      void refreshNetwork();
     }
-    void refreshNetwork();
     return;
   }
 }

@@ -15,16 +15,94 @@ export function slugify(text: string): string {
 }
 
 /** Files that run code when opened with the system default: a link to one in a Markdown
- *  file (a downloaded README) asks before it is opened. */
+ *  file (a downloaded README) shows a stronger warning before it is opened. */
 const RUNNABLE = new Set([
   "exe", "com", "bat", "cmd", "ps1", "psm1", "vbs", "vbe", "js", "jse", "wsf", "wsh", "msi", "msp", "scr", "pif",
   "cpl", "hta", "jar", "lnk", "reg", "sh", "bash", "zsh", "fish", "csh", "run", "bin", "desktop", "appimage", "command",
   "app", "py", "pyw", "pl", "rb", "php", "action", "workflow",
 ]);
 export function isRunnable(path: string): boolean {
-  const name = path.split(/[\\/]/).pop() ?? "";
+  // Windows ShellExecute strips trailing dots and spaces before resolving the extension.
+  const name = (path.split(/[\\/]/).pop() ?? "").replace(/[. ]+$/, "");
   const dot = name.lastIndexOf(".");
   return dot > 0 && RUNNABLE.has(name.slice(dot + 1).toLowerCase());
+}
+
+/**
+ * Tags stripped from rendered Markdown HTML. Embedded media tags are forbidden
+ * because the preview CSP grants `media-src` loopback access (`http://127.0.0.1:*`)
+ * for Gall's own media player, so untrusted Markdown must not instantiate media elements.
+ * Image maps (`map`, `area`) are also forbidden so links stay on ordinary `<a>` elements.
+ */
+export const MARKDOWN_FORBID_TAGS = [
+  "style", "form", "input", "button", "textarea", "select",
+  "audio", "video", "source", "track", "map", "area",
+] as const;
+
+/** Sanitizer options used for Markdown HTML: HTML profile only (no SVG/MathML links), no embedded media or forms. */
+export const MARKDOWN_SANITIZE_OPTIONS = {
+  USE_PROFILES: { html: true },
+  FORBID_TAGS: [...MARKDOWN_FORBID_TAGS],
+  FORBID_ATTR: ["xlink:href", "usemap"],
+} as const;
+
+export type MarkdownLinkAction =
+  | { kind: "anchor"; id: string }
+  | { kind: "external"; url: string }
+  | { kind: "local"; path: string; runnable: boolean }
+  | { kind: "ignore" };
+
+/** Classifies a clicked Markdown `href` into an anchor jump, supported web link, local target, or no-op. */
+export function classifyMarkdownLink(baseDir: string, href: string): MarkdownLinkAction {
+  const trimmed = href.trim();
+  if (!trimmed) return { kind: "ignore" };
+  if (trimmed.startsWith("#")) {
+    const raw = trimmed.slice(1);
+    let id = raw;
+    try { id = decodeURIComponent(raw); } catch { /* keep as written */ }
+    return { kind: "anchor", id };
+  }
+  if (/^(https?|mailto):/i.test(trimmed)) {
+    return { kind: "external", url: trimmed };
+  }
+  const local = resolveRel(baseDir, trimmed);
+  if (!local) return { kind: "ignore" };
+  return { kind: "local", path: local, runnable: isRunnable(local) };
+}
+
+export interface MarkdownLinkHandlers {
+  scrollToAnchor: (id: string) => void;
+  openExternal: (url: string) => void | Promise<void>;
+  confirmLocal: (path: string, runnable: boolean) => Promise<boolean>;
+  openLocal: (path: string) => void | Promise<void>;
+}
+
+/**
+ * Executes a Markdown link click. Every local target requires explicit confirmation
+ * before calling the native opener, because native launchers (such as Linux MIME sniffing)
+ * can execute extensionless or non-runnable-suffix files based on content.
+ */
+export async function activateMarkdownLink(
+  baseDir: string,
+  href: string,
+  handlers: MarkdownLinkHandlers,
+): Promise<MarkdownLinkAction["kind"]> {
+  const action = classifyMarkdownLink(baseDir, href);
+  switch (action.kind) {
+    case "anchor":
+      handlers.scrollToAnchor(action.id);
+      return "anchor";
+    case "external":
+      await handlers.openExternal(action.url);
+      return "external";
+    case "local": {
+      if (!(await handlers.confirmLocal(action.path, action.runnable))) return "local";
+      await handlers.openLocal(action.path);
+      return "local";
+    }
+    case "ignore":
+      return "ignore";
+  }
 }
 
 /** Resolves a relative link or image (`./img/a.png`, `../b.md`) against the file's folder; null for URLs and anchors. */
@@ -48,7 +126,12 @@ export function resolveRel(baseDir: string, href: string): string | null {
  */
 export async function renderMarkdown(text: string, path: string, fileUrl: (p: string) => string): Promise<DocumentFragment> {
   const [md, { default: DOMPurify }] = await Promise.all([markdownIt(), import("dompurify")]);
-  const frag = DOMPurify.sanitize(md.render(text), { RETURN_DOM_FRAGMENT: true, FORBID_TAGS: ["style", "form", "input", "button", "textarea", "select"] });
+  const frag = DOMPurify.sanitize(md.render(text), {
+    ...MARKDOWN_SANITIZE_OPTIONS,
+    FORBID_TAGS: [...MARKDOWN_SANITIZE_OPTIONS.FORBID_TAGS],
+    FORBID_ATTR: [...MARKDOWN_SANITIZE_OPTIONS.FORBID_ATTR],
+    RETURN_DOM_FRAGMENT: true,
+  });
   const baseDir = parent(path) ?? path;
 
   const seen = new Map<string, number>();

@@ -39,7 +39,11 @@ depends=('cairo'
          'hicolor-icon-theme'
          'libsoup3'
          'webkit2gtk-4.1')
-optdepends=('gst-plugins-good: video and audio preview'
+optdepends=('gvfs-mtp: phones and cameras (MTP) in the sidebar'
+            'gvfs-smb: Windows network shares'
+            'gvfs-nfs: NFS shares'
+            'kio-fuse: KDE/Dolphin network shares (SMB, NFS, SFTP)'
+            'gst-plugins-good: video and audio preview'
             'gst-libav: more video formats in the preview'
             'git: Git status in the file list'
             'ttf-nerd-fonts-symbols: Nerd Font file icons')

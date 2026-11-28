@@ -5,8 +5,18 @@ import { keyActions, type Keyed } from "./actionsKeys";
 import { basename, isInside } from "./path";
 import { getState, setState, type MenuItem } from "../state/store";
 
-/** URI schemes "Connect to server…" accepts. */
+/** Primary URI schemes shown in "Connect to server…" hints. */
 export const SERVER_SCHEMES = ["smb", "sftp", "nfs", "davs", "ftp"] as const;
+const ACCEPTED_SERVER_SCHEMES = new Set<string>([
+  ...SERVER_SCHEMES,
+  "ssh",
+  "dav",
+  "webdav",
+  "webdavs",
+  "ftps",
+  "ftpes",
+  "afp",
+]);
 
 /** Checks a typed server address; the error text is shown to the user. */
 export function validateServerUri(input: string): { ok: true; uri: string } | { ok: false; error: string } {
@@ -15,7 +25,7 @@ export function validateServerUri(input: string): { ok: true; uri: string } | { 
   const m = /^([a-z][a-z0-9+.-]*):\/\/(.*)$/i.exec(uri);
   if (!m) return { ok: false, error: `Start the address with a scheme: ${SERVER_SCHEMES.map((s) => `${s}://`).join(", ")}` };
   const scheme = m[1].toLowerCase();
-  if (!(SERVER_SCHEMES as readonly string[]).includes(scheme)) return { ok: false, error: `“${scheme}://” is not supported. Use ${SERVER_SCHEMES.map((s) => `${s}://`).join(", ")}` };
+  if (!ACCEPTED_SERVER_SCHEMES.has(scheme)) return { ok: false, error: `“${scheme}://” is not supported. Use ${SERVER_SCHEMES.map((s) => `${s}://`).join(", ")}` };
   if (!m[2].trim() || m[2].startsWith("/")) return { ok: false, error: "The address needs a server name after the scheme" };
   if (/[\0\s]/.test(uri)) return { ok: false, error: "The address must not contain spaces" };
   return { ok: true, uri: `${scheme}://${m[2]}` };

@@ -239,6 +239,9 @@ pub struct PreviewInfo {
     /// For an item inside an archive: its extracted copy, which the webview loads
     /// (images, video, PDF) instead of the virtual path.
     pub local_path: Option<String>,
+    /// Linux: GStreamer lacks the demuxer/sink plugins for this media file and FFmpeg is
+    /// available, so the UI should open the FFmpeg fallback player immediately.
+    pub use_ffmpeg: bool,
 }
 
 /// Items inside archives larger than this are not extracted just to preview them.
@@ -354,6 +357,9 @@ pub fn preview_info(path: &Path, text_limit: usize) -> Result<PreviewInfo> {
                 info.width = Some(dim.width);
                 info.height = Some(dim.height);
             }
+        }
+        PreviewKind::Video | PreviewKind::Audio => {
+            info.use_ffmpeg = video::should_prefer_ffmpeg(&entry.ext, entry.size);
         }
         PreviewKind::Text | PreviewKind::Note => {
             let (t, trunc, bin) = read_text(path, text_limit)?;

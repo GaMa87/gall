@@ -364,7 +364,7 @@ export const api = {
   defaultFileManagerRestore: () => invoke<T.DefaultFileManagerStatus>("default_file_manager_restore"),
   omarchyStateGet: () => invoke<T.OmarchyState>("omarchy_state_get"),
   gvfsNetworkMounts: () => invoke<T.NetworkMount[]>("gvfs_network_mounts"),
-  connectServer: (uri: string) => invoke<void>("connect_server", { uri }),
+  connectServer: (uri: string) => invoke<string | null>("connect_server", { uri }),
   gvfsUnmount: (target: string) => invoke<void>("gvfs_unmount", { target }),
   actionsList: () => invoke<T.ActionDef[]>("actions_list"),
   actionsForSelection: (targets: T.ActionTarget[]) => invoke<T.ActionDef[]>("actions_for_selection", { targets }),
@@ -475,6 +475,7 @@ export const fileSrc = (path: string) => convertFileSrc(path);
 /** URL prefix of the backend's local media server (Linux), set from `AppInfo` at startup. */
 let mediaBase: string | null = null;
 export const setMediaBase = (base: string | null | undefined) => { mediaBase = base ?? null; };
+export const getMediaBase = (): string | null => mediaBase;
 
 /** Source for `<video>`/`<audio>`. WebKitGTK cannot play media from the asset protocol, so on
  *  Linux it comes from the loopback media server; elsewhere it is the asset URL. */

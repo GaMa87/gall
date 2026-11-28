@@ -1051,6 +1051,16 @@ fn views<'a>(place: &'a Place, head: &'a str, in_head: &'a str, base: &'a str) -
             Box::new(move || in_worktree(place, |target| gitrepository::Request::Merge { target })),
         ),
         (
+            "prepare a merge without committing",
+            n(6, 12, 1),
+            Box::new(move || {
+                in_worktree(place, |target| gitrepository::Request::MergeWithMode {
+                    target,
+                    mode: gitrepository::MergeMode::NoCommit,
+                })
+            }),
+        ),
+        (
             "rebase 3 commits onto a branch",
             n(9, 15, 1),
             Box::new(move || {

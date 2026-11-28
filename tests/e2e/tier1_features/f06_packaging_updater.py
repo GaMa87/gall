@@ -21,6 +21,8 @@ from harness import (
     assert_xml_valid,
 )
 
+from harness.assertions import system_prefix_binary_args
+
 from . import (
     parse_selftest_failures,
     read_gall_log,
@@ -283,6 +285,7 @@ def _t1_f6_05_store_managed_updater(ctx: RunContext) -> E2EResult:
                         "GALL_SELFTEST_CAPTURE": "webview",
                     }
                 )
+                bin_args, bin_target = system_prefix_binary_args(ctx.binary_path)
                 bwrap_cmd = [
                     "bwrap",
                     "--ro-bind", "/", "/",
@@ -292,7 +295,8 @@ def _t1_f6_05_store_managed_updater(ctx: RunContext) -> E2EResult:
                     "--overlay-src", "/usr/share", "--tmp-overlay", "/usr/share",
                     "--dir", "/usr/share/gall",
                     "--ro-bind", str(marker), "/usr/share/gall/package-managed",
-                    str(ctx.binary_path),
+                    *bin_args,
+                    bin_target,
                     str(sb.work),
                 ]
                 res = sb.run_in_dbus(bwrap_cmd, env_overrides=env_ov, timeout=45.0)

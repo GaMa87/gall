@@ -23,6 +23,16 @@ _FORBIDDEN_SUBSTRINGS: tuple[str, ...] = (
 )
 
 
+def system_prefix_binary_args(binary: "Path | str") -> tuple[list[str], str]:
+    """bwrap arguments that show `binary` under /opt, plus the path to run.
+
+    The updater honours the package-managed marker only for a binary in a system folder, which a
+    debug build in a worktree is not.
+    """
+    target = "/opt/gall-e2e/gall"
+    return ["--tmpfs", "/opt", "--dir", "/opt/gall-e2e", "--ro-bind", str(binary), target], target
+
+
 def read_mock_calls(sb: "SandboxEnv", cmd: str | None = None) -> list[dict[str, Any]]:
     if not sb.mock_log.exists():
         return []

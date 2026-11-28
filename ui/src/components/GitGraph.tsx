@@ -269,7 +269,17 @@ export function GitGraph({ path: initialPath, compareFile, focusFile = compareFi
     } catch (e) { actions.setError(String(e)); await reload(); }
     finally { setSwitchProgressTask(null); setSwitchBusy(false); }
   };
-  const actions = useGitRepositoryActions(path, repository, reload, checkout, (head) => { setTarget({ kind: "commit", id: head }); setInspected(head); setRangeBase(null); setShowChanges(false); });
+  const selectWorkingChanges = () => {
+    setTarget({ kind: "working" }); setInspected(null); setShowAdvanced(false); setShowRebase(false); setContext("files");
+  };
+  const openWorkingChanges = () => { selectWorkingChanges(); setShowChanges(true); };
+  const actions = useGitRepositoryActions(path, repository, reload, checkout, (head, mergePrepared) => {
+    setRangeBase(null);
+    if (mergePrepared) openWorkingChanges();
+    else {
+      setShowChanges(false); setTarget({ kind: "commit", id: head }); setInspected(head);
+    }
+  }, () => setRemoteTagRefresh((value) => value + 1));
   const busy = childBusy || switchBusy || actions.busy;
   /** Parts of the window that hold unsaved work (see `markDirty`); closing asks only while this is not empty. */
   const dirty = useRef(new Set<string>());
@@ -327,14 +337,16 @@ export function GitGraph({ path: initialPath, compareFile, focusFile = compareFi
     try {
       await invoke<string>("git_repository_action", { path, request: { action: "resolveContent", file: target.file, content }, expected: repository?.token ?? null });
       A.notify(tt("Resolved {file}", { file: target.file })); await reload();
-      // The next conflicted file opens by itself; after the last one the Continue button of the operation bar has focus, so
-      // Enter is the one key that goes on (the operation bar enables it once no conflict is left).
+      // Open the next conflict or focus the next step in the operation bar.
       const fresh = await invoke<Repository>("git_repository", { path });
       const next = fresh.conflicts.find((file) => file !== target.file);
       if (next) { setTarget({ kind: "conflict", file: next }); setContext("conflicts"); }
       else if (fresh.operation) {
-        A.notify(tt("All conflicts are resolved. Press Enter to continue the {operation}.", { operation: fresh.operation }));
-        later(() => root.current?.querySelector<HTMLButtonElement>(".gg-operation button:not([disabled])")?.focus(), 120);
+        A.notify(fresh.operation === "merge"
+          ? tt("All conflicts are resolved. Press Enter to review the merge in Working Changes.")
+          : tt("All conflicts are resolved. Press Enter to continue the {operation}.", { operation: fresh.operation }));
+        const nextControl = fresh.operation === "merge" ? ".gg-merge-changes" : ".gg-operation button:not([disabled])";
+        later(() => root.current?.querySelector<HTMLButtonElement>(nextControl)?.focus(), 120);
       }
     } catch (e) { actions.setError(String(e)); await reload().catch(() => {}); }
     finally { setSwitchBusy(false); }
@@ -586,7 +598,8 @@ export function GitGraph({ path: initialPath, compareFile, focusFile = compareFi
     const at = sideTabs.indexOf(sidebar), next = sideTabs[(Math.max(0, at) + step + sideTabs.length) % sideTabs.length];
     setSidebar(next); setContext(next); later(focusSidebar, 40);
   };
-  const working = () => { setTarget({ kind: "working" }); setInspected(null); setShowAdvanced(false); setShowRebase(false); setShowChanges((value) => !value); setContext("files"); };
+  const workingDuringOperation = repository?.editStop || (repository?.operation === "merge" && !repository.conflicts.length);
+  const working = () => { selectWorkingChanges(); setShowChanges((value) => !value); };
   const canRun = (action: string, selection = target) => gitActionEnabled(action, {
     commit: !!targetCommit(selection), head: !!repository?.head,
     referenceKind: selection?.kind === "reference" ? selection.ref.kind : undefined,
@@ -1045,7 +1058,7 @@ export function GitGraph({ path: initialPath, compareFile, focusFile = compareFi
       if (action === "refresh" || action === "fetch") setRemoteTagRefresh((value) => value + 1);
     });
   };
-  const operationMenu = (selection = target): MenuItem[] => repository?.operation ? ["continue", "skip", "abort"].map((action) => ({ label: `${action[0].toUpperCase() + action.slice(1)} ${repository.operation}…`, danger: action !== "continue", disabled: busy || !canRun(action, selection), run: () => run(action, selection) })) : [];
+  const operationMenu = (selection = target): MenuItem[] => repository?.operation ? ["continue", "skip", "abort"].map((action) => ({ label: action === "continue" && repository.operation === "merge" ? tt("Commit merge with Git’s message") : `${action[0].toUpperCase() + action.slice(1)} ${repository.operation}…`, danger: action !== "continue", disabled: busy || !canRun(action, selection), run: () => run(action, selection) })) : [];
   /** Repository-wide actions (the toolbar Actions button); the object menus never repeat them. */
   const repositoryActions = ["showStashes", "reflog", "palette", "undo", "redo", "journal", "fetch", "pull", "push", "forcePush", "refresh", "search", "operation", "tools"];
   const openRepositoryMenu = () => {
@@ -1319,7 +1332,9 @@ export function GitGraph({ path: initialPath, compareFile, focusFile = compareFi
         {!compareFile && <button className="gg-advanced-button" title={tt("Worktrees, bisect, patches, notes and more")} disabled={busy} onClick={() => { setAdvancedTab(undefined); setShowAdvanced((value) => !value); setShowRebase(false); setInspected(null); setShowChanges(false); }}>{tt("Tools")}<GitKeyCap scope="history" k="x" /></button>}
       </div>
       {(error || actions.error) && <div className={`gg-error ${openError === (error || actions.error) ? "open" : ""}`}><p role="alert">{error || actions.error}</p><button aria-expanded={openError === (error || actions.error)} title={tt("Show the whole message")} aria-label={tt("Show the whole message")} onClick={() => setOpenError((shown) => shown === (error || actions.error) ? "" : error || actions.error)}>{openError === (error || actions.error) ? "▴" : "▾"}</button></div>}
-      {repository?.operation && !compareFile && <div className="gg-operation"><strong>{repository.operation} {tt("in progress")}</strong>{repository.operationCommit && <span className="gg-applying" title={repository.operationCommit.id}>{repository.operation === "merge" ? "merging" : "applying"} <code>{repository.operationCommit.id.slice(0, 8)}</code> {repository.operationCommit.subject}{repository.operationCommit.step ? ` (${repository.operationCommit.step[0]}/${repository.operationCommit.step[1]})` : ""}</span>}<span>{repository.conflicts.length} {tt("conflicted files")}</span><button disabled={busy || !!repository.conflicts.length} onClick={() => run("continue")}>{tt("Continue")}</button><button disabled={busy || !canRun("skip")} onClick={() => run("skip")}>{tt("Skip…")}</button><button disabled={busy} onClick={() => run("abort")}>{tt("Abort…")}</button></div>}
+      {repository?.operation && !compareFile && <div className="gg-operation"><strong>{repository.operation} {tt("in progress")}</strong>{repository.operationCommit && <span className="gg-applying" title={repository.operationCommit.id}>{repository.operation === "merge" ? "merging" : "applying"} <code>{repository.operationCommit.id.slice(0, 8)}</code> {repository.operationCommit.subject}{repository.operationCommit.step ? ` (${repository.operationCommit.step[0]}/${repository.operationCommit.step[1]})` : ""}</span>}<span>{repository.conflicts.length} {tt("conflicted files")}</span>
+        {repository.operation === "merge" && !repository.conflicts.length && <button className="gg-merge-changes" disabled={busy || !!graph?.readOnlyReason} onClick={openWorkingChanges}>{tt("Working Changes")}</button>}
+        <button disabled={busy || !!repository.conflicts.length} onClick={() => run("continue")}>{repository.operation === "merge" && !repository.conflicts.length ? tt("Commit merge with Git’s message") : tt("Continue")}</button><button disabled={busy || !canRun("skip")} onClick={() => run("skip")}>{tt("Skip…")}</button><button disabled={busy} onClick={() => run("abort")}>{tt("Abort…")}</button></div>}
       <div className="gg-workspace-body" {...dragHandlers}>
         {showSidebar && !compareFile && <aside className="gg-sidebar" aria-label={tt("Repository panels")} onKeyDown={(e) => {
           if (["ArrowDown", "ArrowUp"].includes(e.key) || (vim && ["j", "k"].includes(e.key))) { e.preventDefault(); e.stopPropagation(); const list = [...e.currentTarget.querySelectorAll<HTMLButtonElement>(".gg-side-row")]; const at = list.indexOf(document.activeElement as HTMLButtonElement); const next = Math.max(0, Math.min(list.length - 1, at + (["ArrowDown", "j"].includes(e.key) ? 1 : -1))); list[next]?.focus(); list[next]?.click(); }
@@ -1344,7 +1359,7 @@ export function GitGraph({ path: initialPath, compareFile, focusFile = compareFi
             {searchProgress && <GitProgressBar progress={searchProgress} compact onCancel={found.cancel} />}
             {ghost && target?.kind === "reference" && <div className={`gg-ghost ${ghost.files.length ? "conflict" : ""}`} aria-hidden="true"><svg width="36" height="24"><path d="M 10 24 V 12 M 26 24 Q 26 12 10 12" /><circle cx="10" cy="12" r="5" /></svg><span>{tt("Merge {source} into {target}", { source: target.ref.name, target: repository?.branch ?? "" })}</span><small>{ghost.files.length ? tt(ghost.files.length === 1 ? "{count} file in conflict" : "{count} files in conflict", { count: ghost.files.length }) : tt("no conflicts")}</small></div>}
             <div className="gg-columns" style={{ gridTemplateColumns: grid }}><span>{tt("Graph")}</span><span>{tt("Commit")}</span><span>{tt("Author")}</span><span>{tt("Date")}</span><span>{tt("Hash")}</span><span /></div>
-            {items.map((row, index) => row === null ? <button key="working" disabled={busy || loading || !!graph.readOnlyReason || (!!repository?.operation && !repository.editStop) || !!repository?.bisectActive} className={`gg-row gg-working ${target?.kind === "working" ? "selected" : ""} ${showChanges ? "expanded" : ""}`} style={{ gridTemplateColumns: grid }} onFocus={() => { setSelected(index); setContext("history"); setTarget({ kind: "working" }); }} onClick={working} aria-expanded={showChanges}>
+            {items.map((row, index) => row === null ? <button key="working" disabled={busy || loading || !!graph.readOnlyReason || (!!repository?.operation && !workingDuringOperation) || !!repository?.bisectActive} className={`gg-row gg-working ${target?.kind === "working" ? "selected" : ""} ${showChanges ? "expanded" : ""}`} style={{ gridTemplateColumns: grid }} onFocus={() => { setSelected(index); setContext("history"); setTarget({ kind: "working" }); }} onClick={working} aria-expanded={showChanges}>
               <svg width={graphWidth} height={ROW_HEIGHT} aria-hidden="true" className="gg-lanes">{[...new Set([...(headRow?.edges.map((edge) => edge.from) ?? []), headRow?.lane ?? 0])].filter((lane) => lane !== headRow?.lane || !headRow.tip).map((lane) => <path key={lane} className={`gg-color-${(lane === headRow?.lane ? headRow.color : headRow?.edges.find((e) => e.from === lane)?.color ?? 0) % 6}`} d={`M ${18 + lane * 18} 0 V ${ROW_HEIGHT}`} />)}<path className={`gg-color-${(headRow?.color ?? 0) % 6}`} d={`M ${18 + workingLane * 18} ${ROW_MID} V ${ROW_HEIGHT}`} /><circle className={`gg-color-${(headRow?.color ?? 0) % 6} gg-working-dot`} cx={18 + workingLane * 18} cy={ROW_MID} r="6" /></svg>
               <span className="gg-message"><b>{tt("Working Changes")}</b><span className="gg-badge">{graph.changes ? tt("{count} changed", { count: graph.changes.trimEnd().split("\n").length }) : tt("Clean")}</span></span><span className="gg-muted">{tt("Local")}</span><span /><span className="gg-muted">{showChanges ? tt("Collapse") : tt("Review")}</span><span />
             </button> : <button key={row.key} data-commit={row.id} data-stash={row.stash} disabled={busy || loading} draggable={!compareFile && !row.stash} className={`gg-row ${row.stash ? "gg-stash-row" : ""} ${reached && !inFocus(reached, row.key) ? "gg-dim" : ""} ${dragOver === row.id ? "gg-drop-target" : ""} ${rowSelected(row) ? "selected" : ""} ${picked.has(row.id) ? "picked" : ""}`} aria-selected={picked.has(row.id) || undefined} style={{ gridTemplateColumns: grid }} onFocus={() => { setSelected(index); setContext("history"); setTarget(rowTarget(row)); }} onClick={(e) => {

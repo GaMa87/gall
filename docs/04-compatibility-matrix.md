@@ -215,6 +215,7 @@ WN-103. Where the workflow differs, the table records the reason or the missing 
 | Start rebase with another rebase active | Git refuses nested rebases | Gall requires finishing or aborting the current operation | final comparison pending |
 | Continue or abort rebase conflicts | Git resumes or restores the operation | operation bar offers Continue and Abort | final comparison pending |
 | Merge with no fast-forward | `merge --no-ff` | Merge dialog offers a merge commit even when fast-forward is possible | regression added, Linux checks pending |
+| Prepare a merge and commit manually | Git uses `merge --no-ff --no-commit`; lazygit accepts these flags via `git.merging.args` | **Merge without committing** stages the result and preserves both parents for **Commit merge** in Working Changes. The user can stage further edits and enter a custom message. | core, running-app and process-budget regressions added, runtime checks pending |
 | Fast-forward-only merge | `merge --ff-only` | Merge dialog offers the mode and leaves a diverged checkout unchanged on refusal | regression added, Linux checks pending |
 | Squash merge | `merge --squash` | Merge dialog stages the result as a squash without advancing HEAD | regression added, Linux checks pending |
 | Continue a resolved merge | commits the resolved index without a checkout | Gall commits the index without a working-tree collision check. Ignored replacements for staged deletions are preserved | regression added, Linux checks pending |
@@ -244,7 +245,7 @@ WN-103. Where the workflow differs, the table records the reason or the missing 
 | Repair a worktree | `worktree repair` | Worktrees actions accept a linked checkout path | final comparison pending |
 | Prune worktrees | `worktree prune` | Worktrees actions expose prune | final comparison pending |
 | Lock or unlock a worktree | `worktree lock` and `unlock` | native worktree actions | final comparison pending |
-| Create lightweight or annotated tags | `tag` or `tag -a` | tag action uses a message to distinguish annotated tags | final comparison pending |
+| Create lightweight or annotated tags | `tag` or `tag -a` | tag action uses a message to distinguish annotated tags. The optional **Push tag to origin immediately** checkbox pushes only the newly created tag and keeps it locally if the push fails | running-app scenario added, runtime checks pending |
 | Push a tag | `push <remote> <tag>` | the tag action selects a remote and pushes only the named tag object without force | regression added, Linux checks pending |
 | Delete a tag | lazygit offers local or remote deletion, using `git tag -d` or a remote deletion refspec | Tags offers local deletion and remote deletion. Remote deletion targets the tag namespace and keeps the local tag | regression added, Linux checks pending |
 | Bisect start, mark good or bad, skip and reset | native Git bisect controls | Gall selects and checks out candidates with native commands | final comparison pending |

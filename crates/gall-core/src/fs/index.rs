@@ -104,6 +104,7 @@ const REMOTE_FS: &[&str] = &[
     "fuse.gcsfuse",
     "fuse.goofys",
     "fuse.gvfsd-fuse",
+    "fuse.kio-fuse",
     "fuse.curlftpfs",
     "fuse.onedriver",
     "fuse.google-drive-ocamlfuse",
@@ -271,7 +272,7 @@ struct Entry {
     hidden: bool,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Snapshot {
     arena: String,
     entries: Vec<Entry>,
@@ -342,6 +343,8 @@ pub struct FileIndex {
     /// Paths under these prefixes rank higher (e.g. the home folder).
     preferred: RwLock<Vec<String>>,
 }
+
+const CACHE_MAGIC: &str = "gall-index-cache 1";
 
 /// Score bonus for hits under a preferred prefix.
 const BONUS_PREFERRED: i32 = 25;
@@ -513,6 +516,184 @@ impl FileIndex {
         }
         *w = Arc::new(snap);
         removed
+    }
+
+    /// Osmosis: adds paths seen while browsing or after a file operation to the snapshot, so active
+    /// folders stay fresh without a rebuild. Paths already indexed, outside the indexed roots, or
+    /// seen before the first build finished are ignored. Returns how many were added.
+    pub fn upsert_paths(&self, items: &[(PathBuf, bool)]) -> usize {
+        if items.is_empty() {
+            return 0;
+        }
+        let mut w = self.snap.write().unwrap();
+        if w.built_at.is_none() {
+            return 0;
+        }
+        let wanted: std::collections::HashSet<&str> = items
+            .iter()
+            .filter(|(p, _)| w.roots.iter().any(|r| p.starts_with(r)))
+            .filter_map(|(p, _)| p.to_str())
+            .collect();
+        let existing: std::collections::HashSet<String> = w
+            .entries
+            .iter()
+            .map(|e| w.path(e))
+            .filter(|p| wanted.contains(p))
+            .map(str::to_string)
+            .collect();
+        let fresh: Vec<(String, bool)> = items
+            .iter()
+            .filter_map(|(p, d)| p.to_str().map(|s| (s.to_string(), *d)))
+            .filter(|(s, _)| wanted.contains(s.as_str()) && !existing.contains(s))
+            .collect();
+        if fresh.is_empty() {
+            return 0;
+        }
+        let n = fresh.len();
+        let snap = Arc::make_mut(&mut w);
+        push_items(
+            snap,
+            fresh.into_iter().map(|(p, d)| (p, d, false)).collect(),
+            usize::MAX,
+        );
+        n
+    }
+
+    /// Osmosis for one listed folder: its visible, non-hidden children join the index.
+    /// `children` are `(name, is_dir)`; names starting with a dot are left to the next rebuild,
+    /// which applies the ignore rules.
+    pub fn upsert_dir(&self, dir: &Path, children: &[(String, bool)]) -> usize {
+        let items: Vec<(PathBuf, bool)> = children
+            .iter()
+            .filter(|(n, _)| !n.starts_with('.'))
+            .map(|(n, d)| (dir.join(n), *d))
+            .collect();
+        self.upsert_paths(&items)
+    }
+
+    /// Renames `from` and everything below it to `to` in place (a rename or move done in the app).
+    /// Returns how many entries moved.
+    pub fn rename_prefix(&self, from: &Path, to: &Path) -> usize {
+        let (Some(f), Some(t)) = (from.to_str(), to.to_str()) else {
+            return 0;
+        };
+        let f = f.trim_end_matches(['/', '\\']);
+        if f.is_empty() {
+            return 0;
+        }
+        let mut w = self.snap.write().unwrap();
+        let moved = w
+            .entries
+            .iter()
+            .filter(|e| {
+                w.path(e)
+                    .strip_prefix(f)
+                    .is_some_and(|r| r.is_empty() || r.starts_with(['/', '\\']))
+            })
+            .count();
+        if moved == 0 {
+            return 0;
+        }
+        let old = w.clone();
+        let mut snap = Snapshot {
+            arena: String::with_capacity(old.arena.len()),
+            entries: Vec::with_capacity(old.entries.len()),
+            roots: old.roots.clone(),
+            built_at: old.built_at,
+            build_ms: old.build_ms,
+            restricted_dirs: old.restricted_dirs,
+        };
+        for e in &old.entries {
+            let s = old.path(e);
+            let moved_path = s
+                .strip_prefix(f)
+                .filter(|r| r.is_empty() || r.starts_with(['/', '\\']))
+                .map(|r| format!("{t}{r}"));
+            let path = moved_path.as_deref().unwrap_or(s);
+            let start = snap.arena.len();
+            snap.arena.push_str(path);
+            let name = path.rfind(['/', '\\']).map(|i| i + 1).unwrap_or(0);
+            snap.entries.push(Entry {
+                start: start as u32,
+                len: path.len() as u32,
+                name: name.min(u16::MAX as usize) as u16,
+                ..*e
+            });
+        }
+        *w = Arc::new(snap);
+        moved
+    }
+
+    /// Writes the snapshot as one compact file (`path` created with its folders). Call it once after a
+    /// completed build, never periodically.
+    pub fn save_cache(&self, path: &Path) -> std::io::Result<()> {
+        let s = self.snap.read().unwrap().clone();
+        let Some(built) = s.built_at else {
+            return Ok(());
+        };
+        let ms = built
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        let mut out = String::with_capacity(s.arena.len() + s.entries.len() * 3 + 256);
+        out.push_str(CACHE_MAGIC);
+        out.push('\n');
+        out.push_str(&format!("{ms}\t{}\n", s.build_ms));
+        for r in &s.roots {
+            out.push_str(&format!("R{}\n", r.to_string_lossy()));
+        }
+        for e in &s.entries {
+            let flags = (e.is_dir as u8) | ((e.hidden as u8) << 1);
+            out.push((b'0' + flags) as char);
+            out.push_str(s.path(e));
+            out.push('\n');
+        }
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, out)?;
+        std::fs::rename(&tmp, path)
+    }
+
+    /// Loads a snapshot written by [`FileIndex::save_cache`] when nothing was built yet. The snapshot
+    /// keeps its original build time, so an on-demand refresh still replaces it. Returns the number of
+    /// entries loaded; a missing or unreadable cache loads nothing.
+    pub fn load_cache(&self, path: &Path) -> usize {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return 0;
+        };
+        let mut lines = text.lines();
+        if lines.next() != Some(CACHE_MAGIC) {
+            return 0;
+        }
+        let Some((ms, build_ms)) = lines.next().and_then(|l| l.split_once('\t')) else {
+            return 0;
+        };
+        let (Ok(ms), Ok(build_ms)) = (ms.parse::<u64>(), build_ms.parse::<u64>()) else {
+            return 0;
+        };
+        let mut snap = Snapshot {
+            built_at: Some(SystemTime::UNIX_EPOCH + Duration::from_millis(ms)),
+            build_ms,
+            ..Default::default()
+        };
+        let mut items = Vec::new();
+        for l in lines {
+            if let Some(r) = l.strip_prefix('R') {
+                snap.roots.push(PathBuf::from(r));
+            } else if let Some(flags) = l.bytes().next().filter(|b| (b'0'..=b'3').contains(b)) {
+                let f = flags - b'0';
+                items.push((l[1..].to_string(), f & 1 != 0, f & 2 != 0));
+            }
+        }
+        push_items(&mut snap, items, usize::MAX);
+        let n = snap.entries.len();
+        let mut w = self.snap.write().unwrap();
+        if w.built_at.is_some() {
+            return 0;
+        }
+        *w = Arc::new(snap);
+        n
     }
 
     /// Current roots, plus `extra` if it is not already covered.
@@ -1266,11 +1447,13 @@ mod tests {
                  nas:/export /mnt/nas nfs4 rw 0 0\n\
                  //srv/share /mnt/My\\040Share cifs rw 0 0\n\
                  gdrive: /home/u/Google\\040Drive fuse.rclone rw 0 0\n\
+                 kio-fuse /run/user/1000/kio-fuse-AbCdEf fuse.kio-fuse rw 0 0\n\
                  /dev/sdb1 /run/media/u/USB fuseblk rw 0 0\n";
         let r = parse_remote_mounts(t);
         assert!(r.contains(Path::new("/mnt/nas")));
         assert!(r.contains(Path::new("/mnt/My Share")));
         assert!(r.contains(Path::new("/home/u/Google Drive")));
+        assert!(r.contains(Path::new("/run/user/1000/kio-fuse-AbCdEf")));
         assert!(!r.contains(Path::new("/home")));
         assert!(
             !r.contains(Path::new("/run/media/u/USB")),
@@ -1461,6 +1644,52 @@ mod tests {
         idx.rebuild(&[p.to_path_buf()], &opts, &cancel);
         assert_eq!(rs(&idx), 0);
         assert!(idx.query("App.tsx", None, 10).total > 0);
+    }
+
+    #[test]
+    fn learns_renames_and_listings_without_a_rebuild_and_survives_a_cache_round_trip() {
+        let d = tree();
+        let p = d.path();
+        let idx = FileIndex::new();
+        let new_file = p.join("src/fresh.rs");
+        std::fs::write(&new_file, "").unwrap();
+        // Nothing is learned before the first build.
+        assert_eq!(idx.upsert_paths(&[(new_file.clone(), false)]), 0);
+        let opts = IndexOptions {
+            exclude: vec![],
+            ..Default::default()
+        };
+        idx.rebuild(&[p.to_path_buf()], &opts, &AtomicBool::new(false));
+        assert_eq!(idx.query("'fresh.rs", None, 10).total, 1);
+
+        let later = p.join("src").join("later.rs");
+        std::fs::write(&later, "").unwrap();
+        assert_eq!(
+            idx.upsert_dir(
+                &p.join("src"),
+                &[("later.rs".into(), false), (".dot".into(), false)]
+            ),
+            1
+        );
+        assert_eq!(idx.query("'later.rs", None, 10).total, 1);
+        // Already known paths are not added twice.
+        assert_eq!(idx.upsert_paths(&[(later, false)]), 0);
+
+        std::fs::rename(p.join("ui"), p.join("web")).unwrap();
+        assert!(idx.rename_prefix(&p.join("ui"), &p.join("web")) > 0);
+        let hits = idx.query("'App.tsx", None, 10).hits;
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].path.contains("web"));
+
+        let cache = p.join("index.cache");
+        idx.save_cache(&cache).unwrap();
+        let fresh = FileIndex::new();
+        assert!(fresh.load_cache(&cache) > 0);
+        assert_eq!(fresh.query("'App.tsx", None, 10).total, 1);
+        assert_eq!(fresh.query("'later.rs", None, 10).total, 1);
+        // Garbage is ignored.
+        std::fs::write(&cache, "nonsense").unwrap();
+        assert_eq!(FileIndex::new().load_cache(&cache), 0);
     }
 
     #[test]

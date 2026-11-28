@@ -172,7 +172,7 @@ export interface SyncCheck { path: string; stamp: { size: number; mtime: number 
 export type SyncOp = { op: "copy"; src: string; dest: string } | { op: "trash"; path: string };
 export interface SyncReport { copied: number; replaced: number; trashed: number; bytes: number; undoId?: number | null }
 
-/** Fallback info for a video the built-in player cannot play (video_probe; needs FFmpeg). */
+/** Fallback info for media the built-in player cannot play (video_probe; needs FFmpeg). */
 export interface VideoProbe {
   platform: string;
   ffmpeg: boolean;
@@ -182,6 +182,9 @@ export interface VideoProbe {
   width: number | null;
   height: number | null;
   duration: number | null;
+  fps?: number | null;
+  hasVideo?: boolean;
+  hasAudio?: boolean;
   poster: string | null;
 }
 
@@ -587,6 +590,8 @@ export interface PreviewInfo {
   folderBytes: number | null;
   /** Item inside an archive: its extracted copy, which the webview loads. */
   localPath?: string | null;
+  /** Linux: GStreamer lacks plugins for this media file and FFmpeg is available. */
+  useFfmpeg?: boolean;
 }
 
 /** "Always open … with …" (Open with › Ctrl+Enter). target: "ext:md" or "path:<file>"; dir limits it to a folder. */

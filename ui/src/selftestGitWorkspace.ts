@@ -2,6 +2,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { invoke } from "@tauri-apps/api/core";
 import * as A from "./state/actions";
 import type { Repository } from "./core/gitRepository";
+import type { GitCommitDetails } from "./api/types";
 
 export async function runGitWorkspaceSelfTest(h: typeof import("./selftest").gitSelftest) {
   const { $, $$, key, click, typeInto, until, sleep, shot, setWindowSize, log } = h;
@@ -474,6 +475,8 @@ export async function runGitWorkspaceSelfTest(h: typeof import("./selftest").git
     await narrowShot("workspace-partial-staging");
     // WN-35 keys in the diff: ] jumps to the next hunk, v starts a line range, j extends it, Space stages what is chosen.
     click($$(".gc-file").find((r) => r.textContent?.includes("Unstaged") && r.textContent?.includes("file.txt"))!); await sleep(200);
+    // Inside WSL the diff arrives late and a cursor set before then is reset, so the keys start once the last hunk is on screen.
+    await until(() => $$(".gc-diff-line").some((line) => line.textContent?.includes("twenty-five changed")), 8000);
     ($(".gc-patch") as HTMLElement).focus(); await sleep(100);
     key("]", {}, $(".gc-patch")); await sleep(120);
     log(!!$(".gc-diff-line.current")?.textContent?.includes("@@"), "] moves the cursor to the next hunk header");
@@ -483,7 +486,9 @@ export async function runGitWorkspaceSelfTest(h: typeof import("./selftest").git
     log($$(".gc-diff-line.chosen").length >= 2 && startChosen === 0, "v starts a line range at the hunk header and moving down extends it over the changed lines", String($$(".gc-diff-line.chosen").length));
     await shot("workspace-hunk-keys");
     key(" ", {}, $(".gc-patch")); await sleep(300);
-    const afterKey = await invoke<string>("git_file_patch", { path, file: "file.txt", staged: true });
+    let afterKey = await invoke<string>("git_file_patch", { path, file: "file.txt", staged: true });
+    // Staging inside WSL takes longer than the fixed pause.
+    for (let i = 0; i < 20 && !afterKey.includes("twenty-five changed"); i++) { await sleep(250); afterKey = await invoke<string>("git_file_patch", { path, file: "file.txt", staged: true }); }
     log(afterKey.includes("twenty-five changed"), "Space in the diff stages the chosen lines by key", afterKey);
     // Dragging a file row to the other list stages it.
     const dragged = $$(".gc-file").find((r) => r.textContent?.includes("Unstaged"));
@@ -547,9 +552,48 @@ export async function runGitWorkspaceSelfTest(h: typeof import("./selftest").git
     await shot("workspace-after-rebase");
     click(history("direct historical reword")!); await selectedKey("n"); await dialog("Create branch", "review-branch");
     log(!!await until(() => $$(".gg-side-row").some((r) => r.textContent?.includes("review-branch"))), "create branch from selected historical commit");
-    await selectedKey("T"); await dialog("Next", "review-tag"); await dialog("Create tag", "Annotated test tag");
+    const originBeforeTag = (await repo()).refs.find((ref) => ref.fullName === "refs/remotes/origin/main")?.id;
+    const pushTagCheckbox = () => $<HTMLInputElement>(".modal .dialog-check input[type=checkbox]");
+    await selectedKey("T"); await dialog("Next", "review-tag");
+    const pushTag = await until(pushTagCheckbox);
+    if (!pushTag) throw new Error("Tag creation did not offer push to origin");
+    log(!pushTag.checked, "immediate tag push is unchecked initially");
+    await shot("workspace-create-tag-push");
+    click(pushTag);
+    log(!!await until(() => pushTag.checked), "the option can be enabled without changing the tag description");
+    await dialog("Create tag", "Annotated test tag"); await settle();
+    await selectedKey("T"); await dialog("Next", "review-local-tag");
+    await until(pushTagCheckbox);
+    log(pushTagCheckbox()?.checked === false, "a second tag starts with push unchecked again");
+    await dialog("Create tag"); await settle();
+
     await press("Tags", $(".gg-side-tabs")!); await sleep(100);
-    log(!!await until(() => $$(".gg-side-row").some((r) => r.textContent?.includes("review-tag"))), "annotated tag appears in its own Tags panel");
+    const tagRow = (name: string) => `.gg-side-row[data-drag-ref="refs/tags/${name}"]`;
+    log(!!await until(() => $(`${tagRow("review-tag")} .gg-synced`) && $(`${tagRow("review-local-tag")} [aria-label="Local only"]`), 8000), "the checked tag appears on origin while the unchecked one stays local");
+    log((await repo()).refs.find((ref) => ref.fullName === "refs/remotes/origin/main")?.id === originBeforeTag, "creating and pushing a single tag leaves the remote branch at the same commit");
+    const tagLookup = crypto.randomUUID();
+    await invoke("git_remote_tags_register", { id: tagLookup });
+    try {
+      const tags = await invoke<{ name: string; id: string; peeled: string | null }[]>("git_remote_tags", { path, remote: "origin", id: tagLookup });
+      const annotated = tags.find((tag) => tag.name === "review-tag");
+      log(!!annotated?.peeled && annotated.id !== annotated.peeled, "origin has the annotated tag object");
+    } finally {
+      await invoke("git_remote_tags_release", { id: tagLookup });
+    }
+
+    const localTag = $(tagRow("review-tag"))!;
+    localTag.focus(); click(localTag);
+    await until(() => localTag.classList.contains("selected"));
+    key("d", {}, localTag);
+    await dialog("Delete tag"); await settle();
+    click(history("direct historical reword")!);
+    await selectedKey("T"); await dialog("Next", "review-tag");
+    const repush = await until(pushTagCheckbox);
+    if (!repush) throw new Error("Tag creation did not offer push to origin");
+    click(repush); await until(() => repush.checked);
+    await dialog("Create tag", "A different annotation for the same tag name"); await settle();
+    log(!!$(".gg-error")?.textContent?.includes("Tag review-tag was created locally, but could not be pushed to origin.")
+      && (await repo()).refs.some((ref) => ref.fullName === "refs/tags/review-tag"), "a rejected tag push reports the failure and keeps the newly created local tag");
     await press("Refs", $(".gg-side-tabs")!); await sleep(100);
     log(!$$(".gg-side-row").some((r) => r.textContent?.includes("review-tag")), "tags are not listed among branches");
     await press("Remotes", $(".gg-side-tabs")!); await sleep(100);
@@ -638,19 +682,48 @@ export async function runGitWorkspaceSelfTest(h: typeof import("./selftest").git
       await shot("workspace-hint-labels");
       key("Escape", {}, document.body); await sleep(100);
     }
-    const mergeBranch = async (name: string) => {
-      const branch = await until(() => $<HTMLButtonElement>(`.gg-side-row[data-drag-ref="refs/heads/${name}"]:not(:disabled)`));
-      if (!branch) throw new Error(`Missing local branch ${name}`);
-      branch.focus();
-      if (!await until(() => document.activeElement === branch && branch.classList.contains("selected"))) {
-        throw new Error(`The branch ${name} did not receive selection and focus`);
-      }
+    const mergeBranch = async (name: string, chooseWithKey = false) => {
+      // The row can be replaced by a render between the lookup and the focus, so each attempt looks it up again.
+      const branch = await until(() => {
+        const row = $<HTMLButtonElement>(`.gg-side-row[data-drag-ref="refs/heads/${name}"]:not(:disabled)`);
+        if (row && document.activeElement !== row) row.focus();
+        return row && document.activeElement === row && row.classList.contains("selected") ? row : null;
+      }, 6000);
+      if (!branch) throw new Error(`The branch ${name} did not receive selection and focus`);
       key("M", { shiftKey: true }, branch);
       if (!await until(() => $(".modal .buttons"), 12000)) throw new Error(`The merge command did not ask for confirmation on ${name}`);
-      await dialog("Merge");
+      if (chooseWithKey) {
+        key("c", {}, $(".modal"));
+        if (!await until(() => !$(".modal"))) throw new Error("The merge mode shortcut did not close the dialog");
+      } else {
+        await shot("workspace-merge-modes");
+        await dialog("Merge without committing");
+      }
     };
-    await mergeBranch("conflict-left"); await settle();
-    await mergeBranch("conflict-right");
+    const beforeMerge = await repo();
+    const left = beforeMerge.refs.find((ref) => ref.fullName === "refs/heads/conflict-left")?.id;
+    await mergeBranch("conflict-left");
+    const changes = await until(() => $(".git-changes"));
+    if (!changes) throw new Error("Merge without committing did not open Working Changes");
+    log(!!await until(() => $(".gc-file .staged", changes)), "merge without committing opens Working Changes with the merge staged");
+    const prepared = await repo();
+    log(prepared.head === beforeMerge.head && prepared.operation === "merge", "merge without committing keeps HEAD and leaves an in-progress merge");
+    await h.api.createFile(path, "merge-extra.txt");
+    await press("Refresh", changes);
+    log(!!await until(() => $(".gc-file [title='merge-extra.txt']", changes)), "a new file is available to stage during the merge");
+    await press("Stage all", changes);
+    log(!!await until(() => $(".gc-file [title='merge-extra.txt']", changes)?.closest(".gc-file")?.querySelector(".staged")), "the new file is staged alongside the merge");
+    const mergeMessage = $("textarea[aria-label='Commit message']", changes) as HTMLTextAreaElement;
+    typeInto(mergeMessage, "Merge left with an extra file\n\nCustom message body");
+    await shot("workspace-merge-without-committing");
+    await press("Commit merge", changes);
+    log(!!await until(() => !$(".gg-operation") && history("Merge left with an extra file"), 8000), "custom commit completes the merge");
+    const merged = await repo();
+    const details = await invoke<GitCommitDetails>("git_commit_details", { path, commit: merged.head, base: beforeMerge.head });
+    log(details.parents.length === 2 && details.parents[0] === beforeMerge.head && details.parents[1] === left
+      && details.message.includes("Custom message body") && details.files.some((file) => file.path === "merge-extra.txt"), "custom merge preserves both parents and includes the added file and message");
+    await press("Collapse", $(".gg-working-title")!); await settle();
+    await mergeBranch("conflict-right", true);
     log(!!await until(() => $(".gg-operation")?.textContent?.includes("merge"), 8000), "conflicting merge remains visible and resumable");
     log(!!await until(() => $(".gg-conflicts-tab")?.getAttribute("aria-pressed") === "true", 4000), "Conflicts tab appears first and is selected when conflicts exist"); await sleep(80);
     click($$(".gg-side-row").find((r) => r.textContent?.includes("file.txt"))!);
@@ -695,9 +768,21 @@ export async function runGitWorkspaceSelfTest(h: typeof import("./selftest").git
     click($(".gm-card .gm-left")!); await sleep(80);
     log(!!$(".gm-status")?.textContent?.includes("0 left"), "the status counts the conflicts that are left");
     await press("Confirm", $(".gm")!); await settle();
-    log(!!await until(() => document.activeElement?.textContent?.trim().startsWith("Continue"), 4000), "after the last conflicted file the Continue button has focus, so Enter continues");
-    await press("Continue", $(".gg-operation")!);
-    log(!!await until(() => !$(".gg-operation"), 8000), "resolution and continue complete actual merge");
+    log(!!await until(() => document.activeElement === button("Working Changes", $(".gg-operation") ?? document), 4000), "after the last conflict the Working Changes button has focus");
+    await press("Working Changes", $(".gg-operation")!);
+    const resolvedMessage = await until(() => $<HTMLTextAreaElement>(".gc-commit textarea"));
+    if (!resolvedMessage) throw new Error("Resolved merge did not open the commit message editor");
+    const resolved = await repo();
+    log(resolved.operation === "merge" && !resolved.conflicts.length && resolved.head === merged.head, "resolving the last conflict leaves the merge ready for review and the old HEAD in place");
+    await h.updateSettings({ keyboardProfile: "explorer" });
+    resolvedMessage.focus();
+    typeInto(resolvedMessage, "Merge after reviewing the conflict");
+    await until(() => $(".git-changes .gc-commit button:not(:disabled)"));
+    key("Enter", { ctrlKey: true }, resolvedMessage);
+    log(!!await until(() => !$(".gg-operation") && history("Merge after reviewing the conflict"), 8000), "Ctrl+Enter in Working Changes commits the resolved merge with Vim keys off");
+    await h.updateSettings({ keyboardProfile: "vim" });
+    // The conflict message of the merge stays in the banner until the user refreshes, as a person would before the next task.
+    click($<HTMLButtonElement>("button[aria-label='Refresh Git workspace']")!); await settle();
     const noteCommit = (await repo()).head;
     click($(`[data-commit="${noteCommit}"]`)!); await sleep(120);
     await press("Tools");

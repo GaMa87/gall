@@ -28,6 +28,7 @@ optdepends=('xdg-desktop-portal: use Gall as the open and save dialog of other p
             'gvfs-mtp: phones and cameras (MTP) in the sidebar'
             'gvfs-smb: Windows network shares'
             'gvfs-nfs: NFS shares'
+            'kio-fuse: KDE/Dolphin network shares (SMB, NFS, SFTP)'
             'gst-plugins-good: video and audio preview'
             'gst-libav: more video formats in the preview'
             'git: Git status in the file list'
