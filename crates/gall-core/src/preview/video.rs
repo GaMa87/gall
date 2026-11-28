@@ -659,6 +659,9 @@ mod tests {
         );
     }
 
+    // FreeDesktop thumbnails are a Linux cache; on Windows canonicalize() yields a \\?\ path,
+    // which cannot be a file:// URI for that cache.
+    #[cfg(unix)]
     #[test]
     fn finds_fresh_freedesktop_thumbnail_and_rejects_stale() {
         let dir = tempfile::tempdir().unwrap();
